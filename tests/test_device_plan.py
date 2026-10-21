@@ -163,8 +163,8 @@ def test_stage2_shards_its_reads_over_the_devices_as_one_streamed_source_reads(t
     )
     host_source = store_block_source.StoreGenotypeBlockSource
 
-    def host_shard(store, block_rows, block_indices, means, scales, _device_budget, workspace_bytes, sample_indices=None):
-        return host_source(store, block_rows, block_indices, means, scales, host, workspace_bytes, sample_indices)
+    def host_shard(store, block_rows, block_indices, means, scales, _device_budget, workspace_bytes, sample_indices=None, code_cache=None):
+        return host_source(store, block_rows, block_indices, means, scales, host, workspace_bytes, sample_indices, code_cache)
 
     monkeypatch.setattr(compute_budget, "_try_import_cupy", lambda: np)
     monkeypatch.setattr(store_block_source, "StoreGenotypeBlockSource", host_shard)

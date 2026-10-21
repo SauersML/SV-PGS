@@ -98,10 +98,6 @@ STOPS = [
 def test_a_step_stopped_part_way_and_started_again_makes_an_uninterrupted_run_s_outputs(
     workspace, monkeypatch, tmp_path, request, step, where, finished, kept, mirrored  # noqa: F811 (the fixture)
 ) -> None:
-    if step == "direct_sv" and mirrored:
-        # The mirror carries a finished chromosome's record and its store files but not its direct rows,
-        # direct_sv.partial/rows/<chromosome>.npz, so the restarted step cannot finish (FileNotFoundError).
-        request.applymarker(pytest.mark.xfail(strict=True, raises=FileNotFoundError, reason="run_mirror.STORE_CHROMOSOME_FILES lacks direct_sv's rows"))
     synthetic, client = workspace
     # With a GATK-SV call set, so the direct_sv step has chromosomes to merge and with_sv fits its rows.
     config = WorkspaceConfig.from_mapping({

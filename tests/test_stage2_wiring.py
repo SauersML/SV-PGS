@@ -588,7 +588,8 @@ def test_a_group_resumes_only_when_every_model_is_checkpointed(tmp_path: Path, m
     first = fit()
     assert fitted_groups == [[0, 1], [2]]
     checkpoints = tmp_path / "work" / "checkpoints" / "key"
-    assert sorted(path.name for path in checkpoints.iterdir()) == ["model0.npz", "model1.npz", "model2.npz"]
+    # A restart unit (``restart_store``): the models' checkpoints beside the unit's manifest.
+    assert sorted(path.name for path in checkpoints.iterdir()) == ["UNIT.json", "model0.npz", "model1.npz", "model2.npz"]
     resumed = fit()
     assert fitted_groups == [[0, 1], [2]]
     np.testing.assert_array_equal(resumed.noise_variance, first.noise_variance)

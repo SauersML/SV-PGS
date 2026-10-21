@@ -34,6 +34,7 @@ from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.memory_broker import HOST, MemoryBroker, current_broker, device_pool, meter_device
 from sv_pgs.phase_timer import GB, timing
 from sv_pgs.progress import log
+from sv_pgs.restart_store import CodeCache, definition_sources, facts, unit_key
 
 _GATHER_SOURCE = r"""
 extern "C" __global__
@@ -107,6 +108,7 @@ class StoreGenotypeBlockSource:
         budget: ComputeBudget,
         workspace_bytes: int,
         sample_indices: NDArray[np.int64] | None = None,
+        code_cache: CodeCache | None = None,
     ) -> None:
         self._store = store
         self._sample_indices = None
@@ -185,6 +187,10 @@ class StoreGenotypeBlockSource:
         self._refused = False
         self.resident_codes_bytes = sum(_aligned(int(rows.shape[0])) * self._padded_samples for rows in self._block_rows)
         self._broker = None
+        # Each block's signed codes as a restart unit (``_iter_prepared``), on a device only: the host route's tiles are
+        # the store's own reads.
+        self._code_cache = code_cache if self._cupy is not None else None
+        self._code_keys: list[tuple[str, dict[str, str]]] | None = None
         if self._cupy is not None:
             device_id = int(self._cupy.cuda.runtime.getDevice())
             self._pool = device_pool(device_id)
@@ -258,12 +264,12 @@ class StoreGenotypeBlockSource:
     @classmethod
     def from_statistics(
         cls, store: DosageStore, statistics: GenotypeSufficientStatistics, budget: ComputeBudget, workspace_bytes: int,
-        sample_indices: NDArray[np.int64] | None = None,
+        sample_indices: NDArray[np.int64] | None = None, code_cache: CodeCache | None = None,
     ) -> StoreGenotypeBlockSource:
         """The reduced model's LD blocks of one Stage 0 pass: each reduced column is its tie
         group's representative, whose store row, mean and scale Stage 0 recorded."""
         block_rows, block_indices, means, scales = reduced_block_layout(statistics)
-        return cls(store, block_rows, block_indices, np.concatenate(means), np.concatenate(scales), budget, workspace_bytes, sample_indices)
+        return cls(store, block_rows, block_indices, np.concatenate(means), np.concatenate(scales), budget, workspace_bytes, sample_indices, code_cache)
 
     @property
     def sample_count(self) -> int:
@@ -308,8 +314,11 @@ class StoreGenotypeBlockSource:
         self._resident_complete = self._cupy is not None and self._resident is not None
 
     def _iter_streamed(self, first_block: int) -> Iterator[tuple[int, CodeBlockTile]]:
-        """The blocks from ``first_block`` on, read from the store."""
+        """The blocks from ``first_block`` on, read from the store (or from their prepared codes, ``_iter_prepared``)."""
         if self._cupy is not None:
+            if self._code_cache is not None:
+                yield from self._iter_prepared(first_block)
+                return
             yield from (self._iter_decoded_tiles(first_block) if self._decoder is not None else self._iter_device_tiles(first_block))
             return
         spans = self._store.iter_codes(self._spans[first_block:], self._sample_indices, self._budget)
@@ -320,6 +329,51 @@ class StoreGenotypeBlockSource:
             gathered = codes[rows - start]
             np.subtract(gathered.view(np.int8), np.int8(SIGNED_CODE_OFFSET), out=target)
             yield block_index, self._tile(block_index, block_index % 2)
+
+    def _iter_prepared(self, first_block: int) -> Iterator[tuple[int, CodeBlockTile]]:
+        """The blocks from ``first_block`` on from their prepared codes where every one of them is a whole restart unit
+        (``restart_store``: ``codes``, one per block, keyed by the store, the block's rows, the samples and the source of
+        this class with every definition it reaches, the store's reads among them, never the engine's), else from the store, each block missing its unit then kept as one. A
+        restarted fit's resident set then fills from the compact signed codes (``resident_codes_bytes``, 8-15 GB a
+        device on All of Us whole-genome arms [real]) on the local disk, not from a read of the whole store (547 GB,
+        about 20 minutes [real]). The device placement, the means and the scales are not the codes' bytes: a unit serves
+        either device, and every tile takes its standardization from this fit's Stage 0. A block's host copy lives for
+        that block alone, charged to the ledger. A partly prepared set is read from the store, which completes it."""
+        cache = self._code_cache
+        if self._code_keys is None:
+            source = definition_sources([("sv_pgs.store_block_source", "StoreGenotypeBlockSource")])
+            samples = self._sample_indices if self._sample_indices is not None else np.arange(self._samples, dtype=np.int64)
+            self._code_keys = []
+            for rows in self._block_rows:
+                named = facts({"store": cache.store_key, "rows": rows, "samples": samples, "padded_samples": self._padded_samples, "source": source})
+                self._code_keys.append((unit_key(named), named))
+        units = [cache.store.unit("codes", key) for key, _named in self._code_keys[first_block:]]
+        if all(unit is not None for unit in units):
+            log(f"resident genotype codes: blocks {first_block} to {len(self._block_rows) - 1} read from their prepared codes on {self._pool}")
+            for block_index, (path, _record) in zip(range(first_block, len(self._block_rows)), units):
+                slot = block_index % 2
+                shape = (_aligned(int(self._block_rows[block_index].shape[0])), self._padded_samples)
+                values = np.load(path / "codes.npy", mmap_mode="r", allow_pickle=False)
+                if values.shape != shape or values.dtype != np.dtype(np.int8):
+                    raise ValueError(f"{path}'s prepared codes are {values.shape} {values.dtype}, not {shape} int8")
+                with self._broker.reserve(HOST, values.nbytes, "a prepared genotype-code block"):
+                    self._signed[slot][:shape[0]].set(values)
+                    self._cupy.cuda.get_current_stream().synchronize()
+                del values
+                self._keep(block_index, slot)
+                yield block_index, self._tile(block_index, slot)
+            return
+        streamed = self._iter_decoded_tiles(first_block) if self._decoder is not None else self._iter_device_tiles(first_block)
+        for (block_index, tile), unit in zip(streamed, units):
+            if unit is None:
+                key, named = self._code_keys[block_index]
+                rows = _aligned(int(self._block_rows[block_index].shape[0]))
+                with self._broker.reserve(HOST, rows * self._padded_samples, "a prepared genotype-code block"):
+                    values = self._signed[block_index % 2][:rows].get()
+                    with cache.store.build("codes", key, group=cache.group, named=named, supersede=False) as directory:
+                        np.save(directory / "codes.npy", values, allow_pickle=False)
+                    del values
+            yield block_index, tile
 
     def _iter_device_tiles(self, first_block: int = 0) -> Iterator[tuple[int, CodeBlockTile]]:
         cupy = self._cupy

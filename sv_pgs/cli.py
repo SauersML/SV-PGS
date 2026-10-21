@@ -136,6 +136,11 @@ def build_parser() -> argparse.ArgumentParser:
             "It is only read."
         ),
     )
+    mirror_parser.add_argument(
+        "--fit-arm", action="append", choices=ARMS, default=None,
+        help="The arms whose restart units this job restores and pushes (repeatable; every arm's when omitted): a fit job "
+             "given --fit-arm, so jobs fitting other arms of the run at once never touch each other's units.",
+    )
 
     subparsers.add_parser(
         "version",
@@ -214,9 +219,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         run_directory, remote = WorkspaceConfig.read(args.config).run_directory, GcsRemote(args.mirror)
         bases = bases_of(args.mirror, remote, args.base or (), lambda url: Base(GcsRemote(url), url, mounted(url)))
         if args.action == "push":
-            push(run_directory, remote, bases=bases)
+            push(run_directory, remote, bases=bases, arms=args.fit_arm)
         else:
-            restore(run_directory, remote, mounted(args.mirror), bases=bases)
+            restore(run_directory, remote, mounted(args.mirror), bases=bases, arms=args.fit_arm)
         return 0
 
     if args.command == "census-all-of-us-traits":

@@ -1,7 +1,8 @@
 """Atomic, non-pickle checkpoints for completed folds, including their original draw laws.
 
-Only complete fits are reused. Partial optimizer state is deliberately not a checkpoint.
-The caller binds each checkpoint to a digest of the code, store and fitting problem.
+Only complete fits are reused here; a mean-field start (``restart_store.save_warm_start``) shares the atomic archive
+writer and is solved and certified again, never reused as a fit. The caller binds each checkpoint to a digest of the
+engine's code, the store and the fitting problem, and keeps it in the restart store (``restart_store``).
 """
 from __future__ import annotations
 
@@ -45,6 +46,14 @@ def save_checkpoint(path: Path, fit: Any, key: str, elapsed_seconds: float) -> N
         raise TypeError(f"unsupported checkpoint value: {type(value).__name__}")
 
     metadata = {"format": FORMAT, "key": key, "elapsed_seconds": elapsed_seconds, "fit": encode(fit)}
+    save_archive(path, metadata, arrays)
+
+
+def save_archive(path: Path, metadata: dict[str, Any], arrays: dict[str, np.ndarray]) -> None:
+    """One NPZ of JSON and non-object arrays, renamed into place only after its bytes are durable: a reader (or the run
+    mirror) sees the old archive or the whole new one, and a failed write leaves the old one and no temporary."""
+    if any(value.dtype.hasobject for value in arrays.values()):
+        raise ValueError("checkpoint arrays cannot contain Python objects")
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:

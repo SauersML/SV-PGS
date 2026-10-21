@@ -266,11 +266,13 @@ class ShardedDualSource:
     @classmethod
     def from_statistics(
         cls, store: Any, statistics: Any, budget: ComputeBudget, workspace_bytes: int, sample_indices: NDArray[np.int64] | None = None,
+        code_cache: Any = None,
     ) -> ShardedDualSource:
         """One Stage 0 pass's reduced LD blocks over every device of ``budget``, each device streaming
         its own blocks from ``store``, on the store samples ``sample_indices`` only (a model's training
         samples; ``store_block_source.StoreGenotypeBlockSource``'s). The devices read at once, so each
-        shard's read-ahead plans against an equal share of the host memory."""
+        shard's read-ahead plans against an equal share of the host memory. ``code_cache`` (``restart_store.CodeCache``)
+        keeps each block's codes as its own unit, whichever device reads it."""
         from sv_pgs.compute_budget import _try_import_cupy
         from sv_pgs.store_block_source import StoreGenotypeBlockSource, reduced_block_layout
 
@@ -306,6 +308,7 @@ class ShardedDualSource:
                     shard_budget,
                     workspace_bytes,
                     sample_indices,
+                    code_cache,
                 ))
         bounds = [(int(indices[0]), int(indices[-1]) + 1) for indices in block_indices]
         return cls(shards, plan, bounds, shards[0].sample_count, cupy)

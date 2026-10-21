@@ -76,6 +76,7 @@ from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.gram_space import GramBand, read_block
 from sv_pgs.phase_timer import TimedOracle, timed_sweep, timing
 from sv_pgs.progress import log
+from sv_pgs.restart_store import WarmStart, load_warm_start, save_warm_start, state_key
 from sv_pgs.krylov_recycle import local_response
 from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
 from sv_pgs.tie_map import _compact_identity_tie_map
@@ -1661,6 +1662,9 @@ class _FullDataMeanField:
         self.best_elbo = np.full(model_count, -np.inf)
         self.best_state: list[_ModelState | None] = [None] * model_count
         self.best_hyperparameters: list[MixtureHyperparameters | None] = [None] * model_count
+        # Where each best state is kept as it is found (``fit_full_data``'s warm starts; never a mixture component's):
+        # durable before the outer loop asks for its curvature, which can be the longest part of a trial.
+        self.checkpoint: Callable[[int, MixtureHyperparameters, _ModelState], None] | None = None
         # Each model's held fixed point (``_fixed_point``: its hyperparameters, its state and the point), and the held
         # state the model is at now (a fixed point's, or one ``_restore_state`` put back; None once a solve moves it):
         # where the two are one at the same hyperparameters, a call keeps the point (``__call__``). A fixed point's
@@ -2397,7 +2401,10 @@ class _FullDataMeanField:
         self.refreshes += 1
         for model in solving:
             if self.elbo[model] > self.best_elbo[model]:
-                self.best_elbo[model], self.best_state[model], self.best_hyperparameters[model] = self.elbo[model], self._state(model), hyperparameters[model]
+                state = self._state(model)
+                self.best_elbo[model], self.best_state[model], self.best_hyperparameters[model] = self.elbo[model], state, hyperparameters[model]
+                if self.checkpoint is not None:
+                    self.checkpoint(model, hyperparameters[model], state)
         if self.monitor is not None:
             self.monitor.observe(self, hyperparameters, solving)
         return [self._held[model][2] if model in held else self._fixed_point(model, hyperparameters[model]) for model in range(self.model_count)]
@@ -2905,6 +2912,7 @@ def fit_full_data(
     band: GramBand | None = None,
     null_scale: float = 1.0,
     monitor: Any = None,
+    warm_start: WarmStart | None = None,
 ) -> FullDataFit:
     """Stage 2 from the prior (see the module docstring); ``seed`` draws the certificate's variant-side probes.
     ``starts`` (with ``start_noise`` and ``start_mean``, the members' means per model) continue an earlier fit of this
@@ -2930,7 +2938,17 @@ def fit_full_data(
 
     ``monitor`` (``eb_monitor.MonitorView``, the mean-field route's) logs each outer-loop call's posterior mean scored
     on the models' evaluation rows; it is told each stage (a new oracle) and shown each call, and nothing here reads
-    anything of it."""
+    anything of it.
+
+    ``warm_start`` (the restart store's ``eb`` units, ``restart_store.WarmStart``): on the mean-field route each solve's
+    oracle keeps every model's best-ELBO state there as it finds it, keyed by the request (its store, offsets, problem
+    and prior form, without the engine's source), the route, the state's layout (Stage 0's rows, ties and blocks, the
+    dual solver's samples, targets, covariates and sites, the draws and seed) and the solve's actual prior (the nested
+    start's base prior, a moved lattice); a solve whose model has one starts there, at its hyperparameters and noise, in
+    place of the moment, nested or continued start, and solves it again (its first call has no cold competitor, and no
+    saved ELBO stands as a best). The outer loop's search history is not kept, so a resumed fit can take another path
+    to another local optimum, and its certificate is the returned state's own; a fit that is not interrupted does the
+    same operations as without it."""
     # The empirical Bayes' per-variant passes (the data objective, its derivatives and line integrals, the tilted
     # moments, the moment start's Grams) run on the Gaussian's device (``scale_mixture_ep.device_scope``), as the small-n
     # route's do: on the host each was a numba pass over every variant on the VM's cores while its GPUs waited, the
@@ -2955,14 +2973,58 @@ def fit_full_data(
         raise ValueError("the Gram-space route (``gram_space``) is the mean-field fit of a quantitative model")
     oracle_class = _GramMeanField if gram_route else _FullDataMeanField
     extra_oracle = {} if band is None else {"band": band}
+    keeping = warm_start is not None and inference == "mean_field"
+    # The layout is read before any oracle reweights the dual solver (a binary trial moves its working targets); the
+    # nested priors share it and add their own schemas (``warm_starts``).
+    layout = None if not keeping else state_key(
+        request=warm_start.request, route=oracle_class.__name__, rows=np.asarray(statistics.active_rows),
+        ties=TieGroups.from_tie_map(statistics.tie_map), blocks=np.asarray(statistics.block_of_reduced),
+        training=np.asarray(_host(gaussian.training)), targets=np.asarray(_host(gaussian.targets)),
+        covariates=np.asarray(_host(gaussian.covariates)), offsets=np.asarray(_host(gaussian.offsets)), sites=model_sites,
+        draw_count=draw_count, seed=seed,
+    )
+    residual_length = band.group_count if gram_route else int(np.asarray(_host(gaussian.training)).shape[0])
+    kept: dict[str, tuple[Path, list]] = {}
+
+    def warm_starts(model_prior: ScaleMixturePrior) -> tuple[str | None, list]:
+        """The solve on ``model_prior``'s key and each model's saved (hyperparameters, state), or None per model."""
+        if not keeping:
+            return None, [None] * gaussian.model_count
+        key = state_key(layout=layout, prior=model_prior)
+        if key not in kept:
+            directory = warm_start.store.mutable("eb", key, group=warm_start.group, named={"layout": layout, "prior": state_key(prior=model_prior)})
+            kept[key] = directory, [
+                load_warm_start(directory / f"model{model}.npz", key, model_prior, residual_length, model_sites[model])
+                for model in range(gaussian.model_count)
+            ]
+        return key, kept[key][1]
 
     def solve(
         model_prior: ScaleMixturePrior, starts: list[MixtureHyperparameters], noise: F64Array, start_mean: F64Array | None,
         start_sites: Sequence[BernoulliSites | None], stage: str,
     ):
+        key, resumed = warm_starts(model_prior)
+        noise = np.array(noise, dtype=np.float64, copy=True)
+        for model, entry in enumerate(resumed):
+            if entry is not None:
+                starts[model], noise[model] = entry[0], entry[1].noise
         extra = {} if start_mean is None else {"start_mean": start_mean}
         extra["sites"] = list(start_sites)
         oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra, **extra_oracle)
+        for model, entry in enumerate(resumed):
+            if entry is not None:
+                # A solver version is this process's: the saved one names nothing here. The residual is made again from
+                # the saved means by this engine's own read (``_residual_of``): q is the start, the residual a function
+                # of it, and an engine edit the key does not hold may define it otherwise. The first call's solve starts
+                # here, not at the cold start, so the cold start's need it records (``_solved``) is the carried solve's,
+                # a lower bound that the model's first budgeted cold solve, which always runs, measures again. Installed
+                # once; a later solve on this prior (a lattice continuation) starts where it is told.
+                oracle._restore_state(oracle._charged(replace(entry[1], version=oracle.version)), model)
+                oracle.residual[model] = oracle._residual_of(model)
+                resumed[model] = None
+        if key is not None:
+            directory = kept[key][0]
+            oracle.checkpoint = lambda model, hyperparameters, state: save_warm_start(directory / f"model{model}.npz", key, hyperparameters, state)
         if monitor is not None:
             monitor.stage(stage)
             oracle.monitor = monitor
@@ -2973,8 +3035,19 @@ def fit_full_data(
             # The oracle's refusals say why it had no fixed point; they belong with the failure.
             raise FloatingPointError(f"{error}; mean_field refusals: {oracle.refusals}") from error
 
+    # A model resumed on the fitted prior starts there (``solve``), as a continued fit does: the nested search is behind it.
+    _key, resumed = warm_starts(prior)
+    if starts is None and any(entry is not None for entry in resumed):
+        starts = [
+            entry[0] if entry is not None else initial_hyperparameters(prior, moments[model].mean_variance)
+            for model, entry in enumerate(resumed)
+        ]
+    base = without_annotations(prior) if starts is None and prior.annotation_groups else None
+    _base_key, base_resumed = warm_starts(base) if base is not None else (None, resumed)
     # A binary model's noise is known: 1 in its whitened coordinates.
-    noise = np.where(binary, 1.0, np.array([moment.noise for moment in moments]))
+    noise = np.where(binary, 1.0, np.array([
+        entry[1].noise if entry is not None else moments[model].noise for model, entry in enumerate(base_resumed)
+    ]))
     if starts is not None:
         continued_noise = noise if start_noise is None else np.where(binary, 1.0, np.asarray(start_noise, dtype=np.float64))
         fixed_points, fits = solve(prior, list(starts), continued_noise, None if start_mean is None else np.asarray(start_mean, dtype=np.float64).copy(),
@@ -2983,8 +3056,12 @@ def fit_full_data(
         # Nested empirical Bayes (``small_n.fit_small_n``): the prior without annotation groups first, then the annotated
         # one continued from its fit, every annotation effect zero at its lambda = infinity edge
         # (``embed_hyperparameters``), so an annotation group enters only where the evidence rises.
-        base = without_annotations(prior)
-        base_points, base_fits = solve(base, [initial_hyperparameters(base, moment.mean_variance) for moment in moments], noise, None, model_sites, "base")
+        assert base is not None
+        base_starts = [
+            entry[0] if entry is not None else initial_hyperparameters(base, moments[model].mean_variance)
+            for model, entry in enumerate(base_resumed)
+        ]
+        base_points, base_fits = solve(base, base_starts, noise, None, model_sites, "base")
         starts = [embed_hyperparameters(base, prior, fit.hyperparameters) for fit in base_fits]
         fixed_points, fits = solve(
             prior, starts, np.asarray(base_points.noise, dtype=np.float64).copy(), base_points.mean.copy(), base_points.sites, "annotated",

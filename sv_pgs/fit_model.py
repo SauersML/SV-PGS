@@ -43,6 +43,7 @@ from sv_pgs.dosage_store import DosageStore
 from sv_pgs.eb_monitor import EvaluationRows
 from sv_pgs.full_data_fit import FitCertificate
 from sv_pgs.imputation_reliability import checked_log_reliability
+from sv_pgs.restart_store import RestartStore, module_sources, unit_key
 from sv_pgs.stage2_wiring import fit_models
 
 # The scorer's K posterior draws, which also set every certificate tolerance (1/(2K) nats).
@@ -101,7 +102,10 @@ class FitRequest:
     ``training`` are [n, models], and a model's non-training targets are never read by the fit (``evaluation``'s are
     the EB monitor's, which only logs). ``log_variance_offset`` [store records] is each record's log measurement
     reliability, log r^2 <= 0, the prior's variance offset (-inf: the record carries no signal); None takes r^2 from
-    the store's ``quality`` column. Stage 0 keeps its LD blocks under ``work_dir``.
+    the store's ``quality`` column. The fit's scratch is ``work_dir``; its restart units (``restart_store``: Stage 0
+    and its LD store, the band, the codes, the EB starts and the completed models' checkpoints) are kept in
+    ``restart_dir``, by default ``work_dir`` itself, which a caller places outside any directory an edit can set aside
+    (``workspace_pipeline``'s fit step: the run's restart/<arm>).
 
     The fit has no measurement-object and no target-variance term: the measurement model enters as the records'
     ``log_variance_offset`` (and as the store's own recalibrated dosages), and every target is taken as measured
@@ -140,6 +144,7 @@ class FitRequest:
     # The LD function: True adds each record's Stage 0 LD score as a learned smooth of its prior variance
     # (``annotation_design.ld_score_annotation``); False, the prior without it.
     ld_score_prior: bool = False
+    restart_dir: Path | None = None
 
     def __post_init__(self) -> None:
         """Check every field's rank, kind, values and agreement, and only then convert.
@@ -158,6 +163,8 @@ class FitRequest:
         set_field(self, "trait_types", trait_types)
         set_field(self, "research_ids", tuple(str(research_id) for research_id in self.research_ids))
         set_field(self, "work_dir", Path(self.work_dir))
+        if self.restart_dir is not None:
+            set_field(self, "restart_dir", Path(self.restart_dir))
         if not isinstance(self.annotated_prior, bool):
             raise ValueError("annotated_prior must be True or False.")
         if not isinstance(self.length_by_class, bool):
@@ -241,24 +248,40 @@ class FitRequest:
         return len(self.model_names)
 
 
+def fit_identity(request: FitRequest, store_key: str) -> dict[str, str]:
+    """What a completed model's checkpoint is the fit of, as named digests (``restart_store``'s facts): the engine's
+    source (``fit_model`` and every package module it imports: an edit outside it, to the workspace's steps, the mirror
+    or the launcher, keeps every completed model), the store's content (``store_key``), the records' offsets, the
+    problem (the cohort's binding to the store, the models, likelihoods, covariates, targets and training rows, the
+    draws and the seed: the whole request, since its groups and their seeds depend on its other models) and the prior's
+    form. The deployment prevalences are applied to the returned models after the checkpoints and are not part of it.
+    ``request`` is the identity without the source: a mean-field start (``restart_store.WarmStart``) is solved again
+    by whatever engine reads it."""
+    identity = {
+        "source": module_sources("sv_pgs.fit_model"),
+        "store": store_key,
+        "offset": offset_digest(request.log_variance_offset),
+        "problem": problem_digest(
+            research_ids=request.research_ids, store_columns=request.store_columns,
+            model_names=request.model_names, trait_types=request.trait_types,
+            covariate_names=request.covariate_names, covariate_columns=request.covariate_columns,
+            covariates=request.covariates, targets=request.targets, training=request.training,
+            draw_count=DRAW_COUNT, seed=request.seed,
+        ),
+        "prior_form": (
+            f"annotated_prior={request.annotated_prior}" + (" length_by_class=True" if request.length_by_class else "")
+            + (" ld_score_prior=True" if request.ld_score_prior else "")
+        ),
+    }
+    return identity
+
+
 def fit(request: FitRequest) -> FittedModel:
     """Fit every model of ``request`` on its training rows and return the artifact."""
     row_count, model_count = request.store_columns.shape[0], request.model_count
-    source_key = code_digest()
     store_key = store_digest(request.store.root)
-    offset_key = offset_digest(request.log_variance_offset)
-    problem_key = problem_digest(
-        research_ids=request.research_ids, store_columns=request.store_columns,
-        model_names=request.model_names, trait_types=request.trait_types,
-        covariate_names=request.covariate_names, covariate_columns=request.covariate_columns,
-        covariates=request.covariates, targets=request.targets, training=request.training,
-        draw_count=DRAW_COUNT, seed=request.seed,
-    )
-    prior_form = (
-        f"annotated_prior={request.annotated_prior}" + (" length_by_class=True" if request.length_by_class else "")
-        + (" ld_score_prior=True" if request.ld_score_prior else "")
-    )
-    checkpoint_key = hashlib.sha256("\n".join((source_key, store_key, offset_key, problem_key, prior_form)).encode()).hexdigest()
+    identity = fit_identity(request, store_key)
+    checkpoint_key = unit_key(identity)
     fitted = fit_models(
         store=request.store,
         store_columns=request.store_columns,
@@ -280,6 +303,10 @@ def fit(request: FitRequest) -> FittedModel:
         model_names=request.model_names,
         length_by_class=request.length_by_class,
         ld_score_prior=request.ld_score_prior,
+        restart=RestartStore(request.restart_dir if request.restart_dir is not None else request.work_dir),
+        identity=identity,
+        store_key=store_key,
+        request_key=unit_key({name: value for name, value in identity.items() if name != "source"}),
     )
     parts = certificate_parts(fitted.certificate, model_count)
     trained = request.training.any(axis=1)
@@ -303,12 +330,12 @@ def fit(request: FitRequest) -> FittedModel:
         fit_counts=parts.counts,
         refusals=parts.refusals,
         provenance=Provenance(
-            code_digest=source_key,
+            code_digest=code_digest(),
             store_digest=store_key,
             sites_digest=sites_digest(request.store.root),
             cohort_digest=cohort_digest([research_id for research_id, kept in zip(request.research_ids, trained) if kept]),
-            offset_digest=offset_key,
-            problem_digest=problem_key,
+            offset_digest=identity["offset"],
+            problem_digest=identity["problem"],
             # One digest over the models' own prior schemas, in model order.
             prior_digest=hashlib.sha256("\n".join(fitted.prior_digests).encode()).hexdigest(),
         ),

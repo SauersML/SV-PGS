@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import json
 import shutil
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -42,7 +44,7 @@ from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.eb_monitor import MONITOR_SWITCH, EbMonitor, EvaluationCodes, EvaluationRows, EvaluationTee, GroupEvaluation, monitor_on
 from sv_pgs.fast_scoring import ScoringModel
-from sv_pgs.gram_space import GramBand, build_band_store, far_field_scale, pass_costs
+from sv_pgs.gram_space import BandStore, GramBand, build_band_store, far_field_scale, pass_costs
 from sv_pgs.full_data_fit import FitCertificate, FullDataFit, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
 from sv_pgs.marginal_variances import certificate_level
 from sv_pgs.memory_broker import memory_scope
@@ -58,6 +60,9 @@ from sv_pgs.annotation_design import (
     BY_CLASS_ANNOTATIONS, LOG_SCALE_ANNOTATIONS, annotation_design, frequency_annotation, ld_score_annotation, smooth_shift_record,
 )
 from sv_pgs.progress import log
+from sv_pgs.restart_store import (
+    REQUEST, CodeCache, RestartStore, WarmStart, definition_sources, facts, load_statistics, module_sources, save_statistics, unit_key,
+)
 from sv_pgs.scale_mixture_ep import Cavity, MixtureHyperparameters, ScaleMixturePrior, extended_lattice, halved_lattice, lattice_check, scale_mixture_prior, transfer_hyperparameters
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
 
@@ -179,6 +184,16 @@ LD_STORE_BYTES_PER_VARIANT_AND_CAP = 2 * np.dtype(np.float32).itemsize
 coupling to the block before, each at most the cap wide."""
 
 
+def _cap_limits(store: DosageStore, candidates: I64Array, training_columns: I64Array, covariate_count: int, budget: ComputeBudget) -> tuple[int, int]:
+    """The largest cap the memory allows, and the largest chromosome's candidate count in cap steps (``_block_cap``)."""
+    sample_groups = np.full(store.n_samples, -1, dtype=np.int64)
+    sample_groups[training_columns] = 0
+    memory_cap = stage0_block_cap(budget, build_sample_layout(sample_groups), covariate_count + 1)
+    chromosome_of_row = np.searchsorted(np.asarray(store.chromosome_starts), candidates, side="right") - 1
+    largest = int(np.bincount(chromosome_of_row).max())
+    return memory_cap, -(-largest // BLOCK_CAP_STEP) * BLOCK_CAP_STEP
+
+
 def _block_cap(
     store: DosageStore, candidates: I64Array, training_columns: I64Array, covariate_count: int, budget: ComputeBudget, work_dir: Path,
 ) -> int:
@@ -190,18 +205,14 @@ def _block_cap(
     model and failed when the disk filled, hours into Stage 0.
 
     There is at least one candidate: ``_fit_group`` returns the null genetic models before Stage 0 when there is none."""
-    sample_groups = np.full(store.n_samples, -1, dtype=np.int64)
-    sample_groups[training_columns] = 0
-    memory_cap = stage0_block_cap(budget, build_sample_layout(sample_groups), covariate_count + 1)
+    memory_cap, chromosome_cap = _cap_limits(store, candidates, training_columns, covariate_count, budget)
     free_bytes = shutil.disk_usage(work_dir).free
     try:
         disk_cap = largest_block_cap(free_bytes // 2, lambda cap: int(candidates.shape[0]) * cap * LD_STORE_BYTES_PER_VARIANT_AND_CAP)
     except MemoryError as error:
         raise OSError(f"{work_dir}'s {free_bytes / 1e9:.1f} GB free cannot hold Stage 0's LD store and band for {candidates.shape[0]:,} candidates: {error}") from error
-    chromosome_of_row = np.searchsorted(np.asarray(store.chromosome_starts), candidates, side="right") - 1
-    largest = int(np.bincount(chromosome_of_row).max())
-    cap = min(memory_cap, disk_cap, -(-largest // BLOCK_CAP_STEP) * BLOCK_CAP_STEP)
-    log(f"stage2 wiring: block cap {cap:,} (memory {memory_cap:,}, disk {disk_cap:,} of {free_bytes / 1e9:.0f} GB free, largest chromosome {largest:,} candidates)")
+    cap = min(memory_cap, disk_cap, chromosome_cap)
+    log(f"stage2 wiring: block cap {cap:,} (memory {memory_cap:,}, disk {disk_cap:,} of {free_bytes / 1e9:.0f} GB free, largest chromosome {chromosome_cap:,} candidates in cap steps)")
     return cap
 
 
@@ -479,13 +490,94 @@ def _quarantine_codes(fit: _ModelFit) -> list[str]:
 
 def stage2_source(
     store: DosageStore, statistics: GenotypeSufficientStatistics, budget: ComputeBudget, workspace_bytes: int, training_columns: I64Array,
+    code_cache: CodeCache | None = None,
 ) -> StreamedDualSource | ShardedDualSource:
     """Stage 2's reads of the store on a model's training samples: sharded by LD block over every CUDA device of the
     budget where it has several (``device_plan.ShardedDualSource``: each block's products on its own device, a read's
-    images summed on the first), else streamed on the one device or the host."""
+    images summed on the first), else streamed on the one device or the host; on a device each block's codes are kept
+    as a restart unit where ``code_cache`` names the store (``StoreGenotypeBlockSource._iter_prepared``)."""
     if budget.device_kind == "cuda" and len(budget.device_ids) > 1:
-        return ShardedDualSource.from_statistics(store, statistics, budget, workspace_bytes, sample_indices=training_columns)
-    return StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, workspace_bytes, sample_indices=training_columns))
+        return ShardedDualSource.from_statistics(store, statistics, budget, workspace_bytes, sample_indices=training_columns, code_cache=code_cache)
+    return StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, workspace_bytes, sample_indices=training_columns, code_cache=code_cache))
+
+
+def _stage0(
+    store: DosageStore, candidates: I64Array, training_columns: I64Array, covariates: F64Array, targets: F64Array, config: ModelConfig,
+    budget: ComputeBudget, work_dir: Path, restart: RestartStore, group: str, store_key: str,
+    tiles: Callable[[int], DosageStoreTileSource] | None = None,
+) -> tuple[Path, dict]:
+    """Stage 0's restart unit for these inputs (``_fit_group``), made where there is none this machine can use. Its key
+    holds the store's content, the candidate records, the training rows, covariates and targets in their order, the
+    configuration, the devices it ran on (their kind, count and compute capabilities; the host's threads on the CPU),
+    the source of Stage 0's modules with every module they import and of the unit's codec, never the engine's, and the
+    block cap it was cut at. The cap is a resource choice (``_block_cap``: the memory's, the disk's and the largest
+    chromosome's), so a unit of these inputs is found by its other facts and serves wherever this machine's memory and
+    chromosomes allow its cap, the largest such first: recomputed from the disk a restored unit already fills, the cap
+    fell and missed the unit at every restart. A unit cut at a cap this machine cannot hold is made again at this
+    machine's, under its own key, which supersedes it here and, through the mirror, there (a whole mirrored unit is
+    never replaced, so a rebuild under the same key would have been restored and refused at every restart). ``tiles``
+    gives the pass's tile source at the cap it cuts (the EB monitor's tee, ``_fit_group``), which reads the same tiles."""
+    named = facts({
+        "store": store_key, "candidates": candidates, "training": training_columns, "covariates": covariates, "targets": targets,
+        "config": repr(config), "devices": repr((budget.device_kind, len(budget.device_ids), budget.device_compute_capabilities,
+                                                 budget.cpu_threads if budget.device_kind == "cpu" else None)),
+        "source": module_sources("sv_pgs.genotype_statistics", "sv_pgs.dosage_store"),
+        "codec": definition_sources([("sv_pgs.restart_store", "save_statistics"), ("sv_pgs.restart_store", "load_statistics")]),
+    })
+    usable = min(_cap_limits(store, candidates, training_columns, covariates.shape[1], budget))
+    built = [
+        (int(record["values"]["block_cap"]), path, record) for path, record in restart.units("stage0")
+        if {name: value for name, value in record["facts"].items() if name != "block_cap"} == named
+    ]
+    serving = [entry for entry in built if entry[0] <= usable]
+    if serving:
+        cap, path, record = max(serving, key=lambda entry: entry[0])
+        log(f"stage2 wiring: Stage 0 reused from its restart unit (block cap {cap:,})")
+        return path, record
+    block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget, work_dir)
+    named = {**named, **facts({"block_cap": block_cap})}
+    if built:
+        log(f"stage2 wiring: Stage 0's restart units have block caps {', '.join(f'{cap:,}' for cap, _path, _record in built)}, above this machine's {usable:,}: made again")
+    else:
+        restart.explain("stage0", group, named)
+    key = unit_key(named)
+    with restart.build("stage0", key, group=group, named=named, values={"block_cap": block_cap}) as directory:
+        statistics = compute_genotype_statistics(
+            DosageStoreTileSource(store, candidates) if tiles is None else tiles(block_cap), training_columns, covariates, targets,
+            config, budget, block_cap, directory / "ld",
+        )
+        save_statistics(directory, statistics)
+        del statistics
+    found = restart.unit("stage0", key)
+    assert found is not None
+    return found
+
+
+def _band(
+    ld: LdGramStore, sample_count: int, share: int, level: float, array_module, kappa: float, restart: RestartStore, group: str, stage0: str,
+) -> BandStore:
+    """The summary band's restart unit (``gram_space.build_band_store``), made where there is none: keyed by the Stage 0
+    unit's build it is cut from, the samples, the test's level, kappa, the array module and the source of the band's
+    builder and of the definitions it reaches, never of the sweeps beside it in ``gram_space``. The workspace is not in
+    the key: it sets only the extent test's row chunks (``marginal_variances.ld_lag_profiles``), a summation order, and
+    it is the free device memory each job measures, so as a key part it missed the band at every restart; it is
+    recorded with the unit."""
+    named = facts({
+        "stage0": stage0, "samples": sample_count, "level": repr(float(level)), "kappa": repr(float(kappa)),
+        "backend": array_module.__name__,
+        "source": definition_sources([("sv_pgs.gram_space", "build_band_store"), ("sv_pgs.gram_space", "BandStore")]),
+    })
+    key = unit_key(named)
+    found = restart.unit("band", key)
+    if found is None:
+        restart.explain("band", group, named)
+        with restart.build("band", key, group=group, named=named, values={"share": share}) as directory:
+            build_band_store(ld, sample_count, directory, share, level, array_module, kappa)
+        found = restart.unit("band", key)
+        assert found is not None
+    else:
+        log("stage2 wiring: summary band reused from its restart unit")
+    return BandStore(found[0])
 
 
 def _fitted_cavity(fit: FullDataFit, model: int) -> Cavity:
@@ -511,6 +603,10 @@ def _fit_group(
     annotated_prior: bool = True,
     length_by_class: bool = False,
     ld_score_prior: bool = False,
+    restart: RestartStore | None = None,
+    group: str = "group",
+    store_key: str | None = None,
+    request_key: str | None = None,
     evaluation: GroupEvaluation | None = None,
 ) -> list[_ModelFit]:
     """The group of the request's ``models`` (``model_groups``) on the sorted store columns ``training_columns``, whose
@@ -537,7 +633,18 @@ def _fit_group(
 
     ``evaluation``, the group's evaluation rows, is the EB monitor's alone (``eb_monitor``): Stage 0's pass keeps their
     codes as it reads, and the mean-field fit logs each outer-loop call's posterior mean scored on them. Nothing of the
-    fit reads it."""
+    fit reads it. A Stage 0 reused from its restart unit reads no tile, so the monitor then logs its calls unscored.
+
+    Its products are ``restart``'s units of ``group`` (``restart_store``; by default a store in ``work_dir``), each
+    reused where its key matches: Stage 0 (keyed by ``store_key``, the candidates, the training rows, covariates and
+    targets, the configuration, the devices and Stage 0's modules; its block cap a resource choice it records, reused
+    where this machine's memory allows it), the far-field scale and the band (keyed by that Stage 0 unit's build and
+    their own inputs and producing definitions), each block's codes (``CodeCache``) and each model's best mean-field
+    start (``WarmStart``, keyed by ``request_key``). A ``store_key`` of None (a caller that did not digest the store)
+    keys this call's products to it alone."""
+    restart = restart if restart is not None else RestartStore(work_dir / "restart")
+    store_key = store_key if store_key is not None else uuid.uuid4().hex
+    request_key = request_key if request_key is not None else uuid.uuid4().hex
     # SPEC 1fca1cf: no variant is filtered by rarity or any threshold (only a derived bound may leave one out).
     config = ModelConfig(minimum_minor_allele_frequency=0.0)
     binary = trait_type == TraitType.BINARY
@@ -580,18 +687,22 @@ def _fit_group(
     count = len(genetic)
     store_targets = targets[:, genetic]
     model_sites = [sites[model] for model in genetic]
-    block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget, work_dir)
-    # The EB monitor's codes of the evaluation rows, kept from Stage 0's own tiles (``eb_monitor.EvaluationTee``).
+    # The EB monitor's codes of the evaluation rows, kept from Stage 0's own tiles (``eb_monitor.EvaluationTee``) where
+    # this job makes Stage 0 (``_stage0`` asks for its tiles at the cap it cuts them at).
     evaluation_codes = None
-    if evaluation is not None and evaluation.store_columns.size:
-        try:
-            evaluation_codes = EvaluationCodes(candidates, evaluation.store_columns, block_cap)
-        except MemoryError as error:
-            log(f"eb monitor: off: {error}")
-    statistics = compute_genotype_statistics(
-        DosageStoreTileSource(store, candidates) if evaluation_codes is None else EvaluationTee(store, candidates, evaluation_codes),
-        training_columns, covariates, store_targets, config, budget, block_cap, work_dir / "ld",
-    )
+
+    def tiles(block_cap: int) -> DosageStoreTileSource:
+        nonlocal evaluation_codes
+        if evaluation is not None and evaluation.store_columns.size:
+            try:
+                evaluation_codes = EvaluationCodes(candidates, evaluation.store_columns, block_cap)
+            except MemoryError as error:
+                log(f"eb monitor: off: {error}")
+        return DosageStoreTileSource(store, candidates) if evaluation_codes is None else EvaluationTee(store, candidates, evaluation_codes)
+
+    stage0_unit = _stage0(store, candidates, training_columns, covariates, store_targets, config, budget, work_dir, restart, group, store_key, tiles)
+    statistics = load_statistics(stage0_unit[0])
+    block_cap = statistics.boundaries.block_cap
     if np.asarray(statistics.active_rows).shape[0] == 0:
         if evaluation_codes is not None:
             evaluation_codes.release()
@@ -650,7 +761,7 @@ def _fit_group(
     )
     # The block source's read workspace and the fit's dense per-block jobs are live together: each gets half.
     share = budget.working_bytes // 2
-    source = stage2_source(store, statistics, budget, share, training_columns)
+    source = stage2_source(store, statistics, budget, share, training_columns, CodeCache(restart, group, store_key))
     # Timing may select a band accelerator, never a different likelihood. Every route
     # retains DualGaussian and recomputes the omitted fields from the full sample operator.
     band = None
@@ -662,14 +773,27 @@ def _fit_group(
         ld = statistics.ld
         stage0_starts = np.asarray(ld.block_boundaries, dtype=np.int64)
         stage0_linked = np.array([ld.has_adjacent(block + 1) for block in range(ld.block_count - 1)], dtype=bool)
-        kappa, kappa_error, pairs = far_field_scale(
-            store, training_columns, covariates, statistics, stage0_starts, stage0_linked, draw_count, _seed(seed, _FAR_FIELD_KEY),
-        )
+        far_named = facts({
+            "stage0": stage0_unit[1]["id"], "store": store_key, "training": training_columns, "covariates": covariates, "draws": draw_count,
+            "seed": str(_seed(seed, _FAR_FIELD_KEY)), "source": definition_sources([("sv_pgs.gram_space", "far_field_scale")]),
+        })
+        far_unit = restart.unit("farfield", unit_key(far_named))
+        if far_unit is None:
+            restart.explain("farfield", group, far_named)
+            measured = far_field_scale(
+                store, training_columns, covariates, statistics, stage0_starts, stage0_linked, draw_count, _seed(seed, _FAR_FIELD_KEY),
+            )
+            with restart.build("farfield", unit_key(far_named), group=group, named=far_named) as directory:
+                (directory / "scale.json").write_text(json.dumps(list(measured)), encoding="utf-8")
+            far_unit = restart.unit("farfield", unit_key(far_named))
+        else:
+            log("stage2 wiring: far field: reused its restart unit")
+        kappa, kappa_error, pairs = json.loads((far_unit[0] / "scale.json").read_text(encoding="utf-8"))
         log(f"stage2 wiring: far field: mean r^2 n' = {kappa:.4g} +- {kappa_error:.2g} over {pairs:,} pairs beyond Stage 0's neighbouring blocks (chance alone: 1)")
     if not binary and inference == "mean_field":
         # The summary band is the mean-field route's; EP runs over the samples, its windows cut at the LD extent read
         # against the same kappa (``null_scale``).
-        band_store = build_band_store(ld, statistics.sample_count, work_dir / "band", share, certificate_level(draw_count), source.array_module, kappa)
+        band_store = _band(ld, statistics.sample_count, share, certificate_level(draw_count), source.array_module, kappa, restart, group, stage0_unit[1]["id"])
         band = GramBand(statistics, share, store=band_store)
         band.far_scale = kappa
         sample_seconds, gram_seconds = pass_costs(band, source, source.array_module)
@@ -752,7 +876,8 @@ def _fit_group(
         def solve(fit_prior: ScaleMixturePrior, **continuation) -> FullDataFit:
             fit = fit_full_data(
                 gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
-                inference=inference, sites=fit_sites, null_scale=kappa, band=fit_band, monitor=watched, **continuation,
+                inference=inference, sites=fit_sites, null_scale=kappa, band=fit_band, monitor=watched,
+                warm_start=WarmStart(restart, group, request_key), **continuation,
             )
             if fit_band is not None and np.any(fit.certificate.outer_criterion_met):
                 # The band's far-field stopping estimate can miss a slowly converging direction: a grouped fixture
@@ -765,6 +890,7 @@ def _fit_group(
                     gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
                     inference=inference, sites=fit_sites, null_scale=kappa, band=None, starts=fit.hyperparameters,
                     start_noise=np.asarray(fit.noise_variance, dtype=np.float64), start_mean=fit.member_mean, monitor=watched,
+                    warm_start=WarmStart(restart, group, request_key),
                 )
             return fit
 
@@ -917,6 +1043,10 @@ def fit_models(
     model_names: Sequence[str] | None = None,
     length_by_class: bool = False,
     ld_score_prior: bool = False,
+    restart: RestartStore | None = None,
+    identity: Mapping[str, str] | None = None,
+    store_key: str | None = None,
+    request_key: str | None = None,
 ) -> FittedModels:
     """Every model of ``fit_model.fit``, a group at a time (``model_groups``; see the module docstring); ``inference``
     names the fixed point (``full_data_fit.fit_full_data``): the mean-field route until the EP route (structured-genome's
@@ -927,13 +1057,26 @@ def fit_models(
     nothing fitted, saved or checkpointed reads it. With the monitor switched off (``eb_monitor.MONITOR_SWITCH``) it
     is dropped here, before any group.
 
-    Each model's completed fit is checkpointed on its own under ``checkpoint_key``; a group is fitted again unless every
-    one of its models is, and a group's seed is the request's with its models' indices, so a rerun fits it the same way."""
+    Each model's completed fit is checkpointed on its own under ``checkpoint_key`` in ``restart`` (by default a store in
+    ``work_dir``: checkpoints/<key>/model<i>.npz), a unit whose facts are ``identity`` (``fit_model.fit_identity``'s named
+    digests), so a fit whose checkpoints no longer match logs which named input changed; a group is fitted again unless
+    every one of its models is, and a group's seed is the request's with its models' indices, so a rerun fits it the same
+    way. A group's other units (Stage 0, the band, its codes and EB starts: ``_fit_group``) are released once its models
+    are checkpointed."""
     if any(trait_type not in (TraitType.QUANTITATIVE, TraitType.BINARY) for trait_type in trait_types):
         raise ValueError(f"unknown trait types in {list(trait_types)}")
     # Stage 0 runs a buffer on every device, and Stage 2's reads are sharded over them by LD block (``stage2_source``).
     stage2_devices = f"CUDA devices {', '.join(str(device) for device in budget.device_ids)}" if budget.device_kind == "cuda" else "the CPU"
     log(f"stage2 wiring: Stage 0 and Stage 2's reads run on {stage2_devices}")
+    restart = restart if restart is not None else RestartStore(work_dir)
+    restart.clean()
+    if checkpoint_key is not None:
+        named = dict(identity) if identity is not None else {"checkpoint": str(checkpoint_key)}
+        if restart.unit("checkpoints", checkpoint_key) is None:
+            restart.explain("checkpoints", REQUEST, named)
+        # One key's checkpoints a request: another key's, which no fit of this request reads, are released here, the
+        # mirror's at its next push.
+        restart.mutable("checkpoints", checkpoint_key, group=REQUEST, named=named, supersede=True)
     measurement = store_measurement(store, log_variance_offset)
     if evaluation is not None and not monitor_on():
         log(f"eb monitor: off ({MONITOR_SWITCH}=0): no codes kept, nothing scored")
@@ -949,7 +1092,7 @@ def fit_models(
         adjusted = np.asarray(covariate_columns[first], dtype=bool)
         label = ", ".join(str(int(model)) for model in group)
         group_dir = Path(work_dir) / f"model{first}"
-        checkpoints = [Path(work_dir) / "checkpoints" / str(checkpoint_key) / f"model{int(model)}.npz" for model in group]
+        checkpoints = [restart.directory / "checkpoints" / str(checkpoint_key) / f"model{int(model)}.npz" for model in group]
         if checkpoint_key is not None and all(checkpoint.is_file() for checkpoint in checkpoints):
             group_fits = [load_checkpoint(checkpoint, checkpoint_key) for checkpoint in checkpoints]
             log(f"stage2 wiring: resumed completed models {label}")
@@ -983,6 +1126,10 @@ def fit_models(
                         annotated_prior,
                         length_by_class,
                         ld_score_prior,
+                        restart,
+                        group_dir.name,
+                        store_key,
+                        request_key,
                         group_evaluation,
                     )
             except FloatingPointError as error:
@@ -996,6 +1143,8 @@ def fit_models(
                     # Each model's share of its group's time, so the shares sum to the fit's.
                     save_checkpoint(checkpoint, fit, checkpoint_key, elapsed / group.shape[0])
             log(f"stage2 wiring: completed models {label} in {elapsed:.3f} seconds")
+        # Its models are checkpointed: no restart reads the group's Stage 0, band, codes or EB starts again.
+        restart.release(group_dir.name)
         # The group's Stage 0 LD blocks and band (its projected Grams, O(p x block cap) bytes on disk) are read by no
         # later group and not by scoring, which the fit already ran: each is removed as its group ends, so the work
         # directory never holds more than one group's.

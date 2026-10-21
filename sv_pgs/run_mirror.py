@@ -9,14 +9,23 @@ The durable state is what the driver resumes from:
 - **A completed step's directory** (``<step>/`` with COMPLETE_FILE). The driver never changes one once it is renamed
   into place. It is pushed whole with COMPLETE_FILE last, so a mirrored step without one is an interrupted push, and
   is never restored.
-- **The fit step's progress in ``fit.partial``:**
-  - each engine checkpoint, which ``fit_checkpoint`` writes whole;
-  - each saved (arm, trait) model with its record, the record last, as the fit step saves them;
-  - the partial's KEY_FILE.
-- **The store step's converted chromosomes in ``store.partial``:** each chromosome's files (STORE_CHROMOSOME_FILES)
-  with its record chromosomes/<chromosome>.json, the record last, as the store step writes them; and the KEY_FILE. A
+- **The fit step's saved models in ``fit.partial``:** each saved (arm, trait) model with its record, the record last,
+  as the fit step saves them, and the partial's KEY_FILE. (Engine checkpoints written there before the restart store
+  are keyed by the whole package's source, which no current fit can match: they are neither pushed nor restored.)
+- **The fit's restart units in ``restart/<arm>/``** (``restart_store``; RESTART), outside every step, so an edit that
+  sets the fit step aside keeps them: a sealed unit (Stage 0 with its LD store, the far-field scale, the band, a
+  block's codes) is pushed payload first and its manifest last, chunked in parallel, and a whole remote copy is never
+  replaced, so a push cut short leaves the last whole copy or none; a mutable unit's self-checking files (an EB start,
+  a completed model's checkpoint) are each replaced whole, sent again when their size or modification time changes
+  (RECEIPT). A unit the fit released is removed from the mirror, but only by a disk that restored that build of it or
+  saw it whole there while it held it (RECEIPT), so a job never removes a unit it never held: another job's, another
+  build of the same key, one a failed restore left behind, or a region's it never restored.
+- **The partial steps' chromosome units:** each converted chromosome's files (STORE_CHROMOSOME_FILES) with its record
+  chromosomes/<chromosome>.json, the record last, as the store and direct_sv steps write them; and the KEY_FILE. A
   fan-out of store shards (``workspace_pipeline.run_pipeline``'s ``store_shard``), one job's tasks on separate disks,
-  meets here: each pushes its own chromosomes under the one key, and the next job restores them all.
+  meets here: each pushes its own chromosomes under the one key, and the next job restores them all. A direct_sv
+  chromosome is whole only with its rows/<chromosome>.npz, which mirrors before this one did not carry: one without
+  it is made again, never restored half.
 - **The score and effects steps' completed batches:** each batch directory with its content-digest record last,
   and the partial's KEY_FILE. Hidden batches are still being written. A completed step carries its final outputs
   alone; its batch copies are needed only while it is partial.
@@ -63,14 +72,21 @@ from pathlib import Path
 from typing import Protocol
 
 from sv_pgs.content_identity import GCS_MOUNTS, record_restored
-from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE, REGIONS_DIRECTORY, STEP_NAMES
+from sv_pgs.restart_store import FORMAT, KINDS, MANIFEST, RestartStore
+from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE, REGIONS_DIRECTORY, RESTART_DIRECTORY, STEP_NAMES
 
 LOGGER = logging.getLogger(__name__)
 PARTIAL = ".partial"
 RESTORING = ".restoring"
-CHECKPOINTS = "work/*/checkpoints/*/*.npz"
-"""The engine's checkpoints in the fit step's partial: <arm>'s work directory, checkpoints/<key>/model<i>.npz
-(``stage2_wiring.fit_models``)."""
+RESTART = RESTART_DIRECTORY
+"""The run's restart store, restart/<arm>/<kind>/<key>/ (``restart_store``)."""
+RECEIPT = ".pushed.json"
+"""In the run's restart directory: each mutable unit file's (size, modification time) when it was last sent or
+restored, by object name; a file whose stamp differs is sent again. And by unit (its prefix), the build id of the
+mirrored copy the disk restored or saw whole there while it held the unit: once the disk no longer holds the unit, a
+push removes the mirrored copy only where it is still that build, and forgets the unit."""
+MULTIPART_PARTS = 10_000
+"""Cloud Storage's XML multipart upload: at most 10,000 parts an object."""
 DIRECTORIES = ".directories.json"
 """Beside a mirrored step, its directories, which GCS keeps only as the prefixes of objects: an empty one is
 restored from this list."""
@@ -84,8 +100,9 @@ after the chromosome's files."""
 BATCH_RECORDS = "batches/*/complete.json"
 """The score/effects partial's committed batches (``postfit_checkpoint``); each record binds its files' content to
 the step key and ordered batch identity. The generation in a repaired batch's record makes the mirror send it again."""
-STORE_CHROMOSOME_FILES = ("fill", "reported", "calibration")
-"""The store step's per-chromosome files beside its store, <directory>/<chromosome>.<suffix>; inside store/, a
+STORE_CHROMOSOME_FILES = ("fill", "reported", "calibration", "rows")
+"""The store and direct_sv steps' per-chromosome files beside their store, <directory>/<chromosome>.<suffix>
+(direct_sv's direct rows, rows/<chromosome>.npz, among them); inside store/, a
 chromosome's files are those under a directory named for it (dosage/half<i>/<chromosome>, stats/half<i>/<chromosome>,
 variants/<chromosome>, loci/<chromosome>)."""
 CARRIED = STEP_NAMES[: STEP_NAMES.index("fit")]
@@ -115,9 +132,13 @@ class Remote(Protocol):
 
     def upload(self, path: Path, name: str) -> None: ...
 
+    def upload_parts(self, path: Path, name: str) -> None: ...
+
     def write(self, name: str, content: bytes) -> None: ...
 
     def download(self, name: str, path: Path) -> str | None: ...
+
+    def download_parts(self, name: str, path: Path) -> None: ...
 
     def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None] | None: ...
 
@@ -171,6 +192,23 @@ class GcsRemote:
     def upload(self, path: Path, name: str) -> None:
         self._bucket.blob(self._root + name).upload_from_filename(str(path))
 
+    def upload_parts(self, path: Path, name: str) -> None:
+        """``upload`` in parts sent at once (Cloud Storage's XML multipart upload): one stream sent a restart unit's
+        150 GB LD store at one connection's rate. The parts go from the library's default count of processes, each with
+        its own client, not threads, whose per-chunk Python work shares one interpreter lock (``download_many``); a
+        push runs beside the fit, so not one per CPU. The object appears only when every part is in, whole or absent
+        like any other."""
+        from google.cloud.storage import transfer_manager
+
+        size = path.stat().st_size
+        if size <= transfer_manager.TM_DEFAULT_CHUNK_SIZE:
+            self.upload(path, name)
+            return
+        transfer_manager.upload_chunks_concurrently(
+            str(path), self._bucket.blob(self._root + name), worker_type=transfer_manager.PROCESS,
+            chunk_size=max(transfer_manager.TM_DEFAULT_CHUNK_SIZE, -(-size // MULTIPART_PARTS)),
+        )
+
     def write(self, name: str, content: bytes) -> None:
         self._bucket.blob(self._root + name).upload_from_string(content)
 
@@ -186,6 +224,24 @@ class GcsRemote:
             written = _HashingFile(handle)
             self._bucket.blob(self._root + name).download_to_file(written, retry=DEFAULT_RETRY.with_timeout(None))
         return written.hexdigest()
+
+    def download_parts(self, name: str, path: Path) -> None:
+        """``download`` in ranges read at once, one process per CPU this process may use, each with its own client, the
+        whole file's CRC32C checked against the object's from the ranges' own: one stream read a restart unit's 150 GB
+        LD store at one connection's rate."""
+        from google.cloud.storage import transfer_manager
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        blob = self._bucket.blob(self._root + name)
+        blob.reload()
+        if blob.size <= transfer_manager.TM_DEFAULT_CHUNK_SIZE:
+            self.download(name, path)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        transfer_manager.download_chunks_concurrently(
+            blob, str(path), download_kwargs={"retry": DEFAULT_RETRY.with_timeout(None)}, worker_type=transfer_manager.PROCESS,
+            max_workers=len(os.sched_getaffinity(0)), crc32c_checksum=True,
+        )
 
     def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None]:
         """``download`` each (local path, object name) pair, in one process per CPU this process may use, each with its
@@ -226,6 +282,9 @@ class DirectoryRemote:
         shutil.copyfile(path, aside)
         os.replace(aside, target)
 
+    def upload_parts(self, path: Path, name: str) -> None:
+        self.upload(path, name)
+
     def write(self, name: str, content: bytes) -> None:
         target = self._root / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -239,6 +298,9 @@ class DirectoryRemote:
             written = _HashingFile(handle)
             shutil.copyfileobj(source, written)
         return written.hexdigest()
+
+    def download_parts(self, name: str, path: Path) -> None:
+        self.download(name, path)
 
     def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None]:
         return _transfer(pairs, lambda path, name: self.download(name, path))
@@ -268,11 +330,17 @@ class _Within:
     def upload(self, path: Path, name: str) -> None:
         self._remote.upload(path, self._prefix + name)
 
+    def upload_parts(self, path: Path, name: str) -> None:
+        self._remote.upload_parts(path, self._prefix + name)
+
     def write(self, name: str, content: bytes) -> None:
         self._remote.write(self._prefix + name, content)
 
     def download(self, name: str, path: Path) -> str | None:
         return self._remote.download(self._prefix + name, path)
+
+    def download_parts(self, name: str, path: Path) -> None:
+        self._remote.download_parts(self._prefix + name, path)
 
     def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None] | None:
         return self._remote.download_many([(path, self._prefix + name) for path, name in pairs])
@@ -337,9 +405,18 @@ def _files(directory: Path) -> list[Path]:
     return sorted(path for path in directory.rglob("*") if path.is_file())
 
 
+def _key_of(record: bytes | None) -> str | None:
+    """The step key a COMPLETE_FILE's content names, or None."""
+    try:
+        return json.loads(record)["key"] if record is not None else None
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 def _push_step(remote: Remote, final: Path, name: str, bases: Sequence[Base] = ()) -> Base | None:
     """A completed step, whole, its COMPLETE_FILE last; or, where a base holds it whole under the same COMPLETE_FILE,
-    nothing, and that base is returned."""
+    nothing, and that base is returned. A mirrored copy under the same key is the same step (made again from the same
+    inputs and code): it is kept, never removed to be sent again, so the mirror always holds one."""
     marker = final / COMPLETE_FILE
     content = marker.read_bytes()
     batches = final / "batches" if name in ("score", "effects") else None
@@ -355,6 +432,12 @@ def _push_step(remote: Remote, final: Path, name: str, bases: Sequence[Base] = (
                 remote.delete(held)
                 remote.delete(remote.sizes(f"{name}{PARTIAL}/"))
                 return base
+    if mirrored is not None and mirrored != content and _key_of(mirrored) == _key_of(content) and all(
+        f"{name}/{path.relative_to(final).as_posix()}" in held for path in files
+    ):
+        # The same step made again (a disk whose restore did not reach it), whole on the mirror: kept, never removed to
+        # be sent again, so the mirror always holds one.
+        return None
     if mirrored == content:
         files = [path for path in files if held.get(f"{name}/{path.relative_to(final).as_posix()}") != path.stat().st_size]
         if not files:
@@ -377,11 +460,10 @@ def _push_step(remote: Remote, final: Path, name: str, bases: Sequence[Base] = (
 
 def _partial_units(partial: Path) -> list[tuple[list[Path], Path]]:
     """The durable units in a step's ``partial``, each as (its files, the file that marks it whole, sent last): the fit
-    step's every engine checkpoint (CHECKPOINTS; a hidden name is one ``fit_checkpoint`` is still writing) and every
-    saved model directory models/<arm>/<trait> beside its record <trait>.json; the store step's every converted
-    chromosome's files beside its record chromosomes/<chromosome>.json; and the score/effects steps' committed
-    batch directories beside their content-digest records."""
-    units: list[tuple[list[Path], Path]] = [([], path) for path in sorted(partial.glob(CHECKPOINTS)) if not path.name.startswith(".")]
+    step's every saved model directory models/<arm>/<trait> beside its record <trait>.json; the store and direct_sv
+    steps' every converted chromosome's files beside its record chromosomes/<chromosome>.json; and the score/effects
+    steps' committed batch directories beside their content-digest records."""
+    units: list[tuple[list[Path], Path]] = []
     if (partial / "models").is_dir():
         for record in sorted(partial.glob(RECORDS)):
             model = record.with_suffix("")
@@ -400,11 +482,13 @@ def _partial_units(partial: Path) -> list[tuple[list[Path], Path]]:
 
 
 def _push_partial(remote: Remote, partial: Path, step: str) -> None:
-    # The driver set the step's completed directory aside to make it again under another key, so the mirrored one is
-    # stale: restored, it would take the partial's place.
-    remote.delete(remote.sizes(f"{step}/"))
     name = f"{step}{PARTIAL}"
     key = (partial / KEY_FILE).read_bytes()
+    # The driver set the step's completed directory aside to make it again under another key, so the mirrored one is
+    # stale: restored, it would take the partial's place. One under this partial's key is not (a disk whose restore
+    # did not reach it): it is kept.
+    if _key_of(remote.read(f"{step}/{COMPLETE_FILE}")) != key.decode():
+        remote.delete(remote.sizes(f"{step}/"))
     if remote.read(f"{name}/{KEY_FILE}") != key:
         remote.delete(remote.sizes(f"{name}/"))
         remote.upload(partial / KEY_FILE, f"{name}/{KEY_FILE}")
@@ -455,10 +539,13 @@ def _push_partial(remote: Remote, partial: Path, step: str) -> None:
         LOGGER.info("run mirror: pushed %d durable units of %s", pushed, name)
 
 
-def push(run_directory: Path, remote: Remote, bases: Sequence[Base] = ()) -> None:
+def push(run_directory: Path, remote: Remote, bases: Sequence[Base] = (), arms: Sequence[str] | None = None) -> None:
     """Copy the run's durable state to the mirror, skipping what it already holds and the completed steps a base
-    carries (``Base``), which the mirror names instead (BASES). A file the driver moves away during the push (a partial
-    renamed to its step, a step set aside) ends that directory's push for this time; the next push sees where it went."""
+    carries (``Base``), which the mirror names instead (BASES); the restart units first (an EB start is the newest
+    progress), of ``arms`` only where given (a job that fits those arms). A file the driver moves away during the push
+    (a partial renamed to its step, a step set aside, a released unit) ends that directory's push for this time; the
+    next push sees where it went."""
+    _push_restart(run_directory, remote, arms)
     references: set[str] = set()
     for step in STEP_NAMES:
         final, partial = run_directory / step, run_directory / f"{step}{PARTIAL}"
@@ -480,15 +567,21 @@ def push(run_directory: Path, remote: Remote, bases: Sequence[Base] = ()) -> Non
             remote.write(reference, b"")
     regions = run_directory / REGIONS_DIRECTORY
     for region in sorted(regions.iterdir()) if regions.is_dir() else ():
-        push(region, _Within(remote, f"{REGIONS_DIRECTORY}/{region.name}/"))
+        push(region, _Within(remote, f"{REGIONS_DIRECTORY}/{region.name}/"), arms=arms)
 
 
 def _restorable_partial(names: dict[str, int], name: str) -> list[str]:
-    """The partial's KEY_FILE, checkpoints, every model directory, store chromosome and score/effects batch whose
-    record is mirrored, and those records. Payloads without their record are interrupted uploads, never batches."""
+    """The partial's KEY_FILE, every model directory, store chromosome and score/effects batch whose record is
+    mirrored, and those records. Payloads without their record are interrupted uploads, never batches; a direct_sv
+    chromosome without its rows/<chromosome>.npz (a mirror before it carried them) is made again."""
     prefix = f"{name}/"
     inside = [entry.removeprefix(prefix) for entry in names if entry.startswith(prefix)]
-    records = {relative for relative in inside if _matches(relative, RECORDS) or _matches(relative, STORE_RECORDS)}
+    records = {
+        relative for relative in inside
+        if _matches(relative, RECORDS) or (_matches(relative, STORE_RECORDS) and (
+            name != "direct_sv.partial" or f"rows/{relative.removeprefix('chromosomes/').removesuffix('.json')}.npz" in inside
+        ))
+    }
     models = tuple(record.removesuffix(".json") + "/" for record in records if _matches(record, RECORDS))
     chromosomes = [record.removeprefix("chromosomes/").removesuffix(".json") for record in records if _matches(record, STORE_RECORDS)]
     batches = tuple(
@@ -502,7 +595,6 @@ def _restorable_partial(names: dict[str, int], name: str) -> list[str]:
         or relative.startswith(models)
         or relative.startswith(batches)
         or any(_of_chromosome(relative, chromosome) for chromosome in chromosomes)
-        or (_matches(relative, CHECKPOINTS) and not relative.rsplit("/", 1)[-1].startswith("."))
     )
 
 
@@ -545,15 +637,17 @@ def _replaced_stores(names: dict[str, int]) -> set[str]:
     return set(stores[:-1])
 
 
-def restore(run_directory: Path, remote: Remote, mount: Path | None = None, bases: Sequence[Base] = ()) -> None:
+def restore(
+    run_directory: Path, remote: Remote, mount: Path | None = None, bases: Sequence[Base] = (), arms: Sequence[str] | None = None,
+) -> None:
     """Fill a run directory from the mirror: every completed step, and each partial step's durable units, for every step
-    this run directory does not hold already. Each is downloaded aside and renamed into place, so an interrupted restore
-    leaves no step directory the driver would take for its own. ``mount`` is where the mirror shows on this machine
-    (``mounted``): a completed step's store payload that a later completed step's replaces is linked there, not
-    downloaded. A step before the fit (CARRIED) that the mirror holds neither completed nor partial comes from the first
-    of ``bases`` that holds it completed, its replaced store linked on that base's mount. A completed step whose
-    COMPLETE_FILE is gone or changed after its download (a push or removal where it lies) stops the restore: what was
-    downloaded could mix two steps."""
+    this run directory does not hold already, and the restart units of ``arms`` (every arm's where None). Each is
+    downloaded aside and renamed into place, so an interrupted restore leaves no step directory the driver would take
+    for its own and no unit. ``mount`` is where the mirror shows on this machine (``mounted``): a completed step's store
+    payload that a later completed step's replaces is linked there, not downloaded. A step before the fit (CARRIED)
+    that the mirror holds neither completed nor partial comes from the first of ``bases`` that holds it completed, its
+    replaced store linked on that base's mount. A completed step whose COMPLETE_FILE is gone or changed after its
+    download (a push or removal where it lies) stops the restore: what was downloaded could mix two steps."""
     names = remote.sizes("")
     run_directory.mkdir(parents=True, exist_ok=True)
     # The mirror's objects, a carried step's those of the base that carries it.
@@ -612,6 +706,180 @@ def restore(run_directory: Path, remote: Remote, mount: Path | None = None, base
         record_restored((path, digest) for (path, _entry), digest in zip(pairs, digests or ()) if digest is not None)
         os.rename(aside, target)
         LOGGER.info("run mirror: restored %s from %s, %d files, %.1f GB", name, origin, len(chosen), sum(objects[entry] for entry in chosen) / 1e9)
+    _restore_restart(run_directory, remote, {name: size for name, size in names.items() if name.startswith(f"{RESTART}/")}, arms)
     # Each region's own steps; the driver links the run's steps before the fit into its directory again.
     for region in sorted({entry.split("/")[1] for entry in names if entry.startswith(f"{REGIONS_DIRECTORY}/") and entry.count("/") >= 2}):
-        restore(run_directory / REGIONS_DIRECTORY / region, _Within(remote, f"{REGIONS_DIRECTORY}/{region}/"))
+        restore(run_directory / REGIONS_DIRECTORY / region, _Within(remote, f"{REGIONS_DIRECTORY}/{region}/"), arms=arms)
+
+
+# ---------------------------------------------------------------------------
+# The restart store
+# ---------------------------------------------------------------------------
+
+
+def _remote_units(names: dict[str, int]) -> dict[str, dict[str, int]]:
+    """The mirror's restart objects by unit, restart/<arm>/<kind>/<key>/: each unit's object names (relative to it)
+    and sizes, interrupted uploads included."""
+    units: dict[str, dict[str, int]] = {}
+    for name, size in names.items():
+        root, _, rest = name.partition("/")
+        arm, _, rest = rest.partition("/")
+        kind, _, rest = rest.partition("/")
+        key, _, inner = rest.partition("/")
+        if root == RESTART and kind in KINDS and key and inner:
+            units.setdefault(f"{RESTART}/{arm}/{kind}/{key}/", {})[inner] = size
+    return units
+
+
+def _remote_record(remote: Remote, prefix: str, held: dict[str, int]) -> tuple[dict, bytes] | None:
+    """The mirrored unit at ``prefix``'s manifest, parsed and as read, where the unit is whole (a sealed unit's every
+    file at its recorded size; a mutable unit's files check themselves), else None."""
+    if MANIFEST not in held:
+        return None
+    try:
+        content = remote.read(prefix + MANIFEST) or b""
+        record = json.loads(content)
+        _, _arm, kind, key = prefix.rstrip("/").split("/")
+        if record["format"] != FORMAT or record["kind"] != kind or record["key"] != key:
+            return None
+        if record["files"] is not None and any(
+            held.get(name) != size or Path(name).is_absolute() or ".." in Path(name).parts for name, size in record["files"].items()
+        ):
+            return None
+        return record, content
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def _push_restart(run_directory: Path, remote: Remote, arms: Sequence[str] | None) -> None:
+    """The restart units of ``arms`` (every arm's where None) to the mirror (the module docstring): a sealed unit the
+    mirror holds whole is kept as it is; one it does not is sent payload first, in parts, and its manifest last; a
+    mutable unit's changed files are each replaced whole, its manifest after them; and a mirrored unit this disk
+    restored or saw whole there (its build id in RECEIPT) but no longer holds (released, superseded) is removed,
+    manifest first, where the mirror's copy is still that build."""
+    root = run_directory / RESTART
+    if not root.is_dir():
+        return
+    held = _remote_units(remote.sizes(f"{RESTART}/"))
+    receipt = _read_json(root / RECEIPT, {})
+    local: set[str] = set()
+    pushed = 0
+    for directory in sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")):
+        if arms is not None and directory.name not in arms:
+            continue
+        store = RestartStore(directory)
+        for kind in KINDS:
+            for path, record in store.units(kind):
+                prefix = f"{RESTART}/{directory.name}/{kind}/{path.name}/"
+                local.add(prefix)
+                mirrored = held.get(prefix, {})
+                try:
+                    if record["files"] is not None:
+                        found = _remote_record(remote, prefix, mirrored)
+                        if found is None:
+                            content = (path / MANIFEST).read_bytes()
+                            if MANIFEST in mirrored:
+                                remote.delete([prefix + MANIFEST])
+                            for name in record["files"]:
+                                remote.upload_parts(path / name, prefix + name)
+                            remote.write(prefix + MANIFEST, content)
+                            pushed += 1
+                        receipt[prefix] = record["id"] if found is None else found[0]["id"]
+                        continue
+                    files = sorted((file for file in path.iterdir() if file.is_file() and not file.name.startswith(".")), key=lambda file: file.name == MANIFEST)
+                    for file in files:
+                        stat = file.stat()
+                        stamp = [stat.st_size, stat.st_mtime_ns]
+                        if mirrored.get(file.name) == stat.st_size and receipt.get(prefix + file.name) == stamp:
+                            continue
+                        remote.upload(file, prefix + file.name)
+                        receipt[prefix + file.name] = stamp
+                        pushed += 1
+                    receipt[prefix] = record["id"]
+                except FileNotFoundError:
+                    # Released while it was sent: its removal follows below or at the next push.
+                    local.discard(prefix)
+    for prefix, objects in held.items():
+        if prefix in local or prefix not in receipt or (arms is not None and prefix.split("/")[1] not in arms):
+            continue
+        try:
+            build = json.loads(remote.read(prefix + MANIFEST) or b"")["id"] if MANIFEST in objects else None
+        except (ValueError, KeyError, TypeError):
+            build = None
+        if build != receipt[prefix]:
+            LOGGER.info("run mirror: restart unit %s on the mirror is not the build this disk held; it is kept", prefix)
+            continue
+        remote.delete([prefix + MANIFEST])
+        remote.delete([prefix + name for name in objects if name != MANIFEST])
+        LOGGER.info("run mirror: removed restart unit %s, which the fit released", prefix)
+    # A unit the disk no longer holds is done with here, its mirrored copy removed above or not this disk's to remove.
+    for name in list(receipt):
+        unit = "/".join(name.split("/")[:4]) + "/"
+        if unit not in local and (arms is None or unit.split("/")[1] in arms):
+            del receipt[name]
+    temporary = root / f"{RECEIPT}.tmp"
+    temporary.write_text(json.dumps(receipt), encoding="utf-8")
+    os.replace(temporary, root / RECEIPT)
+    if pushed:
+        LOGGER.info("run mirror: pushed %d restart files", pushed)
+
+
+def _restore_restart(run_directory: Path, remote: Remote, names: dict[str, int], arms: Sequence[str] | None) -> None:
+    """Every whole mirrored restart unit of ``arms`` (every arm's where None) the disk does not hold, each downloaded
+    aside, its manifest written last and renamed into place, and entered in RECEIPT with its build id, which lets later
+    pushes remove it once the fit releases it. A unit whose manifest names a missing or short file, with no manifest,
+    or whose files changed while they were downloaded, is left behind."""
+    root = run_directory / RESTART
+    receipt = _read_json(root / RECEIPT, {})
+    pending: list[tuple[Path, Path, dict, bytes, str]] = []
+    pairs: list[tuple[Path, str]] = []
+    parts: list[tuple[Path, str]] = []
+    for prefix, objects in sorted(_remote_units(names).items()):
+        _, arm, kind, key = prefix.rstrip("/").split("/")
+        if arms is not None and arm not in arms or RestartStore(root / arm).unit(kind, key) is not None:
+            continue
+        found = _remote_record(remote, prefix, objects)
+        if found is None:
+            LOGGER.info("run mirror: restart unit %s is not whole on the mirror; it is made again", prefix)
+            continue
+        record, content = found
+        files = list(record["files"]) if record["files"] is not None else [
+            name for name in objects if name != MANIFEST and "/" not in name and not name.startswith(".")
+        ]
+        aside = root / arm / kind / f".restoring.{key}"
+        if aside.exists():
+            shutil.rmtree(aside)
+        aside.mkdir(parents=True)
+        pending.append((aside, root / arm / kind / key, record, content, prefix))
+        (parts if record["files"] is not None else pairs).extend((aside / name, prefix + name) for name in files)
+    # A sealed unit's files are few and large (Stage 0's LD store is one file, ``genotype_statistics``): each is read
+    # in ranges at once, the largest first. A mutable unit's are small, one stream each.
+    for path, name in sorted(parts, key=lambda pair: -names[pair[1]]):
+        remote.download_parts(name, path)
+    remote.download_many(pairs)
+    for aside, target, record, content, prefix in pending:
+        if record["files"] is not None and any((aside / name).stat().st_size != size for name, size in record["files"].items()):
+            # The mirrored unit changed during the download (another job's build of its key): it is made again.
+            LOGGER.info("run mirror: restart unit %s changed on the mirror while it was restored; it is made again", prefix)
+            shutil.rmtree(aside)
+            continue
+        (aside / MANIFEST).write_bytes(content)
+        if target.exists():
+            # A unit the disk holds but not whole (``RestartStore.unit``): the mirror's whole one takes its place.
+            shutil.rmtree(target)
+        os.rename(aside, target)
+        for file in target.iterdir() if record["files"] is None else []:
+            stat = file.stat()
+            receipt[prefix + file.name] = [stat.st_size, stat.st_mtime_ns]
+        receipt[prefix] = record["id"]
+    if pending:
+        (root / RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
+    if pending:
+        LOGGER.info("run mirror: restored %d restart units, %.1f GB", len(pending), sum(names[name] for _path, name in pairs + parts) / 1e9)

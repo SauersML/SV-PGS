@@ -56,6 +56,45 @@ def _bits(array) -> np.ndarray:
     return np.ascontiguousarray(host).view(np.uint64)
 
 
+@pytest.mark.parametrize("codec", ["raw", "rowdict"])
+def test_prepared_codes_fill_a_new_device_source_without_reading_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, codec: str) -> None:
+    """A job's device arrays do not survive a preemption; the gathered codes do, as restart units (``restart_store``). A
+    fresh source over a store whose every block has its unit reads them, with its own means and scales, and gives
+    exactly the products of the source that read the store; one block without its unit sends the whole read back to
+    the store, which completes the set."""
+    if cupy is None:
+        pytest.skip("needs a CUDA device")
+    import shutil
+
+    from sv_pgs.restart_store import CodeCache, RestartStore
+
+    _write_store(tmp_path / "store", _two_half_dosage(), codec)
+    selected = np.arange(_signed_store_codes(_two_half_dosage()).shape[1], dtype=np.int64)[::2]
+    cache = CodeCache(RestartStore(tmp_path / "restart"), "model0", "store contents")
+    first, _, _, _ = _source(tmp_path / "store", "cuda", selected)
+    first._code_cache = cache
+    left = cupy.asarray(np.random.default_rng(56).normal(size=(selected.size, 3)))
+    expected = [cupy.asnumpy(tile.rmatmat(left)) for _, tile in first._iter_streamed(0)]
+    assert len(cache.store.units("codes")) == len(BLOCK_ROWS)
+    second, _, _, _ = _source(tmp_path / "store", "cuda", selected)
+    second._code_cache = cache
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("a complete prepared set must not read the dosage store")
+
+    monkeypatch.setattr(second, "_iter_decoded_tiles", forbidden)
+    monkeypatch.setattr(second, "_iter_device_tiles", forbidden)
+    found = [cupy.asnumpy(tile.rmatmat(left)) for _, tile in second._iter_streamed(0)]
+    assert len(found) == len(expected)
+    for actual, reference in zip(found, expected):
+        np.testing.assert_array_equal(actual, reference)
+    shutil.rmtree(cache.store.units("codes")[0][0])
+    third, _, _, _ = _source(tmp_path / "store", "cuda", selected)
+    third._code_cache = cache
+    assert [cupy.asnumpy(tile.rmatmat(left)).tobytes() for _, tile in third._iter_streamed(0)] == [values.tobytes() for values in expected]
+    assert len(cache.store.units("codes")) == len(BLOCK_ROWS)
+
+
 @pytest.mark.parametrize("codec", ["raw", "zstd", "rowdict"])
 def test_cpu_streamed_tiles_equal_tiles_of_the_gathered_codes(tmp_path: Path, codec: str) -> None:
     _write_store(tmp_path / "store", _two_half_dosage(), codec)

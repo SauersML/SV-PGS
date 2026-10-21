@@ -12,6 +12,7 @@ import pytest
 
 from sv_pgs import run_mirror
 from sv_pgs.content_identity import GCS_MOUNTS
+from sv_pgs.restart_store import MANIFEST, RestartStore, facts, unit_key
 from sv_pgs.run_mirror import Base, DirectoryRemote, GcsRemote, bases_of, mounted, push, restore
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE
 
@@ -25,8 +26,26 @@ def _write(path: Path, content: str | bytes) -> Path:
     return path
 
 
+_BOOKKEEPING = {f"restart/{run_mirror.RECEIPT}"}
+"""The mirror's own record of a disk's restart store, which no run pushes."""
+
+
 def _tree(root: Path) -> dict[str, bytes]:
-    return {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()} if root.is_dir() else {}
+    """Every file under ``root`` but the mirror's own records (_BOOKKEEPING)."""
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*")
+        if path.is_file() and path.relative_to(root).as_posix() not in _BOOKKEEPING
+    } if root.is_dir() else {}
+
+
+def _unit(run: Path, arm: str, inputs: str, payload: bytes = b"gram", group: str = "model0") -> Path:
+    """A sealed Stage 0 restart unit of ``arm`` (``restart_store``) made from ``inputs``: its LD file and statistics."""
+    store = RestartStore(run / "restart" / arm)
+    named = facts({"inputs": inputs})
+    with store.build("stage0", unit_key(named), group=group, named=named) as directory:
+        _write(directory / "ld" / "gram.f32", payload)
+        _write(directory / "statistics.npz", b"statistics")
+    return run / "restart" / arm / "stage0" / unit_key(named)
 
 
 def _followed(root: Path) -> dict[str, bytes]:
@@ -38,8 +57,9 @@ def _followed(root: Path) -> dict[str, bytes]:
 
 
 def _run(root: Path) -> Path:
-    """A run directory with two completed steps, a superseded one, and the fit step's partial: a checkpoint, a checkpoint
-    still being written, scratch, a saved model with its record and a saved model without one yet."""
+    """A run directory with two completed steps, a superseded one, the fit step's partial (an engine checkpoint of the
+    old layout and one still being written, scratch, a saved model with its record and a saved model without one yet)
+    and the fit's restart store: a sealed unit, an EB start's mutable unit and a unit still being built."""
     _write(root / "samples" / "samples.json", "{}")
     _write(root / "samples" / COMPLETE_FILE, '{"key": "a"}')
     _write(root / "store" / "store" / "chunk" / "0", np.arange(64, dtype=np.uint8).tobytes())
@@ -54,6 +74,10 @@ def _run(root: Path) -> Path:
     _write(partial / "models" / "snv_indel" / "asthma" / "model.pickle", b"model")
     _write(partial / "models" / "snv_indel" / "asthma.json", "{}")
     _write(partial / "models" / "snv_indel" / "gout" / "model.pickle", b"unrecorded")
+    _unit(root, "with_sv", "stage0")
+    start = RestartStore(root / "restart" / "with_sv").mutable("eb", "start", group="model0", named=facts({"inputs": "eb"}))
+    _write(start / "model0.npz", b"warm start")
+    _write(root / "restart" / "with_sv" / "band" / ".unfinished" / "within.f32", b"half")
     return root
 
 
@@ -62,11 +86,15 @@ def test_a_restore_brings_back_completed_steps_and_the_fit_s_durable_progress_on
     push(run, remote)
     restored = tmp_path / "restored"
     restore(restored, remote)
+    # The old layout's engine checkpoints are keyed by the whole package's source, which no current fit matches.
     expected = {
         name: content for name, content in _tree(run).items()
         if not name.startswith("store.superseded")
-        and "scratch" not in name and "/." not in name and "/gout/" not in name
+        and "scratch" not in name and "/." not in name and "/gout/" not in name and "/checkpoints/" not in name
     }
+    assert {name for name in expected if name.startswith("restart/")} == {
+        f"restart/with_sv/stage0/{_unit(tmp_path / 'other', 'with_sv', 'stage0').name}/{name}" for name in (MANIFEST, "ld/gram.f32", "statistics.npz")
+    } | {f"restart/with_sv/eb/start/{name}" for name in (MANIFEST, "model0.npz")}
     record = "fit.partial/models/snv_indel/asthma.json"
     expected[record] = (json.dumps({"fit_key": "fitkey", "model_files": {"model.pickle": len(b"model")}}, indent=2, sort_keys=True) + "\n").encode()
     assert _tree(restored) == expected
@@ -206,6 +234,7 @@ def test_a_store_a_later_step_s_replaces_is_linked_to_the_mount_and_the_last_is_
     followed = {
         (Path(directory) / name).relative_to(restored).as_posix(): (Path(directory) / name).read_bytes()
         for directory, _directories, names in os.walk(restored, followlinks=True) for name in names
+        if (Path(directory) / name).relative_to(restored).as_posix() not in _BOOKKEEPING
     }
     assert followed == _tree(run)
 
@@ -480,3 +509,277 @@ def test_a_run_reads_the_bases_its_mirror_names_and_those_each_base_names(tmp_pa
     push(third, opened["r"].remote, bases=bases)
     assert set(_tree(tmp_path / "r")) == {".bases/ops/svpgs/a/run", ".bases/ops/svpgs/s/run"}
     assert bases_of(opened["r"].url, opened["r"].remote, [], open_base) == [opened["a"], opened["s"]]
+
+
+def test_a_restart_unit_is_restored_whole_and_a_whole_mirrored_unit_is_never_replaced(tmp_path: Path) -> None:
+    remote = DirectoryRemote(tmp_path / "mirror")
+    unit = _unit(tmp_path / "first", "snv_indel", "stage0")
+    push(tmp_path / "first", remote)
+    manifest = tmp_path / "mirror" / "restart" / "snv_indel" / "stage0" / unit.name / MANIFEST
+    pushed = manifest.read_bytes()
+    # Another disk made the same unit again, its own build: the mirrored one stays as it is, never removed to be sent again.
+    _unit(tmp_path / "second", "snv_indel", "stage0", b"same key, another build")
+    push(tmp_path / "second", remote)
+    assert manifest.read_bytes() == pushed and (manifest.parent / "ld" / "gram.f32").read_bytes() == b"gram"
+    restore(tmp_path / "third", remote)
+    found = RestartStore(tmp_path / "third" / "restart" / "snv_indel").unit("stage0", unit.name)
+    assert found is not None and (found[0] / "ld" / "gram.f32").read_bytes() == b"gram" and found[1]["id"] == json.loads(pushed)["id"]
+    # A disk that holds the unit already keeps its own.
+    restore(tmp_path / "second", remote)
+    assert (tmp_path / "second" / "restart" / "snv_indel" / "stage0" / unit.name / "ld" / "gram.f32").read_bytes() == b"same key, another build"
+
+
+def test_an_interrupted_or_damaged_mirrored_unit_is_never_restored_and_the_next_push_completes_it(tmp_path: Path) -> None:
+    run, mirror = tmp_path / "run", tmp_path / "mirror"
+    unit = _unit(run, "snv_indel", "stage0")
+
+    class Interrupted(DirectoryRemote):
+        def upload_parts(self, path: Path, name: str) -> None:
+            if name.endswith("statistics.npz"):
+                raise ConnectionError("preempted")
+            super().upload_parts(path, name)
+
+    with pytest.raises(ConnectionError, match="preempted"):
+        push(run, Interrupted(mirror))
+    assert (mirror / "restart" / "snv_indel" / "stage0" / unit.name / "ld" / "gram.f32").is_file()
+    restore(tmp_path / "first", DirectoryRemote(mirror))
+    assert RestartStore(tmp_path / "first" / "restart" / "snv_indel").units("stage0") == []
+    assert not list((tmp_path / "first" / "restart").rglob("gram.f32"))
+    push(run, DirectoryRemote(mirror))
+    # Damaged after its manifest: a file at another size is no unit, and the next push sends it again.
+    (mirror / "restart" / "snv_indel" / "stage0" / unit.name / "ld" / "gram.f32").write_bytes(b"short")
+    restore(tmp_path / "second", DirectoryRemote(mirror))
+    assert RestartStore(tmp_path / "second" / "restart" / "snv_indel").units("stage0") == []
+    push(run, DirectoryRemote(mirror))
+    restore(tmp_path / "third", DirectoryRemote(mirror))
+    assert RestartStore(tmp_path / "third" / "restart" / "snv_indel").unit("stage0", unit.name) is not None
+
+
+def test_a_released_unit_leaves_the_mirror_only_from_a_disk_that_held_it_whole_there(tmp_path: Path) -> None:
+    remote = DirectoryRemote(tmp_path / "mirror")
+    snv = _unit(tmp_path / "origin", "snv_indel", "a")
+    sv = _unit(tmp_path / "origin", "with_sv", "b")
+    push(tmp_path / "origin", remote)
+
+    def mirrored(arm: str) -> dict[str, int]:
+        return remote.sizes(f"restart/{arm}/")
+
+    # A job fitting snv_indel restores that arm alone, and its fit's release removes that arm's units alone.
+    job = tmp_path / "job"
+    restore(job, remote, arms=["snv_indel"])
+    assert RestartStore(job / "restart" / "snv_indel").unit("stage0", snv.name) is not None and not (job / "restart" / "with_sv").exists()
+    _unit(job, "with_sv", "c")
+    RestartStore(job / "restart" / "snv_indel").release()
+    push(job, remote, arms=["snv_indel"])
+    assert mirrored("snv_indel") == {}
+    assert set(mirrored("with_sv")) == {f"restart/with_sv/stage0/{sv.name}/{name}" for name in (MANIFEST, "ld/gram.f32", "statistics.npz")}
+    # Another job's unit, which this disk never restored nor saw whole while it held it, stays; so does an interrupted
+    # upload's, which no disk saw whole.
+    stray = tmp_path / "stray"
+    restore(stray, remote, arms=["snv_indel"])
+    other = _unit(tmp_path / "other", "with_sv", "d")
+    push(tmp_path / "other", remote)
+    _write(tmp_path / "mirror" / "restart" / "with_sv" / "band" / "cut" / "within.f32", b"half")
+    own = _unit(stray, "with_sv", "e")
+    push(stray, remote)
+    RestartStore(stray / "restart" / "with_sv").release()
+    push(stray, remote)
+    names = set(mirrored("with_sv"))
+    assert not any(name.startswith(f"restart/with_sv/stage0/{own.name}/") for name in names)
+    assert {f"restart/with_sv/stage0/{unit}/{MANIFEST}" for unit in (sv.name, other.name)} | {"restart/with_sv/band/cut/within.f32"} <= names
+    # The disk that made and pushed a unit removes it once its fit releases it.
+    RestartStore(tmp_path / "origin" / "restart" / "with_sv").release()
+    push(tmp_path / "origin", remote)
+    assert not any(name.startswith(f"restart/with_sv/stage0/{sv.name}/") for name in mirrored("with_sv"))
+
+
+def test_a_push_removes_only_the_build_of_a_unit_its_disk_held(tmp_path: Path) -> None:
+    remote = DirectoryRemote(tmp_path / "mirror")
+    unit = _unit(tmp_path / "origin", "with_sv", "u")
+    push(tmp_path / "origin", remote)
+    first, second = tmp_path / "first", tmp_path / "second"
+    restore(first, remote)
+    restore(second, remote)
+    manifest = f"restart/with_sv/stage0/{unit.name}/{MANIFEST}"
+    RestartStore(first / "restart" / "with_sv").release()
+    push(first, remote)
+    assert manifest not in remote.sizes("restart/")
+    # Another disk makes the key again and pushes its build: neither a disk that held the earlier build and releases
+    # it now, nor one that released it already and forgot it, removes this one.
+    _unit(tmp_path / "rebuilt", "with_sv", "u", b"another build")
+    push(tmp_path / "rebuilt", remote)
+    RestartStore(second / "restart" / "with_sv").release()
+    push(second, remote)
+    push(first, remote)
+    assert (tmp_path / "mirror" / "restart" / "with_sv" / "stage0" / unit.name / "ld" / "gram.f32").read_bytes() == b"another build"
+
+
+def test_a_unit_changed_on_the_mirror_during_its_restore_is_left_behind_and_kept_there(tmp_path: Path) -> None:
+    mirror = tmp_path / "mirror"
+    unit = _unit(tmp_path / "origin", "with_sv", "u")
+    push(tmp_path / "origin", DirectoryRemote(mirror))
+    _unit(tmp_path / "rebuilt", "with_sv", "u", b"another, longer build")
+
+    class Changing(DirectoryRemote):
+        def download_parts(self, name: str, path: Path) -> None:
+            if name.endswith("gram.f32"):
+                # Between the listing and this read, another job removed the unit and pushed its own build of the key.
+                shutil.rmtree(mirror / "restart" / "with_sv" / "stage0" / unit.name)
+                push(tmp_path / "rebuilt", DirectoryRemote(mirror))
+            super().download_parts(name, path)
+
+    job = tmp_path / "job"
+    restore(job, Changing(mirror))
+    assert RestartStore(job / "restart" / "with_sv").units("stage0") == [] and not list((job / "restart").rglob("gram.f32"))
+    push(job, DirectoryRemote(mirror))
+    assert (mirror / "restart" / "with_sv" / "stage0" / unit.name / "ld" / "gram.f32").read_bytes() == b"another, longer build"
+
+
+def test_a_region_s_restart_units_mirror_in_its_directory_and_leave_it_only_from_a_disk_that_held_them(tmp_path: Path) -> None:
+    remote = DirectoryRemote(tmp_path / "mirror")
+    job = tmp_path / "job"
+    restore(job, remote)
+    unit = _unit(job / "regions" / "apoe", "with_sv", "window")
+    push(job, remote)
+    mirrored = f"regions/apoe/restart/with_sv/stage0/{unit.name}/{MANIFEST}"
+    assert mirrored in remote.sizes("regions/apoe/restart/")
+    later = tmp_path / "later"
+    restore(later, remote)
+    assert RestartStore(later / "regions" / "apoe" / "restart" / "with_sv").unit("stage0", unit.name) is not None
+    # A disk whose restore found nothing of the region, pushing a unit of its own there, removes nothing it never held.
+    stray = tmp_path / "stray"
+    restore(stray, DirectoryRemote(tmp_path / "empty"))
+    _unit(stray / "regions" / "apoe", "with_sv", "other")
+    push(stray, remote)
+    assert mirrored in remote.sizes("regions/apoe/restart/")
+    # The disks that held it, the one that pushed it and the one that restored it, remove it once their fit releases it.
+    RestartStore(later / "regions" / "apoe" / "restart" / "with_sv").release()
+    push(later, remote)
+    assert mirrored not in remote.sizes("regions/apoe/restart/")
+
+
+def test_a_changed_warm_start_is_sent_again_and_an_unchanged_one_is_not(tmp_path: Path) -> None:
+    run, mirror = tmp_path / "run", tmp_path / "mirror"
+    start = RestartStore(run / "restart" / "snv_indel").mutable("eb", "start", group="model0", named=facts({"inputs": "eb"}))
+    _write(start / "model0.npz", b"first start")
+    remote = DirectoryRemote(mirror)
+    push(run, remote)
+    copy = mirror / "restart" / "snv_indel" / "eb" / "start" / "model0.npz"
+    sent = copy.stat().st_mtime_ns
+    push(run, remote)
+    assert copy.stat().st_mtime_ns == sent
+    # A better start of the same size, written later (``fit_checkpoint.save_archive`` replaces the file whole).
+    _write(start / "model0.npz", b"later start")
+    stat = (start / "model0.npz").stat()
+    os.utime(start / "model0.npz", ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    push(run, remote)
+    assert copy.read_bytes() == b"later start"
+    restore(tmp_path / "restored", remote)
+    assert (tmp_path / "restored" / "restart" / "snv_indel" / "eb" / "start" / "model0.npz").read_bytes() == b"later start"
+    # The restored disk's receipt knows the start it holds: nothing is sent again.
+    sent = copy.stat().st_mtime_ns
+    push(tmp_path / "restored", remote)
+    assert copy.stat().st_mtime_ns == sent
+
+
+def test_a_direct_sv_chromosome_is_restored_only_with_its_rows(tmp_path: Path) -> None:
+    partial = tmp_path / "run" / "direct_sv.partial"
+    _write(partial / KEY_FILE, "directkey")
+    for chromosome in ("chr1", "chr2"):
+        _write(partial / "store" / "dosage" / "half0" / chromosome / "shard0", chromosome.encode())
+        _write(partial / "chromosomes" / f"{chromosome}.json", "{}")
+    _write(partial / "rows" / "chr1.npz", b"rows")
+    remote = DirectoryRemote(tmp_path / "mirror")
+    push(tmp_path / "run", remote)
+    # chr2's rows did not reach the mirror (a mirror before it carried them): chr2 is made again, never restored half.
+    restore(tmp_path / "restored", remote)
+    restored = tmp_path / "restored" / "direct_sv.partial"
+    assert (restored / "rows" / "chr1.npz").read_bytes() == b"rows" and (restored / "chromosomes" / "chr1.json").is_file()
+    assert not (restored / "chromosomes" / "chr2.json").exists() and not (restored / "store" / "dosage" / "half0" / "chr2").exists()
+
+
+def test_a_step_made_again_under_its_own_key_keeps_its_mirrored_copy(tmp_path: Path) -> None:
+    run, mirror = _run(tmp_path / "run"), tmp_path / "mirror"
+    remote = DirectoryRemote(mirror)
+    push(run, remote)
+    pushed = (mirror / "samples" / COMPLETE_FILE).read_bytes()
+    # A disk the restore did not reach made the step again: the same key, another finishing time.
+    _write(run / "samples" / COMPLETE_FILE, '{"key": "a", "finished": "later"}')
+    push(run, remote)
+    assert (mirror / "samples" / COMPLETE_FILE).read_bytes() == pushed
+    # A partial under the completed step's own key leaves the mirrored step; one under another key does not.
+    other = tmp_path / "other"
+    _write(other / "store.partial" / KEY_FILE, "b")
+    push(other, remote)
+    assert (mirror / "store" / COMPLETE_FILE).is_file()
+    _write(other / "store.partial" / KEY_FILE, "newstore")
+    push(other, remote)
+    assert not (mirror / "store").exists()
+
+
+def test_a_gcs_restart_file_is_sent_in_parallel_parts_within_the_part_limit(tmp_path: Path, monkeypatch) -> None:
+    transfer_manager = pytest.importorskip("google.cloud.storage.transfer_manager")
+    calls, whole = [], []
+    monkeypatch.setattr(transfer_manager, "upload_chunks_concurrently", lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(transfer_manager, "TM_DEFAULT_CHUNK_SIZE", 2)
+    blob = object()
+    remote = GcsRemote.__new__(GcsRemote)
+    remote._bucket, remote._root = type("Bucket", (), {"blob": lambda self, name: blob})(), "svpgs/run/"
+    monkeypatch.setattr(remote, "upload", lambda path, name: whole.append(name))
+    tiny = _write(tmp_path / "tiny", bytes(2))
+    small = _write(tmp_path / "small", bytes(16))
+    large = _write(tmp_path / "large", bytes(2 * run_mirror.MULTIPART_PARTS + 1))
+    for path in (tiny, small, large):
+        remote.upload_parts(path, f"restart/snv_indel/stage0/key/{path.name}")
+    # A file within one part is sent whole.
+    assert whole == ["restart/snv_indel/stage0/key/tiny"]
+    (small_args, small_options), (large_args, large_options) = calls
+    assert small_args == (str(small), blob) and small_options["worker_type"] == transfer_manager.PROCESS and small_options["chunk_size"] == 2
+    # Past the default chunk's 10,000 parts, each part grows so the object stays within Cloud Storage's limit.
+    assert large_options["chunk_size"] == 3 and -(-large.stat().st_size // large_options["chunk_size"]) <= run_mirror.MULTIPART_PARTS
+
+
+def test_a_gcs_restart_file_is_restored_in_parallel_ranges_with_its_checksum(tmp_path: Path, monkeypatch) -> None:
+    transfer_manager = pytest.importorskip("google.cloud.storage.transfer_manager")
+    calls, whole = [], []
+    monkeypatch.setattr(transfer_manager, "download_chunks_concurrently", lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(transfer_manager, "TM_DEFAULT_CHUNK_SIZE", 2)
+
+    class Blob:
+        def __init__(self, name: str) -> None:
+            self.name, self.size = name, None
+
+        def reload(self) -> None:
+            self.size = 2 if self.name.endswith("tiny") else 64
+
+    remote = GcsRemote.__new__(GcsRemote)
+    remote._bucket, remote._root = type("Bucket", (), {"blob": lambda self, name: Blob(name)})(), "svpgs/run/"
+    monkeypatch.setattr(remote, "download", lambda name, path: whole.append(name))
+    remote.download_parts("restart/snv_indel/stage0/key/tiny", tmp_path / "tiny")
+    remote.download_parts("restart/snv_indel/stage0/key/ld/ld_grams.f32", tmp_path / "ld" / "ld_grams.f32")
+    # A file within one range is read whole; a larger one in ranges, one process per CPU, its CRC32C checked.
+    assert whole == ["restart/snv_indel/stage0/key/tiny"]
+    ((blob, filename), options), = calls
+    assert blob.name == "svpgs/run/restart/snv_indel/stage0/key/ld/ld_grams.f32" and filename == str(tmp_path / "ld" / "ld_grams.f32")
+    assert (tmp_path / "ld").is_dir() and options["worker_type"] == transfer_manager.PROCESS and options["crc32c_checksum"] is True
+    assert options["max_workers"] == len(os.sched_getaffinity(0)) and "retry" in options["download_kwargs"]
+
+
+def test_a_restore_reads_a_sealed_unit_s_files_in_parts_largest_first_and_a_mutable_unit_s_in_one_pass(tmp_path: Path) -> None:
+    run, mirror = _run(tmp_path / "run"), tmp_path / "mirror"
+    push(run, DirectoryRemote(mirror))
+    parts, many = [], []
+
+    class Recording(DirectoryRemote):
+        def download_parts(self, name: str, path: Path) -> None:
+            parts.append(name)
+            super().download_parts(name, path)
+
+        def download_many(self, pairs: list[tuple[Path, str]]) -> None:
+            many.extend(name for _path, name in pairs if name.startswith("restart/"))
+            super().download_many(pairs)
+
+    restore(tmp_path / "job", Recording(mirror))
+    sizes = DirectoryRemote(mirror).sizes("restart/")
+    assert parts and all("/stage0/" in name for name in parts) and [sizes[name] for name in parts] == sorted((sizes[name] for name in parts), reverse=True)
+    assert many and all("/eb/" in name for name in many)

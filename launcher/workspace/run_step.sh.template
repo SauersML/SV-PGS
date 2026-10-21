@@ -133,22 +133,25 @@ export SVPGS_RESTORED_DIGESTS="$RUN/restored-digests"
 export SVPGS_SCORE_READ_CHECKPOINT_SECONDS=300
 mkdir -p "$TMPDIR"
 # Batch cannot write to an existing disk, so this job's disk is new and the run lives in the workspace bucket
-# (sv_pgs/run_mirror.py): restored before the driver starts, pushed every 15 minutes while it runs (each push sends
-# only new checkpoints and finished steps), and pushed once more after it exits. A preemption loses at most the fit
-# progress since the last push. flock keeps one push at a time. With BASE_RUN ("${BASE_RUN}"), that run's mirror carries
-# this run's completed steps before the fit where this run's mirror holds none of a step, and no push copies them here.
+# (sv_pgs/run_mirror.py): restored before the driver starts, pushed every minute while it runs (each push sends only
+# what changed: the fit's new restart units, from Stage 0's LD store to each model's best EB start, and new steps), and
+# pushed once more after it exits. A preemption loses at most the fit progress since the last push; a push sending a
+# large unit (Stage 0's LD store, minutes) runs beside the fit, and the next waits for it. flock keeps one push at a
+# time. A fit job given FIT_ARMS restores and pushes only those arms' restart units. With BASE_RUN ("${BASE_RUN}"),
+# that run's mirror carries this run's completed steps before the fit where this run's mirror holds none of a step, and
+# no push copies them here.
 base=()
 [ -z "${BASE_RUN}" ] || base=(--base "gs://${OPS_BUCKET}/svpgs/${BASE_RUN}/run")
 mirror() {
   flock "$RUN/mirror.lock" "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" --mirror "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run" \
-    ${base[@]+"${base[@]}"}
+    ${base[@]+"${base[@]}"} ${fit_arm[@]+"${fit_arm[@]}"}
 }
 mirror restore || { mark "exit-restore"; exit 1; }
 mark restored
 # A loop's sleep goes first: killed alone, the subshell left it running, and the task (and its log) ended only when the
-# sleep did, up to 15 minutes later. A push in progress is left to finish; the last push below waits on its lock.
+# sleep did. A push in progress is left to finish; the last push below waits on its lock.
 stop() { pkill -x -P "$1" sleep 2>/dev/null; kill "$1" 2>/dev/null; }
-( while sleep 900; do mirror push || mark "push-failed"; done ) &
+( while sleep 60; do mirror push || mark "push-failed"; done ) &
 pusher=$!
 # Batch writes the task log to the bucket only when the task ends, so a fit gave no sign of its progress for hours. The
 # driver's stderr also goes to a file whose last lines are copied beside the task log every 5 minutes: the same lines

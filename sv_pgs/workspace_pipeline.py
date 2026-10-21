@@ -183,6 +183,7 @@ from sv_pgs.store_converter import (
 from sv_pgs.sv_fusion import MINIMUM_SIZE_RATIO, SvSites, candidate_pairs, sequence_resolved_sites
 from sv_pgs.variant_typing import COMMUNITY_SV_MINIMUM_LENGTH, alt_is_symbolic_or_breakend, is_sequence_allele, variant_class_and_length
 from sv_pgs.fit_checkpoint import checkpoint_timings
+from sv_pgs.restart_store import RestartStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -201,6 +202,9 @@ STRUCTURAL_PART = "structural"
 """The name suffix of an all-rows model's structural part (``artifact.model_part`` on ``structural_records``), whose
 genetic score the score step writes beside the model's own for the effects step's variance decomposition."""
 COMPLETE_FILE = "_COMPLETE.json"
+RESTART_DIRECTORY = "restart"
+"""The run's restart units, restart/<arm>/ (``restart_store``), beside its steps and in none of them: an edit that sets
+the fit step aside keeps its Stage 0, band, codes, EB starts and completed models (``_fit_step``)."""
 KEY_FILE = "_KEY"
 EXPORTABLE_FILE = "_EXPORTABLE.json"
 REGIONS_DIRECTORY = "regions"
@@ -3410,6 +3414,12 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     A run given ``fit_arms`` (``run_pipeline``) fits only those arms and leaves the step to the run that finds every arm
     on disk (the run mirror carries each run's models to it), so the arms can be fitted at once on their own machines.
 
+    Each arm's restart units live in the run's restart/<arm> (RESTART_DIRECTORY, ``restart_store``), outside this
+    step's directory: a preempted fit resumes from its Stage 0, band, codes and EB starts there (the run mirror carries
+    them), and a completed model's checkpoint, keyed by the engine's own source and its inputs (``fit_model.fit_identity``),
+    survives an edit that sets this step aside without changing the engine. Once an arm's models are saved, its units
+    but the completed checkpoints are released.
+
     The arms run in ARMS order, each whole before the next, so a run its budget stops (``launcher/workspace``: each
     job's runtime is bounded) holds the first arm's every trait before the second begins; the comparison of the arms
     needs both. After each arm the log gives the hours its fit took and the step's projected total."""
@@ -3439,8 +3449,9 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                 continue
             if unrecorded:
                 work = directory / "work" / arm
-                # A Spot restart keeps completed models' checkpoints; the engine discards only the interrupted group's
-                # scratch and verifies each checkpoint's input digest.
+                # A Spot restart resumes from the arm's restart store (restart/<arm>: the completed models' checkpoints,
+                # each verified against its key, and the interrupted group's Stage 0, band, codes and EB starts); this
+                # directory is the interrupted group's scratch alone.
                 work.mkdir(parents=True, exist_ok=True)
                 unsaved = [trait for trait in unrecorded if not targets[trait].is_dir()]
                 if unsaved:
@@ -3449,10 +3460,10 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                         store.variant_table, store.n_samples, measurement.log_reliability, run.config.fit_minimum_minor_allele_frequency, run.config.fit_minimum_r2,
                         run.config.fit_variant_sites, run.config.fit_region,
                     )
-                    request = fit_request(
+                    request = dataclasses.replace(fit_request(
                         cohort, store, arm_log_reliability(store.variant_table, kept, arm), run.budget, work, run.config.seed,
                         run.config.disease_likelihood, run.config.annotated_prior, run.config.length_by_class, run.config.ld_score_prior,
-                    )
+                    ), restart_dir=run.config.run_directory / RESTART_DIRECTORY / arm)
                     timing("fit_filter", time.perf_counter() - filtering)
                     LOGGER.info("workspace pipeline: fitting %s: %d models of %d traits", arm, len(request.model_names), len(cohort.trait_names))
                     started = time.perf_counter()
@@ -3469,7 +3480,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                         "left need %.1f h more", arm, fitted_seconds[-1] / 3600.0, np.mean(fitted_seconds) / 3600.0, remaining,
                         remaining * np.mean(fitted_seconds) / 3600.0,
                     )
-                timings = checkpoint_timings(work)
+                timings = checkpoint_timings(run.config.run_directory / RESTART_DIRECTORY / arm)
                 for trait in unrecorded:
                     fitted = run.bindings.load_model(targets[trait])
                     if tuple(fitted.model_names) != trait_model_names[trait]:
@@ -3490,6 +3501,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                         },
                     )
                 _remove_own(work, directory)
+                RestartStore(run.config.run_directory / RESTART_DIRECTORY / arm).release()
             for target, trait_name in zip(targets, cohort.trait_names):
                 records[arm][trait_name] = json.loads(target.with_name(target.name + ".json").read_text(encoding="utf-8"))
     if others:

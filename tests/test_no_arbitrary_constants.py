@@ -63,6 +63,8 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('run_mirror.py', 'restore'): ('unit', frozenset({1e9}), 'bytes per GB'),
     ('phase_timer.py', 'GB'): ('unit', frozenset({1e9}), 'bytes per GB'),
     ('phase_timer.py', 'DeviceBusy.kernel_seconds'): ('unit', frozenset({1e3}), 'milliseconds per second: cupy.cuda.get_elapsed_time reports milliseconds (cudaEventElapsedTime)'),
+    ('run_mirror.py', '_restore_restart'): ('unit', frozenset({1e9}), 'bytes per GB'),
+    ('run_mirror.py', 'MULTIPART_PARTS'): ('spec', frozenset({10_000}), "Cloud Storage's XML API multipart upload: at most 10,000 parts an object (cloud.google.com/storage/docs/multipart-uploads)"),
     ('workspace_pipeline.py', '_prediction_budget'): ('derived', frozenset({4}), "four plan arrays at peak (concatenation, unique work, union, positions), and four caller arrays per scoring column (linear variances, linear predictor, predictive mean, predictive variance)"),
     ('workspace_pipeline.py', 'score_batches'): ('derived', frozenset({4}), "the host shared four ways: the loaded models, the scorer's per-model plan positions, its accumulators, and its read-ahead buffers"),
     ('gatksv_store_rows.py', 'PHRED_SCALE'): ('definitional', frozenset({10.0}), 'the phred scale of a genotype quality: Q = -10 log10 P(miscall) (Ewing and Green 1998, Genome Res 8:186)'),
