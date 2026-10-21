@@ -978,6 +978,58 @@ def test_breast_cancer_cases_are_invasive_and_female_and_controls_are_women_of_4
     assert counts["n_excluded_control_exclusion"] == 1 and counts["n_excluded_ambiguous_code"] == 1
 
 
+def test_pre_landmark_depth_leaves_out_every_day_with_a_diagnosis_or_a_case_procedure(cdr: _Cdr):
+    coronary = resolve_disease_definition("coronary_artery_disease")
+    for person_id in (1, 2):
+        cdr.person(person_id, 1950, MALE)
+        cdr.observation_period(person_id, "2010-01-01", "2024-01-01")
+    # Person 1's only pre-landmark days (the landmark is 2011-01-01) are diagnosis days, one also coded with pain.
+    cdr.condition(1, 91000025, "2010-03-01")
+    cdr.condition(1, PAIN, "2010-03-01")
+    cdr.condition(1, 91000025, "2010-09-01")
+    cdr.condition(1, PAIN, "2015-01-01")
+    # Person 2: a coronary intervention on a day coded with pain only, and one more day of pain.
+    cdr.procedure(2, 91000027, "2010-05-01")
+    cdr.condition(2, PAIN, "2010-05-01")
+    cdr.condition(2, PAIN, "2010-07-01")
+
+    rows = cdr.disease_rows(coronary)
+    assert rows["1"]["phenotype_occurrence_count"] == 2 and rows["1"]["condition_dates"] == 3
+    assert rows["1"]["pre_landmark_condition_dates"] == 0
+    assert rows["2"]["case_procedure_dates"] == 1 and rows["2"]["condition_dates"] == 2
+    assert rows["2"]["pre_landmark_condition_dates"] == 1
+
+    training_rows, _columns, _counts = _prepare_training_rows(coronary, list(rows.values()), [])
+    covariates = {row["person_id"]: (row["target"], row["log1p_pre_landmark_condition_dates"]) for row in training_rows}
+    assert covariates == {"1": (1, 0.0), "2": (1, math.log1p(1))}
+
+
+def test_pre_landmark_depth_of_a_control_is_every_condition_date_to_the_landmark_and_drug_days_stay(cdr: _Cdr):
+    hypertension = resolve_disease_definition("hypertension")
+    for person_id in (1, 2):
+        cdr.person(person_id, 1950, FEMALE)
+        cdr.observation_period(person_id, "2010-01-01", "2024-01-01")
+    # Person 1, a control: pain twice on one day, on two more days up to the landmark itself, and on two after it.
+    control_days = ("2010-02-01", "2010-02-01", "2010-06-01", "2011-01-01", "2011-01-02", "2015-01-01")
+    for date in control_days:
+        cdr.condition(1, PAIN, date)
+    landmark = _date("2010-01-01") + datetime.timedelta(days=365)
+    # Person 2, a case by one diagnosis and lisinopril: the drug's pre-landmark day, coded with pain, still counts.
+    cdr.condition(2, 320128, "2015-01-01")
+    cdr.drug(2, 91000020, "2010-04-01")
+    cdr.condition(2, PAIN, "2010-04-01")
+    cdr.condition(2, PAIN, "2010-08-01")
+
+    rows = cdr.disease_rows(hypertension)
+    assert rows["1"]["pre_landmark_condition_dates"] == len({date for date in control_days if _date(date) <= landmark}) == 3
+    assert rows["1"]["condition_dates"] == len(set(control_days))
+    assert rows["2"]["case_medication_dates"] == 1 and rows["2"]["pre_landmark_condition_dates"] == 2
+
+    training_rows, _columns, _counts = _prepare_training_rows(hypertension, list(rows.values()), [{}])
+    covariates = {row["person_id"]: (row["target"], row["log1p_pre_landmark_condition_dates"]) for row in training_rows}
+    assert covariates == {"1": (0, math.log1p(3)), "2": (1, math.log1p(2))}
+
+
 # ---------------------------------------------------------------------------
 # Census
 # ---------------------------------------------------------------------------

@@ -32,9 +32,13 @@ MIN_DISEASE_OCCURRENCES = 2
 # C06's floor, five condition dates on or before the first observation-period
 # start plus a year, selects on pre-outcome EHR use only, but it kept about one
 # All of Us EHR participant in seven; this one keeps more than half.) The
-# pre-landmark depth, distinct condition dates on or before the first
-# observation-period start plus EHR_DEPTH_LANDMARK_DAYS, does not depend on the
-# outcome and stays a covariate.
+# pre-landmark depth, a covariate of every disease fit, counts the distinct
+# condition dates on or before the first observation-period start plus
+# EHR_DEPTH_LANDMARK_DAYS that carry none of the disease's own diagnosis or
+# procedure evidence: a date with a diagnosis code or a case procedure is left
+# out whatever else was coded on it, so a case diagnosed, prevalent or treated
+# in its first EHR year does not get a larger value for it (the query's
+# condition_summaries says why drug and lab dates stay).
 EHR_DEPTH_LANDMARK_DAYS = 365
 LOGGER = logging.getLogger(__name__)
 # Every phenotype adjusts for biological sex (All of Us
@@ -1065,8 +1069,8 @@ def resolve_disease_definition(disease: str) -> DiseaseDefinition:
 
 def build_all_of_us_disease_sql(disease_definition: DiseaseDefinition) -> str:
     """One row per EHR participant: diagnosis dates, exclusion flags, the
-    disease's drug and procedure evidence, the EHR depth (all condition dates
-    and those before the landmark) and the
+    disease's drug and procedure evidence, the EHR depth (all condition dates,
+    and those before the landmark with no diagnosis or case procedure) and the
     ages the liability target needs. Lab evidence comes from the measurement
     query (fetch_all_of_us_lab_criterion_rows); the case and control rules are
     applied in _prepare_training_rows."""
@@ -1122,39 +1126,59 @@ case_procedure_concepts AS (
   UNION DISTINCT
   {_descendant_concepts_sql(dataset, "CPT4", "case_procedure_cpt4_codes")}
 ),
-condition_summaries AS (
-  -- One pass over condition_occurrence. Occurrences are distinct diagnosis
-  -- dates: several condition rows on one day (one visit coded twice) are one
-  -- occurrence, not a confirmation. The EHR depth counts distinct condition
-  -- dates of any kind, all of them and those on or before the landmark.
+condition_days AS (
+  -- One pass over condition_occurrence, a row per person and condition date:
+  -- several condition rows on one day (one visit coded twice) are one
+  -- occurrence, not a confirmation.
   SELECT
     condition_occurrence.person_id,
-    COUNT(
-      DISTINCT IF(disease_concepts.concept_id IS NOT NULL, condition_occurrence.condition_start_date, NULL)
-    ) AS phenotype_occurrence_count,
-    MIN(IF(disease_concepts.concept_id IS NOT NULL, condition_occurrence.condition_start_date, NULL))
-      AS first_condition_date,
+    condition_occurrence.condition_start_date,
+    LOGICAL_OR(disease_concepts.concept_id IS NOT NULL) AS has_disease_code,
     LOGICAL_OR(control_exclusion_concepts.concept_id IS NOT NULL) AS has_control_exclusion_code,
-    LOGICAL_OR(ambiguous_concepts.concept_id IS NOT NULL) AS has_ambiguous_code,
-    COUNT(
-      DISTINCT IF(
-        condition_occurrence.condition_start_date
-          <= DATE_ADD(ehr_participants.observation_start_date, INTERVAL {EHR_DEPTH_LANDMARK_DAYS} DAY),
-        condition_occurrence.condition_start_date,
-        NULL
-      )
-    ) AS pre_landmark_condition_dates,
-    COUNT(DISTINCT condition_occurrence.condition_start_date) AS condition_dates
+    LOGICAL_OR(ambiguous_concepts.concept_id IS NOT NULL) AS has_ambiguous_code
   FROM `{dataset}.condition_occurrence` AS condition_occurrence
-  JOIN ehr_participants
-    ON ehr_participants.person_id = condition_occurrence.person_id
   LEFT JOIN disease_concepts
     ON disease_concepts.concept_id = condition_occurrence.condition_concept_id
   LEFT JOIN control_exclusion_concepts
     ON control_exclusion_concepts.concept_id = condition_occurrence.condition_concept_id
   LEFT JOIN ambiguous_concepts
     ON ambiguous_concepts.concept_id = condition_occurrence.condition_concept_id
-  GROUP BY condition_occurrence.person_id
+  GROUP BY condition_occurrence.person_id, condition_occurrence.condition_start_date
+),
+case_procedure_days AS (
+  SELECT DISTINCT person_id, procedure_date
+  FROM `{dataset}.procedure_occurrence`
+  WHERE procedure_concept_id IN (SELECT concept_id FROM case_procedure_concepts)
+),
+condition_summaries AS (
+  -- Occurrences are the days with a diagnosis code. The EHR depth counts
+  -- condition dates of any kind: all of them, and, for the covariate, those on
+  -- or before the landmark without a diagnosis code or a case procedure, whose
+  -- other codes are there because of the disease (no control has such a day).
+  -- Case-medication and lab days stay: a drug only supports a diagnosis, has
+  -- other indications and recurs on unrelated visits through medication lists,
+  -- and a lab is drawn at visits held whatever its value, so leaving them out
+  -- would take routine visits from the treated and the tested alone.
+  SELECT
+    condition_days.person_id,
+    COUNTIF(condition_days.has_disease_code) AS phenotype_occurrence_count,
+    MIN(IF(condition_days.has_disease_code, condition_days.condition_start_date, NULL)) AS first_condition_date,
+    LOGICAL_OR(condition_days.has_control_exclusion_code) AS has_control_exclusion_code,
+    LOGICAL_OR(condition_days.has_ambiguous_code) AS has_ambiguous_code,
+    COUNTIF(
+      condition_days.condition_start_date
+        <= DATE_ADD(ehr_participants.observation_start_date, INTERVAL {EHR_DEPTH_LANDMARK_DAYS} DAY)
+      AND NOT condition_days.has_disease_code
+      AND case_procedure_days.person_id IS NULL
+    ) AS pre_landmark_condition_dates,
+    COUNT(*) AS condition_dates
+  FROM condition_days
+  JOIN ehr_participants
+    ON ehr_participants.person_id = condition_days.person_id
+  LEFT JOIN case_procedure_days
+    ON case_procedure_days.person_id = condition_days.person_id
+    AND case_procedure_days.procedure_date = condition_days.condition_start_date
+  GROUP BY condition_days.person_id
 ),
 medication_summaries AS (
   -- One pass over drug_exposure: distinct exposure dates of the case
@@ -1177,10 +1201,9 @@ medication_summaries AS (
 procedure_summaries AS (
   SELECT
     person_id,
-    COUNT(DISTINCT procedure_date) AS case_procedure_dates,
+    COUNT(*) AS case_procedure_dates,
     MIN(procedure_date) AS first_case_procedure_date
-  FROM `{dataset}.procedure_occurrence`
-  WHERE procedure_concept_id IN (SELECT concept_id FROM case_procedure_concepts)
+  FROM case_procedure_days
   GROUP BY person_id
 )
 SELECT

@@ -342,9 +342,8 @@ def test_build_all_of_us_disease_sql_uses_workspace_cdr_and_snomed_concept_ances
     assert "concept_code IN UNNEST(@case_snomed_codes)" in sql
     assert "primary_consent_date" in sql
     # A case needs MIN_DISEASE_OCCURRENCES distinct diagnosis dates, not rows.
-    assert (
-        "DISTINCT IF(disease_concepts.concept_id IS NOT NULL, condition_occurrence.condition_start_date, NULL)"
-    ) in sql
+    assert "GROUP BY condition_occurrence.person_id, condition_occurrence.condition_start_date" in sql
+    assert "COUNTIF(condition_days.has_disease_code) AS phenotype_occurrence_count" in sql
     assert "COUNT(*) AS phenotype_occurrence_count" not in sql
     # The SNOMED codes must NOT be string-interpolated into the SQL itself.
     assert all(code not in sql for code in disease_definition.case_snomed_codes)
