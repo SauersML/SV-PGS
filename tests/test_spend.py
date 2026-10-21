@@ -180,3 +180,120 @@ else:
     assert saved.returncode == 0, saved.stderr
     assert not (tmp_path / "calls").exists()
     assert saved.stdout.splitlines()[1] == shown.stdout.splitlines()[1]
+
+
+def _marker(run, moment, event):
+    return f"gs://ops-bucket/svpgs/{run}/markers/{moment.astimezone(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_task_{event}"
+
+
+def _start_fixture():
+    """A fit arm preempted once and running again, two arms of one run at the same time, a job still queued and a fan-out:
+    the jobs, their tasks and the runs' marker names, with every time in minutes from the first job's creation."""
+    created = NOW - datetime.timedelta(hours=3)
+
+    def at(minutes):
+        return created + datetime.timedelta(minutes=minutes)
+
+    launched = "bash /mnt/disks/ops/svpgs/{run}/launcher/{slot}/run_step.sh"
+    jobs = [
+        _job("svpgs-aou-wa1-train-6", "a2-highgpu-2g", "SPOT", 2000, "RUNNING", script=launched.format(run="aou-wa1", slot="train-6")),
+        _job("svpgs-aou-wb1-train-6", "a2-highgpu-2g", "SPOT", 2000, "SUCCEEDED", script=launched.format(run="aou-wb1", slot="train-6")),
+        _job("svpgs-aou-wb1-train-7", "a2-highgpu-2g", "SPOT", 2000, "SUCCEEDED", script=launched.format(run="aou-wb1", slot="train-7")),
+        _job("svpgs-aou-wc1-train-6", "a2-highgpu-2g", "SPOT", 2000, "QUEUED", script=launched.format(run="aou-wc1", slot="train-6")),
+        _job("svpgs-aou-wa1-train-5", "n2d-standard-128", "SPOT", 500, "SUCCEEDED", tasks=22, script=launched.format(run="aou-wa1", slot="train-5")),
+    ]
+    for job in jobs:
+        job["createTime"] = _stamp(created)
+    jobs[3]["createTime"] = _stamp(NOW - datetime.timedelta(minutes=12))
+    tasks = {
+        "svpgs-aou-wa1-train-6": [{"name": "task0", "status": {"state": "RUNNING", "statusEvents": [
+            _task_event("ASSIGNED", at(4)), _task_event("RUNNING", at(7)), _task_event("FAILED", at(60), 50001),
+            _task_event("PENDING", at(60.5)), _task_event("ASSIGNED", at(70)), _task_event("RUNNING", at(72))]}}],
+        "svpgs-aou-wb1-train-6": [{"name": "task0", "status": {"state": "SUCCEEDED", "statusEvents": [
+            _task_event("ASSIGNED", at(2)), _task_event("RUNNING", at(5)), _task_event("SUCCEEDED", at(90), 0)]}}],
+        "svpgs-aou-wb1-train-7": [{"name": "task0", "status": {"state": "SUCCEEDED", "statusEvents": [
+            _task_event("ASSIGNED", at(3)), _task_event("RUNNING", at(6)), _task_event("SUCCEEDED", at(80), 0)]}}],
+        "svpgs-aou-wc1-train-6": [{"name": "task0", "status": {"state": "PENDING", "statusEvents": []}}],
+    }
+    markers = [
+        _marker("aou-wa1", at(7.5), "started"), _marker("aou-wa1", at(9), "env-ready"), _marker("aou-wa1", at(17), "restored"),
+        _marker("aou-wa1", at(60), "terminated"),
+        _marker("aou-wa1", at(72.5), "started"), _marker("aou-wa1", at(73.5), "env-ready"), _marker("aou-wa1", at(79.5), "restored"),
+        # the fan-out's task markers and the driver's step markers are not a one-task job's start
+        _marker("aou-wa1", at(1), "3-started"), "gs://ops-bucket/svpgs/aou-wa1/markers/20261020T170000Z_fit_started",
+        _marker("aou-wb1", at(5.5), "started"), _marker("aou-wb1", at(7), "env-ready"), _marker("aou-wb1", at(14), "restored"),
+        _marker("aou-wb1", at(6.5), "started"), _marker("aou-wb1", at(8), "env-ready"), _marker("aou-wb1", at(15), "restored"),
+    ]
+    return jobs, tasks, markers
+
+
+def test_each_attempt_s_start_is_split_by_batch_s_states_and_the_run_s_markers() -> None:
+    jobs, tasks, markers = _start_fixture()
+    text = spend.starts(jobs, tasks, spend.markers_of(markers), NOW)
+    rows = {(line.split()[1], line.split()[2]): line.split()[3:] for line in text.splitlines()[2:] if line.startswith("aou-")}
+    prep = _rate("a2-highgpu-2g", "SPOT", 2000)
+    # queued 0 -> 4, boot 4 -> 7, script 7 -> 7.5, environment 7.5 -> 9, restore 9 -> 17, start 0 -> 9; the VM from 4 to 17
+    assert rows[("svpgs-aou-wa1-train-6", "1")] == ["50001", "4.0", "3.0", "0.5", "1.5", "8.0", "9.0", f"{13 / 60 * prep:.2f}"]
+    # the retry waits from the preemption: 60 -> 70 for a VM, its start 60 -> 73.5
+    assert rows[("svpgs-aou-wa1-train-6", "2")] == ["-", "10.0", "2.0", "0.5", "1.0", "6.0", "13.5", f"{9.5 / 60 * prep:.2f}"]
+    # two arms of one run at once: Batch's parts, but neither takes the run's markers
+    assert rows[("svpgs-aou-wb1-train-6", "1")] == ["0", "2.0", "3.0", "?", "?", "?", "?", "-"]
+    assert rows[("svpgs-aou-wb1-train-7", "1")][:3] == ["0", "3.0", "3.0"]
+    assert rows[("svpgs-aou-wc1-train-6", "-")] == ["-", "12.0", "no", "VM", "yet,", "QUEUED"]
+    summary = {line.split()[0]: line.split()[1:] for line in text.splitlines() if line.startswith(("median", "largest"))}
+    assert summary["median"] == ["3.5", "3.0", "0.5", "1.2", "7.0", "11.2"] and summary["largest"] == ["10.0", "3.0", "0.5", "1.5", "8.0", "13.5"]
+    assert f"over these attempts: ${22.5 / 60 * prep:.2f}" in text
+    assert "not split (several tasks, or no task listing): svpgs-aou-wa1-train-5" in text
+    # Durations only: no clock time of any zone.
+    assert not re.search(r"\d\d:\d\d|\d{8}T\d{6}", text)
+
+
+def test_the_start_split_lists_jobs_tasks_and_each_run_s_markers_and_nothing_else(tmp_path: Path) -> None:
+    """Against a local fake gcloud that answers the three listings and refuses every other command."""
+    jobs, tasks, markers = _start_fixture()
+    jobs, tasks = jobs[1:3], {name: tasks[name] for name in ("svpgs-aou-wb1-train-6", "svpgs-aou-wb1-train-7")}
+    (tmp_path / "jobs.json").write_text(json.dumps(jobs))
+    (tmp_path / "tasks").mkdir()
+    for name, listed in tasks.items():
+        (tmp_path / "tasks" / f"{name}.json").write_text(json.dumps(listed))
+    (tmp_path / "markers.txt").write_text("\n".join(markers) + "\n")
+    executable = tmp_path / "gcloud"
+    executable.write_text(f"#!{sys.executable}\n" + '''
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+Path(os.environ["CALLS"]).open("a").write(json.dumps(args) + "\\n")
+root = Path(os.environ["FAKE"])
+if args[:3] == ["batch", "jobs", "list"]:
+    print((root / "jobs.json").read_text())
+elif args[:3] == ["batch", "tasks", "list"]:
+    print((root / "tasks" / (args[args.index("--job") + 1] + ".json")).read_text())
+elif args[:2] == ["storage", "ls"]:
+    prefix = args[2].removeprefix("gs://ops-bucket/")
+    print("\\n".join(line for line in (root / "markers.txt").read_text().splitlines() if line.startswith("gs://ops-bucket/" + prefix)))
+else:
+    sys.exit(f"refused: {args}")
+''')
+    executable.chmod(0o755)
+    environment = dict(os.environ, PATH=str(tmp_path) + os.pathsep + os.environ["PATH"], CALLS=str(tmp_path / "calls"), FAKE=str(tmp_path))
+    script = LAUNCHER / "spend.py"
+    shown = subprocess.run([sys.executable, str(script), "--location", "us-central1", "--starts", "--ops-bucket", "ops-bucket"], env=environment, capture_output=True, text=True)
+    assert shown.returncode == 0, shown.stderr
+    calls = [json.loads(line) for line in (tmp_path / "calls").read_text().splitlines()]
+    assert calls == [
+        ["batch", "jobs", "list", "--location", "us-central1", "--format=json"],
+        ["batch", "tasks", "list", "--job", "svpgs-aou-wb1-train-6", "--location", "us-central1", "--format=json"],
+        ["batch", "tasks", "list", "--job", "svpgs-aou-wb1-train-7", "--location", "us-central1", "--format=json"],
+        ["storage", "ls", "gs://ops-bucket/svpgs/aou-wb1/markers/"],
+    ]
+    # Finished attempts read the same at any time, so the listing matches the function's own account.
+    assert shown.stdout.rstrip("\n") == spend.starts(jobs, tasks, spend.markers_of(markers), NOW)
+    # The same from saved listings, with no gcloud call; --starts without markers is refused.
+    os.remove(tmp_path / "calls")
+    saved = subprocess.run([sys.executable, str(script), "--listing", str(tmp_path / "jobs.json"), "--task-listings", str(tmp_path / "tasks"), "--starts",
+                            "--markers", str(tmp_path / "markers.txt")], env=environment, capture_output=True, text=True)
+    assert saved.returncode == 0, saved.stderr
+    assert saved.stdout == shown.stdout and not (tmp_path / "calls").exists()
+    refused = subprocess.run([sys.executable, str(script), "--listing", str(tmp_path / "jobs.json"), "--task-listings", str(tmp_path / "tasks"), "--starts"],
+                             env=environment, capture_output=True, text=True)
+    assert refused.returncode == 2 and "--ops-bucket or --markers" in refused.stderr
