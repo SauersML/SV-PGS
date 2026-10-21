@@ -28,19 +28,17 @@ from sv_pgs.marginal_variances import (
     sandwich_diagonal,
     KernelFactor,
     exact_block_information,
-    block_trace_certificate,
     cavity_tolerance,
     certificate_level,
     probes_to_decide,
     certificate_tolerance,
-    covariance_products,
     marginal_variances,
     variance_jvp,
     window_cross,
 )
 import sv_pgs.marginal_variances as marginal_variances_module
 from sv_pgs.marginal_variances import _heavy_cut
-from tests.oracles import exact_bulk_diagonal, far_field_trace
+from tests.oracles import block_trace_certificate, covariance_products, exact_bulk_diagonal, far_field_trace
 
 
 def _genotypes(generator, sample_count: int, variant_count: int, correlation: float) -> np.ndarray:

@@ -12,7 +12,7 @@ with their store codes:
    a copy-number record never does. A pair's evidence is the Fisher z of the
    correlation of the imputed DS with the call over the called samples. Pairs
    with z >= ``sv_fusion.MINIMUM_PAIRING_Z`` are resolved one to one in order of
-   decreasing z and returned as ``FusionPairs``. They are fused by the
+   decreasing z (``one_to_one``). They are fused by the
    measurement model (``measurement_model.LdBlock`` with the call absorbed), from
    truth pairs, never here: the truth-free two-source calibration assumed
    classical error on the imputed DS, which a draw-type DS violates.
@@ -83,15 +83,6 @@ class ImputedSvRecords:
         record_count = self.sites.starts.shape[0]
         if self.codes.dtype != np.uint8 or self.codes.ndim != 2 or self.codes.shape[0] != record_count:
             raise ValueError("ImputedSvRecords.codes must be uint8 [records, samples], one row per site.")
-
-
-@dataclass(frozen=True, slots=True)
-class FusionPairs:
-    """One-to-one pairs of an imputed record and a GATK-SV row (an index into ``GatksvRows``) of one event."""
-
-    imputed_records: I64Array
-    gatksv_rows: I64Array
-    pairing_z: F64Array
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,21 +294,3 @@ def one_to_one(evidence: PairEvidence) -> I64Array:
         taken_second.add(second)
         chosen.append(pair)
     return np.array(sorted(chosen), dtype=np.int64)
-
-
-def gatksv_store_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[GatksvRows, FusionPairs]:
-    """Every called GATK-SV record as a row, each no-call filled, and the pairs the measurement model fuses.
-
-    ``gatksv`` holds one chromosome's kept records aligned to the store's samples
-    and ``imputed`` the same chromosome's imputed SV records.
-    """
-    rows, evidence = gatksv_block_rows(gatksv, imputed)
-    row_of_record = np.full(gatksv.record_count, -1, dtype=np.int64)
-    row_of_record[rows.gatksv_records] = np.arange(rows.gatksv_records.shape[0])
-    chosen = one_to_one(evidence)
-    fusion = FusionPairs(
-        imputed_records=evidence.imputed_records[chosen],
-        gatksv_rows=row_of_record[evidence.gatksv_records[chosen]],
-        pairing_z=evidence.pairing_z[chosen],
-    )
-    return rows, fusion

@@ -6,7 +6,7 @@ Test infrastructure, kept out of the package: a route that agrees with one of th
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import numpy as np
@@ -15,7 +15,7 @@ from scipy.linalg import solve_triangular
 
 from sv_pgs.code_products import DIGIT_BITS
 from sv_pgs.dual_solve import DualModels, DualTile, DualTileSource, PassCount, _checked_bounds, sequential_map_reduce
-from sv_pgs.marginal_variances import KernelFactor
+from sv_pgs.marginal_variances import BlockCertificate, BulkSolve, KernelFactor, _certificate
 from sv_pgs.phenotype_measurement import OccasionModelFit, Occasions, _Model, _result, _State
 from sv_pgs.scale_mixture_ep import (
     Cavity,
@@ -59,6 +59,65 @@ def exact_bulk_diagonal(factor: KernelFactor) -> NDArray[np.float64]:
     """
     inverse_lower = solve_triangular(factor.lower, np.eye(factor.lower.shape[0]), lower=True)
     return np.sum(np.square(inverse_lower), axis=0)
+
+
+def block_trace_certificate(
+    variances: NDArray[np.float64],
+    blocks: tuple[NDArray[np.int64], ...],
+    probes: NDArray[np.float64],
+    covariance_probes: NDArray[np.float64],
+    tolerance: "float | NDArray[np.float64]",
+    level: float,
+    skewness: "NDArray[np.float64] | None" = None,
+) -> BlockCertificate:
+    """Test each block's tr(Sigma_bb) against Rademacher probes z (p x k) and Sigma z (from the solver).
+
+    For each probe, z_b' (Sigma z)_b is an unbiased estimate of tr(Sigma_bb). The block's relative error is
+    (mean - sum_b variances) / sum_b variances, and its standard error is the probes' own spread over sqrt(k),
+    with intervals as in ``_certificate``.
+    """
+    per_probe = [np.sum(probes[members] * covariance_probes[members], axis=0) for members in blocks]
+    estimate = np.array([float(np.sum(variances[members])) for members in blocks])
+    return _certificate(estimate, per_probe, tolerance, level, skewness)
+
+
+def covariance_products(
+    solve: BulkSolve, probes: NDArray[np.float64], back_products: NDArray[np.float64], resolved_coupling: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Sigma v for variant-side vectors v (p x k), exactly, from two solver products.
+
+    With u = Xt (D_S v) (forward pass), t = Z_L' u (sample-side, |L| x k) and
+    w = K_S^-1 u - Z_L core^-1 (t - v_L), the solver returns ``back_products`` = Xt' w and
+    ``resolved_coupling`` = t. Block elimination (identity 1) gives
+        (Sigma v)_S = D v - D (Xt' w),   (Sigma v)_L = core^-1 (v_L - t).
+    """
+    is_resolved = np.zeros(solve.site_precision.shape[0], dtype=bool)
+    is_resolved[solve.resolved] = True
+    bulk_variance = np.where(is_resolved, 0.0, 1.0 / np.where(is_resolved, 1.0, solve.site_precision))
+    products = bulk_variance[:, None] * (probes - back_products)
+    products[solve.resolved] = np.linalg.solve(solve.resolved_core, probes[solve.resolved] - resolved_coupling)
+    return products
+
+
+def reassociation_bound(block_images: Sequence[Any], array_module: Any) -> Any:
+    """Elementwise bound on how far two summation orders of ``block_images`` can differ in fp64.
+
+    Each order is within ``gamma_(B-1) M`` of the exact sum, ``M = sum_b |image_b|``. The bound is
+    evaluated in fp64 as ``2 gamma_(B+1) M~``: the computed M~ is at least ``(1 - gamma_(B-1)) M``
+    and the bound's own arithmetic rounds by a relative ``4u`` or less, while
+    ``gamma_(B+1) / gamma_(B-1) >= 1 + 2 / (B - 1)`` covers both for any ``B`` below ``u^-1/2``.
+    """
+    count = len(block_images)
+    if count <= 1:
+        return array_module.zeros_like(block_images[0]) if count else 0.0
+    unit = np.finfo(np.float64).eps / 2.0
+    if count * count * unit >= 1.0:
+        raise ValueError(f"{count} blocks are too many for the fp64 reassociation bound")
+    gamma = (count + 1) * unit / (1.0 - (count + 1) * unit)
+    magnitude = array_module.zeros_like(block_images[0])
+    for image in block_images:
+        magnitude += array_module.abs(image)
+    return 2.0 * gamma * magnitude
 
 
 def fit_at_exponent(occasions: Occasions, exponent: float, working_bytes: int) -> OccasionModelFit:

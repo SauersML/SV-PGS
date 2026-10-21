@@ -8,7 +8,8 @@ import pytest
 
 from sv_pgs import dual_solve
 from sv_pgs.compute_budget import _cupy_device_context, _try_import_cupy
-from sv_pgs.device_plan import ShardedDualSource, plan_blocks, reassociation_bound
+from sv_pgs.device_plan import ShardedDualSource, plan_blocks
+from tests.oracles import reassociation_bound
 
 cupy = _try_import_cupy()
 DEVICE_COUNT = 0 if cupy is None else int(cupy.cuda.runtime.getDeviceCount())

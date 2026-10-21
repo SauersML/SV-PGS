@@ -38,13 +38,13 @@ point built on them is biased. The exact marginals follow from two identities.
 `variance_jvp` gives the variance map's derivative, -diag(Sigma diag(w) Sigma), in the same
 representation, for the hyperparameter curvature products: resolved pairs exactly, window pairs through
 identity 2, and pairs beyond the window through the block sandwich diag(Sigma_bb R_b Sigma_bb), since a
-variant's LD partners absorb most of its chance coupling with distant blocks. `covariance_products`
-gives Sigma v exactly from the solver's back products, for the certificate's probes.
+variant's LD partners absorb most of its chance coupling with distant blocks. `information_products`
+gives (D - Sigma) v on the bulk sites exactly from the solver's back products, for the certificate's probes.
 
-The deterministic equivalent's own relative error, ||K_S^-1||_F / tr(K_S^-1) = sqrt(omega_S2 / n) /
-omega_S, is the scale that `block_trace_certificate` tests each block against. It is the only
-approximation here, and it is what the certificate checks: LD coupling a block to the far field,
-beyond its window, shows up as a block whose measured trace error provably exceeds that scale.
+The deterministic equivalent is the only approximation here, and it is what the certificate checks
+(`block_information_certificate`): each block's data information tr(D - Sigma)_b, measured by probes, against
+the window approximation's. LD coupling a block to the far field, beyond its window, shows up as a block
+whose measured information error provably exceeds the tolerance its EP fixed point allows (`cavity_tolerance`).
 """
 
 from __future__ import annotations
@@ -554,7 +554,7 @@ def ld_extent(
     its cavity information certificate in 1 of 9 blocks, so the extent is the whole tail's. Beyond it the Grams hold
     nothing a window could use, so blocks need be no wider: the leave-block-out windows (the block and its two
     neighbours) then reach at least w on each side, and whatever the data do hold beyond is far field, which
-    ``block_trace_certificate`` tests. ``level`` is the test's family-wise error (EP: its certificate's,
+    ``block_information_certificate`` tests. ``level`` is the test's family-wise error (EP: its certificate's,
     ``certificate_level``); ``null_scale`` the far pairs' measured mean r^2 n (``extent_from_profile``; 1 by default).
     ``profiles`` are the blocks' lag profiles where Stage 0 kept them (``LdGramStore.lag_profiles``), in place of
     summing them again from every stored Gram."""
@@ -568,7 +568,7 @@ def refined_grams(grams: BlockGrams, width: int) -> BlockGrams:
     every part's Gram and each part's Gram with its successor slices of the stored ones (views of a memory map, no
     copy), across an original boundary from the stored cross-Gram (zero where there is none). The windows of the
     refined blocks are then as wide as the budget allows (``window_width``), and whatever LD reaches beyond a part's
-    neighbours is far field, which ``block_trace_certificate`` tests like any other."""
+    neighbours is far field, which ``block_information_certificate`` tests like any other."""
     width = max(1, int(width))
     blocks: list[NDArray[np.int64]] = []
     within: list[Any] = []
@@ -887,26 +887,6 @@ def _certificate(
     )
 
 
-def block_trace_certificate(
-    variances: NDArray[np.float64],
-    blocks: tuple[NDArray[np.int64], ...],
-    probes: NDArray[np.float64],
-    covariance_probes: NDArray[np.float64],
-    tolerance: "float | NDArray[np.float64]",
-    level: float,
-    skewness: "NDArray[np.float64] | None" = None,
-) -> BlockCertificate:
-    """Test each block's tr(Sigma_bb) against Rademacher probes z (p x k) and Sigma z (from the solver).
-
-    For each probe, z_b' (Sigma z)_b is an unbiased estimate of tr(Sigma_bb). The block's relative error is
-    (mean - sum_b variances) / sum_b variances, and its standard error is the probes' own spread over sqrt(k),
-    with intervals as in ``_certificate``.
-    """
-    per_probe = [np.sum(probes[members] * covariance_probes[members], axis=0) for members in blocks]
-    estimate = np.array([float(np.sum(variances[members])) for members in blocks])
-    return _certificate(estimate, per_probe, tolerance, level, skewness)
-
-
 def stage_level(level: float, stage: int) -> float:
     """The level for stage s = 0, 1, ... of a sequential certificate with fresh probes at each stage.
 
@@ -942,11 +922,13 @@ def probes_to_decide(certificate: BlockCertificate, probe_count: int) -> float:
 
 
 def information_products(solve: BulkSolve, back_products: NDArray[np.float64]) -> NDArray[np.float64]:
-    """(D - Sigma) v on bulk sites, formed directly as D_S (Xt' w) from ``covariance_products``' back product.
+    """(D - Sigma) v on bulk sites, formed directly as D_S (Xt' w) from the solver's back product.
 
-    Forming D v - Sigma v by subtraction loses about log10(tr Sigma_b / tr(D - Sigma)_b) digits to
-    cancellation, which is large when there is little data per variant. The back product gives the difference
-    itself, so its accuracy is the dual solve's. Resolved rows are zero: the resolved sites are exact in core.
+    With u = Xt (D_S v), t = Z_L' u and w = K_S^-1 u - Z_L core^-1 (t - v_L), the solver returns Xt' w, and block
+    elimination (identity 1) gives (Sigma v)_S = D_S v - D_S (Xt' w). Forming D v - Sigma v by subtraction loses
+    about log10(tr Sigma_b / tr(D - Sigma)_b) digits to cancellation, which is large when there is little data per
+    variant. The back product gives the difference itself, so its accuracy is the dual solve's. Resolved rows are
+    zero: the resolved sites are exact in core.
     """
     is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
     is_bulk[solve.resolved] = False
@@ -1051,8 +1033,8 @@ def block_information_certificate(
     EP matches sites to the cavity P_j = 1/Sigma_jj - Pi_j. For a bulk site, Sigma_jj = D_j - D_j^2 q_j, so
     P_j = q_j / (1 - D_j q_j): what P needs is the relative accuracy of D_j - Sigma_jj, the variance the data
     removed, not of Sigma_jj itself. When D_j q_j is small (little data per variant, the production regime),
-    a variance correct to 1e-3 can leave a cavity tens of percent off. ``block_trace_certificate`` cannot see
-    that, and this certificate can.
+    a variance correct to 1e-3 can leave a cavity tens of percent off, which a test of tr(Sigma_bb) itself
+    would pass.
 
     ``removed_products`` is (D - Sigma) z on bulk sites, from ``information_products``. The estimator is the
     control-variate Hutchinson identity,
@@ -1176,26 +1158,6 @@ def certificate_tolerance(solve: BulkSolve, bulk_probe_count: int) -> float:
     sqrt(2/k) times the equivalent's own scale. The two are independent, so they add in quadrature.
     """
     return approximation_scale(solve) * float(np.sqrt(1.0 + 2.0 / bulk_probe_count))
-
-
-def covariance_products(
-    solve: BulkSolve, probes: NDArray[np.float64], back_products: NDArray[np.float64], resolved_coupling: NDArray[np.float64]
-) -> NDArray[np.float64]:
-    """Sigma v for variant-side vectors v (p x k), exactly, from two solver products.
-
-    With u = Xt (D_S v) (forward pass), t = Z_L' u (sample-side, |L| x k) and
-    w = K_S^-1 u - Z_L core^-1 (t - v_L), the solver returns ``back_products`` = Xt' w and
-    ``resolved_coupling`` = t. Block elimination (identity 1) gives
-        (Sigma v)_S = D v - D (Xt' w),   (Sigma v)_L = core^-1 (v_L - t).
-    The forward product, the K_S solve and the back product ride existing passes (the certificate is lagged
-    one refresh). No p x |L| array is needed.
-    """
-    is_resolved = np.zeros(solve.site_precision.shape[0], dtype=bool)
-    is_resolved[solve.resolved] = True
-    bulk_variance = np.where(is_resolved, 0.0, 1.0 / np.where(is_resolved, 1.0, solve.site_precision))
-    products = bulk_variance[:, None] * (probes - back_products)
-    products[solve.resolved] = np.linalg.solve(solve.resolved_core, probes[solve.resolved] - resolved_coupling)
-    return products
 
 
 def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.float64], array_module: Any = np) -> JacobianProduct:

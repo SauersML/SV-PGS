@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from sv_pgs import dual_solve
-from tests.oracles import DenseDualSource, mean_from_dual, rounded_operand
+from tests.oracles import DenseDualSource, covariance_products, mean_from_dual, rounded_operand
 from tests.memory_budget import run_within_budget
 
 EPS = np.finfo(np.float64).eps
@@ -842,7 +842,6 @@ def test_an_infinite_information_tolerance_needs_no_solve() -> None:
     probes = np.random.default_rng(64).choice(np.array([-1.0, 1.0]), size=(genotypes.shape[1], 3))
     with np.errstate(invalid="raise", over="raise"):
         back_products, coupling, _residual_norm = gaussian.information_solve(probes, 0, np.inf)
-    from sv_pgs.marginal_variances import covariance_products
 
     posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, 0)[0]
     expected = np.linalg.solve(posterior_precision, probes)

@@ -9,18 +9,44 @@ import pytest
 from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import CODES_PER_DOSAGE
 from sv_pgs.gatksv_source import MISSING_QUALITY, GatksvBlock
+from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.gatksv_store_rows import (
     RELIABILITY_SOURCES,
+    GatksvRows,
     ImputedSvRecords,
     PairEvidence,
     gatksv_block_rows,
     gatksv_sites,
-    gatksv_store_rows,
     one_to_one,
 )
 from sv_pgs.sv_fusion import MINIMUM_PAIRING_Z, SvSites
 
 _SAMPLE_COUNT = 20_000
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FusionPairs:
+    """One-to-one pairs of an imputed record and a GATK-SV row (an index into ``GatksvRows``) of one event."""
+
+    imputed_records: I64Array
+    gatksv_rows: I64Array
+    pairing_z: F64Array
+
+
+def gatksv_store_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[GatksvRows, FusionPairs]:
+    """A whole chromosome as one block: its rows and its pairs resolved one to one, each pair's GATK-SV record as its
+    row. The direct_sv step reads blocks and resolves their pairs together (``workspace_pipeline``); this is the
+    one-block reference its blocks are checked against."""
+    rows, evidence = gatksv_block_rows(gatksv, imputed)
+    row_of_record = np.full(gatksv.record_count, -1, dtype=np.int64)
+    row_of_record[rows.gatksv_records] = np.arange(rows.gatksv_records.shape[0])
+    chosen = one_to_one(evidence)
+    fusion = FusionPairs(
+        imputed_records=evidence.imputed_records[chosen],
+        gatksv_rows=row_of_record[evidence.gatksv_records[chosen]],
+        pairing_z=evidence.pairing_z[chosen],
+    )
+    return rows, fusion
 
 
 def _draw_and_calls(

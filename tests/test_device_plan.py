@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 
 from sv_pgs.compute_budget import ComputeBudget, check_visible_devices, exposed_device_count
-from sv_pgs.device_plan import devices_for_blocks, plan_blocks, reassociation_bound
+from sv_pgs.device_plan import devices_for_blocks, plan_blocks
+from tests.oracles import reassociation_bound
 
 
 def _budget(device_ids: tuple[int, ...]) -> ComputeBudget:

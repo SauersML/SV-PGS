@@ -1,17 +1,41 @@
-"""Copy-number store columns: modal copy number, code scale, and the per-record affine decode."""
+"""Copy-number store columns: modal copy number, code scale, and the per-record affine decode.
+
+``encode_copy_numbers`` and ``decode_values`` write the store's encoding out in full: the reference a copy-number
+column's codes and decoded values are checked against."""
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from sv_pgs.copy_number import (
-    allele_count_decode,
-    copy_number_codes_per_unit,
-    decode_values,
-    encode_copy_numbers,
-    modal_copy_numbers,
-)
+from sv_pgs._typing import F64Array, NDArray, U8Array
+from sv_pgs.copy_number import allele_count_decode, copy_number_codes_per_unit, modal_copy_numbers
 from sv_pgs.dosage_store import CODES_PER_DOSAGE, MAXIMUM_CODE
+
+
+def encode_copy_numbers(copy_numbers: NDArray, codes_per_unit: NDArray) -> U8Array:
+    """Codes CN * codes_per_unit per record, [records, samples]; exact for every integer copy number."""
+    values = np.asarray(copy_numbers)
+    scale = np.asarray(codes_per_unit, dtype=np.int64)
+    if values.dtype.kind not in "iu" or values.ndim != 2 or scale.shape != (values.shape[0],):
+        raise ValueError("encode_copy_numbers needs integer copy numbers [records, samples] and one scale per record.")
+    codes = values.astype(np.int64) * scale[:, None]
+    if codes.size and (int(codes.min()) < 0 or int(codes.max()) > MAXIMUM_CODE):
+        raise ValueError(f"a copy number times its record's codes per unit must lie in [0, {MAXIMUM_CODE}].")
+    return codes.astype(np.uint8)
+
+
+def decode_values(codes: NDArray, codes_per_unit: NDArray, value_origin: NDArray) -> F64Array:
+    """value = code / codes_per_unit + value_origin, [records, samples]: an ALT dosage, or CN - modal CN."""
+    stored = np.asarray(codes)
+    scale = np.asarray(codes_per_unit, dtype=np.float64)
+    origin = np.asarray(value_origin, dtype=np.float64)
+    if stored.ndim != 2 or scale.shape != (stored.shape[0],) or origin.shape != scale.shape:
+        raise ValueError("decode_values needs codes [records, samples] and one scale and origin per record.")
+    if not np.all(scale > 0):
+        raise ValueError("every record needs a positive codes_per_unit.")
+    if stored.size and int(stored.max()) > MAXIMUM_CODE:
+        raise ValueError(f"codes above {MAXIMUM_CODE} are the missing fill value, never a stored value.")
+    return stored.astype(np.float64) / scale[:, None] + origin[:, None]
 
 
 def test_the_modal_copy_number_is_the_most_frequent_call_and_the_smallest_among_ties() -> None:
