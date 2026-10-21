@@ -1,7 +1,7 @@
 """The round launcher (launcher/workspace/round.py) on fixture specs, against a fixture git repository and a fake
 gcloud over a local directory, never a cloud account: the plan of an 11-trait round on each timeline with its minutes
-and dollars, which steps each run takes from its base and why the others are its job's, that a dry run changes
-nothing, that --execute stages once and checks it, copies a step's record last and submits each job with the round's
+and dollars, which steps each run takes from its base and why the others are its job's, each arm's warm or cold start
+and why, that a dry run changes nothing, that --execute stages once and checks it, copies a step's record last and submits each job with the round's
 settings, the shapes (one GPU by default, canaries), the merges with and without PARTNER_RUN and arm_vms' store job
 (--follow), the dollars through ag-cost's round_cost where it is there, and a job built from a round's staging that
 checks its copy of the source."""
@@ -105,9 +105,9 @@ for step in ("samples", "store", "phenotypes", "cohort", "measurement", "direct_
 """
 
 
-def _repository(root: Path, step_codes: bool = False, accepts: bool = True, partner: bool = False, driver: str = "") -> tuple[Path, str]:
+def _repository(root: Path, step_codes: bool = False, accepts: bool = True, partner: bool = False, driver: str = "", artifact: str = "") -> tuple[Path, str]:
     """A git repository standing in for the study's: the files round.py reads of a commit (``partner``: its task has
-    ag-score's PARTNER_RUN; ``driver``: more of its workspace_pipeline.py)."""
+    ag-score's PARTNER_RUN; ``driver``: more of its workspace_pipeline.py; ``artifact``: its sv_pgs/artifact.py)."""
     files = {
         "sv_pgs/workspace_pipeline.py": ("accept_steps_from = None\n" if accepts else "STEPS = ()\n") + driver,
         "sv_pgs/store.py": "STORE = 1\n",
@@ -118,6 +118,8 @@ def _repository(root: Path, step_codes: bool = False, accepts: bool = True, part
     }
     if step_codes:
         files["launcher/workspace/step_codes.py"] = STEP_CODES
+    if artifact:
+        files["sv_pgs/artifact.py"] = artifact
     for name, text in files.items():
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).write_text(text)
@@ -215,12 +217,32 @@ def test_a_spec_takes_the_round_s_defaults_and_refuses_what_would_move_a_key_or_
     named = planner.read_spec(dict(unshaped, machine_type="a2-ultragpu-1g"))
     assert (named["gpu_count"], named["gpu_type"]) == (1, "nvidia-a100-80gb")
     assert planner.read_spec(dict(unshaped, canaries=["ldl_cholesterol:snv_indel", "l:with_sv"]))["canaries"] == ["l:snv_indel", "l:with_sv"]
+    # Warm starts by default, each trait from its base run unless it names its own warm_from runs; none where the spec
+    # turns them off or names warm_start_models itself. The spec's own trait entries are left as they were.
+    raw = _spec("abc1234", count=2)
+    raw["traits"][1]["warm_from"] = ["aou-we6", "aou-we5"]
+    spec = planner.read_spec(raw)
+    assert spec["warm_start"] is True and [trait["warm_from"] for trait in spec["traits"]] == [["aou-wl5"], ["aou-we6", "aou-we5"]]
+    assert "warm_from" not in raw["traits"][0]
+    assert planner.warm_patterns(spec["traits"]) == [f"/mnt/disks/ops/svpgs/{run}/run/fit*/models/{{arm}}/{{trait}}" for run in ("aou-wl5", "aou-we6", "aou-we5")]
+    assert all(trait["warm_from"] == [] for trait in planner.read_spec(_spec("abc1234", warm_start=False))["traits"])
+    assert all(trait["warm_from"] == [] for trait in planner.read_spec(_spec("abc1234", config={"warm_start_models": ["/x/{arm}/{trait}"]}))["traits"])
+    for changes, message in (
+        ({"warm_start": False}, "warm_start is false"), ({"config": {"warm_start_models": []}}, "config sets warm_start_models"),
+        ({"warm_start": True, "warm_from_value": ["aou-wl1", "aou-wl1"]}, "each once"), ({"warm_start": True, "warm_from_value": ["Bad"]}, "warm_from"),
+    ):
+        raw = _spec("abc1234", count=1, **{key: value for key, value in changes.items() if key != "warm_from_value"})
+        raw["traits"][0]["warm_from"] = changes.get("warm_from_value", ["aou-wl1"])
+        with pytest.raises(planner.RoundError, match=message):
+            planner.read_spec(raw)
+    with pytest.raises(planner.RoundError, match="true .* or false"):
+        planner.read_spec(_spec("abc1234", warm_start="yes"))
     for changes, message in (
         ({"config": {"seed": 3}}, "moves a reused step's key"), ({"layout": "one_vm"}, "layout"), ({"run_disk_gb": 1000}, "multiple of 375"),
         ({"merge_slot": "train-1"}, "own slot"), ({"wanted": 1}, "unknown keys"), ({"arms": ["with_sv", "with_sv"]}, "arms"),
         ({"traits": [{"name": "asthma", "code": "a", "base_run": "x"}, {"name": "gout", "code": "a", "base_run": "y"}]}, "code is its own"),
         ({"canaries": ["af:snv_indel"]}, "a canary is TRAIT:ARM"), ({"canaries": ["l:snv_indel", "ldl_cholesterol:snv_indel"]}, "once"),
-        ({"canaries": ["l:snv_indel"], "layout": "trait_jobs"}, "arms of arm_jobs"), ({"layout": "arm_vms"}, "store_machine_type"),
+        ({"canaries": ["l:snv_indel"], "layout": "trait_jobs"}, "arms of arm_jobs"), ({"layout": "arm_vms", "store_machine_type": 32}, "store_machine_type"),
     ):
         with pytest.raises(planner.RoundError, match=message):
             planner.read_spec(_spec("abc1234", **changes))
@@ -272,6 +294,7 @@ def test_the_other_layouts_one_run_per_trait_or_per_arm(tmp_path) -> None:
     assert "FIT_ARMS" not in plan.jobs[0]["environment"]
     rows = {phase: (low, high) for phase, low, high, _note in planner.fit_rows(plan.timeline, plan.spec)}
     assert rows["eb"] == pytest.approx((97.5, 97.5)) and rows["score"] == (15, 15)
+    assert planner.read_spec(_spec(commit, layout="arm_vms"))["store_machine_type"] == "n2d-highmem-32"
     plan = planner.build(planner.read_spec(_spec(commit, layout="arm_vms", store_machine_type="n2d-standard-32")), *planner.read_timeline("budget"), None, repository)
     assert [entry["environment"]["RUN_ID"] for entry in plan.jobs] == ["aou-r7-all1", "aou-r7-all2"] and len(plan.merges) == 1
     assert plan.store["run_id"] == "aou-r7-all0" and all(entry["after"] == [plan.store["name"]] for entry in plan.jobs)
@@ -346,6 +369,17 @@ def test_with_partner_run_the_later_arm_finishes_the_run_and_a_cpu_merge_is_the_
     (submitted,) = [json.loads(line) for line in (fake / "submitted.jsonl").read_text().splitlines()]
     assert (submitted["RUN_ID"], submitted["PARTNER_RUN"], submitted["MACHINE_TYPE"]) == ("aou-r7-l1", "aou-r7-l2", "n2d-standard-16")
     assert (fake / "commands.log").read_text().split() == ["merge"]
+    # The run that got further is the merge's RUN_ID (ag-score's rule): aou-r7-l2 adopted l1's parts and pushed both
+    # arms' handoffs before its finish failed, so the merge finishes in it, not in l1.
+    (svpgs / "aou-r7-l2/run/effects.partial/batches/c3").mkdir(parents=True)
+    (svpgs / "aou-r7-l2/run/effects.partial/batches/c3/handoff.json").write_text("{}")
+    assert planner.follow(plan, planner.Gcloud(BUCKET, True), cloud, "p", "r") == []
+    submitted = json.loads((fake / "submitted.jsonl").read_text().splitlines()[-1])
+    assert (submitted["RUN_ID"], submitted["PARTNER_RUN"], submitted["BUDGET_SLOT"]) == ("aou-r7-l2", "aou-r7-l1", "train-2")
+    # Once a merge job of either run exists, nothing more is submitted.
+    (fake / "jobs/svpgs-aou-r7-l2-train-2").write_text("RUNNING")
+    assert planner.follow(plan, planner.Gcloud(BUCKET, True), cloud, "p", "r") == []
+    assert len((fake / "submitted.jsonl").read_text().splitlines()) == 2
 
 
 def test_arm_vms_submits_its_store_job_first_and_its_fit_jobs_after_it(tmp_path, cloud) -> None:
@@ -395,7 +429,8 @@ def test_a_dry_run_takes_every_step_from_the_base_and_changes_nothing(tmp_path, 
     assert planner.main([str(tmp_path / "round.json"), "--repository", str(repository)]) == 0
     shown = capsys.readouterr().out
     assert "[FAIL]" not in shown and "--execute stages, writes, copies and submits" in shown
-    assert shown.count("samples store phenotypes cohort measurement direct_sv / -") == 4 and "BASE_RUN=aou-wl5" in shown
+    assert shown.count("kept: samples store phenotypes cohort measurement direct_sv; remade: -") == 4 and "BASE_RUN=aou-wl5" in shown
+    assert shown.count("a record of the earlier key formula kept where /mnt/disks/ops/svpgs/aou-wl5/source made it") == 2
     calls = _calls(fake)
     # Reads only: no copy into the bucket (the base's source comes down to the work directory), nothing submitted.
     assert [call for call in calls if call.startswith("storage cp -r gs://")]
@@ -405,8 +440,71 @@ def test_a_dry_run_takes_every_step_from_the_base_and_changes_nothing(tmp_path, 
     config = plan.runs[0]["config"]
     assert config["marker_directory"] == "/mnt/disks/ops/svpgs/aou-r7-l1/markers" and config["accept_steps_from"] == "/mnt/disks/ops/svpgs/aou-wl5/source"
     assert config["diseases"] == ["ldl_cholesterol"] and config["seed"] == 7
+    # This fixture's driver has no warm_start_models: every arm cold, said once, and no config names it.
+    assert "warm_start_models" not in config and any(state == "warn" and "every arm starts cold" in text for state, text in plan.checks)
     with pytest.raises(RuntimeError, match="outside --execute"):
         planner.Gcloud(BUCKET, False).copy("a", "b")
+
+
+def test_each_arm_starts_from_its_own_earlier_model_and_the_plan_names_each_start(tmp_path, cloud) -> None:
+    """warm_start_models by default: a run's config names its trait's warm_from runs' saved models, the same patterns
+    for both arms so their fit keys agree, and the plan reads the bucket for each arm's start: warm from a mean-field
+    model on the store the run keeps, cold where its runs hold none (and why), and a trait whose two arms would start
+    unlike fails the plan (the study's rule: both cold, or each from its own arm)."""
+    repository, commit = _repository(tmp_path / "repo", driver="warm_start_models = ()\n", artifact='MODEL_FORMAT = "svpgs-model v3"\n')
+    fake = _bucket(tmp_path, repository, "le")
+    svpgs = fake / "gcs" / BUCKET / "svpgs"
+    # A live pair before its merge: aou-wl5 holds with_sv's model in its fit partial and aou-wl1 snv_indel's, on a copy
+    # of the same store.
+    shutil.copytree(svpgs / "aou-wl5/run/store", svpgs / "aou-wl1/run/store")
+
+    def save(run: str, directory: str, arm: str, laws=("product_mixture",), accepted: bool = True, model_format: str = "svpgs-model v3") -> Path:
+        folder = svpgs / run / "run" / directory / "models" / arm / "ldl_cholesterol"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "model.json").write_text(json.dumps({"format": model_format, "draw_laws": list(laws), "acceptance": {"accepted": accepted}, "provenance": {}}))
+        (folder / "arrays.npz").write_bytes(b"a")
+        return folder
+
+    save("aou-wl5", "fit.partial", "with_sv")
+    save("aou-wl1", "fit.partial", "snv_indel", accepted=False)
+    raw = _spec(commit, count=2)
+    raw["traits"][0]["warm_from"] = ["aou-wl5", "aou-wl1"]
+    raw["traits"][1]["warm_from"] = []
+
+    def plan_of():
+        return planner.build(planner.read_spec(raw), *planner.read_timeline("budget"), planner.Gcloud(BUCKET, False), repository)
+
+    plan = plan_of()
+    patterns = [f"/mnt/disks/ops/svpgs/{run}/run/fit*/models/{{arm}}/{{trait}}" for run in ("aou-wl5", "aou-wl1")]
+    assert [run["config"].get("warm_start_models") for run in plan.runs] == [patterns, patterns, None, None]
+    assert plan.runs[0]["starts"] == {("ldl_cholesterol", "snv_indel"): ("warm", "svpgs/aou-wl1/run/fit.partial/models/snv_indel/ldl_cholesterol (a fit not accepted)")}
+    assert plan.runs[1]["starts"] == {("ldl_cholesterol", "with_sv"): ("warm", "svpgs/aou-wl5/run/fit.partial/models/with_sv/ldl_cholesterol (an accepted fit)")}
+    assert plan.runs[3]["starts"] == {("egfr_ckd_epi_2021", "with_sv"): ("cold", "no warm_from run named")}
+    assert not [text for state, text in plan.checks if state == "FAIL"]
+    assert ("warn", "warm starts: 2 of 4 arms start from an earlier model, 2 cold (each named under its run)") in plan.checks
+    shown = planner.render(plan)
+    assert "warm snv_indel ldl_cholesterol: svpgs/aou-wl1/run/fit.partial/models/snv_indel/ldl_cholesterol (a fit not accepted)" in shown
+    assert "cold with_sv egfr_ckd_epi_2021: no warm_from run named" in shown
+    # One arm's model on another store, or not a mean-field model: that arm is cold, and the trait's arms would start
+    # unlike, which fails the plan.
+    (svpgs / "aou-wl1/run/store" / planner.COMPLETE).write_text(json.dumps({"key": "another-store"}))
+    plan = plan_of()
+    assert plan.runs[0]["starts"][("ldl_cholesterol", "snv_indel")] == ("cold", "no saved model in aou-wl5; aou-wl1's store is not the one this run keeps")
+    assert [text for state, text in plan.checks if state == "FAIL"] == [
+        "warm starts: each trait's arms start alike, but not ldl_cholesterol: name the run holding the cold arm's model in its warm_from, or [] for both cold"]
+    (svpgs / "aou-wl1/run/store" / planner.COMPLETE).write_text(json.dumps({"key": "store-key"}))
+    save("aou-wl1", "fit.partial", "snv_indel", laws=("gaussian",))
+    assert plan_of().runs[0]["starts"][("ldl_cholesterol", "snv_indel")][1].endswith("aou-wl1/run/fit.partial/models/snv_indel/ldl_cholesterol holds no mean-field model")
+    save("aou-wl1", "fit.partial", "snv_indel", model_format="svpgs-model v2")
+    assert plan_of().runs[0]["starts"][("ldl_cholesterol", "snv_indel")][1].endswith("ldl_cholesterol is a 'svpgs-model v2' model, not 'svpgs-model v3'")
+    # After the merge both arms' models are in one run's completed fit: each arm finds two, and the job ranks them.
+    save("aou-wl1", "fit.partial", "snv_indel")
+    save("aou-wl5", "fit", "snv_indel")
+    assert plan_of().runs[0]["starts"][("ldl_cholesterol", "snv_indel")] == (
+        "warm", "svpgs/aou-wl5/run/fit/models/snv_indel/ldl_cholesterol (an accepted fit; 2 models, the job takes the best)")
+    # Offline the patterns are named and the starts unchecked.
+    plan = planner.build(planner.read_spec(raw), *planner.read_timeline("budget"), None, repository)
+    assert "starts unchecked (the bucket was not read): warm_start_models " + " ".join(patterns) in planner.render(plan)
 
 
 def test_a_step_whose_code_differs_and_the_steps_reading_it_are_the_job_s_to_make(tmp_path, cloud, monkeypatch) -> None:
@@ -446,7 +544,8 @@ def test_a_base_that_carries_its_steps_through_its_own_base_is_followed(tmp_path
     plan = planner.build(planner.read_spec(_spec(commit, count=1)), *planner.read_timeline("budget"), planner.Gcloud(BUCKET, False), repository)
     run = plan.runs[0]
     assert run["reuse"] == list(planner.PREPARED) and run["holders"] == {step: "aou-wl5" if step == "samples" else "aou-wl4" for step in planner.PREPARED}
-    assert run["config"]["accept_steps_from"] == "/mnt/disks/ops/svpgs/aou-wl4/source" and any("_rounds/r6/source made other steps" in note for note in plan.notes)
+    assert run["config"]["accept_steps_from"] == "/mnt/disks/ops/svpgs/aou-wl4/source"
+    assert any(state == "warn" and "but samples are held by a run staged from _rounds/r6/source" in text for state, text in plan.checks)
     assert plan.jobs[0]["environment"]["BASE_RUN"] == "aou-wl5"
 
 

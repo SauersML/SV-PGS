@@ -32,6 +32,12 @@ What a round uses:
   code differs, or that reads such a step, is the job's to make. Where the commit's driver has accept_steps_from, the
   config names the base's source, so a record made before the key's formula changed is still taken where that source
   made it from these inputs with this code.
+- Each arm's empirical Bayes started from its own arm's saved model of the trait in the trait's warm_from runs (the
+  live round's, by default its base run), where the commit's driver has warm_start_models (warm_seeds): the config
+  names run/fit*/models/{arm}/{trait} of each such run, the same patterns for both arms of a trait so their fit keys
+  agree. The plan reads each model's model.json (names and digests, no values) and says per arm whether it starts warm
+  and from which model, or cold and why; a trait whose two arms would start unlike (one warm, one cold) fails the plan,
+  since the comparison's difference must be the data's, not the starts'.
 - Every job: SHARED_RUNTIME=1, Spot with MAX_RETRIES 3 under the job templates' RETRY_TASK lifecycle (a retry only when
   the VM went away), unless the spec says otherwise.
 - A fit job's shape: one A100 on four local SSDs (ONE_GPU) unless the spec names another. No arm has run on one GPU
@@ -46,7 +52,8 @@ device_sweep's 11-trait sweep. A trait's two arms (arm_jobs), or the round's (ar
 ways, by what the commit's task knows:
 - with PARTNER_RUN (ag-score's), each arm's job scores its own arm and the later of the two finishes the run on its VM,
   minutes after its fit: no merge VM, restore or digest. A merge job on CPUs (submit.sh merge) is submitted by --follow
-  only where both fit jobs have ended, neither run holds the round's last step and each holds its arm's handoff;
+  only where both fit jobs have ended, neither run holds the round's last step and each holds its arm's handoff, in
+  the run that got further;
 - without it, as the hand-launched rounds did: once both fit jobs have SUCCEEDED with one fit key, --follow copies the
   other arm's models into one run's fit partial and submits that run on the merge slot (a merge job: its restore,
   digest, both arms' scoring and the report).
@@ -63,9 +70,12 @@ ROUND.json:
   guard's rate; the priced rate rounded up), "env_from" (the first trait's base run), "reuse" (base or copy),
   "reuse_steps" (samples .. direct_sv), "config" (CONFIG_OVERRIDES' keys), "one_gpu_slowdown" (an arm's EB on one GPU
   against two under trait_jobs; 1.0), "merge_machine_type" (a merge job's without PARTNER_RUN; its run's),
-  "merge_cpu_machine_type" (a merge job's with PARTNER_RUN; CPU_MERGE's) and "store_machine_type" (arm_vms' store job's
-  CPU machine, which arm_vms needs). A trait may carry its own machine_type, gpu_type, gpu_count, run_disk_type and
-  run_disk_gb, as a trait whose codes outgrow one A100-40 does; a canary is TRAIT:ARM, by the trait's code or name.
+  "merge_cpu_machine_type" (a merge job's with PARTNER_RUN; CPU_MERGE's), "store_machine_type" (arm_vms' store job's
+  CPU machine; STORE_MACHINE's) and "warm_start" (true: each arm from its own earlier model; false: every arm
+  cold). A trait may carry its own machine_type, gpu_type, gpu_count, run_disk_type and run_disk_gb, as a trait whose
+  codes outgrow one A100-40 does, and its "warm_from", the runs whose saved models start its arms (its base_run; name
+  both runs of a live pair, such as ["aou-wl5", "aou-wl1"], while their merge has not put both arms in one); a canary
+  is TRAIT:ARM, by the trait's code or name.
 The workspace's own settings come from the environment, as for submit.sh (WORKSPACE_ENVIRONMENT).
 
 Standard library only, Python 3.8 or later (the workspace app's python3). It prints names, sizes, minutes and dollars,
@@ -118,8 +128,14 @@ CONFIG_OVERRIDES = (
 """The run config's keys a round may set apart from its base runs' without moving a step before the fit's key: the
 fit's and the export's own, which no step before the fit reads (compact_fit_store keys only ag-share's fit_store step,
 after direct_sv; warm_start_models, saved-model patterns such as "/mnt/disks/ops/svpgs/<earlier run>/run/fit/models/
-{arm}/{trait}", starts each arm's empirical Bayes from an earlier round's model, warm_seeds). A key the commit's driver
-does not name fails the plan."""
+{arm}/{trait}", starts each arm's empirical Bayes from an earlier round's model, warm_seeds: set here, it replaces the
+patterns of the traits' warm_from runs and goes unchecked). A key the commit's driver does not name fails the plan."""
+WARM_PATTERN = "{run}/run/fit*/models/{{arm}}/{{trait}}"
+"""A warm_from run's saved models under OPS_MOUNT as warm_start_models names them (``workspace_pipeline._warm_seeds``
+fills {arm} and {trait}): its completed fit's and its partial's (a FIT_ARMS run's own arm before its merge), each arm
+its own."""
+MEAN_FIELD = "product_mixture"
+"""The draw law of a saved mean-field model, the only kind ``_warm_seeds`` starts a fit from (model.json's draw_laws)."""
 ARM_VMS_CONFIG = {"cross_fit": False, "compact_fit_store": True, "arm_pass": True}
 """An arm_vms run's config apart from its traits' bases (ag-share's layout): one fold split for every trait, the fit on
 the compact fit store and every trait's groups in one pass (ag-sweep's arm_pass). A key the commit's driver does not
@@ -168,7 +184,12 @@ is a choice, not a measurement."""
 GPU_TYPES = {"a2-highgpu": "nvidia-tesla-a100", "a2-ultragpu": "nvidia-a100-80gb"}
 """Each A2 family's GPU, for a spec that names its machine but not the GPU."""
 STORE_DISK = {"run_disk_type": "pd-balanced", "run_disk_gb": 2000}
-"""arm_vms' store job's disk: the AoU rounds' run disk [real], which held the store and the steps that rewrite it."""
+"""arm_vms' store job's disk: the AoU rounds' run disk [real], which held the store and the steps that rewrite it
+(ag-share: direct_sv's 547 GB store, the fit store's copy and measurement's outputs)."""
+STORE_MACHINE = "n2d-highmem-32"
+"""arm_vms' store job's machine by default (ag-share's, priced by ag-cost: the fit store's pass, one streamed CPU read
+of direct_sv's store and a 20-53 GB write, ~30 min there). Its high memory is for the measurement and direct_sv steps
+the job makes again for the 11-trait cohort, whose minutes on it nobody has measured."""
 
 PHASES = (
     ("start", "queue, boot and environment", "ag-infra"),
@@ -272,7 +293,7 @@ def read_spec(raw: dict) -> dict:
     known = {
         "round", "source_commit", "layout", "traits", "arms", "run_prefix", "provisioning_model", "max_retries", "through",
         "fit_slot", "merge_slot", "store_slot", "hourly_usd", "env_from", "reuse", "reuse_steps", "config", "one_gpu_slowdown",
-        "merge_machine_type", "merge_cpu_machine_type", "store_machine_type", "canaries", *SHAPE_KEYS,
+        "merge_machine_type", "merge_cpu_machine_type", "store_machine_type", "canaries", "warm_start", *SHAPE_KEYS,
     }
     unknown = sorted(set(raw) - known)
     if unknown:
@@ -285,13 +306,24 @@ def read_spec(raw: dict) -> dict:
     traits = spec.get("traits")
     if not isinstance(traits, list) or not traits:
         raise RoundError("traits lists each trait as {name, code, base_run}")
+    spec.setdefault("warm_start", True)
+    if not isinstance(spec["warm_start"], bool):
+        raise RoundError("warm_start is true (each arm from its own earlier model) or false")
+    explicit = isinstance(spec.get("config"), dict) and "warm_start_models" in spec["config"]
     for trait in traits:
-        if not isinstance(trait, dict) or not {"name", "code", "base_run"} <= set(trait) or not set(trait) <= {"name", "code", "base_run", *SHAPE_KEYS}:
-            raise RoundError(f"each trait is {{name, code, base_run}} and optionally its own {SHAPE_KEYS}")
+        if not isinstance(trait, dict) or not {"name", "code", "base_run"} <= set(trait) or not set(trait) <= {"name", "code", "base_run", "warm_from", *SHAPE_KEYS}:
+            raise RoundError(f"each trait is {{name, code, base_run}} and optionally its warm_from and its own {SHAPE_KEYS}")
         _match(r"[a-z][a-z0-9_]*", trait["name"], "a trait's name")
         _match(r"[a-z][a-z0-9]{0,2}", trait["code"], "a trait's code")
         _match(r"[a-z][a-z0-9-]{0,25}", trait["base_run"], "a trait's base_run")
         _shape(trait, trait["name"])
+        if "warm_from" in trait and (not spec["warm_start"] or explicit):
+            raise RoundError(f"{trait['name']}'s warm_from names runs where " + ("config sets warm_start_models" if explicit else "warm_start is false"))
+        if not isinstance(trait.get("warm_from", []), list) or len(set(trait.get("warm_from", []))) != len(trait.get("warm_from", [])):
+            raise RoundError(f"{trait['name']}'s warm_from lists runs, each once")
+        for run in trait.get("warm_from", []):
+            _match(r"[a-z][a-z0-9-]{0,25}", run, f"a run of {trait['name']}'s warm_from")
+    spec["traits"] = traits = [dict(trait, warm_from=list(trait.get("warm_from", [trait["base_run"]] if spec["warm_start"] and not explicit else []))) for trait in traits]
     for key in ("name", "code"):
         values = [trait[key] for trait in traits]
         if len(set(values)) != len(values):
@@ -360,9 +392,8 @@ def read_spec(raw: dict) -> dict:
     for key in ("merge_machine_type", "merge_cpu_machine_type"):
         if spec[key] is not None:
             _match(r"[a-z0-9-]+", spec[key], key)
-    if spec["layout"] == "arm_vms":
-        _match(r"[a-z0-9-]+", spec.get("store_machine_type"), "arm_vms' store_machine_type (its store job's CPU machine)")
-    spec.setdefault("store_machine_type", None)
+    spec.setdefault("store_machine_type", STORE_MACHINE)
+    _match(r"[a-z0-9-]+", spec["store_machine_type"], "store_machine_type (arm_vms' store job's CPU machine)")
     if spec.get("hourly_usd") is not None and (not isinstance(spec["hourly_usd"], int) or spec["hourly_usd"] < 1):
         raise RoundError("hourly_usd is a whole number of dollars (budget_guard's rate)")
     return spec
@@ -496,6 +527,17 @@ class Gcloud:
         shown = self._run(["storage", "ls", self.url(f"{run}/run/*/{COMPLETE}")])
         lines = shown.stdout.splitlines() if shown.returncode == 0 else []
         return {matched.group(1) for line in lines for matched in [re.search(r"/run/([^/]+)/" + re.escape(COMPLETE) + "$", line.strip())] if matched}
+
+    def models(self, run: str) -> dict:
+        """The saved models a run's mirror holds where warm_start_models looks (WARM_PATTERN): each model's directory
+        under svpgs/ by (arm, trait), from one listing of their model.json."""
+        shown = self._run(["storage", "ls", self.url(WARM_PATTERN.format(run=run).format(arm="*", trait="*") + "/model.json")])
+        found: dict = {}
+        for line in shown.stdout.splitlines() if shown.returncode == 0 else ():
+            matched = re.search(r"/svpgs/(" + re.escape(run) + r"/run/fit[^/]*/models/([^/]+)/([^/]+))/model\.json$", line.strip())
+            if matched:
+                found.setdefault((matched.group(2), matched.group(3)), []).append(matched.group(1))
+        return found
 
     def download(self, path: str, local: Path):
         """A directory (code: a staged source tree) copied into ``local``, a read: the local tree where it came whole,
@@ -652,10 +694,75 @@ def reusable(wanted: list, complete: set, code: dict) -> tuple:
     return taken, made
 
 
-def run_config(bases: dict, run_id: str, traits: list, spec: dict, accept_from) -> dict:
+def record_key(cloud: Gcloud, run, step: str = "store"):
+    """The key in ``run``'s mirror's record of ``step`` (its _COMPLETE.json), or None where there is none."""
+    text = cloud.read(f"{run}/run/{step}/{COMPLETE}") if run else None
+    try:
+        return json.loads(text)["key"] if text else None
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def warm_start(cloud: Gcloud, trait: dict, arm: str, store, saved: dict, keys: dict, metadata: dict, model_format=None) -> tuple:
+    """Where ``arm``'s fit of ``trait`` starts: ("warm", the first of its warm_from runs' saved models that
+    ``workspace_pipeline._warm_seeds`` can take, and how many there are) or ("cold", why each run gives none). A model
+    qualifies in a run whose store record has the key of the store this run keeps (``store``: the same store has the
+    same sites, which _warm_seeds requires) where its model.json lists a mean-field draw law and is of the commit's
+    ``model_format`` (artifact.MODEL_FORMAT, the only one load_model reads; unchecked where None). The job ranks every model
+    that qualifies (``_seed_rank``: the same arm's reliabilities, the same problem, an accepted fit, the newer), so with
+    several it may take another than the one named. ``saved``, ``keys`` and ``metadata`` keep the bucket's reads for the
+    other arms and runs."""
+    found, reasons = [], []
+    for run in trait["warm_from"]:
+        if run not in saved:
+            saved[run] = cloud.models(run)
+        folders = saved[run].get((arm, trait["name"]), [])
+        if not folders:
+            reasons.append(f"no saved model in {run}")
+            continue
+        if run not in keys:
+            keys[run] = record_key(cloud, holders(cloud, run, ["store"])[0].get("store"))
+        if store is None or keys[run] != store:
+            reasons.append(f"{run}'s store is not the one this run keeps")
+            continue
+        for folder in folders:
+            if folder not in metadata:
+                text = cloud.read(f"{folder}/model.json")
+                try:
+                    metadata[folder] = json.loads(text) if text else None
+                except ValueError:
+                    metadata[folder] = None
+            shown = metadata[folder]
+            if not isinstance(shown, dict):
+                reasons.append(f"{folder}/model.json unreadable")
+            elif model_format is not None and shown.get("format") != model_format:
+                reasons.append(f"{folder} is a {shown.get('format')!r} model, not {model_format!r}")
+            elif MEAN_FIELD not in shown.get("draw_laws", ()):
+                reasons.append(f"{folder} holds no mean-field model")
+            else:
+                found.append((folder, bool((shown.get("acceptance") or {}).get("accepted", False))))
+    if not found:
+        return "cold", "; ".join(reasons) or "no warm_from run named"
+    folder, accepted = found[0]
+    return "warm", f"svpgs/{folder} ({'an accepted fit' if accepted else 'a fit not accepted'}" + (f"; {len(found)} models, the job takes the best)" if len(found) > 1 else ")")
+
+
+def warm_patterns(traits: list) -> list:
+    """warm_start_models for a run of ``traits``: WARM_PATTERN of each trait's warm_from runs, in order, each once."""
+    patterns: list = []
+    for trait in traits:
+        for run in trait["warm_from"]:
+            pattern = f"{OPS_MOUNT}/" + WARM_PATTERN.format(run=run)
+            if pattern not in patterns:
+                patterns.append(pattern)
+    return patterns
+
+
+def run_config(bases: dict, run_id: str, traits: list, spec: dict, accept_from, warm: bool = False) -> dict:
     """A run's config: its base run's (``bases``: base run -> its config), with its own marker directory, the round's
-    fit-only keys, accept_steps_from where the commit's driver reads it, and for a run of several traits each trait from
-    its own base's lists (``SHARED_FIELDS`` checked equal by the caller)."""
+    fit-only keys, accept_steps_from where the commit's driver reads it, warm_start_models of its traits' warm_from runs
+    where ``warm`` (the commit's driver reads it and the spec's config names none), and for a run of several traits each
+    trait from its own base's lists (``SHARED_FIELDS`` checked equal by the caller)."""
     config = json.loads(json.dumps(bases[traits[0]["base_run"]]))
     config["marker_directory"] = f"{OPS_MOUNT}/{run_id}/markers"
     if len(traits) > 1:
@@ -670,9 +777,14 @@ def run_config(bases: dict, run_id: str, traits: list, spec: dict, accept_from) 
             weights.update({name: weight for name, weight in ((bases[trait["base_run"]].get("panel") or {}).get("weights") or {}).items() if name in names})
         if config.get("panel"):
             config["panel"] = dict(config["panel"], weights=weights)
+    # A base a round made carries that round's accept_steps_from and warm starts, neither of them this run's.
+    config.pop("accept_steps_from", None)
+    config.pop("warm_start_models", None)
     config.update(spec["config"])
     if accept_from is not None:
         config["accept_steps_from"] = accept_from
+    if warm and warm_patterns(traits):
+        config["warm_start_models"] = warm_patterns(traits)
     return config
 
 
@@ -680,9 +792,9 @@ def run_config(bases: dict, run_id: str, traits: list, spec: dict, accept_from) 
 # The plan
 # ---------------------------------------------------------------------------
 class Plan:
-    """The round as planned: its runs and fit jobs; arm_vms' store job (``store``); with PARTNER_RUN each trait's
-    in-job finish and its CPU merge job for --follow (``finishes``), without it each trait's merge job (``merges``); the
-    copies, the checks and the notes."""
+    """The round as planned: its runs (each with the steps it keeps and remakes and, where ``warm``, each arm's start)
+    and fit jobs; arm_vms' store job (``store``); with PARTNER_RUN each trait's in-job finish and its CPU merge job for
+    --follow (``finishes``), without it each trait's merge job (``merges``); the copies, the checks and the notes."""
 
     def __init__(self, spec: dict, timeline_label: str, timeline: dict) -> None:
         self.spec, self.timeline_label, self.timeline = spec, timeline_label, timeline
@@ -699,6 +811,7 @@ class Plan:
         self.notes: list = []
         self.arms_in_turn = False
         self.partner = False
+        self.warm = False
 
     def check(self, passed, text: str, failure: str = "FAIL") -> None:
         self.checks.append(("ok" if passed else failure, text))
@@ -769,6 +882,29 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
         if spec["config"]:
             unknown = sorted(key for key in spec["config"] if not re.search(rf"\b{key}\b", driver))
             plan.check(not unknown, "config: the commit's driver " + (f"does not name {', '.join(unknown)}" if unknown else "names every key the round sets"))
+        if any(trait["warm_from"] for trait in spec["traits"]):
+            plan.check("warm_start_models" in driver, "warm starts: the commit's driver " + (
+                "has warm_start_models: each arm from its own arm's saved model in its trait's warm_from runs" if "warm_start_models" in driver
+                else "has no warm_start_models: every arm starts cold"), failure="warn")
+    if "warm_start_models" in spec["config"]:
+        plan.notes.append("warm starts: the spec's config names warm_start_models for every run; its models are not checked")
+    elif not spec["warm_start"]:
+        plan.notes.append("warm starts: off (warm_start false), every arm starts cold")
+    warm = plan.warm = bool(plan.files) and "warm_start_models" in driver and any(trait["warm_from"] for trait in spec["traits"])
+    saved: dict = {}
+    keys: dict = {}
+    metadata: dict = {}
+    records: dict = {}
+    artifact = commit / "sv_pgs/artifact.py"
+    model_format = re.search(r'^MODEL_FORMAT = "([^"]+)"', artifact.read_text(encoding="utf-8"), re.M) if artifact.is_file() else None
+    model_format = model_format.group(1) if model_format else None
+
+    def kept_store(holder):
+        """The key of the store record ``holder``'s mirror holds (the store a run keeps), read once a holder."""
+        if holder not in records:
+            records[holder] = record_key(cloud, holder)
+        return records[holder]
+
     shapes = [shape_of(spec, [trait], [arm]) for trait in spec["traits"] for arm in spec["arms"]] if layout.runs == "trait_arm" else []
     if spec["canaries"]:
         plan.notes.append(f"canaries: {len(spec['canaries'])} of {len(shapes)} arms on {spec['machine_type']} ({', '.join(spec['canaries'])}), the others on "
@@ -821,8 +957,12 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
             # job has SUCCEEDED (--follow), in the store run's config.
             store = plan.runs[0]
             config = dict(store["config"], marker_directory=f"{OPS_MOUNT}/{run_id}/markers") if store["config"] else None
+            starts = None
+            if warm and cloud is not None:
+                kept = kept_store(store["holders"].get("store"))
+                starts = {(trait["name"], arm): warm_start(cloud, trait, arm, kept, saved, keys, metadata, model_format) for trait in spec["traits"] for arm in arms}
             plan.runs.append({"run_id": run_id, "traits": store["traits"], "arms": arms, "base": store_id, "reuse": list(PREPARED), "made": {},
-                              "config": config, "shape": shape, "holders": {}})
+                              "config": config, "shape": shape, "holders": {}, "starts": starts})
             environment = job_environment(spec, run_id, spec["fit_slot"], shape, plan.staging, store_id, FIT_ARMS=" ".join(arms))
             plan.jobs.append(_job(run_id, spec["fit_slot"], "fit", environment, after=[plan.store["name"]]))
             continue
@@ -867,23 +1007,29 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
             made.update({step: "the run's own traits" for step in spec["reuse_steps"] if step not in wanted})
             if accepts and held.get("store"):
                 accept_from = f"{OPS_MOUNT}/{sources.get(held['store'])}" if sources.get(held["store"]) else None
-                other = sorted({sources[held[step]] for step in taken if sources.get(held[step]) != sources.get(held["store"])})
+                other = [step for step in taken if sources.get(held[step]) != sources.get(held["store"])]
                 if other:
-                    plan.notes.append(f"{run_id}: accept_steps_from names the store's source; {', '.join(other)} made other steps")
+                    plan.check(False, f"{run_id}: accept_steps_from names the store's source, but {', '.join(other)} are held by a run staged "
+                               f"from {', '.join(sorted({str(sources.get(held[step])) for step in other}))}: the job remakes any of them whose "
+                               "record holds a key of the earlier formula that the store's source does not give", failure="warn")
             if "store" in wanted and "store" not in taken:
                 plan.check(False, f"{run_id}: its job would convert the store again ({made['store']}): name a base whose store this commit keeps")
             unchecked = [step for step in wanted if code.get(step) is None and step in held]
             if unchecked:
                 plan.check(False, f"{run_id}: the code of {', '.join(unchecked)} is unchecked against the base's source "
                            "(sv_pgs differs and the commit has no launcher/workspace/step_codes.py)")
-        config = run_config(bases, run_id, traits, spec, accept_from) if base in bases and all(trait["base_run"] in bases for trait in traits) else None
+        config = run_config(bases, run_id, traits, spec, accept_from, warm) if base in bases and all(trait["base_run"] in bases for trait in traits) else None
         if config is not None and run_id == store_id:
             config.update(arm_keys)
         if run_id == store_id:
             shape = dict(STORE_DISK, machine_type=spec["store_machine_type"])
+        starts = None
+        if warm and cloud is not None:
+            kept = kept_store(held["store"]) if "store" in taken else None
+            starts = {(trait["name"], arm): warm_start(cloud, trait, arm, kept, saved, keys, metadata, model_format) for trait in traits for arm in arms}
         plan.runs.append({"run_id": run_id, "traits": [trait["name"] for trait in traits], "arms": arms, "base": base, "reuse": taken,
                           "made": {step: why for step, why in made.items() if why != "not asked"}, "config": config, "shape": shape,
-                          "holders": {step: held[step] for step in taken}})
+                          "holders": {step: held[step] for step in taken}, "starts": starts})
         if spec["reuse"] == "copy":
             for step in taken:
                 plan.copies.append((held[step], run_id, step, sum(cloud.listing(f"{held[step]}/run/{step}").values()) if cloud else None))
@@ -894,6 +1040,18 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
             continue
         own = {"PARALLEL_ARMS": "1"} if layout.parallel_arms else {"FIT_ARMS": " ".join(arms)} if layout.merge else {}
         plan.jobs.append(_job(run_id, spec["fit_slot"], "fit", job_environment(spec, run_id, spec["fit_slot"], shape, plan.staging, reuse_base, **own)))
+    if warm and cloud is not None:
+        # The study's rule (_warm_seeds): a trait's two arms start alike, both cold or each from its own arm's model.
+        states: dict = {}
+        for run in plan.runs:
+            for (trait, _arm), (state, _where) in (run["starts"] or {}).items():
+                states.setdefault(trait, set()).add(state)
+        unlike = [trait for trait, found in states.items() if len(found) > 1]
+        plan.check(not unlike, "warm starts: each trait's arms start alike" + (
+            f", but not {', '.join(unlike)}: name the run holding the cold arm's model in its warm_from, or [] for both cold" if unlike else ""))
+        starts = [state for run in plan.runs for state, _where in (run["starts"] or {}).values()]
+        plan.check("cold" not in starts, f"warm starts: {starts.count('warm')} of {len(starts)} arms start from an earlier model"
+                   + (f", {starts.count('cold')} cold (each named under its run)" if "cold" in starts else ""), failure="warn")
     if layout.merge:
         fitted = [run for run in plan.runs if run["run_id"] != store_id]
         groups = [[run for run in fitted if run["traits"] == [trait["name"]]] for trait in spec["traits"]] if layout.runs == "trait_arm" else [fitted]
@@ -1001,19 +1159,28 @@ def render(plan: Plan) -> str:
     shapes = [run["shape"] for run in plan.runs if run["run_id"] != (plan.store or {}).get("run_id")]
     usual = max(shapes, key=shapes.count) if shapes else shape_of(spec, [], [])
     lines = [
-        f"round {spec['round']}: {len(spec['traits'])} traits x {len(spec['arms'])} arms, layout {layout.name} ({layout.summary})",
+        f"round {spec['round']}: {len(spec['traits'])} trait{'s' if len(spec['traits']) > 1 else ''} x {len(spec['arms'])} arms, layout {layout.name} ({layout.summary})",
         f"jobs: {usual['machine_type']} x{usual['gpu_count']} {usual['gpu_type']} {spec['provisioning_model']}, MAX_RETRIES {spec['max_retries']}, "
         f"run disk {usual['run_disk_type']} {usual['run_disk_gb']} GB, through {spec['through']}; steps before the fit by "
         + ("BASE_RUN (no copy)" if spec["reuse"] == "base" else "server-side copy"),
-        *plan.notes, "", f"runs ({len(plan.runs)}):",
-        f"  {'RUN_ID':<14} {'arms':<18} {'base':<12} steps taken from the base / made by the job",
+        *plan.notes, "", f"runs ({len(plan.runs)}): each step before the fit kept from the base or remade by the job, and each arm's start:",
+        f"  {'RUN_ID':<14} {'arms':<18} {'base':<12} steps before the fit",
     ]
     for run in plan.runs:
         made = ", ".join(f"{step} ({why})" for step, why in run["made"].items()) or "-"
         arms = " ".join(run["arms"]) or "(store job)"
-        lines.append(f"  {run['run_id']:<14} {arms:<18} {run['base']:<12} {' '.join(run['reuse']) or '-'} / {made}")
+        lines.append(f"  {run['run_id']:<14} {arms:<18} {run['base']:<12} kept: {' '.join(run['reuse']) or '-'}; remade: {made}")
         if len(run["traits"]) > 1 and run is plan.runs[0]:
             lines.append(f"  {'':<14} traits: {' '.join(run['traits'])}")
+        if (run["config"] or {}).get("accept_steps_from"):
+            lines.append(f"  {'':<14} a record of the earlier key formula kept where {run['config']['accept_steps_from']} made it from these inputs")
+        if (run["config"] or {}).get("warm_start_models"):
+            lines.append(f"  {'':<14} warm_start_models: {' '.join(run['config']['warm_start_models'])}")
+        for (trait, arm), (state, where) in (run["starts"] or {}).items():
+            lines.append(f"  {'':<14} {state} {arm} {trait}: {where}")
+        if run["starts"] is None and run["arms"] and plan.warm:
+            patterns = warm_patterns([trait for trait in spec["traits"] if trait["name"] in run["traits"]])
+            lines.append(f"  {'':<14} starts unchecked (the bucket was not read): warm_start_models {' '.join(patterns)}")
         if run["shape"] != usual:
             shape = run["shape"]
             lines.append(f"  {'':<14} shape: {shape['machine_type']}" + (f" x{shape['gpu_count']} {shape['gpu_type']}" if run["run_id"] != (plan.store or {}).get("run_id") else "")
@@ -1059,7 +1226,8 @@ def render(plan: Plan) -> str:
     elif plan.merges:
         lines.append(row(MERGE[0], projected["merge"], "a merge job after the slowest of its runs"))
     if plan.store:
-        lines.append(f"  {'store job':<14} {'?':>11}  {'ag-share':<46} before the fit jobs, once per cohort: no timeline has its minutes")
+        lines.append(f"  {'store job':<14} {'?':>11}  {'ag-share':<46} before the fit jobs, once per cohort: the fit store's pass ~30 (ag-cost), "
+                     "but measurement and direct_sv made again for the round's cohort, unmeasured; no timeline has its minutes")
     verdict = "met" if projected["wall"][1] <= TARGET_MINUTES else "not met" if projected["wall"][0] > TARGET_MINUTES else "met at the low end only"
     lines.append(f"  {'round':<14} {_span(projected['wall'], _digits(projected['wall'])):>11}  submission to every report"
                  + (" after the store job" if plan.store else "") + f"; goal {TARGET_MINUTES}: {verdict}")
@@ -1160,6 +1328,9 @@ def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str)
       models are copied into its run's fit partial (each model's files, then its record);
     - a CPU merge job with PARTNER_RUN only where both fit jobs have ended, neither run holds the round's last step (the
       later arm's job finished neither) and each holds its arm's handoff (effects.partial's handoff.json, written last).
+      Its RUN_ID is the run that got further (ag-score's rule): one whose fit is complete or that holds both arms'
+      handoffs pushed its adoption, so the merge finishes in it, its partner's models being gone from a completed fit's
+      partial; otherwise the plan's order.
     Returns what still waits, with why."""
     states: dict = {}
 
@@ -1170,19 +1341,27 @@ def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str)
 
     waiting = []
     for entry in [entry for entry in plan.jobs if entry["after"]] + plan.merges + plan.finishes:
-        if state(entry["name"]) is not None:
+        names = [f"svpgs-{run}-{plan.spec['merge_slot']}" for run in entry["runs"]] if "finisher" in entry else [entry["name"]]
+        if any(state(name) is not None for name in names):
             continue
         before = {name: state(name) or "not found" for name in entry["after"]}
         if "finisher" in entry:
-            if any(plan.spec["through"] in cloud.completed(run) for run in entry["runs"]):
+            complete = {run: cloud.completed(run) for run in entry["runs"]}
+            if any(plan.spec["through"] in steps for steps in complete.values()):
                 continue
             if any(value not in ("SUCCEEDED", "FAILED") for value in before.values()):
                 waiting.append((entry["name"], before))
                 continue
-            missing = [run for run in entry["runs"] if not any(name.endswith("/handoff.json") for name in cloud.listing(f"{run}/run/effects.partial/batches"))]
+            handoffs = {run: [name for name in cloud.listing(f"{run}/run/effects.partial/batches") if name.endswith("/handoff.json")] for run in entry["runs"]}
+            missing = [run for run, found in handoffs.items() if not found]
             if missing:
                 waiting.append((entry["name"], {run: "no handoff: its arm's parts are not mirrored, so resubmit its fit job" for run in missing}))
                 continue
+            further = [run for run in entry["runs"] if "fit" in complete[run] or len(handoffs[run]) > 1]
+            if further and further[0] != entry["run_id"]:
+                partner = next(run for run in entry["runs"] if run != further[0])
+                entry = dict(entry, run_id=further[0], name=f"svpgs-{further[0]}-{plan.spec['merge_slot']}",
+                             environment=dict(entry["environment"], RUN_ID=further[0], PARTNER_RUN=partner))
         elif any(value != "SUCCEEDED" for value in before.values()):
             waiting.append((entry["name"], before))
             continue
