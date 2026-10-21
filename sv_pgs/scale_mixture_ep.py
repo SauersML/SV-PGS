@@ -4957,7 +4957,7 @@ def fit_hyperparameters(
     inner_gains: list[list[float]] = [[] for _model in range(count)]
     # A provisional release has its own polish; a refused release restores the anchor's gain history.
     anchor_gains: list[list[float]] = [[] for _model in range(count)]
-    # Whether the model's last whole joint trial had no certified state at its own fixed point.
+    # Whether the model's last whole joint trial had no certified state: no fixed point, or none certified at it.
     whole_uncertifiable: list[bool] = [False] * count
 
     def tail_of(model: int) -> float:
@@ -5367,8 +5367,11 @@ def fit_hyperparameters(
                     )
 
                 if trial_point is None:
-                    # No EP fixed point at the trial: refused, like a trial the test rejects, and counted.
+                    # No EP fixed point at the trial: refused, like a trial the test rejects, and counted. A whole step
+                    # without one has no certified value at its end either.
                     unresolved[model] += 1
+                    if entry.fraction == 1.0:
+                        whole_uncertifiable[model] = True
                     report("no fixed point")
                 else:
                     trial_correction, trial_state = solve_state(trial, trial_point)
