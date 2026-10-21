@@ -32,6 +32,7 @@ from sv_pgs.draw_laws import law_from_arrays
 from sv_pgs.feature_identity import layout_digest, portable
 from sv_pgs.fast_scoring import (
     GeneticScores,
+    ReadCheckpoint,
     ScoringModel,
     ScoringPlan,
     posterior_predictive_probability,
@@ -456,14 +457,20 @@ def predict(model: FittedModel, store: DosageStore, sample_indices: np.ndarray, 
 
 
 def predict_models(
-    models: Sequence[FittedModel], store: DosageStore, sample_indices: np.ndarray, covariates: F64Array, budget: ComputeBudget
+    models: Sequence[FittedModel],
+    store: DosageStore,
+    sample_indices: np.ndarray,
+    covariates: F64Array,
+    budget: ComputeBudget,
+    checkpoint: ReadCheckpoint | None = None,
 ) -> Prediction:
     """Score every model of every fitted model in ``models`` from one read of the store: the columns of the returned
     arrays are the models' ``model_names`` in order, ``models[0]``'s first.
 
     The fitted models were saved separately (each its own fit, certificate and provenance) but must share the
     covariates (the same ``covariate_names``, which ``covariates`` follows without the intercept) and the store's
-    variant layout; the store read, the dominant cost of scoring, is then paid once for all of them.
+    variant layout; the store read, the dominant cost of scoring, is then paid once for all of them. ``checkpoint``
+    keeps that read part way through, so a restart reads only its rest (``fast_scoring.score_genetic``).
     """
     if not models:
         raise ValueError("scoring needs at least one fitted model.")
@@ -504,7 +511,9 @@ def predict_models(
             "ij,jk,ik->i", fixed_design, scoring.covariate_covariance, fixed_design
         )
 
-    genetic = score_genetic(StoreCodeBlocks(store, budget), ScoringPlan.from_models(scorings), budget, samples, draws="variance", reduce=linear_variance)
+    genetic = score_genetic(
+        StoreCodeBlocks(store, budget), ScoringPlan.from_models(scorings), budget, samples, draws="variance", reduce=linear_variance, checkpoint=checkpoint
+    )
     linear_predictor = score_linear_predictor(genetic.means, covariate_matrix, scorings)
     predictive_mean = np.empty_like(linear_predictor)
     predictive_variance = np.empty_like(linear_predictor)

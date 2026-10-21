@@ -24,26 +24,33 @@ workspace beside the run's mirror, and which no step stages for export.
 A run that fits regions (``WorkspaceConfig.fit_regions``) has LDpred2 fitted on each region's snv_indel records in
 turn, on the run's one cohort and store, and each line names its region ("region" first); a run without them writes
 the lines it always did.
+
+Each fold model's fit is kept as it ends, in ``--units`` (``FoldUnits``): a whole-genome run has one such fit per trait
+and evaluated fold, each a band and an R session estimated at an hour or more (not yet measured), after the driver and
+in the same Spot task, so a preempted task that starts again fits only the folds it had not finished. A kept fold holds its training
+means, posterior mean effects and held-out scores; its partial r^2 is read again from them, as the report would.
 """
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import pathlib
-from collections.abc import Sequence
+import zipfile
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from benchmarks.bench_sim.submissions import ldpred2_auto_allvar
+from benchmarks.bench_sim.submissions import ldpred2_auto, ldpred2_auto_allvar, sbayesrc
 from sv_pgs.all_of_us import MINIMUM_REPORTED_PARTICIPANTS
 from sv_pgs.config import TraitType
 from sv_pgs.compute_budget import detect_compute_budget
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.workspace_pipeline import (
-    WorkspaceConfig, _cases_text, _final_measurement_model, _final_store, _fold_weighted, _partial_r2, _read_cohort, _Run, _shown, arm_log_reliability,
-    fit_filtered, workspace_bindings, write_baseline_scores,
+    COMPLETE_FILE, STEP_NAMES, WorkspaceConfig, _cases_text, _final_measurement_model, _final_store, _fold_weighted, _partial_r2, _read_cohort,
+    _Run, _shown, arm_log_reliability, fit_filtered, workspace_bindings, write_baseline_scores,
 )
 
 CHROMOSOME_SPACING_CM = 1e4
@@ -101,7 +108,71 @@ def held_out_score(view: StoreView, means: np.ndarray, effects: np.ndarray) -> n
     return total
 
 
-def ldpred2_trait(store: DosageStore, records: np.ndarray, cohort, trait: int) -> tuple[dict[str, object], np.ndarray, np.ndarray]:
+class FoldUnits:
+    """Each fold model's LDpred2 fit, kept as it ends in ``directory`` (the ops mount, beside the run's mirror: the
+    held-out scores are participant-level, as ``--scores`` is), one NPZ per fit named by the digest of what it was fitted
+    from: the run's finished steps' keys up to the store LDpred2 reads, this code and the R script, and the fit's
+    trait, model, records, training and held-out columns. Each is written aside and renamed into place, so a reader sees
+    a whole one or none; one that cannot be read is fitted again."""
+
+    FILES = ("means", "effects", "score")
+
+    def __init__(self, directory: pathlib.Path, identity: Mapping[str, object]) -> None:
+        self.directory, self.identity = pathlib.Path(directory), dict(identity)
+
+    def path(self, **fit: object) -> pathlib.Path:
+        content = json.dumps({**self.identity, **fit}, sort_keys=True)
+        return self.directory / f"{hashlib.sha256(content.encode()).hexdigest()}.npz"
+
+    def read(self, path: pathlib.Path) -> dict[str, np.ndarray] | None:
+        try:
+            with np.load(path, allow_pickle=False) as arrays:
+                return {name: np.array(arrays[name]) for name in self.FILES}
+        except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+            return None
+
+    def write(self, path: pathlib.Path, arrays: Mapping[str, np.ndarray]) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        aside = path.with_name(f".{path.name}.{os.getpid()}")
+        with open(aside, "wb") as handle:
+            np.savez(handle, **{name: arrays[name] for name in self.FILES})
+        os.replace(aside, path)
+
+
+def _digest(values: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(values)).hexdigest()
+
+
+def run_identity(run: _Run) -> dict[str, object]:
+    """What every fold's fit of this run reads beyond its own rows: the keys of the run's finished steps through the one
+    whose store it reads (direct_sv's), and the code: this module, the bench-sim LDpred2 arm, its R script and the two
+    arms it borrows from (the band window and covariate basis, the row and GEMM helpers)."""
+    steps = STEP_NAMES[: STEP_NAMES.index("direct_sv") + 1]
+    keys = {step: json.loads((run.output(step) / COMPLETE_FILE).read_text(encoding="utf-8"))["key"] for step in steps if (run.output(step) / COMPLETE_FILE).is_file()}
+    code = hashlib.sha256()
+    for source in (pathlib.Path(__file__), *(pathlib.Path(module.__file__) for module in (ldpred2_auto_allvar, ldpred2_auto, sbayesrc)), ldpred2_auto_allvar._SCRIPT):
+        code.update(source.read_bytes())
+    return {"format": "aou-ldpred2-fold-v1", "steps": keys, "code": code.hexdigest()}
+
+
+def _fold_fit(store: DosageStore, records: np.ndarray, cohort, trait: int, model: int, held: np.ndarray, units: FoldUnits | None) -> tuple[StoreView, np.ndarray]:
+    """The held-out view of ``model`` and its scores: from its kept fit, or fitted now and kept."""
+    test = cohort_view(store, records, cohort, held, trait)
+    train = cohort_view(store, records, cohort, cohort.training[:, model], trait)
+    path = None if units is None else units.path(
+        trait=cohort.trait_names[trait], model=int(model), records=_digest(records), training=_digest(train.columns), held=_digest(test.columns),
+    )
+    kept = None if path is None or units is None else units.read(path)
+    if kept is not None and kept["score"].shape == (test.n_samples,):
+        return test, kept["score"]
+    means, effects = ldpred2_auto_allvar.posterior_effects(train, np.arange(records.shape[0]))
+    score = held_out_score(test, means, effects)
+    if path is not None and units is not None:
+        units.write(path, {"means": means, "effects": effects, "score": score})
+    return test, score
+
+
+def ldpred2_trait(store: DosageStore, records: np.ndarray, cohort, trait: int, units: FoldUnits | None = None) -> tuple[dict[str, object], np.ndarray, np.ndarray]:
     """LDpred2-auto on each evaluated model's own training and held-out rows, on the report's partial-r^2 scale: the
     trait's aggregate line, and its held-out cohort rows with their scores, each person's by the model that left them out.
 
@@ -109,6 +180,7 @@ def ldpred2_trait(store: DosageStore, records: np.ndarray, cohort, trait: int) -
     per-fold correlations with row-count weights, so the baseline does too; pooling differently scaled fold scores
     would answer another question. Empty and suppressed cells do not launch a fit, and a disease's case count is shown
     only where neither it nor the controls it implies is 1 to 20 (``_cases_text``).
+    With ``units`` each fold's fit is kept as it ends, and a kept one is not fitted again (``FoldUnits``).
     """
     models = cohort.trait_models(trait) if hasattr(cohort, "trait_models") else (cohort.all_rows_model(trait),)
     evaluated = [(model, np.flatnonzero(cohort.held_out[:, model] & np.isfinite(cohort.targets[:, trait]))) for model in models]
@@ -127,12 +199,9 @@ def ldpred2_trait(store: DosageStore, records: np.ndarray, cohort, trait: int) -
     values, held_rows, held_scores = [], [np.zeros(0, dtype=np.int64)], [np.zeros(0)]
     if _shown(count, cases):
         for model, rows in evaluated:
-            means, effects = ldpred2_auto_allvar.posterior_effects(
-                cohort_view(store, records, cohort, cohort.training[:, model], trait), np.arange(records.shape[0]))
             held = np.zeros(cohort.targets.shape[0], dtype=bool)
             held[rows] = True
-            test = cohort_view(store, records, cohort, held, trait)
-            score = held_out_score(test, means, effects)
+            test, score = _fold_fit(store, records, cohort, trait, model, held, units)
             values.append((test.n_samples, _partial_r2(test.phenotype, score, test.covariates)))
             held_rows.append(cohort_rows(cohort, held))
             held_scores.append(score)
@@ -169,9 +238,11 @@ def main(argv: list[str] | None = None) -> int:
         "--baselines", type=pathlib.Path,
         help="The baseline directory the report reads (default the run config's, WorkspaceConfig.baselines): ldpred2_auto.npz there, a region's under regions/<name>.",
     )
+    parser.add_argument("--units", help="Where each fold's fit is kept as it ends, and found again after a restart (FoldUnits): kept in the workspace.")
     args = parser.parse_args(argv)
     config = WorkspaceConfig.read(args.config)
     run = _Run(config, workspace_bindings(), detect_compute_budget(), {})
+    units = None if args.units is None else FoldUnits(pathlib.Path(args.units), run_identity(run))
     cohort = _read_cohort(run)
     measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
     lines = []
@@ -190,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
             records = np.flatnonzero(np.isfinite(arm_log_reliability(table, kept, "snv_indel")))
             variants[index] = records.shape[0]
             for trait in range(len(cohort.trait_names)):
-                line, rows, score = ldpred2_trait(store, records, cohort, trait)
+                line, rows, score = ldpred2_trait(store, records, cohort, trait, units)
                 scores[index, rows, trait] = score
                 lines.append(json.dumps({"region": name, **line} if name else line))
                 print(lines[-1], flush=True)

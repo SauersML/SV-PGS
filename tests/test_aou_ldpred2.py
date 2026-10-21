@@ -152,6 +152,61 @@ def test_cross_fit_baseline_uses_each_held_out_models_training_rows_and_fold_wei
     assert result["pgs_partial_r2"] == pytest.approx(expected, rel=1e-9)
 
 
+def test_a_fold_fit_kept_as_it_ends_is_not_fitted_again_after_a_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A task stopped after one fold's fit, started again, fits only the other fold and writes the line and held-out
+    scores an uninterrupted pass writes; a kept fold of other code or steps, or one damaged on the disk, is fitted
+    again."""
+    store = _store(tmp_path / "store", 3)[0]
+    cohort = _cohort(np.random.default_rng(7), 100)
+    cohort.held_out = np.zeros((_SAMPLES, 3), dtype=bool)
+    cohort.held_out[:_SAMPLES // 2, 0] = True
+    cohort.held_out[_SAMPLES // 2:, 1] = True
+    cohort.training = ~cohort.held_out
+    cohort.trait_models = lambda trait: np.arange(3)
+    cohort.all_rows_model = lambda trait: 2
+    records = np.arange(30)
+    fitted = []
+
+    def fit(train, rows, stop=None):
+        if len(fitted) == stop:
+            raise RuntimeError("preempted fit")
+        fitted.append(train.columns.copy())
+        return train.codes(rows).astype(np.float64).mean(axis=1) / 127.0, np.linspace(-1.0, 1.0, rows.size) * (1 + len(fitted) % 2)
+
+    monkeypatch.setattr(aou_ldpred2.ldpred2_auto_allvar, "posterior_effects", fit)
+    expected = aou_ldpred2.ldpred2_trait(store, records, cohort, 0)
+    units = aou_ldpred2.FoldUnits(tmp_path / "units", {"format": "test", "steps": {"cohort": "a"}, "code": "b"})
+    fitted.clear()
+    monkeypatch.setattr(aou_ldpred2.ldpred2_auto_allvar, "posterior_effects", lambda train, rows: fit(train, rows, stop=1))
+    with pytest.raises(RuntimeError, match="preempted fit"):
+        aou_ldpred2.ldpred2_trait(store, records, cohort, 0, units)
+    assert len(list((tmp_path / "units").glob("*.npz"))) == 1 and not list((tmp_path / "units").glob(".*"))
+    fitted.clear()
+    monkeypatch.setattr(aou_ldpred2.ldpred2_auto_allvar, "posterior_effects", fit)
+    # The restart fits the second fold only, as the uninterrupted pass's second fit (the stub's effects say which).
+    fitted.append(None)
+    resumed = aou_ldpred2.ldpred2_trait(store, records, cohort, 0, units)
+    assert len(fitted) == 2 and np.array_equal(fitted[1], np.sort(cohort.store_columns[cohort.training[:, 1]]))
+    assert resumed[0] == expected[0]
+    np.testing.assert_array_equal(resumed[1], expected[1])
+    np.testing.assert_array_equal(resumed[2], expected[2])
+    # Every fold is kept now: nothing is fitted again.
+    monkeypatch.setattr(aou_ldpred2.ldpred2_auto_allvar, "posterior_effects", lambda *args: pytest.fail("a kept fold was fitted again"))
+    again = aou_ldpred2.ldpred2_trait(store, records, cohort, 0, units)
+    assert again[0] == expected[0] and np.array_equal(again[2], expected[2])
+    # Another step key (or code) is another fit.
+    other = aou_ldpred2.FoldUnits(tmp_path / "units", {"format": "test", "steps": {"cohort": "c"}, "code": "b"})
+    with pytest.raises(pytest.fail.Exception, match="fitted again"):
+        aou_ldpred2.ldpred2_trait(store, records, cohort, 0, other)
+    # A kept fold cut short on the disk (no ZIP directory left) is fitted again, not fatal.
+    damaged = sorted((tmp_path / "units").glob("*.npz"))[0]
+    damaged.write_bytes(damaged.read_bytes()[: damaged.stat().st_size // 2])
+    fitted.clear()
+    monkeypatch.setattr(aou_ldpred2.ldpred2_auto_allvar, "posterior_effects", fit)
+    aou_ldpred2.ldpred2_trait(store, records, cohort, 0, units)
+    assert len(fitted) == 1
+
+
 def _binary_cohort(generator: np.random.Generator, rows: int) -> tuple[SimpleNamespace, np.ndarray]:
     """A one-disease cohort of ``rows`` people in families of two, its covariates an intercept and one more, and three
     held-out scores [snv_indel, with_sv, ldpred2] that each carry some of the liability."""

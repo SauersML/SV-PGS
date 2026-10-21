@@ -83,14 +83,32 @@ per-block buffers on the host (page-locked read buffers as pinned), and on CUDA
 each device's accumulator and tile buffers on its own pool; on CUDA the block
 rows and the sample tile width together minimize the kernel launches within
 the device memory that remains.
+
+Restarts. A batch's read is the scorer's one long piece of work: one read of
+every scored row of the store, tens of minutes to over an hour at the All of
+Us whole-genome workload [real]. With a ``ReadCheckpoint`` the read is kept
+part way through, when the checkpoint says it is due: how many of its reads
+are done, the block rows and tile widths that cut them, every lane's partial
+sums (the CPU accumulator, or each device's own) and the draws' offsets so far,
+and a whole batch's sums once its read ends while later batches remain. A
+restart under the same identity (the store rows, the batch's models with their
+coefficients and draw laws, the samples, the device kind and its lane count)
+loads them and reads only the rest, in the kept cut where it fits this
+machine's memory. Every block then reaches the same lane in the same order with
+the same shapes, so the scores are the uninterrupted read's to the bit; where
+the kept cut does not fit, the read starts again.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
+import hashlib
+import json
 import math
-from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
 import numpy as np
 from scipy import stats
@@ -103,7 +121,7 @@ from sv_pgs.compute_budget import ComputeBudget, _cupy_device_context, _try_impo
 from sv_pgs.config import TraitType
 from sv_pgs.data import TieMap
 from sv_pgs.draw_laws import DenseDraws, DrawLaw
-from sv_pgs.memory_broker import HOST, PINNED, broker_for, device_pool
+from sv_pgs.memory_broker import HOST, PINNED, MemoryBroker, broker_for, device_pool
 from sv_pgs.progress import log
 from sv_pgs.tie_members import TieGroups, prior_variance_weights
 
@@ -126,6 +144,19 @@ class CodeBlockSource(Protocol):
         buffers: Sequence[U8Array],
     ) -> Iterator[tuple[int, int, U8Array]]:
         """Yield (start, stop, codes[stop - start, sample_count]) for each range, in order."""
+
+
+class ReadCheckpoint(Protocol):
+    """Where ``score_genetic`` keeps a batch's read part way through (the module docstring's restarts). ``due`` says
+    whether to keep it now; ``write(identity, files)`` gives a directory whose ``files`` are published together when
+    the context exits, in place of the last ones kept under ``identity``; ``read(identity, files)`` is the directory of
+    the whole ``files`` last published under ``identity``, or None."""
+
+    def due(self) -> bool: ...
+
+    def read(self, identity: Mapping[str, Any], files: Sequence[str]) -> Path | None: ...
+
+    def write(self, identity: Mapping[str, Any], files: Sequence[str]) -> AbstractContextManager[Path]: ...
 
 
 @dataclass(frozen=True)
@@ -476,17 +507,25 @@ def _cpu_panels(sample_count: int, worker_count: int) -> list[tuple[int, int]]:
     return [(start, stop) for start, stop in zip(edges[:-1], edges[1:]) if stop > start]
 
 
+BlockKeeper = Callable[[int, Callable[[], Iterator[F64Array]]], None]
+"""``keep(done, parts)``: called after each block with the count of the batch's reads now done and a callable that
+yields every lane's partial sums on the host, one at a time (``score_genetic``'s checkpoint)."""
+
+
 def _score_cpu(
     blocks: Iterable[tuple[int, int, int, U8Array]],
     weights_for: Callable[[int, int], F64Array],
     accumulator: F64Array,
     budget: ComputeBudget,
+    done: int = 0,
+    keep: BlockKeeper | None = None,
 ) -> None:
-    """accumulator[columns, samples] += W_b' S_b for every block, samples split into owned panels."""
+    """accumulator[columns, samples] += W_b' S_b for every block, samples split into owned panels; ``done`` reads
+    of the batch are in ``accumulator`` already."""
     worker_count = max(1, int(budget.cpu_threads))
     panels = _cpu_panels(accumulator.shape[1], worker_count)
     with ThreadPoolExecutor(max_workers=worker_count) as pool, threadpool_limits(limits=1, user_api="blas"):
-        for plan_start, plan_stop, codes in _plan_blocks(blocks):
+        for block_position, (plan_start, plan_stop, codes) in enumerate(_plan_blocks(blocks), start=done):
             block_weights = np.ascontiguousarray(weights_for(plan_start, plan_stop).T)
 
             def panel(column_range: tuple[int, int], codes: U8Array = codes, block_weights: F64Array = block_weights) -> None:
@@ -496,6 +535,16 @@ def _score_cpu(
 
             for _ in pool.map(panel, panels):
                 pass
+            if keep is not None:
+                keep(block_position + 1, lambda: iter((accumulator,)))
+
+
+def _device_parts(cupy: Any, device_ids: Sequence[int], device_accumulators: Sequence[Any]) -> Iterator[F64Array]:
+    """Each device's accumulator copied to the host, one at a time (the one host temporary ``_batch_bytes`` counts
+    beside the accumulator)."""
+    for device_id, device_accumulator in zip(device_ids, device_accumulators, strict=True):
+        with _cupy_device_context(cupy, device_id):
+            yield cupy.asnumpy(device_accumulator)
 
 
 def _score_cuda(
@@ -504,18 +553,25 @@ def _score_cuda(
     accumulator: F64Array,
     budget: ComputeBudget,
     tiles: Sequence[int],
+    done: int = 0,
+    keep: BlockKeeper | None = None,
+    parts: Sequence[NDArray] = (),
 ) -> None:
     """Blocks round-robin over the visible devices; each device keeps its own fp64 accumulator. ``tiles`` are each
-    device's sample tile widths from its planned share (``_device_tile``)."""
+    device's sample tile widths from its planned share (``_device_tile``). ``done`` reads of the batch are in
+    ``parts``, each device's accumulator as kept, and the next block goes to the device it went to in one read."""
     cupy: Any = _try_import_cupy()
     if cupy is None:
         raise RuntimeError("the compute budget selected CUDA but CuPy is unavailable.")
     column_count, sample_count = accumulator.shape
     device_accumulators = []
-    for device_id in budget.device_ids:
+    for device_position, device_id in enumerate(budget.device_ids):
         with _cupy_device_context(cupy, device_id):
-            device_accumulators.append(cupy.zeros((column_count, sample_count), dtype=cupy.float64))
-    for block_position, (plan_start, plan_stop, codes) in enumerate(_plan_blocks(blocks)):
+            if parts:
+                device_accumulators.append(cupy.asarray(parts[device_position], dtype=cupy.float64))
+            else:
+                device_accumulators.append(cupy.zeros((column_count, sample_count), dtype=cupy.float64))
+    for block_position, (plan_start, plan_stop, codes) in enumerate(_plan_blocks(blocks), start=done):
         device_position = block_position % len(budget.device_ids)
         with _cupy_device_context(cupy, budget.device_ids[device_position]):
             tile_columns = int(tiles[device_position])
@@ -527,6 +583,8 @@ def _score_cuda(
                 # all signed values remain exact, and the GEMM stays float64.
                 signed = cupy.subtract(device_codes[:, start:stop], SIGNED_CODE_OFFSET, dtype=cupy.float64)
                 device_accumulators[device_position][:, start:stop] += block_weights @ signed
+        if keep is not None:
+            keep(block_position + 1, lambda: _device_parts(cupy, budget.device_ids, device_accumulators))
     for device_position, device_id in enumerate(budget.device_ids):
         with _cupy_device_context(cupy, device_id):
             accumulator += cupy.asnumpy(device_accumulators[device_position])
@@ -579,6 +637,89 @@ BatchReducer = Callable[[int, F64Array, F64Array], None]
 """``reduce(model, mean_scores (samples,), draw_scores (samples x K))``: called once per model with its scores, while its
 batch's accumulator holds them (``artifact.predict`` forms its predictive variance there, with no draw kept)."""
 
+_KEPT_READ = "read.json"
+"""A kept read's progress and cut: its reads done and in all, the block rows and each device's tile width."""
+_KEPT_OFFSETS = "offsets.npy"
+
+
+def _kept_files(lanes: int) -> tuple[str, ...]:
+    """A kept read's files: its progress and cut, the draws' offsets so far, and each lane's partial sums."""
+    return (_KEPT_READ, _KEPT_OFFSETS, *(f"lane{lane}.npy" for lane in range(lanes)))
+
+
+def _read_identity(
+    plan: ScoringPlan, batch: Sequence[int], position: int, draws: str, selected: I64Array | None, sample_count: int, budget: ComputeBudget
+) -> dict[str, Any]:
+    """What a kept read of batch ``position`` belongs to: the store rows read and its models, by their rows',
+    coefficients', moments' and (unless ``draws`` is "none") draw laws' bytes (a model fitted again is another read);
+    the samples; the device kind and the lanes that order its sums (the CPU's sample panels, one per worker, or the
+    devices)."""
+    content = hashlib.sha256(np.ascontiguousarray(plan.store_rows))
+    for model in batch:
+        scoring = plan.models[model]
+        for values in (plan.positions[model], scoring.coefficients, scoring.signed_means, scoring.signed_scales):
+            content.update(np.ascontiguousarray(values))
+        if draws != "none":
+            law = scoring.posterior_draws
+            content.update(law.kind.encode())
+            for name, values in sorted(law.arrays().items()):
+                content.update(f"{name}{values.dtype.str}{values.shape}".encode())
+                content.update(np.ascontiguousarray(values))
+    if selected is not None:
+        content.update(np.ascontiguousarray(selected))
+    return {
+        "batch": position, "models": [int(model) for model in batch], "columns": plan.column_count(batch, draws),
+        "rows": int(plan.store_rows.shape[0]), "samples": sample_count, "draws": draws, "device_kind": budget.device_kind,
+        "lanes": len(budget.device_ids) if budget.device_kind == "cuda" else max(1, int(budget.cpu_threads)),
+        "content": content.hexdigest(),
+    }
+
+
+def _kept_array(path: Path, shape: tuple[int, ...]) -> NDArray:
+    """A kept array, mapped from its file, of the shape its batch gives it."""
+    kept = np.load(path, mmap_mode="r", allow_pickle=False)
+    if kept.shape != shape or kept.dtype != np.float64:
+        raise ValueError(f"{path} holds {kept.dtype} {kept.shape}, not the batch's float64 {shape}.")
+    return kept
+
+
+def _kept_cut_fits(
+    cut: Mapping[str, Any], plan: ScoringPlan, columns: int, sample_count: int, host_rows: int, budget: ComputeBudget, broker: MemoryBroker
+) -> bool:
+    """Whether a kept read's cut fits this machine: its block rows within what the host plan allows, the reads they cut
+    the batch into as many as it counts, and on CUDA one tile per device within that device's free memory
+    (``_device_bytes``)."""
+    rows, tiles = int(cut["block_rows"]), [int(tile) for tile in cut["tiles"]]
+    if not 1 <= rows <= host_rows or len(plan.read_ranges(rows)) != int(cut["reads"]) or not 0 <= int(cut["done"]) <= int(cut["reads"]):
+        return False
+    if budget.device_kind != "cuda":
+        return not tiles
+    return len(tiles) == len(budget.device_ids) and all(
+        1 <= tile <= sample_count and _device_bytes(columns, sample_count, rows, tile) <= broker.remaining(device_pool(device_id))
+        for device_id, tile in zip(budget.device_ids, tiles)
+    )
+
+
+def _keeper(
+    checkpoint: ReadCheckpoint, identity: Mapping[str, Any], lanes: int, reads: int, block_rows: int, tiles: Sequence[int], offsets: F64Array
+) -> BlockKeeper:
+    """Keep the read after a block when the checkpoint says it is due and reads remain (the last block's sums are the
+    batch's, kept whole or used at once)."""
+
+    def keep(done: int, parts: Callable[[], Iterator[F64Array]]) -> None:
+        if done >= reads or not checkpoint.due():
+            return
+        with checkpoint.write(identity, _kept_files(lanes)) as directory:
+            for lane, part in enumerate(parts()):
+                np.save(directory / f"lane{lane}.npy", part, allow_pickle=False)
+                del part
+            np.save(directory / _KEPT_OFFSETS, offsets, allow_pickle=False)
+            cut = {"done": done, "reads": reads, "block_rows": block_rows, "tiles": [int(tile) for tile in tiles]}
+            (directory / _KEPT_READ).write_text(json.dumps(cut), encoding="utf-8")
+        log(f"  fast scoring: kept the batch's read at {done} of {reads} reads")
+
+    return keep
+
 
 def score_genetic(
     source: CodeBlockSource,
@@ -587,13 +728,16 @@ def score_genetic(
     sample_indices: NDArray | None = None,
     draws: str = "keep",
     reduce: BatchReducer | None = None,
+    checkpoint: ReadCheckpoint | None = None,
 ) -> GeneticScores:
     """Posterior-mean genetic scores and, unless ``draws`` is "none", their variances under each model's drawing law,
     for every planned model, from one read of the codes per batch of models (the module docstring).
 
     ``sample_indices`` selects store samples (all of them when ``None``); scoring all samples once and slicing folds
     afterwards reads the store once for every fold. ``draws`` is one of ``DRAW_MODES``; ``reduce`` sees every model's
-    mean and draw scores as its batch ends.
+    mean and draw scores as its batch ends. ``checkpoint`` keeps each batch's read part way through, and a batch's
+    sums once its read ends while later batches remain; a restart reads only what is not kept (the module docstring's
+    restarts).
     """
     if draws not in DRAW_MODES:
         raise ValueError(f"draws must be one of {DRAW_MODES}, not {draws!r}")
@@ -601,49 +745,87 @@ def score_genetic(
     sample_count = source.sample_count if selected is None else int(selected.shape[0])
     broker = broker_for(budget)
     owns_buffers = _source_owns_buffers(source)
+    lanes = len(budget.device_ids) if budget.device_kind == "cuda" else 1
     with broker.reserve(HOST, _output_bytes(plan, sample_count, draws), "the scores"):
         means = np.empty((sample_count, plan.model_count))
         variances = np.full_like(means, np.nan)
         kept: list[F64Array] = [np.zeros((sample_count, 0)) for _ in range(plan.model_count)]
         batches = _batches(plan, source.sample_count, sample_count, broker.remaining(HOST), budget.device_kind, draws)
-        for batch, block_rows in batches:
+        for position, (batch, block_rows) in enumerate(batches):
             columns = plan.column_count(batch, draws)
+            identity = None if checkpoint is None else _read_identity(plan, batch, position, draws, selected, sample_count, budget)
+            whole = midway = cut = None
+            if checkpoint is not None and identity is not None:
+                whole = checkpoint.read({**identity, "read": "whole"}, _kept_files(1))
+                midway = None if whole is not None else checkpoint.read({**identity, "read": "part"}, _kept_files(lanes))
+                cut = None if midway is None else json.loads((midway / _KEPT_READ).read_text(encoding="utf-8"))
+            host_rows = block_rows
             tiles: list[int] = []
             device_leases = []
-            if budget.device_kind == "cuda":
+            if budget.device_kind == "cuda" and whole is None:
                 for device_id in budget.device_ids:
                     rows, tile = _device_tile(columns, sample_count, broker.remaining(device_pool(device_id)))
                     block_rows = min(block_rows, rows)
                     tiles.append(tile)
+            if cut is not None:
+                if _kept_cut_fits(cut, plan, columns, sample_count, host_rows, budget, broker):
+                    block_rows, tiles = int(cut["block_rows"]), [int(tile) for tile in cut["tiles"]]
+                else:
+                    log(f"  fast scoring: batch {position}'s kept read is cut in blocks this machine cannot hold; it is read again")
+                    midway = cut = None
+            if budget.device_kind == "cuda" and whole is None:
                 for device_id, tile in zip(budget.device_ids, tiles):
                     device_leases.append(broker.reserve(device_pool(device_id), _device_bytes(columns, sample_count, block_rows, tile), "a scoring batch's device plan"))
             host_plan = _batch_bytes(plan, batch, source.sample_count, sample_count, block_rows, budget.device_kind, draws)
-            ring = 0 if owns_buffers else _READ_AHEAD_BUFFERS * block_rows * source.sample_count
+            ring = 0 if owns_buffers or whole is not None else _READ_AHEAD_BUFFERS * block_rows * source.sample_count
             with broker.reserve(HOST, host_plan - ring, "a scoring batch's accumulator and block buffers"):
-                ring_lease = broker.reserve(PINNED if budget.device_kind == "cuda" else HOST, ring, "the scorer's read-ahead ring")
-                try:
-                    ranges = plan.read_ranges(block_rows)
-                    log(
-                        f"  fast scoring: {len(batch)} of {plan.model_count} models ({columns} weight columns) x {sample_count} samples over "
-                        + f"{plan.store_rows.shape[0]} store rows in {len(ranges)} reads of <= {block_rows} rows on {budget.describe()}"
-                    )
-                    accumulator = np.zeros((columns, sample_count), dtype=np.float64)
-                    offsets = np.zeros(columns)
-                    buffers = [] if owns_buffers else _read_ahead_buffers(block_rows, source.sample_count, budget)
-                    blocks = _read_plan_blocks(source, ranges, buffers, selected)
+                accumulator = np.zeros((columns, sample_count), dtype=np.float64)
+                offsets = np.zeros(columns)
+                if whole is not None:
+                    accumulator[...] = _kept_array(whole / "lane0.npy", accumulator.shape)
+                    offsets[...] = _kept_array(whole / _KEPT_OFFSETS, offsets.shape)
+                    log(f"  fast scoring: {len(batch)} of {plan.model_count} models: the batch's read is kept whole and not read again")
+                else:
+                    ring_lease = broker.reserve(PINNED if budget.device_kind == "cuda" else HOST, ring, "the scorer's read-ahead ring")
+                    try:
+                        ranges = plan.read_ranges(block_rows)
+                        done = 0 if cut is None else int(cut["done"])
+                        log(
+                            f"  fast scoring: {len(batch)} of {plan.model_count} models ({columns} weight columns) x {sample_count} samples over "
+                            + f"{plan.store_rows.shape[0]} store rows in {len(ranges)} reads of <= {block_rows} rows on {budget.describe()}"
+                            + (f", from read {done} as kept" if done else "")
+                        )
+                        parts: list[NDArray] = []
+                        if midway is not None:
+                            offsets[...] = _kept_array(midway / _KEPT_OFFSETS, offsets.shape)
+                            parts = [_kept_array(midway / f"lane{lane}.npy", accumulator.shape) for lane in range(lanes)]
+                            if budget.device_kind != "cuda":
+                                accumulator[...] = parts.pop()
+                        buffers = [] if owns_buffers else _read_ahead_buffers(block_rows, source.sample_count, budget)
+                        blocks = _read_plan_blocks(source, ranges[done:], buffers, selected)
+                        keep = None if checkpoint is None or identity is None else _keeper(
+                            checkpoint, {**identity, "read": "part"}, lanes, len(ranges), block_rows, tiles, offsets
+                        )
 
-                    def weights_for(plan_start: int, plan_stop: int, batch=batch, offsets=offsets) -> F64Array:
-                        return plan.block_weights(batch, draws, plan_start, plan_stop, offsets)
+                        def weights_for(plan_start: int, plan_stop: int, batch=batch, offsets=offsets) -> F64Array:
+                            return plan.block_weights(batch, draws, plan_start, plan_stop, offsets)
 
-                    if budget.device_kind == "cuda":
-                        _score_cuda(blocks, weights_for, accumulator, budget, tiles)
-                    else:
-                        _score_cpu(blocks, weights_for, accumulator, budget)
-                    del buffers, blocks
-                finally:
-                    ring_lease.release()
-                    for lease in device_leases:
-                        lease.release()
+                        if budget.device_kind == "cuda":
+                            _score_cuda(blocks, weights_for, accumulator, budget, tiles, done, keep, parts)
+                        else:
+                            _score_cpu(blocks, weights_for, accumulator, budget, done, keep)
+                        del buffers, blocks, parts
+                    finally:
+                        ring_lease.release()
+                        for lease in device_leases:
+                            lease.release()
+                    if checkpoint is not None and identity is not None and position + 1 < len(batches):
+                        # The batch's sums before its offsets are added, so a restart forms its scores as this pass does.
+                        with checkpoint.write({**identity, "read": "whole"}, _kept_files(1)) as directory:
+                            np.save(directory / "lane0.npy", accumulator, allow_pickle=False)
+                            np.save(directory / _KEPT_OFFSETS, offsets, allow_pickle=False)
+                            cut = {"done": len(ranges), "reads": len(ranges), "block_rows": block_rows, "tiles": tiles}
+                            (directory / _KEPT_READ).write_text(json.dumps(cut), encoding="utf-8")
                 column = 0
                 for model in batch:
                     count = plan.draw_count(model, draws)
@@ -665,6 +847,8 @@ def score_genetic(
         means=means, variances=variances, draw_counts=draw_counts, draws=tuple(kept) if draws == "keep" else (),
         gaussian_posteriors=plan.gaussian_posteriors,
     )
+
+
 def score_linear_predictor(
     genetic_scores: F64Array,
     covariates: F64Array,

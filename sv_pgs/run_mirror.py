@@ -41,9 +41,14 @@ does not send a completed step a base holds whole under the same COMPLETE_FILE; 
 and names the base instead (BASES), which later jobs of the run read as a base, as they do the bases a base names
 (``bases_of``). So a new run's mirror needs no copy of the 0.5-1.5 TB store chain. A base is only read: a run never
 writes or deletes there, and it must be kept while the runs it carries are.
+
+A restore hashes every file's bytes as it writes them and keeps the digests on the job's own disk
+(``content_identity.RESTORED_DIGESTS``), so a digest of a restored store (the fit's ``artifact.store_digest``) reads none
+of it again.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import multiprocessing
@@ -57,7 +62,7 @@ from itertools import repeat
 from pathlib import Path
 from typing import Protocol
 
-from sv_pgs.content_identity import GCS_MOUNTS
+from sv_pgs.content_identity import GCS_MOUNTS, record_restored
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE, REGIONS_DIRECTORY, STEP_NAMES
 
 LOGGER = logging.getLogger(__name__)
@@ -101,7 +106,8 @@ def _of_chromosome(relative: str, chromosome: str) -> bool:
 
 
 class Remote(Protocol):
-    """The mirror: objects named by their path relative to the run directory, '/'-separated."""
+    """The mirror: objects named by their path relative to the run directory, '/'-separated. A download returns the
+    SHA-256 of the bytes it wrote (``_HashingFile``), or None where it cannot say."""
 
     def sizes(self, prefix: str) -> dict[str, int]: ...
 
@@ -111,9 +117,9 @@ class Remote(Protocol):
 
     def write(self, name: str, content: bytes) -> None: ...
 
-    def download(self, name: str, path: Path) -> None: ...
+    def download(self, name: str, path: Path) -> str | None: ...
 
-    def download_many(self, pairs: list[tuple[Path, str]]) -> None: ...
+    def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None] | None: ...
 
     def delete(self, names: Iterable[str]) -> None: ...
 
@@ -168,25 +174,28 @@ class GcsRemote:
     def write(self, name: str, content: bytes) -> None:
         self._bucket.blob(self._root + name).upload_from_string(content)
 
-    def download(self, name: str, path: Path) -> None:
+    def download(self, name: str, path: Path) -> str | None:
         from google.cloud.storage.retry import DEFAULT_RETRY
 
         path.parent.mkdir(parents=True, exist_ok=True)
         # A broken read resumes from its last byte (a range request) for as long as it keeps failing transiently: under
         # the client's default 120 s deadline, one stalled stream among a restore's parallel downloads ended the AoU
-        # whole-genome restore an hour and 547 GB in ("Connection broken: IncompleteRead").
-        self._bucket.blob(self._root + name).download_to_filename(str(path), retry=DEFAULT_RETRY.with_timeout(None))
+        # whole-genome restore an hour and 547 GB in ("Connection broken: IncompleteRead"). The client writes the bytes
+        # in order, a resumed read after the last one written, so they are hashed as they are written.
+        with open(path, "wb") as handle:
+            written = _HashingFile(handle)
+            self._bucket.blob(self._root + name).download_to_file(written, retry=DEFAULT_RETRY.with_timeout(None))
+        return written.hexdigest()
 
-    def download_many(self, pairs: list[tuple[Path, str]]) -> None:
+    def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None]:
         """``download`` each (local path, object name) pair, in one process per CPU this process may use, each with its
         own client: in one process the client's per-chunk Python work shares one interpreter lock, and a thread per CPU
         restored the AoU whole-genome run's 547 GB at 140 MB/s, 65 minutes of every job start."""
         if not pairs:
-            return
+            return []
         # spawn, not fork: a forked child would share the parent client's connections
         with ProcessPoolExecutor(max_workers=len(os.sched_getaffinity(0)), mp_context=multiprocessing.get_context("spawn")) as pool:
-            for _ in pool.map(_download_in_process, repeat(self._url), [name for _, name in pairs], [path for path, _ in pairs]):
-                pass
+            return list(pool.map(_download_in_process, repeat(self._url), [name for _, name in pairs], [path for path, _ in pairs]))
 
     def delete(self, names: Iterable[str]) -> None:
         blobs = [self._bucket.blob(self._root + name) for name in names]
@@ -224,12 +233,15 @@ class DirectoryRemote:
         aside.write_bytes(content)
         os.replace(aside, target)
 
-    def download(self, name: str, path: Path) -> None:
+    def download(self, name: str, path: Path) -> str | None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(self._root / name, path)
+        with open(self._root / name, "rb") as source, open(path, "wb") as handle:
+            written = _HashingFile(handle)
+            shutil.copyfileobj(source, written)
+        return written.hexdigest()
 
-    def download_many(self, pairs: list[tuple[Path, str]]) -> None:
-        _transfer(pairs, lambda path, name: self.download(name, path))
+    def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None]:
+        return _transfer(pairs, lambda path, name: self.download(name, path))
 
     def delete(self, names: Iterable[str]) -> None:
         for name in names:
@@ -259,11 +271,11 @@ class _Within:
     def write(self, name: str, content: bytes) -> None:
         self._remote.write(self._prefix + name, content)
 
-    def download(self, name: str, path: Path) -> None:
-        self._remote.download(self._prefix + name, path)
+    def download(self, name: str, path: Path) -> str | None:
+        return self._remote.download(self._prefix + name, path)
 
-    def download_many(self, pairs: list[tuple[Path, str]]) -> None:
-        self._remote.download_many([(path, self._prefix + name) for path, name in pairs])
+    def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None] | None:
+        return self._remote.download_many([(path, self._prefix + name) for path, name in pairs])
 
     def delete(self, names: Iterable[str]) -> None:
         self._remote.delete([self._prefix + name for name in names])
@@ -273,19 +285,52 @@ _PROCESS_REMOTES: dict[str, GcsRemote] = {}
 """A GcsRemote.download_many worker process's own client, one per mirror URL."""
 
 
-def _download_in_process(url: str, name: str, path: Path) -> None:
+def _download_in_process(url: str, name: str, path: Path) -> str | None:
     if url not in _PROCESS_REMOTES:
         _PROCESS_REMOTES[url] = GcsRemote(url)
-    _PROCESS_REMOTES[url].download(name, path)
+    return _PROCESS_REMOTES[url].download(name, path)
 
 
-def _transfer(pairs: list[tuple[Path, str]], move) -> None:
-    """``move`` every (local path, object name) pair, on one thread per CPU this process may use."""
+class _HashingFile:
+    """A file a download writes front to back, hashed as it is written: the SHA-256 of the bytes on the disk, with no
+    second read (``content_identity.RESTORED_DIGESTS``). The client seeks only to start a transcoded object again from
+    its first byte, which starts the digest again; after any other seek the digest is unknown (None)."""
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+        self._digest = hashlib.sha256()
+
+    def write(self, data) -> int:
+        written = self._handle.write(data)
+        if self._digest is not None:
+            self._digest.update(data)
+        return written
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        position = self._handle.seek(offset, whence)
+        if position == 0:
+            self._handle.truncate()
+            self._digest = hashlib.sha256()
+        else:
+            self._digest = None
+        return position
+
+    def tell(self) -> int:
+        return self._handle.tell()
+
+    def flush(self) -> None:
+        self._handle.flush()
+
+    def hexdigest(self) -> str | None:
+        return None if self._digest is None else self._digest.hexdigest()
+
+
+def _transfer(pairs: list[tuple[Path, str]], move) -> list:
+    """``move`` every (local path, object name) pair, on one thread per CPU this process may use; each one's result."""
     if not pairs:
-        return
+        return []
     with ThreadPoolExecutor(max_workers=len(os.sched_getaffinity(0))) as pool:
-        for _ in pool.map(lambda pair: move(*pair), pairs):
-            pass
+        return list(pool.map(lambda pair: move(*pair), pairs))
 
 
 def _files(directory: Path) -> list[Path]:
@@ -559,9 +604,12 @@ def restore(run_directory: Path, remote: Remote, mount: Path | None = None, base
         # files and 547 GB at the AoU whole-genome workload, each downloaded as one stream; in name order a large one
         # could start last and download alone while the other workers idle.
         chosen.sort(key=lambda entry: -objects[entry])
-        source.download_many([(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen])
+        pairs = [(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen]
+        digests = source.download_many(pairs)
         if target == final and source.read(f"{step}/{COMPLETE_FILE}") != marker:
             raise RuntimeError(f"{step} changed on {origin} while it was restored; restore again.")
+        # Each file's digest as its bytes were written, so a digest of this step's store reads none of them again.
+        record_restored((path, digest) for (path, _entry), digest in zip(pairs, digests or ()) if digest is not None)
         os.rename(aside, target)
         LOGGER.info("run mirror: restored %s from %s, %d files, %.1f GB", name, origin, len(chosen), sum(objects[entry] for entry in chosen) / 1e9)
     # Each region's own steps; the driver links the run's steps before the fit into its directory again.

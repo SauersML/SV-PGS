@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -246,22 +247,61 @@ def test_the_mirror_is_found_on_the_bucket_mount_that_shows_it(monkeypatch) -> N
     assert mounted("gs://cdr/v7/svpgs") is None and mounted("gs://other/run") is None
 
 
-def test_a_gcs_download_retries_a_broken_read_without_a_deadline(tmp_path: Path) -> None:
+def test_a_gcs_download_retries_a_broken_read_without_a_deadline_and_hashes_the_bytes_it_writes(tmp_path: Path) -> None:
     calls = []
 
     class Blob:
         def __init__(self, name: str) -> None:
             self.name = name
 
-        def download_to_filename(self, filename: str, **options) -> None:
-            calls.append((self.name, filename, options))
+        def download_to_file(self, handle, **options) -> None:
+            calls.append((self.name, options))
+            # A resumed read writes on from the last byte written.
+            handle.write(b"chr1 ")
+            handle.write(b"codes")
 
     remote = GcsRemote.__new__(GcsRemote)
     remote._bucket, remote._root = type("Bucket", (), {"blob": lambda self, name: Blob(name)})(), "svpgs/run/"
-    remote.download("store/chr1.codes", tmp_path / "a" / "chr1.codes")
-    (name, filename, options), = calls
-    assert name == "svpgs/run/store/chr1.codes" and filename == str(tmp_path / "a" / "chr1.codes") and (tmp_path / "a").is_dir()
-    assert options["retry"].timeout is None
+    digest = remote.download("store/chr1.codes", tmp_path / "a" / "chr1.codes")
+    (name, options), = calls
+    assert name == "svpgs/run/store/chr1.codes" and (tmp_path / "a" / "chr1.codes").read_bytes() == b"chr1 codes"
+    assert options["retry"].timeout is None and digest == hashlib.sha256(b"chr1 codes").hexdigest()
+
+
+def test_a_download_started_again_from_its_first_byte_is_hashed_again_and_any_other_seek_is_not_hashed(tmp_path: Path) -> None:
+    with open(tmp_path / "codes", "wb") as handle:
+        written = run_mirror._HashingFile(handle)
+        written.write(b"transcoded once")
+        written.seek(0)
+        written.write(b"codes")
+    assert (tmp_path / "codes").read_bytes() == b"codes" and written.hexdigest() == hashlib.sha256(b"codes").hexdigest()
+    with open(tmp_path / "codes", "wb") as handle:
+        written = run_mirror._HashingFile(handle)
+        written.write(b"codes")
+        written.seek(2)
+    assert written.hexdigest() is None
+
+
+def test_a_restore_keeps_the_digest_of_every_byte_it_wrote_so_the_store_digest_reads_none_of_them(tmp_path: Path, monkeypatch) -> None:
+    from sv_pgs import content_identity
+
+    run, remote = _stores(tmp_path / "run", ("store", "measurement", "direct_sv")), DirectoryRemote(tmp_path / "mirror")
+    monkeypatch.delenv(content_identity.RESTORED_DIGESTS, raising=False)
+    expected = {step: content_identity.tree_digest(run / step / "store") for step in ("store", "measurement", "direct_sv")}
+    push(run, remote)
+    monkeypatch.setenv(content_identity.RESTORED_DIGESTS, str(tmp_path / "restored-digests"))
+    restored = tmp_path / "restored"
+    restore(restored, remote, tmp_path / "mirror")
+
+    def unread(path, stamp):
+        pytest.fail(f"{path} was read again after its restore")
+
+    monkeypatch.setattr(content_identity, "_hashed", unread)
+    # The store the fit reads (direct_sv's) was downloaded and hashed as it was written.
+    assert content_identity.tree_digest(restored / "direct_sv" / "store") == expected["direct_sv"]
+    # A store linked to the mount was not downloaded, so no restored digest claims it.
+    with pytest.raises(pytest.fail.Exception):
+        content_identity.tree_digest(restored / "store" / "store" / "chunk")
 
 
 def test_a_gcs_restore_downloads_each_object_in_a_spawned_process_through_that_process_s_client(tmp_path: Path, monkeypatch) -> None:

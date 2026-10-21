@@ -5,6 +5,11 @@ and their output columns. A payload is reusable only beside its record, with tha
 content digest intact. A half-written payload, an interrupted mirror upload or a same-size damaged file is work to
 do again, never a result to assemble. These are workspace results, with the same access rules as the final scores
 and per-record effects, and are not exportable tables.
+
+A score batch's store read is itself kept part way through (``BatchReads``, ``fast_scoring.ReadCheckpoint``): one
+read of every scored row, tens of minutes to over an hour at the All of Us whole-genome workload [real], is the one
+piece of the post-fit steps a preemption could otherwise lose whole. Its kept reads are batches of their own beside
+it, published and mirrored the same way, and removed once the batch is committed.
 """
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ import json
 import logging
 import os
 import shutil
+import time
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -24,6 +30,11 @@ LOGGER = logging.getLogger(__name__)
 BATCHES = "batches"
 RECORD = "complete.json"
 FORMAT = "score-effects-batches-v1"
+READ_SECONDS = "SVPGS_SCORE_READ_CHECKPOINT_SECONDS"
+"""The environment variable giving the seconds between a score batch's kept reads (launcher/workspace sets it). Unset,
+a batch's read is not kept part way through, as before."""
+READS = ".read-"
+"""Between a batch's directory name and its kept read's key: <batch>.read-<key>."""
 
 
 def _digest(path: Path) -> str:
@@ -41,10 +52,10 @@ class BatchCheckpoint:
     ``step_key`` is the partial's KEY_FILE, not a fit key inferred from filenames or modification times.
     """
 
-    def __init__(self, directory: Path, step_key: str, identity: Any, files: Sequence[str]) -> None:
+    def __init__(self, directory: Path, step_key: str, identity: Any, files: Sequence[str], prefix: str = "") -> None:
         self.identity = json.loads(json.dumps({"format": FORMAT, "step_key": step_key, "batch": identity}, sort_keys=True))
         key = hashlib.sha256(json.dumps(self.identity, sort_keys=True).encode()).hexdigest()
-        self.path = directory / BATCHES / key
+        self.path = directory / BATCHES / f"{prefix}{key}"
         self.files = tuple(files)
 
     def read(self) -> Path | None:
@@ -88,3 +99,46 @@ class BatchCheckpoint:
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary)
+
+
+class BatchReads:
+    """The kept reads of one score batch (``fast_scoring.ReadCheckpoint``), each a batch of its own named
+    <batch>.read-<key> beside it, its identity the batch's and the read's. ``seconds`` apart at the least: each keeps
+    every lane's partial sums (its columns x people x 8 bytes a lane: ~0.1 GB for one trait's models at the whole-genome
+    workload, an estimate), which the mirror sends again on each one."""
+
+    def __init__(self, batch: BatchCheckpoint, seconds: float) -> None:
+        self._batch, self._seconds = batch, seconds
+        self._kept = time.monotonic()
+
+    def _checkpoint(self, identity: Any, files: Sequence[str]) -> BatchCheckpoint:
+        return BatchCheckpoint(
+            self._batch.path.parent.parent, self._batch.identity["step_key"], {"batch": self._batch.identity["batch"], "read": identity}, files,
+            prefix=f"{self._batch.path.name}{READS}",
+        )
+
+    def due(self) -> bool:
+        return time.monotonic() - self._kept >= self._seconds
+
+    def read(self, identity: Any, files: Sequence[str]) -> Path | None:
+        return self._checkpoint(identity, files).read()
+
+    @contextmanager
+    def write(self, identity: Any, files: Sequence[str]) -> Iterator[Path]:
+        with self._checkpoint(identity, files).write() as temporary:
+            yield temporary
+        self._kept = time.monotonic()
+
+
+def batch_reads(batch: BatchCheckpoint) -> BatchReads | None:
+    """The kept reads of ``batch`` at the interval READ_SECONDS gives, or None where it is unset."""
+    seconds = os.environ.get(READ_SECONDS)
+    return None if not seconds else BatchReads(batch, float(seconds))
+
+
+def discard_reads(directory: Path, batch: BatchCheckpoint | None = None) -> None:
+    """Remove ``batch``'s kept reads, or every batch's, with any a stopped write left hidden: a committed batch holds
+    its scores, and a step completes without the reads it no longer needs."""
+    for pattern in ("*", ".*") if batch is None else (batch.path.name, f".{batch.path.name}"):
+        for path in (directory / BATCHES).glob(f"{pattern}{READS}*"):
+            shutil.rmtree(path)

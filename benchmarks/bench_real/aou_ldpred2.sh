@@ -8,6 +8,8 @@
 # run config's baseline_directory set to that directory). Then aou_compare.py compares the arms and LDpred2 on the same
 # held-out people ($OPS/compare.tsv, aggregates), where the driver scored the arms. A run of fit_regions has both region
 # by region.
+# Each fold's fit is kept in $OPS/ldpred2-units as it ends (participant-level held-out scores among them: they stay in
+# the workspace bucket too), so a task preempted here and started again fits only the folds it had not finished.
 set -euo pipefail
 rm -rf "$RUN/renv" && mkdir -p "$RUN/renv"
 tar -xzf "$OPS/../reference/renv.tar.gz" -C "$RUN/renv"
@@ -15,5 +17,5 @@ tar -xzf "$OPS/../reference/renv.tar.gz" -C "$RUN/renv"
 "$RUN/renv/bin/python" "$RUN/renv/bin/conda-unpack"
 cd "$RUN/source"
 PATH="$RUN/renv/bin:$PATH" "$RUN/venv/bin/python" -m benchmarks.bench_real.aou_ldpred2 --config "$OPS/run_config.json" --out "$OPS/ldpred2.jsonl" \
-  --scores "$OPS/ldpred2_held_out.npz" --baselines "$OPS/baselines"
+  --scores "$OPS/ldpred2_held_out.npz" --baselines "$OPS/baselines" --units "$OPS/ldpred2-units"
 "$RUN/venv/bin/python" -m benchmarks.bench_real.aou_compare --config "$OPS/run_config.json" --scores "$OPS/ldpred2_held_out.npz" --out "$OPS/compare.tsv"

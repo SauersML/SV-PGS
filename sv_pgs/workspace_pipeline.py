@@ -3564,9 +3564,11 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     Each completed model batch is durable in the keyed partial: a restart fills its columns from that batch before
     loading any fitted model. The exact ordered membership and output columns belong to the batch key, so a different
     memory plan cannot mistake an earlier batch number for its own models. Final calibration and held-out assembly
-    run again from these same float64 values; neither the prediction call nor its arithmetic changes."""
+    run again from these same float64 values; neither the prediction call nor its arithmetic changes. A batch's read of
+    the store is kept part way through as well (``postfit_checkpoint.batch_reads``), so a restart reads only its rest
+    and scores it to the bit; its kept reads go once the batch is committed."""
     from sv_pgs.phase_timer import timing
-    from sv_pgs.postfit_checkpoint import BatchCheckpoint
+    from sv_pgs.postfit_checkpoint import BatchCheckpoint, batch_reads, discard_reads
 
     step_key = (directory / KEY_FILE).read_text(encoding="utf-8")
     cohort = _read_cohort(run)
@@ -3604,6 +3606,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                     structural_genetic[:, part_traits] = arrays["structural_genetic"]
                     model_structural[:, part_models] = arrays["model_structural"]
                 restored_batches += 1
+                discard_reads(directory, checkpoint)
                 continue
             started = time.perf_counter()
             fitted = [_checked_trait_model(run, cohort, ARMS[scored[position][0]], scored[position][1], directories[position]) for position in batch]
@@ -3639,7 +3642,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                 continue
             try:
                 loaded = time.perf_counter()
-                prediction = run.bindings.predict(models, store, cohort.store_columns, cohort.covariates[:, 1:], budget)
+                prediction = run.bindings.predict(models, store, cohort.store_columns, cohort.covariates[:, 1:], budget, checkpoint=batch_reads(checkpoint))
                 # Production prediction checks these too; bindings must obey the same contract. A failed fused read
                 # is retried one trait at a time so one overflow cannot hide the other traits' valid predictions.
                 values_to_check = (prediction.predictive_mean, prediction.predictive_variance, prediction.linear_predictor, prediction.genetic.means)
@@ -3674,8 +3677,11 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
             with checkpoint.write() as temporary:
                 np.savez(temporary / "predictions.npz", **{name: values[:, targets] for name, values in columns.items()},
                          structural_genetic=structural_genetic[:, part_traits], model_structural=model_structural[:, part_models])
+            discard_reads(directory, checkpoint)
             # The batch's models loaded (and checked), then read from the store in one prediction, then committed.
             timing("score_batch", time.perf_counter() - started, models=len(batch), load=loaded - started, predict=predicted - loaded)
+    # A batch split after a failed read leaves that read's kept part behind.
+    discard_reads(directory)
     # Comparisons need the same trait in both arms. If one arm failed during prediction, erase the other arm's
     # already computed columns too; every downstream table uses this trait-wide quarantine.
     for trait, name in enumerate(cohort.trait_names):

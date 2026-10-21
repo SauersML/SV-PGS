@@ -515,3 +515,142 @@ def test_a_product_mixture_law_scores_to_the_dense_reference_of_its_own_draws():
     mean_score, mean_bound, variance, variance_bound = dense_reference(codes, model)
     assert_within(scores.means[:, 0], mean_score, mean_bound)
     assert_within(scores.variances[:, 0], variance, variance_bound)
+
+
+class _Preempted(RuntimeError):
+    pass
+
+
+class _StoppingCodes(InMemoryCodes):
+    """A code source the machine stops under after ``blocks`` blocks in all: the next block is never delivered."""
+
+    def __init__(self, codes: np.ndarray, blocks: int) -> None:
+        super().__init__(codes)
+        self.blocks, self.delivered = blocks, 0
+
+    def iter_code_blocks(self, variant_ranges, buffers):
+        for block in super().iter_code_blocks(variant_ranges, buffers):
+            if self.delivered == self.blocks:
+                raise _Preempted(f"preempted after {self.delivered} blocks")
+            self.delivered += 1
+            yield block
+
+
+def _kept_reads(directory):
+    """Kept reads that are due after every block, in ``directory``, as the score step keeps them."""
+    from sv_pgs.postfit_checkpoint import BatchCheckpoint, BatchReads
+
+    return BatchReads(BatchCheckpoint(directory, "step key", {"models": [0, 1]}, ("predictions.npz",)), 0.0)
+
+
+def _mixture_models(codes: np.ndarray, random_generator: np.random.Generator) -> list[ScoringModel]:
+    """Both folds' models, each drawing from a counter-based product mixture law, so a read resumed part way through
+    must carry the draws' offsets as well as their sums."""
+    from sv_pgs.draw_laws import ProductMixtureDraws
+
+    models = []
+    for fold, base in enumerate(two_fold_models(codes, random_generator)):
+        rows = base.store_rows.shape[0]
+        law = ProductMixtureDraws(
+            class_index=np.zeros(rows, dtype=np.int64), log_scale=np.full(rows, -4.0), omega=np.outer([40.0, 20.0], np.ones(rows)),
+            log_density=np.log(np.full((1, 5), 0.2)), log_variance_grid=np.linspace(-4.0, 2.0, 5),
+            shift=random_generator.normal(size=(2, rows)), weights=np.array([0.5, 0.5]), key=(3, fold), draw_count=6,
+        )
+        models.append(replace(base, posterior_draws=law, covariate_draws=np.repeat(base.alpha[:, None], 6, axis=1)))
+    return models
+
+
+def _assert_identical(actual: GeneticScores, expected: GeneticScores) -> None:
+    assert np.array_equal(actual.means, expected.means) and np.array_equal(actual.variances, expected.variances, equal_nan=True)
+    assert len(actual.draws) == len(expected.draws) and all(np.array_equal(a, b) for a, b in zip(actual.draws, expected.draws))
+
+
+@pytest.mark.parametrize("stop", [1, 4, 9])
+def test_a_read_stopped_part_way_resumes_from_its_kept_sums_to_the_bit(tmp_path, stop):
+    random_generator = np.random.default_rng(31)
+    codes = random_codes(random_generator, variant_count=120, sample_count=45)
+    plan = ScoringPlan.from_models(_mixture_models(codes, random_generator))
+    selected = np.arange(1, 45, 2)
+    budget = cpu_budget(plan, sample_count=45, block_rows=11, threads=3, selected_count=selected.shape[0])
+    expected_source = InMemoryCodes(codes)
+    expected = score_genetic(expected_source, plan, budget, selected)
+    assert expected_source.reads == [(start, stop_row) for start, stop_row, _plan in plan.read_ranges(11)] and len(expected_source.reads) > 9
+    with pytest.raises(_Preempted):
+        score_genetic(_StoppingCodes(codes, stop), plan, budget, selected, checkpoint=_kept_reads(tmp_path))
+    source = InMemoryCodes(codes)
+    resumed = score_genetic(source, plan, budget, selected, checkpoint=_kept_reads(tmp_path))
+    # Only the reads not kept are read again, and the scores are those of one uninterrupted read.
+    assert source.reads == expected_source.reads[stop:]
+    _assert_identical(resumed, expected)
+
+
+def test_a_batch_whose_read_ended_is_kept_whole_and_a_later_batch_resumes_part_way(tmp_path):
+    random_generator = np.random.default_rng(32)
+    codes = random_codes(random_generator, variant_count=120, sample_count=50)
+    plan = ScoringPlan.from_models(_mixture_models(codes, random_generator))
+    one_model = max(_batch_bytes(plan, [model], 50, 50, 1, "cpu", "keep") for model in range(plan.model_count))
+    # Room for the result and one model's read at a time: two batches, each a read of every planned row.
+    budget = replace(cpu_budget(plan, sample_count=50, block_rows=1, threads=2), host_bytes=_output_bytes(plan, 50, "keep") + one_model)
+    expected_source = InMemoryCodes(codes)
+    expected = score_genetic(expected_source, plan, budget)
+    covered = np.cumsum([stop - start for start, stop in expected_source.reads])
+    first = int(np.searchsorted(covered, plan.store_rows.shape[0])) + 1
+    assert covered[first - 1] == plan.store_rows.shape[0] and covered[-1] == 2 * plan.store_rows.shape[0]
+    # Stopped three reads into the second batch: the first batch's sums are kept whole, the second's part way.
+    with pytest.raises(_Preempted):
+        score_genetic(_StoppingCodes(codes, first + 3), plan, budget, checkpoint=_kept_reads(tmp_path))
+    source = InMemoryCodes(codes)
+    resumed = score_genetic(source, plan, budget, checkpoint=_kept_reads(tmp_path))
+    assert source.reads == expected_source.reads[first + 3 :]
+    _assert_identical(resumed, expected)
+    # Kept reads are not results: without them the batches are read again, to the same scores.
+    again = InMemoryCodes(codes)
+    _assert_identical(score_genetic(again, plan, budget, checkpoint=_kept_reads(tmp_path / "elsewhere")), expected)
+    assert again.reads == expected_source.reads
+
+
+def test_a_kept_read_of_other_models_or_draws_or_cut_wider_than_this_machine_holds_is_read_again(tmp_path):
+    random_generator = np.random.default_rng(33)
+    codes = random_codes(random_generator, variant_count=120, sample_count=40)
+    models = two_fold_models(codes, random_generator, draw_count=3)
+    plan = ScoringPlan.from_models(models)
+    budget = cpu_budget(plan, sample_count=40, block_rows=13, threads=2)
+    with pytest.raises(_Preempted):
+        score_genetic(_StoppingCodes(codes, 4), plan, budget, checkpoint=_kept_reads(tmp_path))
+    # Less memory: blocks of 13 rows no longer fit, so the read starts again in blocks that do.
+    narrow = cpu_budget(plan, sample_count=40, block_rows=8, threads=2)
+    source = InMemoryCodes(codes)
+    _assert_identical(score_genetic(source, plan, narrow, checkpoint=_kept_reads(tmp_path)), score_genetic(InMemoryCodes(codes), plan, narrow))
+    assert sum(stop - start for start, stop in source.reads) == plan.store_rows.shape[0]
+    # A model fitted again (other coefficients) is another read: nothing kept for the first applies to it.
+    with pytest.raises(_Preempted):
+        score_genetic(_StoppingCodes(codes, 4), plan, budget, checkpoint=_kept_reads(tmp_path / "refit"))
+    refit = ScoringPlan.from_models([replace(models[0], coefficients=models[0].coefficients * 2.0), models[1]])
+    source = InMemoryCodes(codes)
+    _assert_identical(score_genetic(source, refit, budget, checkpoint=_kept_reads(tmp_path / "refit")), score_genetic(InMemoryCodes(codes), refit, budget))
+    assert sum(stop - start for start, stop in source.reads) == plan.store_rows.shape[0]
+    # So is one whose draws differ under the same posterior mean: the kept sums hold the other draws' scores.
+    with pytest.raises(_Preempted):
+        score_genetic(_StoppingCodes(codes, 4), plan, budget, checkpoint=_kept_reads(tmp_path / "redrawn"))
+    redrawn = ScoringPlan.from_models([replace(models[0], posterior_draws=np.asarray(models[0].posterior_draws) * 2.0), models[1]])
+    source = InMemoryCodes(codes)
+    _assert_identical(score_genetic(source, redrawn, budget, checkpoint=_kept_reads(tmp_path / "redrawn")), score_genetic(InMemoryCodes(codes), redrawn, budget))
+    assert sum(stop - start for start, stop in source.reads) == plan.store_rows.shape[0]
+
+
+@pytest.mark.skipif(_try_import_cupy() is None, reason="needs a CUDA device")
+def test_a_cuda_read_stopped_part_way_resumes_with_each_device_s_own_sums_to_the_bit(tmp_path):
+    random_generator = np.random.default_rng(34)
+    codes = random_codes(random_generator, variant_count=500, sample_count=300)
+    plan = ScoringPlan.from_models(_mixture_models(codes, random_generator))
+    budget = detect_compute_budget()
+    assert budget.device_kind == "cuda"
+    budget = replace(budget, host_bytes=_host_bytes(plan, 300, 300, 64, "cuda"))
+    expected_source = InMemoryCodes(codes)
+    expected = score_genetic(expected_source, plan, budget)
+    assert len(expected_source.reads) > 3
+    with pytest.raises(_Preempted):
+        score_genetic(_StoppingCodes(codes, 3), plan, budget, checkpoint=_kept_reads(tmp_path))
+    source = InMemoryCodes(codes)
+    _assert_identical(score_genetic(source, plan, budget, checkpoint=_kept_reads(tmp_path)), expected)
+    assert source.reads == expected_source.reads[3:]

@@ -521,9 +521,9 @@ class _StoreBlocks:
         yield from self.store.iter_codes(variant_ranges, None, self.budget)
 
 
-def _predict(models: list[_Fitted], store: DosageStore, sample_indices, covariates, budget):
+def _predict(models: list[_Fitted], store: DosageStore, sample_indices, covariates, budget, checkpoint=None):
     scorings = tuple(scoring for model in models for scoring in model.scoring)
-    genetic = score_genetic(_StoreBlocks(store, budget), ScoringPlan.from_models(scorings), budget, np.asarray(sample_indices))
+    genetic = score_genetic(_StoreBlocks(store, budget), ScoringPlan.from_models(scorings), budget, np.asarray(sample_indices), checkpoint=checkpoint)
     linear = score_linear_predictor(genetic.means, covariates, scorings)
     mean = linear.copy()
     for index, scoring in enumerate(scorings):
@@ -1858,6 +1858,57 @@ def test_postfit_checkpoint_code_is_keyed_only_after_the_fit() -> None:
     assert postfit_checkpoint not in workspace_pipeline.module_closure(workspace_pipeline.fit_model)
 
 
+def test_a_score_read_stopped_part_way_resumes_from_its_mirrored_kept_read_to_the_same_outputs(workspace, monkeypatch, tmp_path) -> None:
+    """A batch's one read of the store, the score step's longest piece of work, survives the loss of the VM part way
+    through: the restarted read starts where the mirrored kept read ends, and the scores, held-out tables and report
+    are those of an uninterrupted pass. The completed step keeps no kept read."""
+    from sv_pgs import fast_scoring, postfit_checkpoint
+    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "calibration_fraction": .3, "annotated_prior": False})
+    bindings = _bindings(_Recorder(), client)
+    # Reads of a few rows, so the synthetic store's read has blocks to stop between.
+    batches = fast_scoring._batches
+    monkeypatch.setattr(fast_scoring, "_batches", lambda *args: [(batch, min(rows, 2)) for batch, rows in batches(*args)])
+    run_pipeline(config, bindings, BUDGET, through="fit")
+    blocks = _StoreBlocks.iter_code_blocks
+    read: list[tuple[int, int]] = []
+
+    def reading(self, variant_ranges, buffers, stop=None):
+        for start, stop_row, codes in blocks(self, variant_ranges, buffers):
+            if len(read) == stop:
+                raise RuntimeError("preempted read")
+            read.append((start, stop_row))
+            yield start, stop_row, codes
+
+    monkeypatch.setattr(_StoreBlocks, "iter_code_blocks", reading)
+    run_pipeline(config, bindings, BUDGET, through="report")
+    run = config.run_directory
+    expected, report, whole = _postfit_outputs(run / "score"), _postfit_outputs(run / "report"), list(read)
+    assert len(whole) > 6
+    for name in STEP_NAMES[STEP_NAMES.index("score"):]:
+        if (run / name).exists():
+            shutil.rmtree(run / name)
+    monkeypatch.setenv(postfit_checkpoint.READ_SECONDS, "0")
+    read.clear()
+    monkeypatch.setattr(_StoreBlocks, "iter_code_blocks", lambda self, ranges, buffers: reading(self, ranges, buffers, stop=5))
+    with pytest.raises(RuntimeError, match="preempted read"):
+        run_pipeline(config, bindings, BUDGET, through="score")
+    assert list((run / "score.partial" / "batches").glob(f"*{postfit_checkpoint.READS}*/complete.json"))
+    remote = DirectoryRemote(tmp_path / "score-mirror")
+    push(run, remote)
+    shutil.rmtree(run)
+    restore(run, remote)
+    read.clear()
+    monkeypatch.setattr(_StoreBlocks, "iter_code_blocks", reading)
+    run_pipeline(config, bindings, BUDGET, through="report")
+    assert read == whole[5:]
+    _assert_postfit_outputs(run / "score", expected)
+    _assert_postfit_outputs(run / "report", report)
+    assert not [path for path in (run / "score" / "batches").iterdir() if postfit_checkpoint.READS in path.name]
+
+
 def _artifact_bindings(recorder: _Recorder, client: _FakeBigQuery, *, flagged: str | None = None) -> WorkspaceBindings:
     """The synthetic fitter with production artifacts and prediction, so a dry run crosses the actual saved-model
     boundary. The certificate can miss convergence or refuse a model; the scorer's numerical parameters stay finite.
@@ -2010,9 +2061,9 @@ def test_nonfinite_predictions_quarantine_both_arms_and_finish_the_remaining_tab
     bindings = _bindings(_Recorder(), client)
     calls = []
 
-    def predict(models, store, sample_indices, covariates, budget):
+    def predict(models, store, sample_indices, covariates, budget, checkpoint=None):
         calls.append(tuple(name for model in models for name in model.model_names))
-        prediction = _predict(models, store, sample_indices, covariates, budget)
+        prediction = _predict(models, store, sample_indices, covariates, budget, checkpoint)
         for index, name in enumerate(calls[-1]):
             if all_traits or name.startswith(config.diseases[0] + "/"):
                 prediction.linear_predictor[:, index] = np.nan
@@ -2114,7 +2165,7 @@ def test_an_entirely_unscorable_fit_finishes_with_only_quarantine_rows(workspace
         model.refusals = tuple(f"model {index}: the fit failed: synthetic refusal" for index in range(len(model.model_names)))
         return model
 
-    def unexpected_prediction(*args):
+    def unexpected_prediction(*args, **kwargs):
         pytest.fail("no quarantined trait is passed to prediction")
 
     summary = run_pipeline(config, dataclasses.replace(bindings, fit=fit, predict=unexpected_prediction), BUDGET)

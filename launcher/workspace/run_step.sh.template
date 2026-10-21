@@ -124,6 +124,13 @@ restore_started=$SECONDS
 # of a pass over its bytes (sv_pgs/content_identity.py), which for the imputed and GATK-SV call sets is terabytes a start.
 # IMPUTED_BUCKET holds the imputed batches and their strata sidecar, PANEL_BUCKET the panel's bubble.split sites.
 export SVPGS_GCS_MOUNTS='{"/mnt/disks/ops": "gs://${OPS_BUCKET}", "/mnt/disks/cdr": "gs://${CDR_BUCKET}", "/mnt/disks/imputed": "gs://${IMPUTED_BUCKET}", "/mnt/disks/panel": "gs://${PANEL_BUCKET}"}'
+# The restore hashes each file's bytes as it writes them and keeps the digests here, on this job's own disk
+# (sv_pgs/content_identity.py): the fit's digest of the store it restored then reads none of its 547 GB again.
+export SVPGS_RESTORED_DIGESTS="$RUN/restored-digests"
+# A score batch's read of the store (tens of minutes to over an hour for the whole genome) is kept this often, each
+# time its partial sums (a trait's models and structural parts x 65 columns x its people x 8 bytes a device, ~0.1 GB
+# est.) that the pusher sends on (sv_pgs/postfit_checkpoint.py): a preemption loses at most this and one push.
+export SVPGS_SCORE_READ_CHECKPOINT_SECONDS=300
 mkdir -p "$TMPDIR"
 # Batch cannot write to an existing disk, so this job's disk is new and the run lives in the workspace bucket
 # (sv_pgs/run_mirror.py): restored before the driver starts, pushed every 15 minutes while it runs (each push sends
