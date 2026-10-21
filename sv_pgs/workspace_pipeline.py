@@ -4248,15 +4248,18 @@ PRIOR_REFERENCE_CLASS = VariantClass.SNV.value
 """The class every prior and posterior enrichment is relative to: SNVs, the class every arm fits."""
 PRIOR_BY_LENGTH_COLUMNS = (
     "trait", "arm", "variant_class", "length_bin", "variants", "prior_variance", "prior_variance_geometric", "prior_expected_absolute_effect",
-    "prior_enrichment", "posterior_second_moment", "posterior_enrichment",
+    "prior_enrichment", "posterior_second_moment", "posterior_enrichment", "posterior_enrichment_standard_error", "posterior_enrichment_ci_low",
+    "posterior_enrichment_ci_high", "jackknife_blocks",
 )
 """``prior_by_length.tsv``: the learned prior by (trait, arm, class, length bin), read from the fitted model
 (``prior_moments``), as means over the bin's fitted records: the prior variance of a record's effect on its standardized
 genotype (its expected share of the trait's variance before the data, LD aside), its geometric mean, the prior's
 expected |effect| per unit (one allele, or one copy), the prior variance relative to the SNVs' mean
 (PRIOR_REFERENCE_CLASS), and the posterior second moment E[beta^2 | data] of the standardized effect and its enrichment
-on the same reference. Each mean is over the bin's records with every other annotation (frequency, gene context) as the
-genome has it, so a bin is the prior an SV of that class and length gets in this fit, not a length effect alone."""
+on the same reference, with that enrichment's delete-one-block jackknife standard error and normal interval
+(``jackknife_ratio``, as in ``prior_enrichment.tsv``). Each mean is over the bin's records with every other annotation
+(frequency, gene context) as the genome has it, so a bin is the prior an SV of that class and length gets in this fit,
+not a length effect alone. The prior columns have no interval, as in ``prior_enrichment.tsv``."""
 PRIOR_ENRICHMENT_COLUMNS = (
     "trait", "arm", "variant_class", "variants", "prior_variance", "prior_enrichment", "prior_share", "posterior_second_moment",
     "posterior_enrichment", "posterior_enrichment_standard_error", "posterior_enrichment_ci_low", "posterior_enrichment_ci_high",
@@ -4271,9 +4274,13 @@ E[beta^2 | data] on standardized genotypes over every fitted record's, each reco
 records aside) with its jackknife interval, its share of the fitted records, and their ratio, the heritability
 enrichment of LD score regression's partitioning (Finucane et al. 2015, Nat Genet 47:1228) read from the posterior,
 with its jackknife interval. A structural class's row is its structural records (COMMUNITY_SV_MINIMUM_LENGTH and
-longer), as every structural record together is; its shorter records are in the length table's SHORT_RECORDS bin. The
-prior's enrichment has no interval: the empirical Bayes keeps point hyperparameters, so the fit holds no uncertainty
-about them."""
+longer), as every structural record together is; its shorter records are in the length table's SHORT_RECORDS bin.
+
+The prior columns have no interval. The empirical Bayes keeps one point estimate of the hyperparameters (x, rho), and
+the saved model holds nothing about their uncertainty. A Laplace interval would need the total curvature B + S at the
+fit's final state (``scale_mixture_ep``) and every record's annotation design, and the fit saves neither. The
+jackknife over records does not apply: it would measure how the class mean moves with the records in it, not how the
+fitted hyperparameters move with the data."""
 JACKKNIFE_BLOCKS = 200
 """The posterior enrichment's jackknife blocks: contiguous runs of the fitted records in store (genome) order, as LD
 score regression's 200-block jackknife (Bulik-Sullivan et al. 2015, Nat Genet 47:291), each long against LD."""
@@ -4294,8 +4301,9 @@ def prior_moments(scoring: Any, unit: F64Array) -> PriorMoments | None:
     law holds each member's log u_j = o_j + d_j' theta (its unit offset and every annotation smooth at the fitted
     coefficients) and its class's lattice masses log pi_ck on the nodes t_k (``draw_laws.ProductMixtureDraws``), so the
     prior beta_j ~ sum_k pi_ck N(0, u_j e^t_k) has variance u_j sum_k pi_ck e^t_k and expected |beta_j|
-    sqrt(2 / pi) sqrt(u_j) sum_k pi_ck e^(t_k / 2), per unit times ``unit``. None for a law that does not hold the prior
-    (dense draws, the full-data and small-n routes)."""
+    sqrt(2 / pi) sqrt(u_j) sum_k pi_ck e^(t_k / 2), per unit times ``unit``. The full-data fit's default (mean-field)
+    inference saves that law, so a model from ``fit_model.fit`` with any record holds its prior. None for dense draws,
+    which hold no prior: the full-data fit's EP inference and ``small_n``'s fit."""
     law = scoring.posterior_draws
     if not hasattr(law, "log_density"):
         return None
@@ -4411,7 +4419,12 @@ def effect_summaries(
     reference_shown = bool(reference.any()) and PRIOR_REFERENCE_CLASS not in hidden_short
     with np.errstate(divide="ignore", invalid="ignore"):
         prior_reference = float(prior.variance[reference].mean()) if reference_shown else float("nan")
-        posterior_reference = float(second[reference].mean()) if reference_shown else float("nan")
+    quantile = stats.norm.ppf((1.0 + CONFIDENCE_LEVEL) / 2.0)
+    every = np.ones(classes.shape[0], dtype=bool)
+
+    def interval(estimate: float, standard_error: float) -> tuple[str, str]:
+        return _number(estimate - quantile * standard_error), _number(estimate + quantile * standard_error)
+
     length_blanks = ("",) * (len(PRIOR_BY_LENGTH_COLUMNS) - PRIOR_BY_LENGTH_COLUMNS.index("prior_variance"))
     for name, level in pairs:
         member = (classes == name) & (bins == level)
@@ -4419,17 +4432,12 @@ def effect_summaries(
             lines["prior_by_length.tsv"].append((trait, arm, name, level, _hidden_records(int(member.sum())), *length_blanks))
             continue
         variance = prior.variance[member]
+        enrichment, standard_error, blocks = jackknife_ratio(second, member, reference, JACKKNIFE_BLOCKS) if reference_shown else (np.nan, np.nan, 0)
         lines["prior_by_length.tsv"].append((
             trait, arm, name, level, int(member.sum()), _number(variance.mean()), _number(np.exp(np.mean(np.log(variance)))),
             _number(prior.absolute_effect[member].mean()), _number(variance.mean() / prior_reference), _number(second[member].mean()),
-            _number(second[member].mean() / posterior_reference),
+            _number(enrichment), _number(standard_error), *interval(enrichment, standard_error), blocks,
         ))
-    quantile = stats.norm.ppf((1.0 + CONFIDENCE_LEVEL) / 2.0)
-    every = np.ones(classes.shape[0], dtype=bool)
-
-    def interval(estimate: float, standard_error: float) -> tuple[str, str]:
-        return _number(estimate - quantile * standard_error), _number(estimate + quantile * standard_error)
-
     class_blanks = ("",) * (len(PRIOR_ENRICHMENT_COLUMNS) - PRIOR_ENRICHMENT_COLUMNS.index("prior_variance"))
     for name in [*sorted(set(classes.tolist())), *(["all_structural"] if structural.any() else [])]:
         if name == "all_structural":
@@ -4656,7 +4664,7 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
     return {
         "files": exportable, "not_exportable": refused,
         "variant_tables": f"{len(ARMS) * len(reported)} per-record effect tables, kept in the workspace",
-        "prior": f"the learned prior read from {priors} of {len(ARMS) * len(reported)} models' draw laws (mean-field models hold it; others have none)",
+        "prior": f"the learned prior read from {priors} of {len(ARMS) * len(reported)} models' draw laws (the full-data fit's mean-field law holds it; a dense law has none)",
     }
 
 

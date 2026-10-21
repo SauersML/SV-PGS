@@ -2758,6 +2758,13 @@ def test_effect_summaries_give_the_prior_by_class_and_length_and_hide_what_would
     short = (classes == "deletion") & (lengths < 50.0)
     assert float(by_length["deletion", "<50"]["prior_variance"]) == pytest.approx(prior.variance[short].mean(), rel=1e-5)
     assert float(by_length["deletion", "<50"]["prior_expected_absolute_effect"]) == pytest.approx(prior.absolute_effect[short].mean(), rel=1e-5)
+    # A bin's posterior enrichment carries the class table's jackknife interval, from the same blocks.
+    deletions = by_length["deletion", "<50"]
+    assert float(deletions["posterior_enrichment"]) == pytest.approx(second[short].mean() / second[snv].mean(), rel=1e-5)
+    estimate, standard_error, blocks = workspace_pipeline.jackknife_ratio(second, short, snv, workspace_pipeline.JACKKNIFE_BLOCKS)
+    assert float(deletions["posterior_enrichment_standard_error"]) == pytest.approx(standard_error, rel=1e-5) and standard_error > 0.0
+    assert float(deletions["posterior_enrichment_ci_low"]) < estimate < float(deletions["posterior_enrichment_ci_high"])
+    assert deletions["jackknife_blocks"] == blocks == workspace_pipeline.JACKKNIFE_BLOCKS
     assert by_length["deletion", "50-499"]["variants"] == "suppressed" and by_length["deletion", "50-499"]["prior_variance"] == ""
 
     # Every table passes the export check; without a prior there are no prior lines.
