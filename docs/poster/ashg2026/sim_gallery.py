@@ -118,11 +118,11 @@ GROUPS = (
     ("Trait", ("sparse_sv", "polygenic_sv", "low_heritability", "rare_disease")),
 )
 ARCHITECTURES = (
-    "Unless named, an architecture has liability h² = 0.1, prevalence 10%, 200 causal variants and 20% causal SVs; "
+    "Unless named, an architecture has liability h² = 0.1, prevalence 10%, 200 causal variants and 20% causal SVs, with "
+    "SV effects drawn from the same distribution as small-variant effects; "
     "'3× SV effect' triples the SV effect SD, 'well-imputed' draws causal SVs only from those Beagle imputes with "
     "r² ≥ 0.8 and 'common' only from SVs of frequency ≥ 5%."
 )
-POINT_UNIT = "Differences are in AUC × 100 (one unit is 0.01 AUC)."
 
 
 def shade(color: str, amount: float) -> tuple:
@@ -176,7 +176,7 @@ def cells(rows: list[dict]) -> dict[tuple[str, int], list[dict]]:
 
 
 def finite(rows: list[dict], key: str) -> list[float]:
-    return [100 * row[key] for row in rows if row.get(key) is not None and math.isfinite(row[key])]
+    return [row[key] for row in rows if row.get(key) is not None and math.isfinite(row[key])]
 
 
 def layout(present) -> list[tuple[str, str]]:
@@ -233,9 +233,9 @@ def accuracy_figure(grids, summary):
             va="top", ha="left", linespacing=1.0)
     counts = {}
     for key, method, color in (("with_sv_auc", "SV-PGS", BLUE), ("ldpred2_auc", "LDpred2-auto", VERMILLION)):
-        pooled = [interval([100 * row[key] for point, _, _ in SV_SHARES for row in grouped.get((point, size), [])])
+        pooled = [interval([row[key] for point, _, _ in SV_SHARES for row in grouped.get((point, size), [])])
                   for size in SIZES]
-        mean, low, high = (np.array([cell[i] for cell in pooled]) / 100 for i in range(3))
+        mean, low, high = (np.array([cell[i] for cell in pooled]) for i in range(3))
         counts[method] = [cell[3] for cell in pooled]
         ax.fill_between(SIZES, low, high, color=color, alpha=0.18, linewidth=0, zorder=1)
         ax.plot(SIZES, mean, color=color, linewidth=3, zorder=3, marker="o", markersize=5.8,
@@ -259,10 +259,10 @@ def accuracy_figure(grids, summary):
                    linewidth=1.8, zorder=2)
         gap.plot(xs, means, color=color, linewidth=1.8, marker="o", markersize=5.8, markeredgecolor="white",
                  markeredgewidth=0.8, zorder=3, label=share)
-    gap.set_ylim(-0.5, 7.5)
-    gap.set_yticks(range(0, 8, 2))
+    gap.set_ylim(-0.005, 0.075)
+    gap.set_yticks(np.arange(0, 0.061, 0.02))
     gap.set_xlabel("Training sample size")
-    gap.set_ylabel("AUC × 100, SV-PGS − LDpred2-auto")
+    gap.set_ylabel("ΔAUC, SV-PGS − LDpred2-auto")
     gap.legend(title="Causal variants that are SVs", loc="upper left", ncol=3, handlelength=1.2, columnspacing=1.0,
                handletextpad=0.4, title_fontsize=11, fontsize=11, alignment="left", borderaxespad=0.1)
     letter(gap, "b", x=-0.27)
@@ -278,7 +278,7 @@ def accuracy_figure(grids, summary):
         "(Daetwyler et al. 2008; Wray et al. 2010); dotted: the AUC of the true genetic value. b, The paired "
         "difference in AUC between the methods on the same held-out people for each setting separately, mean and "
         "Student-t 95% interval over its replicates; the three overlap at every size, which is why a pools them. "
-        f"{POINT_UNIT} bench-sim v7 cohort from 1000 Genomes haplotypes, Beagle-imputed SVs; fitted on MSI."
+        f"bench-sim v7 cohort from 1000 Genomes haplotypes, Beagle-imputed SVs; fitted on MSI."
     )
     return fig, caption
 
@@ -310,15 +310,15 @@ def ldpred2_figure(grids):
     ax.text(1.02, -1.0, "n", transform=matplotlib.transforms.blended_transform_factory(ax.transAxes, ax.transData),
             ha="left", va="center", color=GREY, fontstyle="italic")
     row_labels(ax, rows, -0.78)
-    ax.set_xlim(-1.5, 12)
-    ax.set_xticks(range(0, 13, 4))
-    ax.set_xlabel("AUC × 100, SV-PGS − LDpred2-auto")
+    ax.set_xlim(-0.015, 0.12)
+    ax.set_xticks(np.arange(0, 0.121, 0.04))
+    ax.set_xlabel("ΔAUC, SV-PGS − LDpred2-auto")
     caption = (
         f"Figure 2 | SV-PGS is more accurate than LDpred2-auto across simulated genetic architectures. Paired "
         f"difference in test AUC on the same 10,000 held-out people between SV-PGS (every SNV, indel and imputed SV) "
         f"and LDpred2-auto (HapMap3-density SNVs), both trained on the same {size:,} people: replicates (grey), mean "
         f"and Student-t 95% interval (blue); n replicates at right. SV-PGS had the higher AUC in {wins} of {total} "
-        f"replicates. {ARCHITECTURES} {POINT_UNIT} Not yet replicated three times at {size:,}: "
+        f"replicates. {ARCHITECTURES} Not yet replicated three times at {size:,}: "
         f"{', '.join(missing).lower()}."
     )
     return fig, caption
@@ -353,7 +353,7 @@ def sv_gain_figure(grids):
         clear += interval(true[point])[1] > 0
     ax.text(1.055, -1.0, "n", transform=place, ha="center", va="center", color=GREY, fontstyle="italic")
     row_labels(ax, rows, -0.75)
-    ax.set_xlabel("AUC × 100, SV-PGS with SVs − SV-PGS without SVs")
+    ax.set_xlabel("ΔAUC, SV-PGS with SVs − SV-PGS without SVs")
     handles = [
         Line2D([0], [0], marker="o", color=BLUE, markeredgecolor="white", markeredgewidth=0.8, markersize=7.8,
                linewidth=2.2, label="True SV genotypes"),
@@ -368,7 +368,7 @@ def sv_gain_figure(grids):
         "chromosome 22 window (60,000 records). Means with Student-t 95% intervals over replicates, training sizes "
         f"5,000-40,000 pooled; n replicates at right (true, imputed). The true-genotype interval lies above zero for {clear} of "
         f"{shown} architectures. Same simulated people, truth and fits; only the SV genotypes differ. "
-        f"{ARCHITECTURES} {POINT_UNIT}"
+        f"{ARCHITECTURES}"
     )
     return fig, caption
 
@@ -387,7 +387,7 @@ def heatmap_figure(grids):
     rows = layout(lambda point: True)
     clear_values = [abs(mean) for table in summaries.values() for mean, low, high, n in table.values()
                     if n >= 2 and (low > 0 or high < 0)]
-    limit = max(0.5, math.ceil(10 * max(clear_values, default=0.5)) / 10)
+    limit = max(0.005, math.ceil(1000 * max(clear_values, default=0.005)) / 1000)
     norm = matplotlib.colors.Normalize(-limit, limit)
     cmap = LinearSegmentedColormap.from_list("gain", [VERMILLION, "#FFFFFF", BLUE])
     fig, axes = plt.subplots(1, 2, figsize=(200 * MM, 168 * MM), sharey=True)
@@ -408,7 +408,7 @@ def heatmap_figure(grids):
                 # an interval that covers zero is drawn pale, so colour carries only what the replicates support
                 colours[i, j] = rgb if clear else rgb + (1 - rgb) * 0.75
                 dark = colours[i, j] @ np.array([0.299, 0.587, 0.114]) < 0.55
-                ax.text(j, i, signed(mean, 2), ha="center", va="center", fontsize=11,
+                ax.text(j, i, "<0.001" if clear and abs(mean) < 0.0005 else signed(mean, 3), ha="center", va="center", fontsize=11,
                         color="white" if dark else (INK if clear else GREY),
                         fontweight="bold" if clear else "normal")
         ax.imshow(colours, aspect="auto", interpolation="nearest")
@@ -429,9 +429,8 @@ def heatmap_figure(grids):
         "Figure 4 | The gain from adding SVs by architecture and training size. Mean paired difference in test AUC on "
         "the same held-out people between SV-PGS fitted with and without SVs on one chromosome 22 window, with SVs "
         "measured by their true genotypes (a) or imputed (b). Bold on full colour: the Student-t 95% interval over "
-        f"replicates excludes zero; grey on pale colour: it does not. Colour saturates at ±{limit:.1f}. Dashes: fewer "
-        f"than two replicates. 40,000-person window fits are not yet replicated and are left out. {ARCHITECTURES} "
-        f"{POINT_UNIT}"
+        f"replicates excludes zero ('<0.001': a gain below 0.001 whose interval excludes zero); grey on pale colour: it does not. Colour saturates at ±{limit:.3f}. Dashes: fewer "
+        f"than two replicates. 40,000-person window fits are not yet replicated and are left out. {ARCHITECTURES}"
     )
     return fig, caption
 
