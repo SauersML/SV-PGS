@@ -6,7 +6,7 @@ window-truth), and from simulation_summary.json for the analytic expected AUC an
 
     uv run --with matplotlib python docs/poster/ashg2026/sim_gallery.py [output directory]
 
-Figures are sized in millimetres for print (single column 89 mm, double 183 mm) with 7.5-8 pt type. Each is written as a
+Figures are sized in millimetres for print (single column 89 mm, double 183 mm) with 11-12.5 pt type. Each is written as a
 vector PDF and a 600 dpi PNG; gallery.pdf holds every figure on its own page above its legend.
 """
 from __future__ import annotations
@@ -55,32 +55,32 @@ def _font() -> str:
 
 plt.rcParams.update({
     "font.family": _font(),
-    "font.size": 7.5,
-    "axes.labelsize": 8,
-    "axes.titlesize": 8,
-    "xtick.labelsize": 7.5,
-    "ytick.labelsize": 7.5,
-    "legend.fontsize": 7.5,
-    "axes.linewidth": 0.6,
+    "font.size": 11.5,
+    "axes.labelsize": 12.5,
+    "axes.titlesize": 12.5,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "legend.fontsize": 11,
+    "axes.linewidth": 1.2,
     "axes.edgecolor": INK,
     "axes.labelcolor": INK,
     "axes.spines.top": False,
     "axes.spines.right": False,
-    "axes.labelpad": 3,
-    "xtick.major.width": 0.6,
-    "ytick.major.width": 0.6,
+    "axes.labelpad": 5,
+    "xtick.major.width": 1.2,
+    "ytick.major.width": 1.2,
     "xtick.minor.width": 0.4,
     "ytick.minor.width": 0.4,
-    "xtick.major.size": 2.5,
-    "ytick.major.size": 2.5,
+    "xtick.major.size": 4.5,
+    "ytick.major.size": 4.5,
     "xtick.minor.size": 1.5,
     "ytick.minor.size": 1.5,
     "xtick.direction": "out",
     "ytick.direction": "out",
     "xtick.color": INK,
     "ytick.color": INK,
-    "lines.linewidth": 1.0,
-    "lines.markersize": 3.5,
+    "lines.linewidth": 2.0,
+    "lines.markersize": 6,
     "legend.frameon": False,
     "legend.handlelength": 1.6,
     "legend.borderaxespad": 0.2,
@@ -156,7 +156,7 @@ def interval(values) -> tuple[float, float, float, int]:
 
 
 def letter(ax, text: str, x: float = -0.16, y: float = 1.04) -> None:
-    ax.text(x, y, text, transform=ax.transAxes, ha="left", va="bottom", fontsize=9, fontweight="bold")
+    ax.text(x, y, text, transform=ax.transAxes, ha="left", va="bottom", fontsize=14, fontweight="bold")
 
 
 def load_results() -> dict[str, list[dict]]:
@@ -221,15 +221,15 @@ def accuracy_figure(grids, summary):
     """(a) Test AUC against training size per method, pooled over 0%, 5% and 20% causal SVs; (b) the paired gap between
     the methods for each share of causal SVs, which shows the pooling hides nothing."""
     grouped = cells(grids["grid"])
-    fig, (ax, gap) = plt.subplots(1, 2, figsize=(170 * MM, 68 * MM), gridspec_kw={"width_ratios": [1.25, 1.0]})
-    fig.subplots_adjust(left=0.075, right=0.985, top=0.93, bottom=0.17, wspace=0.62)
+    fig, (ax, gap) = plt.subplots(1, 2, figsize=(200 * MM, 86 * MM), gridspec_kw={"width_ratios": [1.25, 1.0]})
+    fig.subplots_adjust(left=0.095, right=0.985, top=0.90, bottom=0.17, wspace=0.62)
     log_size_axis(ax)
     expected = summary["points"]["null"]["expected_auc"]
     ceiling = summary["points"]["null"]["true_value_auc"]
-    ax.axhline(ceiling, color=GREY, linestyle=(0, (1, 1.5)), linewidth=0.8, zorder=4)
-    ax.text(SIZES[0] / 1.3 * 1.04, ceiling + 0.002, "True genetic value", color=GREY, fontsize=7, va="bottom")
-    ax.plot(SIZES, [expected[str(size)] for size in SIZES], color=GREY, linestyle=(0, (4, 2)), linewidth=0.8, zorder=4)
-    ax.text(SIZES[-1] * 1.12, expected[str(SIZES[-1])] - 0.001, "Expected\n(theory)", color=GREY, fontsize=7,
+    ax.axhline(ceiling, color=GREY, linestyle=(0, (1, 1.5)), linewidth=1.6, zorder=4)
+    ax.text(SIZES[0] / 1.3 * 1.04, ceiling + 0.002, "True genetic value", color=GREY, fontsize=11, va="bottom")
+    ax.plot(SIZES, [expected[str(size)] for size in SIZES], color=GREY, linestyle=(0, (4, 2)), linewidth=1.6, zorder=4)
+    ax.text(SIZES[-1] * 1.12, expected[str(SIZES[-1])] - 0.001, "Expected\n(theory)", color=GREY, fontsize=11,
             va="top", ha="left", linespacing=1.0)
     counts = {}
     for key, method, color in (("with_sv_auc", "SV-PGS", BLUE), ("ldpred2_auc", "LDpred2-auto", VERMILLION)):
@@ -238,9 +238,9 @@ def accuracy_figure(grids, summary):
         mean, low, high = (np.array([cell[i] for cell in pooled]) / 100 for i in range(3))
         counts[method] = [cell[3] for cell in pooled]
         ax.fill_between(SIZES, low, high, color=color, alpha=0.18, linewidth=0, zorder=1)
-        ax.plot(SIZES, mean, color=color, linewidth=1.5, zorder=3, marker="o", markersize=3.4,
-                markeredgecolor="white", markeredgewidth=0.5)
-        ax.text(SIZES[-1] * 1.12, mean[-1], method, color=color, fontsize=8, fontweight="bold", va="center",
+        ax.plot(SIZES, mean, color=color, linewidth=3, zorder=3, marker="o", markersize=5.8,
+                markeredgecolor="white", markeredgewidth=0.8)
+        ax.text(SIZES[-1] * 1.12, mean[-1], method, color=color, fontsize=12.5, fontweight="bold", va="center",
                 ha="left")
     ax.set_ylim(0.52, 0.68)
     ax.set_yticks(np.arange(0.52, 0.681, 0.04))
@@ -249,22 +249,22 @@ def accuracy_figure(grids, summary):
     letter(ax, "a", x=-0.2)
 
     log_size_axis(gap)
-    gap.axhline(0, color=INK, linewidth=0.6, zorder=1)
+    gap.axhline(0, color=INK, linewidth=1.2, zorder=1)
     for index, (point, share, color) in enumerate(SV_SHARES):
         nudge = 2 ** (0.09 * (index - 1))
         stats_by_size = [interval(finite(grouped.get((point, size), []), "delta_auc_vs_ldpred2")) for size in SIZES]
         xs = [size * nudge for size in SIZES]
         means = [cell[0] for cell in stats_by_size]
         gap.vlines(xs, [cell[1] for cell in stats_by_size], [cell[2] for cell in stats_by_size], color=color,
-                   linewidth=0.9, zorder=2)
-        gap.plot(xs, means, color=color, linewidth=0.9, marker="o", markersize=3.4, markeredgecolor="white",
-                 markeredgewidth=0.5, zorder=3, label=share)
+                   linewidth=1.8, zorder=2)
+        gap.plot(xs, means, color=color, linewidth=1.8, marker="o", markersize=5.8, markeredgecolor="white",
+                 markeredgewidth=0.8, zorder=3, label=share)
     gap.set_ylim(-0.5, 7.5)
     gap.set_yticks(range(0, 8, 2))
     gap.set_xlabel("Training sample size")
     gap.set_ylabel("AUC × 100, SV-PGS − LDpred2-auto")
     gap.legend(title="Causal variants that are SVs", loc="upper left", ncol=3, handlelength=1.2, columnspacing=1.0,
-               handletextpad=0.4, title_fontsize=7, fontsize=7, alignment="left", borderaxespad=0.1)
+               handletextpad=0.4, title_fontsize=11, fontsize=11, alignment="left", borderaxespad=0.1)
     letter(gap, "b", x=-0.27)
     caption = (
         "Figure 1 | SV-PGS gains accuracy faster than LDpred2-auto as the training sample grows, by the same margin "
@@ -292,17 +292,17 @@ def ldpred2_figure(grids):
     values = {point: finite(grouped.get((point, size), []), "delta_auc_vs_ldpred2") for point in LABELS}
     rows = layout(lambda point: len(values[point]) >= 3)
     missing = [LABELS[point] for point in LABELS if len(values[point]) < 3]
-    fig, ax = plt.subplots(figsize=(120 * MM, 104 * MM))
+    fig, ax = plt.subplots(figsize=(165 * MM, 140 * MM))
     fig.subplots_adjust(left=0.43, right=0.93, top=0.95, bottom=0.11)
-    ax.axvline(0, color=INK, linewidth=0.6, zorder=1)
+    ax.axvline(0, color=INK, linewidth=1.2, zorder=1)
     wins = total = 0
     for y, (kind, point) in enumerate(rows):
         if kind != "point":
             continue
         mean, low, high, n = interval(values[point])
-        ax.scatter(values[point], [y] * n, s=7, color=LIGHT, linewidths=0, zorder=2)
-        ax.hlines(y, low, high, color=BLUE, linewidth=1.1, zorder=3)
-        ax.scatter([mean], [y], s=20, color=BLUE, edgecolor="white", linewidth=0.5, zorder=4)
+        ax.scatter(values[point], [y] * n, s=21, color=LIGHT, linewidths=0, zorder=2)
+        ax.hlines(y, low, high, color=BLUE, linewidth=2.2, zorder=3)
+        ax.scatter([mean], [y], s=60, color=BLUE, edgecolor="white", linewidth=1, zorder=4)
         ax.text(1.02, y, f"{n}", transform=matplotlib.transforms.blended_transform_factory(ax.transAxes, ax.transData),
                 ha="left", va="center", color=GREY)
         wins += sum(value > 0 for value in values[point])
@@ -334,9 +334,9 @@ def sv_gain_figure(grids):
     for row in grids["window-truth"]:
         true[row["point"]].extend(finite([row], "delta_auc"))
     rows = layout(lambda point: len(true[point]) >= 3 and len(imputed[point]) >= 3)
-    fig, ax = plt.subplots(figsize=(130 * MM, 112 * MM))
+    fig, ax = plt.subplots(figsize=(180 * MM, 152 * MM))
     fig.subplots_adjust(left=0.40, right=0.90, top=0.91, bottom=0.10)
-    ax.axvline(0, color=INK, linewidth=0.6, zorder=1)
+    ax.axvline(0, color=INK, linewidth=1.2, zorder=1)
     place = matplotlib.transforms.blended_transform_factory(ax.transAxes, ax.transData)
     clear = shown = 0
     for y, (kind, point) in enumerate(rows):
@@ -345,9 +345,9 @@ def sv_gain_figure(grids):
         for column, offset, values, color, face in ((1.02, -0.17, true[point], BLUE, BLUE),
                                                     (1.09, 0.17, imputed[point], SKY, "white")):
             mean, low, high, n = interval(values)
-            ax.hlines(y + offset, low, high, color=color, linewidth=1.1, zorder=3)
-            ax.scatter([mean], [y + offset], s=18, facecolor=face, edgecolor=color if face == "white" else "white",
-                       linewidth=0.9 if face == "white" else 0.5, zorder=4)
+            ax.hlines(y + offset, low, high, color=color, linewidth=2.2, zorder=3)
+            ax.scatter([mean], [y + offset], s=54, facecolor=face, edgecolor=color if face == "white" else "white",
+                       linewidth=1.8 if face == "white" else 0.5, zorder=4)
             ax.text(column, y, f"{n}", transform=place, ha="left", va="center", color=color)
         shown += 1
         clear += interval(true[point])[1] > 0
@@ -355,10 +355,10 @@ def sv_gain_figure(grids):
     row_labels(ax, rows, -0.75)
     ax.set_xlabel("AUC × 100, SV-PGS with SVs − SV-PGS without SVs")
     handles = [
-        Line2D([0], [0], marker="o", color=BLUE, markeredgecolor="white", markeredgewidth=0.5, markersize=4.6,
-               linewidth=1.1, label="True SV genotypes"),
-        Line2D([0], [0], marker="o", color=SKY, markerfacecolor="white", markeredgewidth=0.9, markersize=4.2,
-               linewidth=1.1, label="Imputed SV genotypes"),
+        Line2D([0], [0], marker="o", color=BLUE, markeredgecolor="white", markeredgewidth=0.8, markersize=7.8,
+               linewidth=2.2, label="True SV genotypes"),
+        Line2D([0], [0], marker="o", color=SKY, markerfacecolor="white", markeredgewidth=1.4, markersize=7.1,
+               linewidth=2.2, label="Imputed SV genotypes"),
     ]
     ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.0, 1.01), ncol=2, columnspacing=1.6)
     caption = (
@@ -390,8 +390,8 @@ def heatmap_figure(grids):
     limit = max(0.5, math.ceil(10 * max(clear_values, default=0.5)) / 10)
     norm = matplotlib.colors.Normalize(-limit, limit)
     cmap = LinearSegmentedColormap.from_list("gain", [VERMILLION, "#FFFFFF", BLUE])
-    fig, axes = plt.subplots(1, 2, figsize=(142 * MM, 118 * MM), sharey=True)
-    fig.subplots_adjust(left=0.375, right=0.99, top=0.90, bottom=0.02, wspace=0.05)
+    fig, axes = plt.subplots(1, 2, figsize=(200 * MM, 168 * MM), sharey=True)
+    fig.subplots_adjust(left=0.395, right=0.99, top=0.90, bottom=0.02, wspace=0.05)
     for panel, (ax, (grid, title)) in enumerate(zip(axes, panels)):
         colours = np.ones((len(rows), len(sizes), 3))
         for i, (kind, point) in enumerate(rows):
@@ -401,14 +401,14 @@ def heatmap_figure(grids):
                 mean, low, high, n = summaries[grid][(point, size)]
                 if n < 2:
                     colours[i, j] = to_rgb("#F2F2F2")
-                    ax.text(j, i, "–", ha="center", va="center", fontsize=7, color=GREY)
+                    ax.text(j, i, "–", ha="center", va="center", fontsize=11, color=GREY)
                     continue
                 clear = low > 0 or high < 0
                 rgb = np.array(cmap(norm(mean))[:3])
                 # an interval that covers zero is drawn pale, so colour carries only what the replicates support
                 colours[i, j] = rgb if clear else rgb + (1 - rgb) * 0.75
                 dark = colours[i, j] @ np.array([0.299, 0.587, 0.114]) < 0.55
-                ax.text(j, i, signed(mean, 2), ha="center", va="center", fontsize=7,
+                ax.text(j, i, signed(mean, 2), ha="center", va="center", fontsize=11,
                         color="white" if dark else (INK if clear else GREY),
                         fontweight="bold" if clear else "normal")
         ax.imshow(colours, aspect="auto", interpolation="nearest")
@@ -417,13 +417,13 @@ def heatmap_figure(grids):
         ax.tick_params(axis="both", length=0)
         ax.set_xticks(np.arange(-0.5, len(sizes)), minor=True)
         ax.set_yticks(np.arange(-0.5, len(rows)), minor=True)
-        ax.grid(which="minor", color="white", linewidth=1.2)
+        ax.grid(which="minor", color="white", linewidth=2.4)
         ax.tick_params(which="minor", length=0)
         for spine in ax.spines.values():
             spine.set_visible(False)
         ax.set_title(title, fontweight="bold", pad=16)
-        letter(ax, "ab"[panel], x=-0.04 if panel else -1.02, y=1.065)
-    row_labels(axes[0], rows, -1.02)
+        letter(ax, "ab"[panel], x=-0.04 if panel else -1.1, y=1.065)
+    row_labels(axes[0], rows, -1.1)
     axes[0].set_ylim(len(rows) - 0.5, -0.5)
     caption = (
         "Figure 4 | The gain from adding SVs by architecture and training size. Mean paired difference in test AUC on "
@@ -442,26 +442,26 @@ def heatmap_figure(grids):
 def genotype_figure(summary):
     accuracy = summary["genotype_accuracy"]["r2_by_frequency"]
     records = np.load(LOCAL / "public" / "sv_records.npz")
-    fig, (left, right) = plt.subplots(1, 2, figsize=(183 * MM, 66 * MM), gridspec_kw={"width_ratios": [1.15, 1.0]})
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.90, bottom=0.18, wspace=0.28)
+    fig, (left, right) = plt.subplots(1, 2, figsize=(220 * MM, 88 * MM), gridspec_kw={"width_ratios": [1.15, 1.0]})
+    fig.subplots_adjust(left=0.075, right=0.98, top=0.90, bottom=0.18, wspace=0.28)
     for key, color, label in (("SNV", INK, "SNVs"), ("SV", BLUE, "SVs")):
         bins = accuracy[key]["bins"]
         centers = np.array([math.sqrt(b["low"] * b["high"]) for b in bins])
         median = np.array([b["median"] for b in bins])
         left.fill_between(centers, [b["q25"] for b in bins], [b["q75"] for b in bins], color=color, alpha=0.15,
                           linewidth=0)
-        left.plot(centers, median, color=color, linewidth=1.0, marker="o", markersize=3, markeredgecolor="white",
-                  markeredgewidth=0.4)
-        left.text(centers[-1] * 1.15, median[-1], label, color=color, fontsize=7, va="center", fontweight="bold")
+        left.plot(centers, median, color=color, linewidth=2, marker="o", markersize=5.1, markeredgecolor="white",
+                  markeredgewidth=0.6)
+        left.text(centers[-1] * 1.15, median[-1], label, color=color, fontsize=11, va="center", fontweight="bold")
     left.set_xscale("log")
     left.set_xlim(5e-4, 0.8)
     left.set_ylim(0, 1.02)
     left.set_xticks([0.001, 0.01, 0.1], ["0.1%", "1%", "10%"])
     left.set_xlabel("Minor allele frequency")
-    left.set_ylabel("Imputation r² (dosage vs true genotype)")
+    left.set_ylabel("Imputation r²")
     share = accuracy["SV"]["below_1pct"]
-    left.axvline(0.01, color=LIGHT, linewidth=0.6, linestyle=(0, (2, 2)), zorder=0)
-    left.text(0.0108, 0.03, f"{share:.0%} of SVs\nhave MAF < 1%", fontsize=6.5, color=GREY, va="bottom")
+    left.axvline(0.01, color=LIGHT, linewidth=1.2, linestyle=(0, (2, 2)), zorder=0)
+    left.text(0.0108, 0.03, f"{share:.0%} of SVs\nhave MAF < 1%", fontsize=10.5, color=GREY, va="bottom")
     letter(left, "a", x=-0.13)
 
     kind = records["svtype"][records["measured"]]
@@ -475,7 +475,7 @@ def genotype_figure(summary):
     for label, mask, color in groups:
         counts, _ = np.histogram(length[mask], bins=edges)
         right.bar(edges[:-1], counts, width=np.diff(edges), bottom=bottom, align="edge", color=color,
-                  edgecolor="white", linewidth=0.3, label=f"{label} ({int(mask.sum()):,})")
+                  edgecolor="white", linewidth=0.6, label=f"{label} ({int(mask.sum()):,})")
         bottom += counts
     right.set_xscale("log")
     right.set_xlim(45, 1.1e6)
@@ -500,7 +500,7 @@ def genotype_figure(summary):
 
 def compute_figure(grids):
     grouped = cells(grids["grid"])
-    fig, ax = plt.subplots(figsize=(89 * MM, 68 * MM))
+    fig, ax = plt.subplots(figsize=(130 * MM, 95 * MM))
     fig.subplots_adjust(left=0.17, right=0.72, top=0.95, bottom=0.17)
     methods = (("with_sv", "SV-PGS with SVs", BLUE, 0.08, 0.80), ("snv_indel", "SV-PGS without SVs", SKY, -0.0, 1.25),
                ("ldpred2_auto", "LDpred2-auto", VERMILLION, -0.08, 1.0))
@@ -514,11 +514,11 @@ def compute_figure(grids):
                 continue
             q25, median, q75 = np.percentile(hours, [25, 50, 75])
             x = xs[step] + offset
-            ax.vlines(x, q25, q75, color=color, linewidth=1.0)
+            ax.vlines(x, q25, q75, color=color, linewidth=2)
             present.append(x), medians.append(median)
-        ax.plot(present, medians, color=color, linewidth=1.0, marker="o", markersize=3.2, markeredgecolor="white",
-                markeredgewidth=0.4)
-        ax.text(xs[-1] + 0.2, medians[-1] * nudge, label, color=color, fontsize=6.5, va="center")
+        ax.plot(present, medians, color=color, linewidth=2, marker="o", markersize=5.4, markeredgecolor="white",
+                markeredgewidth=0.6)
+        ax.text(xs[-1] + 0.2, medians[-1] * nudge, label, color=color, fontsize=10.5, va="center")
     ax.set_yscale("log")
     ax.set_yticks([1 / 60, 10 / 60, 1, 10], ["1 min", "10 min", "1 h", "10 h"])
     ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
