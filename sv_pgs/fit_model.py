@@ -45,7 +45,7 @@ from sv_pgs.full_data_fit import FitCertificate
 from sv_pgs.imputation_reliability import checked_log_reliability
 from sv_pgs.restart_store import RestartStore, module_sources, unit_key
 from sv_pgs.stage2_wiring import fit_models
-from sv_pgs.warm_seeds import Seed
+from sv_pgs.warm_seeds import Seed, content_digest, for_problem
 
 # The scorer's K posterior draws, which also set every certificate tolerance (1/(2K) nats).
 DRAW_COUNT = 64
@@ -266,11 +266,12 @@ def fit_identity(request: FitRequest, store_key: str) -> dict[str, str]:
     or the launcher, keeps every completed model), the store's content (``store_key``), the records' offsets, the
     problem (the cohort's binding to the store, the models, likelihoods, covariates, targets and training rows, the
     draws and the seed: the whole request, since its groups and their seeds depend on its other models) and the prior's
-    form, and, where any model has a seed, each seed's saved model (a checkpoint holds the fit from its start; a fit
-    without seeds keeps the identity it had). The deployment prevalences are applied to the returned models after the
-    checkpoints and are not part of it. ``request`` is the identity without the source and the seeds: a mean-field start
-    (``restart_store.WarmStart``) is solved again by whatever engine reads it, and is the newer progress on the same
-    problem whatever seed it began from, so a preempted fit resumes its own even where the retry chose another seed."""
+    form, and, where any model has a seed, each seed's saved model, or its content where it was read from memory
+    (``warm_seeds.content_digest``: a checkpoint holds the fit from its start; a fit without seeds keeps the identity
+    it had). The deployment prevalences are applied to the returned models after the checkpoints and are not part of
+    it. ``request`` is the identity without the source and the seeds: a mean-field start (``restart_store.WarmStart``)
+    is solved again by whatever engine reads it, and is the newer progress on the same problem whatever seed it began
+    from, so a preempted fit resumes its own even where the retry chose another seed."""
     identity = {
         "source": module_sources("sv_pgs.fit_model"),
         "store": store_key,
@@ -288,7 +289,7 @@ def fit_identity(request: FitRequest, store_key: str) -> dict[str, str]:
         ),
     }
     if request.seeds is not None and any(seed is not None for seed in request.seeds):
-        identity["seeds"] = ",".join("-" if seed is None else seed.digest or seed.source for seed in request.seeds)
+        identity["seeds"] = ",".join("-" if seed is None else seed.digest or content_digest(seed) for seed in request.seeds)
     return identity
 
 
@@ -298,6 +299,11 @@ def fit(request: FitRequest) -> FittedModel:
     store_key = store_digest(request.store.root)
     identity = fit_identity(request, store_key)
     checkpoint_key = unit_key(identity)
+    seeds = request.seeds
+    if seeds is not None and any(seed is not None for seed in seeds):
+        # A seed's settled mode search stands only for its own problem (``warm_seeds.for_problem``).
+        sites = sites_digest(request.store.root)
+        seeds = tuple(None if seed is None else for_problem(seed, identity["problem"], identity["offset"], sites) for seed in seeds)
     fitted = fit_models(
         store=request.store,
         store_columns=request.store_columns,
@@ -323,7 +329,7 @@ def fit(request: FitRequest) -> FittedModel:
         identity=identity,
         store_key=store_key,
         request_key=unit_key({name: value for name, value in identity.items() if name not in ("source", "seeds")}),
-        seeds=request.seeds,
+        seeds=seeds,
     )
     parts = certificate_parts(fitted.certificate, model_count)
     trained = request.training.any(axis=1)

@@ -380,6 +380,35 @@ def test_an_empirical_bayes_ended_by_its_allowance_returns_its_best_state_where_
     assert np.all(np.isfinite(ended.member_mean)) and np.isfinite(ended.noise_variance[0])
 
 
+def test_a_fit_from_the_prior_whose_outer_loop_makes_no_certified_progress_returns_its_best_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With its allowance unspent, an outer loop can still end with no certified step (``NoCertifiedProgress``: B + S
+    indefinite after a walk outside every basin). A fit from the prior then returns its best-ELBO state, uncertified,
+    with the loop's error among its refusals, so the arm is scored and flagged; a continuation raises, for its caller
+    to fit from the prior or keep the fit it continued (``stage2_wiring``)."""
+    from sv_pgs import full_data_fit
+    from sv_pgs.scale_mixture_ep import NoCertifiedProgress
+
+    fit = _mean_field_fit(tmp_path)
+
+    def walking(prior, starts, oracle, working_bytes, tolerance):
+        # The start's solve, then the loop's error.
+        assert all(point is not None for point in oracle(list(starts)))
+        raise NoCertifiedProgress("the Newton-B step makes no certified progress at the EP fixed point (the test's)")
+
+    monkeypatch.setattr(full_data_fit, "fit_hyperparameters", walking)
+    ended = fit()
+    certificate = ended.certificate
+    assert not certificate.outer_criterion_met[0]
+    assert any(
+        "the outer loop made no certified progress, and every model returns its best-ELBO state, uncertified: the Newton-B step makes no "
+        "certified progress at the EP fixed point (the test's)" in refusal for refusal in certificate.refusals
+    )
+    assert not any("allowance" in refusal for refusal in certificate.refusals)
+    assert np.all(np.isfinite(ended.member_mean)) and np.isfinite(ended.noise_variance[0]) and np.any(ended.member_mean[:, 0] != 0.0)
+    with pytest.raises(FloatingPointError, match=r"\(the test's\)"):
+        fit(starts=ended.hyperparameters, start_noise=np.asarray(ended.noise_variance, dtype=np.float64), start_mean=ended.member_mean)
+
+
 def test_ridge_component_is_the_gaussian_members_posterior_mean(tmp_path: Path) -> None:
     # ``_ridge_mean``: the dual solver at uniform Gaussian sites against the dense posterior mean
     # D Xp' (Xp D Xp' + sigma^2 I)^-1 yp, D = diag(v e^o), on the covariate-projected training rows.
@@ -826,6 +855,38 @@ def test_relative_solve_retries_from_its_latest_duals_for_the_unfinished_columns
         assert seen[0] is None
     np.testing.assert_array_equal(seen[1], [[22.0]])
     np.testing.assert_array_equal(solved, right)
+
+
+def test_a_column_stopped_at_its_floor_is_charged_the_error_it_reached():
+    """A posterior-solve column whose certificate stopped above its request (float64's floor, ``posterior_solve``) is
+    accepted, and the posterior reports the relative error it reached; B's response is charged that, not the request,
+    which reported the solve as 50 times more accurate than it was (Codex EB review 4)."""
+    from types import SimpleNamespace
+    from sv_pgs.full_data_fit import _norm_bounds, _relative_solve
+    from sv_pgs.scale_mixture_ep import _EPSILON, GaussianPosterior, _charged_resolution
+
+    right = np.eye(2)
+    gaussian = SimpleNamespace(array_module=np, last_posterior_duals=np.zeros((1, 2)))
+    calls = []
+
+    def posterior_solve(values, model, bound, start):
+        # Column 0 meets its request; column 1 stops at a certificate 50 times its bound.
+        calls.append(bound.copy())
+        return values.copy(), np.array([0.5 * bound[0], 50.0 * bound[1]])
+
+    gaussian.posterior_solve = posterior_solve
+    reached: list[float] = []
+    solved = _relative_solve(gaussian, 0, np.ones(2), lambda: None, None, reached)(right, 1e-4)
+    np.testing.assert_array_equal(solved, right)
+    assert len(calls) == 1 and len(reached) == 1
+    lower, _upper = _norm_bounds(np.ones(2), np.array([0.5e-4, 50e-4]))
+    assert reached[0] == pytest.approx(50e-4 / lower[1], rel=1e-12) and reached[0] > 1e-4
+    response = lambda mean_by_z, variance_by_z, tolerance: (mean_by_z, variance_by_z)
+    charged = GaussianPosterior(cavity_response=response, reached=lambda: max(reached))
+    assert _charged_resolution(charged, 1e-4) == reached[0]
+    assert _charged_resolution(GaussianPosterior(cavity_response=response), 1e-4) == 1e-4
+    assert _charged_resolution(GaussianPosterior(cavity_response=response, reached=lambda: 1e-6), 1e-4) == 1e-4
+    assert _charged_resolution(GaussianPosterior(cavity_response=response, exact=True, reached=lambda: 1.0), 1e-4) == _EPSILON
 
 
 def test_warm_starts_no_later_solve_asks_for_are_released_after_two_oracle_calls(monkeypatch):

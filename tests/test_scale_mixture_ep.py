@@ -1306,6 +1306,47 @@ def test_the_prediction_check_holds_each_block_to_its_own_budget():
     assert not starved.certified
 
 
+def test_an_empirical_bayes_with_no_certified_rise_ends_uncertified_at_its_no_progress_budget(monkeypatch):
+    """A walk outside every basin (no state the loop reaches has a certified value: the whole-genome arms' plans at
+    "gain nan, state error inf" [real]) has no ending of its own until x halves to double precision: the no-progress
+    budget ends it after ``EB_STALL_TRIALS`` trials, or ``EB_STALL_HOURS``, uncertified where it stands, with the
+    reason as its certificate's refusal and the oracle at the point it returns."""
+    # Normal means, whose exact fixed point is the tilted law itself; no state is certified. Each fixed point's moves
+    # are inflated past the certificate's resolution, so no step reads as unmoved outside every basin (an ending of
+    # its own, ``fixed point unmoved``) and only the budget can end the walk.
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    monkeypatch.setattr(engine, "_outer_state", lambda *arguments, **keywords: None)
+    monkeypatch.setattr(engine, "EB_STALL_TRIALS", 3)
+    solved: list = []
+
+    def fixed_points(hyperparameters):
+        solved.append(np.array(hyperparameters[0].coefficients, copy=True))
+        points = []
+        for model in hyperparameters:
+            moments = tilted_moments(prior, model, cavity, _WORKING_BYTES)
+            points.append(FixedPoint(
+                cavity=cavity, posterior=diagonal_posterior(moments.variance), mean=moments.mean,
+                precision_norm=lambda direction, variance=moments.variance: 1e6 * float(np.sum(np.square(direction) / variance)) + 1.0,
+                effective_effects=float(np.sum(cavity.precision * moments.variance)),
+            ))
+        return points
+
+    (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], fixed_points, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert not fit.certified and fit.remaining_gain == np.inf and fit.prediction_move == np.inf
+    assert "no certified rise of V in 3 trials" in fit.refusal and fit.refusal.endswith("it returns where it stood, uncertified")
+    # The start's solve, the three trials, and at most one more, at the returned point.
+    assert 4 <= len(solved) <= 5
+    np.testing.assert_array_equal(solved[-1], fit.hyperparameters.coefficients)
+    # A budget of no hours ends the search before its first trial, at its start.
+    monkeypatch.setattr(engine, "EB_STALL_HOURS", 0.0)
+    solved.clear()
+    start = initial_hyperparameters(prior)
+    (stopped,) = fit_hyperparameters(prior, [start], fixed_points, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert not stopped.certified and "no certified rise of V in 0 trials" in stopped.refusal
+    assert len(solved) == 1 and stopped.iterations == 0
+    np.testing.assert_array_equal(stopped.hyperparameters.coefficients, start.coefficients)
+
+
 def test_a_density_below_the_kernel_floor_is_a_near_zero_effect_not_a_point_mass():
     # review-mathbugs N1 [real: gene 3 snv_sv's first outer trial]: with every node below the floor given v = 0, a
     # class whose density sits there had tilted variance exactly 0, so the site targets were tau = inf, nu = nan.
@@ -1346,6 +1387,9 @@ def test_a_joint_step_halved_with_no_certified_value_at_rho_hat_moves_its_weight
     weights with x, toward the certified state, and reach a certified value."""
     prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
     start = replace(initial_hyperparameters(prior), log_smoothing=np.full(len(prior.smoothing_blocks), 2.0))
+    # From weights 2.0 the fit walks 17 trials outside every basin, before any plan, with no certified rise of V; the
+    # no-progress budget would end it there, before its first joint trial. Twice that walk.
+    monkeypatch.setattr(engine, "EB_STALL_TRIALS", 34)
     real_step, real_state = engine.hyper_step, engine._outer_state
     planned: dict[str, np.ndarray] = {}
 
@@ -2055,6 +2099,15 @@ def test_derivative_chunk_reclaims_idle_memory_or_refuses_a_tiny_chunk(monkeypat
         else:
             with pytest.raises(MemoryError, match="EB derivative chunk"):
                 engine._derivative_chunk(capacity, 146, 1000)
+
+
+def test_the_device_kernels_set_their_error_flag_atomically():
+    """Every thread that finds an improper cavity sets its launch's one error flag; plain stores of the same value from
+    many threads race in CUDA's memory model, so each is an atomic exchange (Codex EB review 14). Read from the
+    kernels' source here: they run only on a device (``test_engine_kernels_cuda``)."""
+    source = engine.engine_kernels._SOURCE
+    assert "*improper = 1" not in source
+    assert source.count("atomicExch(improper, 1)") == 4
 
 
 def test_derivative_chunk_floor_respects_small_classes_and_working_budgets(monkeypatch):

@@ -46,7 +46,7 @@ from sv_pgs.scale_mixture_ep import (
     scale_mixture_prior,
     tilted_moments,
 )
-from sv_pgs.warm_seeds import Seed, read_seeds, seed_lattice, warm_start
+from sv_pgs.warm_seeds import Seed, content_digest, for_problem, read_seeds, seed_lattice, warm_start
 from tests.test_full_data_fit import _store, _StoreCodes
 
 _TOLERANCE = 0.5 / fit_model.DRAW_COUNT
@@ -220,6 +220,36 @@ def test_a_seed_is_checked_when_it_is_made() -> None:
         _seed(prior, hyperparameters, _ROWS, np.ones(12), np.ones(12), components=np.ones((2, 12)), component_noises=np.array([0.7, 0.0]))
 
 
+def test_a_settled_search_stands_only_for_the_seed_s_own_problem() -> None:
+    """A seed's settled mode search is for its own posterior (Codex EB review 11): for another problem, offsets or store
+    sites it is cleared, its components still the mixture's start, so the fit searches for its modes again."""
+    prior = _prior(_CLASSES, _NODES)
+    components = np.ones((2, 12))
+    seed = _seed(
+        prior, _hyperparameters(prior), _ROWS, np.ones(12), np.ones(12), components=components, component_noises=np.array([0.7, 0.8]), settled=True,
+    )
+    assert for_problem(seed, "problem", "offsets", "sites") is seed
+    assert warm_start(seed, prior, _ROWS, np.ones(12), _variant_class()).settled
+    for other in (("another", "offsets", "sites"), ("problem", "another", "sites"), ("problem", "offsets", "another")):
+        moved = for_problem(seed, *other)
+        assert not moved.settled
+        np.testing.assert_array_equal(moved.components, components)
+        start = warm_start(moved, prior, _ROWS, np.ones(12), _variant_class())
+        assert start is not None and not start.settled and start.components is not None
+
+
+def test_a_seed_read_from_memory_is_named_by_its_content() -> None:
+    """A seed with no saved model's digest is named by everything a fit takes from it (Codex EB review 12): two read
+    from memory under one source but with other means are two seeds, and the same content is one."""
+    prior = _prior(_CLASSES, _NODES)
+    hyperparameters = _hyperparameters(prior)
+    first = _seed(prior, hyperparameters, _ROWS, np.ones(12), np.ones(12), source="previous")
+    again = _seed(prior, hyperparameters, _ROWS, np.ones(12), np.ones(12), source="previous")
+    other = _seed(prior, hyperparameters, _ROWS, np.ones(12), np.full(12, 2.0), source="previous")
+    assert content_digest(first) == content_digest(again) != content_digest(other)
+    assert content_digest(first) != content_digest(dataclasses.replace(first, settled=True))
+
+
 def test_a_group_fits_on_its_seeds_lattice_only_where_every_seed_shares_one_that_covers_the_start() -> None:
     prior = _prior(_CLASSES, _NODES)
     hyperparameters = _hyperparameters(prior)
@@ -325,6 +355,38 @@ def test_a_saved_model_is_a_seed_of_its_mean_field_model(arms: SimpleNamespace) 
     shutil.copytree(arms.root / "models" / "with_sv" / "trait", broken)
     (broken / "arrays.npz").unlink()
     assert read_seeds(broken, _WORKING_BYTES) == {}
+
+
+@_hook
+def test_a_fit_hands_on_a_settled_search_only_for_the_seed_s_own_problem(arms: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``fit_model.fit`` gives the wiring each seed with its settled mode search where the request is the seed's own
+    problem, offsets and store sites, and with it cleared where any differs, here the targets (Codex EB review 11). Its
+    checkpoints name an in-memory seed by its content, so a seed with other means is another fit (review 12)."""
+    (seed,) = read_seeds(arms.root / "models" / "with_sv" / "trait", _WORKING_BYTES).values()
+    assert seed.settled
+    handed = []
+
+    class _Handed(Exception):
+        pass
+
+    def capture(**keywords):
+        handed.append(keywords["seeds"])
+        raise _Handed
+
+    monkeypatch.setattr(fit_model, "fit_models", capture)
+    work = arms.root / "work" / "settled"
+    for targets in (arms.targets, arms.targets + 0.01):
+        with pytest.raises(_Handed):
+            fit_model.fit(fit_model.FitRequest(**_request_arguments(arms.store, arms.covariate, targets, arms.offsets["with_sv"], work), seeds=(seed,)))
+    assert handed[0][0].settled and not handed[1][0].settled
+    in_memory = dataclasses.replace(seed, digest="", source="previous")
+
+    def named(chosen):
+        request = fit_model.FitRequest(**_request_arguments(arms.store, arms.covariate, arms.targets, arms.offsets["with_sv"], work), seeds=(chosen,))
+        return fit_model.fit_identity(request, "store")["seeds"]
+
+    assert named(seed) == seed.digest
+    assert named(in_memory) == named(dataclasses.replace(in_memory)) != named(dataclasses.replace(in_memory, means=1.01 * in_memory.means))
 
 
 @_hook

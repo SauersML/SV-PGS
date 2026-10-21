@@ -649,11 +649,15 @@ class _WindowTermsCache:
     the recomputation. They are held on the host as cache leases of the fit's ledger (``memory_broker.admit``: from
     what the mandatory leases leave, and dropped when a later mandatory lease needs the bytes); a block whose terms do
     not fit, or were dropped, is recomputed. Outside every ledger scope (a caller with no budget) every block is kept.
-    A new solve or new Grams (a new refresh, another model) clears the cache."""
+    A new solve or new Grams (a new refresh, another model) clears the cache: the Grams by every part a window reads,
+    the blocks, the within-block and cross Grams (``_window``) and the scale, since a ``dataclasses.replace`` can keep
+    one part while giving another."""
 
     def __init__(self) -> None:
         self._solve: BulkSolve | None = None
         self._within: tuple | None = None
+        self._blocks: tuple | None = None
+        self._next_cross: tuple | None = None
         self._scale: float | None = None
         self._terms: dict[int, _BlockTerms] = {}
         self._leases: dict[int, Any] = {}
@@ -663,7 +667,7 @@ class _WindowTermsCache:
             lease.release()
         self._leases.clear()
         self._terms.clear()
-        self._solve = self._within = self._scale = None
+        self._solve = self._within = self._blocks = self._next_cross = self._scale = None
 
     def _drop(self, block: int) -> None:
         self._terms.pop(block, None)
@@ -673,9 +677,12 @@ class _WindowTermsCache:
         self, solve: BulkSolve, grams: BlockGrams, cross: WindowCross, bulk_variance: NDArray[np.float64], core_inverse: NDArray[np.float64], block: int,
         array_module: Any,
     ) -> _BlockTerms:
-        if self._solve is not solve or self._within is not grams.within or self._scale != grams.scale:
+        if (
+            self._solve is not solve or self._within is not grams.within or self._blocks is not grams.blocks
+            or self._next_cross is not grams.next_cross or self._scale != grams.scale
+        ):
             self.clear()
-            self._solve, self._within, self._scale = solve, grams.within, grams.scale
+            self._solve, self._within, self._blocks, self._next_cross, self._scale = solve, grams.within, grams.blocks, grams.next_cross, grams.scale
         held = self._terms.get(block)
         if held is not None:
             return held

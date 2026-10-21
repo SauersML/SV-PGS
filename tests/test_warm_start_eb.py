@@ -92,6 +92,43 @@ def test_a_seeded_fit_with_no_certified_start_is_fitted_from_the_prior(arms: Sim
     np.testing.assert_allclose(fallen.noise_variance, cold.noise_variance, rtol=0.05)
 
 
+def test_a_seeded_fit_whose_fit_from_the_prior_makes_no_certified_progress_is_scored_uncertified(arms: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Where neither the seeded start's empirical Bayes nor the fit from the prior makes certified progress (each outer
+    loop raises ``NoCertifiedProgress``), the model is still fitted, scored and flagged: the fit from the prior returns
+    its best-ELBO state, uncertified, and its certificate names both endings (``full_data_fit.fit_full_data``)."""
+    from sv_pgs.scale_mixture_ep import NoCertifiedProgress
+
+    seeds = tuple(read_seeds(arms.root / "models" / "with_sv" / "trait", _WORKING_BYTES).values())
+    fit_full_data = stage2_wiring.fit_full_data
+    continued: list[bool] = []
+
+    def recorded(**keywords):
+        continued.append("starts" in keywords)
+        return fit_full_data(**keywords)
+
+    def walking(prior, starts, oracle, working_bytes, tolerance):
+        # The start's solve, then the loop's error.
+        assert all(point is not None for point in oracle(list(starts)))
+        raise NoCertifiedProgress("the Newton-B step makes no certified progress at the EP fixed point (the test's)")
+
+    monkeypatch.setattr(stage2_wiring, "fit_full_data", recorded)
+    monkeypatch.setattr(full_data_fit, "fit_hyperparameters", walking)
+    request = fit_model.FitRequest(
+        **_request_arguments(arms.store, arms.covariate, arms.targets, arms.offsets["with_sv"], arms.root / "work" / "with_sv_walking"), seeds=seeds,
+    )
+    walked, _eb, _mixture, _orders = _fit(request, monkeypatch)
+    # The seeded start, then the fit from the prior (a lattice check's refit, if any, raises too and leaves it standing).
+    assert continued[:2] == [True, False]
+    assert not bool(walked.certificate["outer_criterion_met"][0])
+    assert any(
+        "so it was fitted from the prior: the Newton-B step makes no certified progress at the EP fixed point (the test's)" in refusal
+        for refusal in walked.refusals
+    )
+    assert any("the outer loop made no certified progress, and every model returns its best-ELBO state, uncertified" in refusal for refusal in walked.refusals)
+    scores = _held_out_scores(arms, walked)
+    assert np.all(np.isfinite(scores)) and float(np.std(scores)) > 0.0
+
+
 def test_a_seed_keys_the_completed_models_but_not_the_starts_a_retry_resumes(arms: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
     """The seeds name the fit's checkpoints (a completed model is the fit from its start), not the restart store's
     empirical Bayes starts (``request_key``), which a preempted fit resumes whatever seed its retry chose; a request

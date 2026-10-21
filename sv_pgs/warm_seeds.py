@@ -50,13 +50,13 @@ and a binary model's sites, an EP fit's or a model with no member are no seed (`
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 
 from sv_pgs._typing import F64Array, I64Array
-from sv_pgs.artifact import _METADATA, FittedModel, load_model
+from sv_pgs.artifact import _METADATA, FittedModel, load_model, named_digest
 from sv_pgs.config import TraitType
 from sv_pgs.draw_laws import ProductMixtureDraws, tile_rows
 from sv_pgs.progress import log
@@ -139,6 +139,36 @@ class Seed:
             noises = np.asarray(self.component_noises if self.component_noises is not None else np.zeros(0))
             if noises.shape != components.shape[:1] or not np.all(np.isfinite(noises)) or not np.all(noises > 0.0):
                 raise ValueError("a seed's mixture components each need a positive noise variance.")
+
+
+def content_digest(seed: Seed) -> str:
+    """SHA-256 of everything a fit takes from ``seed`` (``warm_start``, whose note names its source and model): its
+    members, scales, means, classes, log scales, lattice and densities, hyperparameters, noise, mixture components and
+    their noises, whether its search settled, and the store sites, problem and offsets it was fitted on. A fit's
+    checkpoints name a seed read from memory by it (``fit_model.fit_identity``): such a seed has no saved model's
+    ``digest``, and its source alone named two different seeds alike, so one's completed fit was returned for the other."""
+    parts: dict[str, object] = {
+        "source": seed.source, "model_name": seed.model_name, "store_rows": seed.store_rows, "signed_scales": seed.signed_scales,
+        "means": seed.means, "class_index": seed.class_index, "log_scale": seed.log_scale, "log_density": seed.log_density,
+        "log_variance_grid": seed.log_variance_grid, "coefficients": seed.hyperparameters.coefficients,
+        "log_smoothing": seed.hyperparameters.log_smoothing, "noise": np.array([seed.noise]), "settled": str(seed.settled),
+        "sites_digest": seed.sites_digest, "problem_digest": seed.problem_digest, "offset_digest": seed.offset_digest,
+    }
+    if seed.components is not None:
+        parts["components"] = seed.components
+        parts["component_noises"] = np.asarray(seed.component_noises, dtype=np.float64)
+    return named_digest(parts)
+
+
+def for_problem(seed: Seed, problem: str, offset: str, sites: str) -> Seed:
+    """``seed`` as a start of the fit of ``problem`` and ``offset`` (``artifact.problem_digest``, ``offset_digest``) on
+    a store whose sites are ``sites``: its mode search's ``settled`` stands only where all three are the seed's own. The
+    search settled on the modes of its own posterior; another cohort, phenotype, split, covariates or records'
+    reliabilities move that landscape, where the seed's components can each still be a fixed point while a mode its
+    search never met is the higher one, so the search runs again (the components still start the mixture:
+    ``full_data_fit.MixtureStart``)."""
+    own = seed.problem_digest == problem and seed.offset_digest == offset and seed.sites_digest == sites
+    return seed if own or not seed.settled else replace(seed, settled=False)
 
 
 def main_means(law: ProductMixtureDraws, working_bytes: int, component: int = 0) -> F64Array:
@@ -355,8 +385,9 @@ def warm_start(seed: Seed, prior: ScaleMixturePrior, member_rows: I64Array, scal
     )
     log(f"warm seeds: {note}")
     # The seed's settled mode search stands for this fit only where the fit is the seed's own problem as far as the start
-    # can tell (every member mapped both ways, on its own prior): another arm's adds or drops columns, and the near
-    # duplicates among them are what the mixture's modes are, so its search runs again (``full_data_fit._mode_mixture``).
+    # can tell (every member mapped both ways, on its own prior; ``for_problem`` has cleared it for another problem):
+    # another arm's adds or drops columns, and the near duplicates among them are what the mixture's modes are, so its
+    # search runs again (``full_data_fit._mode_mixture``).
     own = found is not None and at.shape[0] == rows.shape[0] == seed.store_rows.shape[0]
     return WarmStart(
         hyperparameters=hyperparameters, noise=float(seed.noise), mean=mean, note=note, components=components,

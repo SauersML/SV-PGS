@@ -164,6 +164,19 @@ _GAUSS_WEIGHTS = np.array([
 ])
 _QUADPACK_ERROR_SCALE = 200.0
 _QUADPACK_ERROR_POWER = 1.5
+EB_STALL_TRIALS = 8
+"""The trials (fixed points of a joint or inner step) a model's empirical Bayes may take in a row with no certified rise
+of V (no step accepted into a certified state: ``fit_hyperparameters``) before it ends where it is, uncertified. The
+loop's own endings do not bound a walk outside every basin: the whole-genome arms reached plans 2-5 after 2-4 h of
+EB without one, at about 45 minutes a trial [real]. On the CPU fixtures the longest such run in a fit that certified
+was 4 trials and the walks that never certified ran 35-38 [sim]; twice the first. A start far outside every basin can
+take longer: the normal-means fixture from smoothing weights 2.0 walks 17 trials before its first certified rise [sim],
+and its test raises the budget."""
+EB_STALL_HOURS = 6.0
+"""The wall-clock hours a model's empirical Bayes may go with no certified rise of V before it ends where it is,
+uncertified: ``EB_STALL_TRIALS`` trials at the whole-genome arms' 45 minutes a trial [real], which bounds the walk
+where trials are slower still."""
+_SECONDS_PER_HOUR = 3600.0
 
 
 @dataclass(frozen=True)
@@ -1915,6 +1928,11 @@ class GaussianPosterior:
     # Whether the responses are exact to rounding whatever tolerance they are asked for (a dense factor, or
     # independent effects): B's response is then charged its rounding, not the request.
     exact: bool = False
+    # The largest relative error any of this posterior's solves has returned a column at (``full_data_fit``'s
+    # ``_relative_solve``): above the request where a column stopped at float64's floor short of it, which B's
+    # response is then charged in place of the request (``_charged_resolution``). None where every solve meets its
+    # request.
+    reached: Callable[[], float] | None = None
 
     def __post_init__(self) -> None:
         if self.cavity_response is None and (self.solve is None or self.variance_jvp is None):
@@ -2384,6 +2402,16 @@ def _through_z_transposed(prior: ScaleMixturePrior, by_density: tuple[F64Array, 
     return result
 
 
+def _charged_resolution(posterior: GaussianPosterior, relative_tolerance: float) -> float:
+    """The relative error B's response is charged where the posterior answers whole (``cavity_response`` or
+    ``linear_response``): its rounding where the posterior is exact, else the request, or what its solves reached
+    where a column stopped above the request at float64's floor (``GaussianPosterior.reached``: the request alone
+    would report a solve as more accurate than it is)."""
+    if posterior.exact:
+        return _EPSILON
+    return relative_tolerance if posterior.reached is None else max(relative_tolerance, float(posterior.reached()))
+
+
 def _total_curvature_columns(
     prior: ScaleMixturePrior,
     coefficients: F64Array,
@@ -2424,7 +2452,7 @@ def _total_curvature_columns(
         # The fixed point's own cavity response (a mean-field fixed point: ``mean_field``), exact by construction.
         shift_step, precision_step = posterior.cavity_response(mean_by_z, variance_by_z, relative_tolerance)
         if achieved is not None:
-            achieved.append(_EPSILON if posterior.exact else relative_tolerance)
+            achieved.append(_charged_resolution(posterior, relative_tolerance))
         return _total_from_response(prior, fixed_cavity, derivatives, directions, shift_step, precision_step)
     solve, variance_jvp = posterior.solve, posterior.variance_jvp
     assert solve is not None and variance_jvp is not None
@@ -2465,7 +2493,7 @@ def _total_curvature_columns(
         try:
             precision_step = posterior.linear_response(left, gain, diagonal, weight, offset)
             if achieved is not None:
-                achieved.append(_EPSILON if posterior.exact else relative_tolerance)
+                achieved.append(_charged_resolution(posterior, relative_tolerance))
         except np.linalg.LinAlgError as error:
             # I - L singular: the EP fixed point is not locally stable, and its linear response does not exist.
             raise LinearResponseError(f"the EP fixed point's linear response is singular: {error}") from error
@@ -4547,9 +4575,12 @@ class OuterFit:
     last state, 1/2 g'(B + S)^-1 g. ``prediction_move`` is the posterior-mean move of the certifying step in q's
     posterior metric, against ``prediction_tolerance`` = 1 / K = 2 tolerance, i.e. KL(q || q') = move / 2 <= 1 / (2K)
     nats (K = 1 / (2 tolerance) draws; in evidence units, as every other certificate, so it stays defined where p_eff
-    collapses). ``iterations`` counts accepted steps, ``halvings`` the trials refused (by the test, or for having no
-    EP fixed point), and ``unresolved`` those of them that had no EP fixed point at all, so a loop that keeps refusing
-    near its answer is visible in the certificate.
+    collapses). A certified fit's ``hyperparameters`` are that step's, from the last state: its own V and curvature
+    are not formed (they would cost another curvature solve), so the terms above are the state's, V at the step is its
+    local model's to within the model's measured error, and q there is within that KL of the state's. ``iterations``
+    counts accepted steps, ``halvings`` the trials refused (by the test, or for having no EP fixed point), and
+    ``unresolved`` those of them that had no EP fixed point at all, so a loop that keeps refusing near its answer is
+    visible in the certificate.
 
     ``fixed_point_term_measured`` is False while the decisions charge the fixed points' own error along the steps as
     zero (theory-ep: the oracles' perturbation probes are not wired yet); callers treat such a fit as uncertified
@@ -4571,6 +4602,9 @@ class OuterFit:
     # prediction move unchecked): an honest fit, which callers count and report as uncertified, never as certified.
     certified: bool = True
     fixed_point_term_measured: bool = False
+    # Why an uncertified fit ended where its own record does not say (the no-progress budget, ``EB_STALL_TRIALS``):
+    # a line for its certificate's refusals; empty otherwise.
+    refusal: str = ""
 
 
 @dataclass(frozen=True)
@@ -4984,6 +5018,13 @@ def fit_hyperparameters(
     # Whether the oracle's last solve for the model was elsewhere than the point it returns.
     displaced = [False] * count
     histories: list[list[float]] = [[] for _model in range(count)]
+    # The trials each model has taken since its last certified rise of V (a step accepted into a certified state), and
+    # when that was: the no-progress budget (``EB_STALL_TRIALS``, ``EB_STALL_HOURS``).
+    stalled = [0] * count
+    rose = [time.monotonic()] * count
+
+    def progressed(model: int) -> None:
+        stalled[model], rose[model] = 0, time.monotonic()
 
     def segment_reach(model: int, segment: F64Array, fraction: float, gain: float) -> float:
         """The largest gain any shorter fraction of a refused joint step can reach, under the quadratic model of the
@@ -5047,6 +5088,7 @@ def fit_hyperparameters(
         anchors[model] = None
         if polished_state is not None and _rises(realized, resolution, polished_state, tolerance):
             states[model] = replace(polished_state, polished=True)
+            progressed(model)
             return
         refused_releases[model].add(frozenset(
             int(position) for position in np.flatnonzero(np.isfinite(hyperparameters[model].log_smoothing) & ~np.isfinite(anchor_hyperparameters.log_smoothing))
@@ -5267,6 +5309,37 @@ def fit_hyperparameters(
         )
         pending[model] = None
 
+    def stall(model: int, hours: float) -> None:
+        """The model's empirical Bayes ends at its last certified state (where a release is in flight, the one it
+        left), uncertified, with its remaining gain unmeasured: its no-progress budget is spent."""
+        anchor = anchors[model]
+        if anchor is not None:
+            hyperparameters[model], points[model], corrections[model], states[model] = anchor[:4]
+            anchors[model], displaced[model] = None, True
+        state = states[model]
+        entry = pending[model]
+        step = entry.step if entry is not None and entry.step is not None else last_steps[model]
+        if step is None:
+            step = HyperStep(
+                hyperparameters=hyperparameters[model], evidence=np.nan, smoothing_gradient=np.inf, stationarity_steps=np.zeros(0),
+                stationarity_errors=np.zeros(0), stationarity_gain=np.inf,
+            )
+        reason = (
+            f"no certified rise of V in {stalled[model]} trials over {hours:.3g} h, its no-progress budget "
+            f"({EB_STALL_TRIALS} trials or {EB_STALL_HOURS:g} h, ``scale_mixture_ep.EB_STALL_TRIALS``)"
+        )
+        log(
+            f"eb outer: model {model} returns uncertified ({reason}) after {iterations[model]} accepted steps, {halvings[model]} halvings, "
+            f"{unresolved[model]} unresolved"
+        )
+        fits[model] = OuterFit(
+            hyperparameters=hyperparameters[model], step=step, newton_decrement=state.decrement if state is not None else np.inf,
+            remaining_gain=np.inf, prediction_move=np.inf, prediction_tolerance=2.0 * tolerance, iterations=iterations[model],
+            halvings=halvings[model], unresolved=unresolved[model], history=tuple(histories[model]), certified=False,
+            refusal=f"model {model}: its empirical Bayes made {reason}; it returns where it stood, uncertified",
+        )
+        pending[model] = None
+
     def warm_from_states() -> None:
         """The oracle back at the states' points (``FixedPoint.restore``), so the next solve is warm from them."""
         for point in points:
@@ -5274,6 +5347,10 @@ def fit_hyperparameters(
                 point.restore()
 
     while True:
+        for model in range(count):
+            hours = (time.monotonic() - rose[model]) / _SECONDS_PER_HOUR
+            if fits[model] is None and (stalled[model] >= EB_STALL_TRIALS or hours >= EB_STALL_HOURS):
+                stall(model, hours)
         for model in range(count):
             if fits[model] is None and pending[model] is None:
                 pending[model] = plan(model)
@@ -5294,6 +5371,7 @@ def fit_hyperparameters(
                 continue
             trial, trial_point = trials[model], trial_points[model]
             displaced[model] = True
+            stalled[model] += 1
             if entry.newton is None and entry.enters:
                 # The joint trial from a state outside every basin: accepted where the trial's state is certified.
                 assert entry.step is not None
@@ -5307,6 +5385,7 @@ def fit_hyperparameters(
                         displaced[model], pending[model], radii[model] = False, None, None
                         inner_gains[model] = []
                         iterations[model] += 1
+                        progressed(model)
                         continue
                 halvings[model] += 1
                 pending[model] = inner(model, entry.step, entry.remaining, False)
@@ -5392,6 +5471,7 @@ def fit_hyperparameters(
                             displaced[model], pending[model], radii[model] = False, None, None
                             inner_gains[model] = []
                             iterations[model] += 1
+                            progressed(model)
                             continue
                         measured = entry.predicted + remainders[model] + state.tail + state.error + entry.step.evidence_error + entry.step.stationarity_gain
                         if entry.fraction == 1.0 and not entry.certifying and measured <= tolerance:
@@ -5626,6 +5706,9 @@ def fit_hyperparameters(
                 hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                 displaced[model] = False
                 iterations[model] += 1
+                if trial_state is not None:
+                    # An ascent of x into a certified state: a certified rise of V's integrand at these weights.
+                    progressed(model)
                 mode_gain, mode_rounding = _inner_step_agreement(newton.gradient, gradient, proposal)
                 radii[model] = _next_radius(newton, proposal, entry.radius, length, mode_gain, mode_rounding)
                 # A polishing step continues at the same weights; one that left a saddle leads to a new plan.

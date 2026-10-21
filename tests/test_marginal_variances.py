@@ -124,6 +124,32 @@ def test_marginals_track_the_dense_inverse_across_cuts_and_block_jacobi_does_not
     assert jacobi_error > scale
 
 
+def test_the_window_terms_cache_is_keyed_on_every_gram_part_a_window_reads():
+    """The cached window terms of a solve and its within-block Grams are not another layout's (Codex EB review 13): with
+    the same solve and the same within tuple, Grams without their cross-Grams (each window its own block alone) give
+    each block's own terms, not the three-block windows' held ones."""
+    from dataclasses import replace
+
+    generator = np.random.default_rng(6)
+    sample_count, variant_count = 300, 120
+    columns = _genotypes(generator, sample_count, variant_count, 0.95)
+    variance = 0.5 / variant_count * np.exp(generator.normal(0.0, 1.0, variant_count))
+    blocks = tuple(np.arange(start, start + 40) for start in range(0, variant_count, 40))
+    solve = _solve(columns, 1.0 / variance, _resolved(variance, sample_count))
+    grams = _grams(columns, blocks)
+    alone = replace(grams, next_cross=())
+    marginal_variances_module._WINDOW_TERMS.clear()
+    try:
+        windowed = marginal_variances(solve, grams)
+        cut = marginal_variances(solve, alone)
+        marginal_variances_module._WINDOW_TERMS.clear()
+        expected = marginal_variances(solve, alone)
+    finally:
+        marginal_variances_module._WINDOW_TERMS.clear()
+    assert not np.allclose(windowed, expected, rtol=1e-6, atol=0.0)
+    np.testing.assert_array_equal(cut, expected)
+
+
 def test_certificate_flags_only_the_wrong_block():
     generator = np.random.default_rng(5)
     sample_count, variant_count, heritability = 1500, 600, 0.5

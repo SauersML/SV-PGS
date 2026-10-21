@@ -14,7 +14,9 @@ while all three are normal numbers (else exp(log u + t), as on the host); r = 1/
 one division, with v r and q r its products while r is normal (else the host's reciprocal forms, which take
 the limits of an overflowing v or q). A component is pi e^(a/2) sqrt(r), a = h^2 v r, so a node costs a
 sqrt and one exp where the host takes log1p and exp. A negative cavity precision is allowed while every
-1 + v P stays positive; 1 + v P <= 0 anywhere is an error, as on the host.
+1 + v P stays positive; 1 + v P <= 0 anywhere is an error, as on the host. Every thread that finds one sets the
+launch's one error flag by an atomic exchange: plain stores of the same value from many threads are a data race in
+CUDA's memory model, whatever they write.
 
 The reductions are single passes: a running log-sum-exp over the exponents log pi + a/2, whose earlier
 weights are rescaled when the largest moves (one exp per node either way), with weighted Welford updates of
@@ -47,7 +49,7 @@ __device__ __forceinline__ void node_terms(
     if (!(scale_exp >= tiny && scale_exp <= huge && node_exp >= tiny && node_exp <= huge && variance >= tiny && variance <= huge))
         variance = exp(log_scale_value + node);
     const double ratio = variance * precision;
-    if (ratio <= -1.0) *improper = 1;
+    if (ratio <= -1.0) atomicExch(improper, 1);
     *retained = 1.0 / (1.0 + ratio);
     if (fabs(ratio) * tiny < 0.5) {
         *ratio_retained = ratio * *retained;
@@ -111,7 +113,7 @@ extern "C" __global__ void tilted_rows(
     log_normalizer[row] = peak + log(total);
     mean[row] = shift_value * running_mean;
     variance[row] = running_mean + shift_square * (running_square / total);
-    if (bad) *improper = 1;
+    if (bad) atomicExch(improper, 1);
 }
 
 // The M-step's per-effect terms for rows of one class, in batches of ``width`` rows laid out node-major within a batch
@@ -177,7 +179,7 @@ extern "C" __global__ void objective_rows(
     centred[base + node_count * width] = first_mean;
     log_normalizer[row] = peak + log(total);
     curvature[row] = first_square / total + second_mean;
-    if (bad) *improper = 1;
+    if (bad) atomicExch(improper, 1);
 }
 """
 
@@ -261,7 +263,7 @@ extern "C" __global__ void derivative_rows(
     out[5] = second_by_precision - 2.0 * m * mean_by_precision;
     out[6] = with_scale ? f_mu + mu_r : 0.0;
     out[7] = with_scale ? f_raw + raw_r : 0.0;
-    if (bad) *improper = 1;
+    if (bad) atomicExch(improper, 1);
 }
 """
 

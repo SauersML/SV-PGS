@@ -111,6 +111,7 @@ from sv_pgs.scale_mixture_ep import (
     HyperStep,
     MixtureHyperparameters,
     MomentStart,
+    NoCertifiedProgress,
     OuterFit,
     ScaleMixturePrior,
     derived_lattice,
@@ -552,19 +553,22 @@ def _posterior(
     (``scale_mixture_ep.solve_key``): the certified CG stops on its own certificate from any start, so this is exact,
     and at nearby fixed points it starts close to the answer."""
     solve = gaussian.bulk_solves[model]
+    reached: list[float] = []
     return GaussianPosterior(
-        solve=_relative_solve(gaussian, model, variances, ensure, starts),
+        solve=_relative_solve(gaussian, model, variances, ensure, starts, reached),
         variance_jvp=lambda weights: variance_jvp(solve, grams, weights, gaussian.array_module).values,
         local_response=local_response(solve, grams),
+        reached=lambda: max(reached, default=0.0),
     )
 
 
 def _relative_solve(
-    gaussian: Any, model: int, variances: F64Array, ensure: Callable[[], None], starts: dict | None = None
+    gaussian: Any, model: int, variances: F64Array, ensure: Callable[[], None], starts: dict | None = None, reached: list[float] | None = None,
 ) -> Callable[[F64Array, float], F64Array]:
     """Sigma R, each column to relative error e in the posterior metric, from any solver with the dual solver's
     ``posterior_solve`` contract (``dual_solve.DualGaussian``), warm-started from
-    ``starts`` (``_posterior``)."""
+    ``starts`` (``_posterior``). ``reached`` receives each solve's largest relative error over its columns
+    (``GaussianPosterior.reached``): e, or above it where a column stopped at float64's floor."""
 
     def relative_solve(right: F64Array, relative_tolerance: float) -> F64Array:
         # A column is done when its certified error b is at most e times the lower bound on ||x||_A. The first b
@@ -583,7 +587,9 @@ def _relative_solve(
         values = np.asarray(right, dtype=np.float64)
         solution = np.zeros_like(values)
         live = np.flatnonzero(np.any(values != 0.0, axis=0))
-        bound = relative_tolerance * np.sqrt(np.square(values[:, live]).T @ variances)
+        estimate = np.sqrt(np.square(values[:, live]).T @ variances)
+        bound = relative_tolerance * estimate
+        worst = 0.0
         ensure()
         started, solves = time.perf_counter(), 0
         key = solve_key.get()
@@ -603,10 +609,16 @@ def _relative_solve(
             if not np.all(np.isfinite(certified)):
                 raise ValueError("a posterior solve has no certificate at float64's accuracy")
             lower, _upper = _norm_bounds(np.abs(np.sum(values[:, live] * solved, axis=0)), certified)
-            # A certificate above the bound asked for is float64's floor: no solve certifies the column better.
+            # A certificate above the bound asked for is float64's floor: no solve certifies the column better. Such a
+            # column is solved to certified / ||x||_A, which the caller is told (``reached``), not e: relative to the
+            # lower bound on ||x||_A, or to the first estimate of it where the bound is not positive (a response
+            # that vanishes against its floor errs by nothing B can see).
             done = (certified <= relative_tolerance * lower) | (certified > bound)
+            if np.any(done):
+                worst = max(worst, float(np.max(certified[done] / np.where(lower[done] > 0.0, lower[done], estimate[done]))))
             solution[:, live[done]] = solved[:, done]
             bound = np.where(lower > 0.0, relative_tolerance * lower, 0.5 * bound)[~done]
+            estimate = estimate[~done]
             live = live[~done]
             # A tighter certificate continues the solve just made, including where no cross-call cache is open.
             # ``held`` belongs to the preceding fixed point; retrying it discarded this call's Krylov progress.
@@ -616,6 +628,8 @@ def _relative_solve(
         # Each posterior solve logs its CG; this line is the response's whole (with each solve's image and solution
         # reads), after ``ensure``, whose refactoring, if any, is the dual iterate's own line.
         timing("response_solve", time.perf_counter() - started, columns=values.shape[1], solves=solves, warm=int(held is not None))
+        if reached is not None:
+            reached.append(worst)
         return solution
 
     return relative_solve
@@ -671,7 +685,7 @@ def _member_posterior(
             inverse = reduced.local_response(left[member_of_group], right[member_of_group], diagonal[member_of_group], weights[member_of_group])
             return lambda values: inverse(np.asarray(values)[member_of_group])[ties.group]
 
-    return GaussianPosterior(solve=solve, variance_jvp=variance_jvp, local_response=local)
+    return GaussianPosterior(solve=solve, variance_jvp=variance_jvp, local_response=local, reached=reduced.reached)
 
 
 def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array, ties: TieGroups) -> Callable[[F64Array], float]:
@@ -2133,9 +2147,10 @@ class _FullDataMeanField:
         def unread_variance_map(weights: F64Array) -> F64Array:
             raise RuntimeError("the mean-field fixed point's posterior answers by its solve only: it holds no variance map")
 
+        reached: list[float] = []
         return GaussianPosterior(
-            solve=_relative_solve(self.gaussian, model, group_variance, lambda: self._ensure(state, model), self._solve_starts),
-            variance_jvp=unread_variance_map,
+            solve=_relative_solve(self.gaussian, model, group_variance, lambda: self._ensure(state, model), self._solve_starts, reached),
+            variance_jvp=unread_variance_map, reached=lambda: max(reached, default=0.0),
         )
 
     # the sweeps
@@ -2754,7 +2769,11 @@ class _FullDataMeanField:
             shift_step = -(products - squares[:, None] * mean_step) / noise
             if binary:
                 # Known noise: no noise response. The sites' own response is left out of the curvature, as in
-                # ``mean_field`` (the outer loop accepts its steps on the objective itself).
+                # ``mean_field`` (the outer loop accepts its steps on the objective itself), so B is that of fixed
+                # sites, not of the sites profiled out, and the certificate's log-determinant and decrement read it.
+                # Against central differences of the profiled gradient on the binary CPU fixtures B differs by
+                # 0.05-0.2% and 1/2 log|B + S| by at most 0.02 nats at genetic scale 0.5, below the 1% by which a
+                # quantitative fixture's B, whose response is exact, differs from its own differences [sim].
                 return shift_step, np.zeros_like(shift_step)
             _mean_one, shift_one, scalar = noise_terms(relative_tolerance, known)
             right = -2.0 * residual_terms + squares @ (
@@ -2770,7 +2789,7 @@ class _FullDataMeanField:
                 return np.inf
             return float(np.sum(np.square(values[live]) / variance[live]))
 
-        posterior = GaussianPosterior(cavity_response=cavity_response, exact=False)
+        posterior = GaussianPosterior(cavity_response=cavity_response, exact=False, reached=dual.reached)
         cavity = Cavity(precision=omega, shift=shift)
         offset = float(self.elbo[model]) - _data_value(self.prior, hyperparameters.coefficients, cavity, self.working_bytes)
 
@@ -3092,13 +3111,13 @@ def _timed_hyperparameters(
 
 
 def _ended_fits(oracle: "_FullDataMeanField", tolerance: float) -> list[OuterFit]:
-    """Each model's empirical Bayes where the outer loop raised after an allowance ended it (``EB_PASSES``): a model
-    refused its trials can be left at a state where the loop has no certified step and raises
-    (``scale_mixture_ep.NoCertifiedProgress``: B + S indefinite after a walk outside every basin), which would lose
-    the fit. Instead every model returns uncertified at its highest-ELBO refreshed state's hyperparameters (the fit then
-    restores that state, ``restore_best``), its remaining gain, decrement and prediction move unmeasured (infinite) and
-    its step's stationarity unchecked; the loop's counts of steps and halvings went with it (zero here), its unresolved
-    trials are the oracle's. The caller has put the oracle back at those states."""
+    """Each model's empirical Bayes where the outer loop raised after an allowance ended it (``EB_PASSES``), or raised
+    ``NoCertifiedProgress`` in a fit from the prior: a model can be left at a state where the loop has no certified
+    step and raises (``scale_mixture_ep.NoCertifiedProgress``: B + S indefinite after a walk outside every basin), which
+    would lose the fit. Instead every model returns uncertified at its highest-ELBO refreshed state's hyperparameters
+    (the fit then restores that state, ``restore_best``), its remaining gain, decrement and prediction move unmeasured
+    (infinite) and its step's stationarity unchecked; the loop's counts of steps and halvings went with it (zero here),
+    its unresolved trials are the oracle's. The caller has put the oracle back at those states."""
     fits: list[OuterFit] = []
     for model, hyperparameters in enumerate(oracle.best_hyperparameters):
         step = HyperStep(
@@ -3163,7 +3182,13 @@ def fit_full_data(
 
     ``mixture_start`` (a continuation's: the earlier fit's ``FullDataFit.mixture_start``) starts the mode mixture's
     search from the earlier fit's components (``_mode_mixture``) on the mean-field route of quantitative models; it is
-    ignored elsewhere."""
+    ignored elsewhere.
+
+    A fit from the prior on the mean-field route whose outer loop raises ``NoCertifiedProgress`` returns every model's
+    best-ELBO state, uncertified, with the loop's error among its refusals (``_ended_fits``), so the arm is scored and
+    flagged rather than lost; a continuation (``starts``: a seed's start, or a lattice check's refit) raises instead,
+    for its caller to fit from the prior or keep the fit it continued (``stage2_wiring``)."""
+    continued = starts is not None
     # The empirical Bayes' per-variant passes (the data objective, its derivatives and line integrals, the tilted
     # moments) run on the Gaussian's device (``scale_mixture_ep.device_scope``), as the small-n
     # route's do: on the host each was a numba pass over every variant on the VM's cores while its GPUs waited, the
@@ -3251,10 +3276,20 @@ def fit_full_data(
             with device_scope(device):
                 return oracle, _timed_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
         except FloatingPointError as error:
-            if oracle.allowance_spent.any() and all(state is not None for state in oracle.best_state):
-                # Ended by its allowance where the loop then had no certified step: the best-ELBO states, uncertified.
-                log(f"mean-field oracle: the outer loop raised after an allowance ended it ({error}): every model returns its best-ELBO state, uncertified")
-                oracle.refusals.append(f"the outer loop raised after an empirical Bayes allowance ended it: {error}")
+            spent = bool(oracle.allowance_spent.any())
+            stuck = isinstance(error, NoCertifiedProgress) and not continued
+            if (spent or stuck) and all(state is not None for state in oracle.best_state):
+                # Ended by its allowance where the loop then had no certified step, or a fit from the prior with no
+                # certified progress (a continuation's caller has the prior's fit to fall back on): the best-ELBO
+                # states, uncertified.
+                log(
+                    f"mean-field oracle: the outer loop raised{' after an allowance ended it' if spent else ''} ({error}): every model returns its "
+                    "best-ELBO state, uncertified"
+                )
+                oracle.refusals.append(
+                    f"the outer loop raised after an empirical Bayes allowance ended it: {error}" if spent
+                    else f"the outer loop made no certified progress, and every model returns its best-ELBO state, uncertified: {error}"
+                )
                 # Put back here, not by ``restore_best``, which compares ELBOs and the state the loop left can have none.
                 for model, state in enumerate(oracle.best_state):
                     oracle._restore_state(state, model)
@@ -3336,6 +3371,8 @@ def fit_full_data(
     if starts is None and prior.annotation_groups and mean_field is not None:
         budget_unresolved += np.asarray(base_points.unresolved, dtype=np.int64)
     refusals = list(fixed_points.refusals)
+    # An outer loop that ended a model by its no-progress budget says so (``scale_mixture_ep.EB_STALL_TRIALS``).
+    refusals.extend(fit.refusal for fit in fits if fit.refusal)
     for model in np.flatnonzero(allowance_spent):
         refusals.append(
             f"model {int(model)}: its empirical Bayes spent its allowance of {EB_PASSES} sweeps without certifying, and every later trial was "
