@@ -127,6 +127,15 @@ def build_parser() -> argparse.ArgumentParser:
     mirror_parser.add_argument("action", choices=("push", "restore"))
     mirror_parser.add_argument("--config", required=True, help="The run config JSON, whose run_directory is mirrored.")
     mirror_parser.add_argument("--mirror", required=True, help="The mirror, gs://<workspace bucket>/<prefix>.")
+    mirror_parser.add_argument(
+        "--base", action="append", default=None,
+        help=(
+            "Another run's mirror, gs://<bucket>/<prefix>, that carries this run's completed steps before the fit: "
+            "restored from where this run's mirror holds none of a step, and not pushed again where it holds one whole "
+            "(repeatable; the first that holds a step serves it, then the bases this run's mirror and each base name). "
+            "It is only read."
+        ),
+    )
 
     subparsers.add_parser(
         "version",
@@ -200,13 +209,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run-mirror":
-        from sv_pgs.run_mirror import GcsRemote, mounted, push, restore
+        from sv_pgs.run_mirror import Base, GcsRemote, bases_of, mounted, push, restore
 
         run_directory, remote = WorkspaceConfig.read(args.config).run_directory, GcsRemote(args.mirror)
+        bases = bases_of(args.mirror, remote, args.base or (), lambda url: Base(GcsRemote(url), url, mounted(url)))
         if args.action == "push":
-            push(run_directory, remote)
+            push(run_directory, remote, bases=bases)
         else:
-            restore(run_directory, remote, mounted(args.mirror))
+            restore(run_directory, remote, mounted(args.mirror), bases=bases)
         return 0
 
     if args.command == "census-all-of-us-traits":

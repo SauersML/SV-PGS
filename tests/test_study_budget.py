@@ -286,6 +286,35 @@ def test_a_job_given_an_after_script_runs_it_once_its_driver_has_finished(tmp_pa
         assert refused.returncode != 0 and "AFTER_SCRIPT" in refused.stderr
 
 
+@pytest.mark.skipif(shutil.which("flock") is None, reason="run_step.sh runs on Linux")
+def test_a_job_given_a_base_run_names_its_mirror_in_every_restore_and_push(tmp_path):
+    """BASE_RUN is another run of the ops bucket, whose mirror carries this run's steps before the fit (run-mirror
+    --base); without it the mirror commands are as before."""
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(THROUGH="report", UV_EXTRAS="--extra gpu")
+    for refused_base in ("study", "Base", "../other"):
+        environment["BASE_RUN"] = refused_base
+        refused = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+        assert refused.returncode != 0 and "BASE_RUN" in refused.stderr
+    calls = {}
+    for base, slot in (("aou-base", "pilot"), ("", "train-1")):
+        environment.update(BASE_RUN=base, BUDGET_SLOT=slot)
+        submitted = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+        assert submitted.returncode == 0, submitted.stderr
+        script = json.loads((tmp_path / "objects.json").read_text())[f"gs://workspace/svpgs/study/launcher/{slot}/run_step.sh"]
+        # The script's mirror command, run with sv-pgs stubbed.
+        mirror = script[script.index("base=()"):script.index("mirror restore ||")]
+        run = tmp_path / slot
+        (run / "venv/bin").mkdir(parents=True)
+        (run / "venv/bin/sv-pgs").write_text('#!/bin/bash\necho "$*" >> "$(dirname "$0")/calls"\n')
+        (run / "venv/bin/sv-pgs").chmod(0o755)
+        subprocess.run(["bash", "-c", f"RUN={run}; OPS=/ops\n{mirror}\nmirror restore && mirror push"], check=True)
+        calls[base] = (run / "venv/bin/calls").read_text().splitlines()
+    mirrored = "--config /ops/run_config.json --mirror gs://workspace/svpgs/study/run"
+    assert calls["aou-base"] == [f"run-mirror {action} {mirrored} --base gs://workspace/svpgs/aou-base/run" for action in ("restore", "push")]
+    assert calls[""] == [f"run-mirror {action} {mirrored}" for action in ("restore", "push")]
+
+
 def test_submit_refuses_a_disk_size_that_is_not_a_whole_number_of_gb(tmp_path):
     launcher, environment = _fake_cloud(tmp_path)
     environment["RUN_DISK_GB"] = "2T"

@@ -128,9 +128,13 @@ mkdir -p "$TMPDIR"
 # Batch cannot write to an existing disk, so this job's disk is new and the run lives in the workspace bucket
 # (sv_pgs/run_mirror.py): restored before the driver starts, pushed every 15 minutes while it runs (each push sends
 # only new checkpoints and finished steps), and pushed once more after it exits. A preemption loses at most the fit
-# progress since the last push. flock keeps one push at a time.
+# progress since the last push. flock keeps one push at a time. With BASE_RUN ("${BASE_RUN}"), that run's mirror carries
+# this run's completed steps before the fit where this run's mirror holds none of a step, and no push copies them here.
+base=()
+[ -z "${BASE_RUN}" ] || base=(--base "gs://${OPS_BUCKET}/svpgs/${BASE_RUN}/run")
 mirror() {
-  flock "$RUN/mirror.lock" "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" --mirror "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run"
+  flock "$RUN/mirror.lock" "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" --mirror "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run" \
+    ${base[@]+"${base[@]}"}
 }
 mirror restore || { mark "exit-restore"; exit 1; }
 mark restored

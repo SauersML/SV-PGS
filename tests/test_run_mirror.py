@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pytest
 
 from sv_pgs import run_mirror
 from sv_pgs.content_identity import GCS_MOUNTS
-from sv_pgs.run_mirror import DirectoryRemote, GcsRemote, mounted, push, restore
+from sv_pgs.run_mirror import Base, DirectoryRemote, GcsRemote, bases_of, mounted, push, restore
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE
 
 
@@ -25,6 +26,14 @@ def _write(path: Path, content: str | bytes) -> Path:
 
 def _tree(root: Path) -> dict[str, bytes]:
     return {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()} if root.is_dir() else {}
+
+
+def _followed(root: Path) -> dict[str, bytes]:
+    """``_tree``, read through the links a restore leaves to the mount."""
+    return {
+        (Path(directory) / name).relative_to(root).as_posix(): (Path(directory) / name).read_bytes()
+        for directory, _directories, names in os.walk(root, followlinks=True) for name in names
+    }
 
 
 def _run(root: Path) -> Path:
@@ -328,3 +337,106 @@ def test_a_completed_step_marker_does_not_hide_a_missing_payload(tmp_path: Path)
     push(run, remote)
     assert payload.read_bytes() == (run / "store" / "store" / "chunk" / "0").read_bytes()
     assert (mirror / "store" / COMPLETE_FILE).is_file()
+
+
+def _base(tmp_path: Path) -> tuple[Path, Base]:
+    """A base run whose samples, store, measurement and fit steps are complete (the store and measurement each with a
+    store payload), pushed to its mirror; and the base as another run names it."""
+    run = _stores(tmp_path / "base", ("store", "measurement"))
+    _write(run / "samples" / "samples.json", "{}")
+    _write(run / "samples" / COMPLETE_FILE, '{"key": "samples"}')
+    _write(run / "fit" / "models.json", "{}")
+    _write(run / "fit" / COMPLETE_FILE, '{"key": "basefit"}')
+    mirror = tmp_path / "base-mirror"
+    push(run, DirectoryRemote(mirror))
+    return run, Base(DirectoryRemote(mirror), "gs://ops/svpgs/base/run", mirror)
+
+
+def test_a_base_carries_the_steps_before_the_fit_that_a_run_s_mirror_lacks_and_is_never_written(tmp_path: Path) -> None:
+    base_run, base = _base(tmp_path)
+    written = {path: path.stat().st_mtime_ns for path in (tmp_path / "base-mirror").rglob("*")}
+    remote, run = DirectoryRemote(tmp_path / "mirror"), tmp_path / "run"
+    restore(run, remote, tmp_path / "mirror", bases=[base])
+    # The store a later step's replaces is linked on the base's mount and the measurement's downloaded; the base's fit
+    # is its own run's result, never restored.
+    assert (run / "store" / "store").resolve() == (tmp_path / "base-mirror" / "store" / "store").resolve()
+    assert not (run / "measurement" / "store").is_symlink() and (run / "measurement" / "store" / "loci").is_dir()
+    assert _followed(run) == {name: content for name, content in _tree(base_run).items() if not name.startswith("fit/")}
+    # The run's own work goes to its own mirror; the steps the base carries do not, and the mirror names the base.
+    _write(run / "fit.partial" / KEY_FILE, "fitkey")
+    push(run, remote, bases=[base])
+    push(run, remote, bases=[base])
+    assert set(_tree(tmp_path / "mirror")) == {f"fit.partial/{KEY_FILE}", ".bases/ops/svpgs/base/run"}
+    assert {path: path.stat().st_mtime_ns for path in (tmp_path / "base-mirror").rglob("*")} == written
+    # The next job's new disk is filled the same way.
+    again = tmp_path / "again"
+    restore(again, remote, tmp_path / "mirror", bases=[base])
+    assert _tree(again) == _tree(run) and (again / "store" / "store").resolve() == (run / "store" / "store").resolve()
+
+
+def test_a_run_s_own_steps_come_before_a_base_s_and_a_step_made_as_the_base_holds_it_is_the_base_s(tmp_path: Path) -> None:
+    _base_run, base = _base(tmp_path)
+    remote, mirror = DirectoryRemote(tmp_path / "mirror"), tmp_path / "mirror"
+    # This run's measurement was made under another key (another cohort), and its store is partway (a fan-out).
+    run = _stores(tmp_path / "run", ("measurement",))
+    _write(run / "measurement" / COMPLETE_FILE, '{"key": "other cohort"}')
+    _write(run / "store.partial" / KEY_FILE, "storekey")
+    push(run, remote, bases=[base])
+    assert (mirror / "measurement" / COMPLETE_FILE).read_text() == '{"key": "other cohort"}'
+    restored = tmp_path / "restored"
+    restore(restored, remote, None, bases=[base])
+    assert (restored / "measurement" / COMPLETE_FILE).read_text() == '{"key": "other cohort"}'
+    assert (restored / "store.partial" / KEY_FILE).read_text() == "storekey" and not (restored / "store").exists()
+    assert (restored / "samples" / COMPLETE_FILE).read_text() == '{"key": "samples"}'
+    # Made again as the base holds it, the step is the base's: this mirror's stale copy is removed, not sent again.
+    shutil.rmtree(run / "measurement")
+    shutil.copytree(tmp_path / "base" / "measurement", run / "measurement")
+    push(run, remote, bases=[base])
+    assert not (mirror / "measurement").exists() and (mirror / ".bases" / "ops" / "svpgs" / "base" / "run").is_file()
+    # Without the base, the same step is pushed whole, as before.
+    push(run, remote)
+    assert _tree(mirror / "measurement") == _tree(run / "measurement")
+
+
+def test_a_restore_stops_when_a_step_changes_where_it_lies_while_it_is_downloaded(tmp_path: Path) -> None:
+    _base_run, base = _base(tmp_path)
+
+    class Pushed(DirectoryRemote):
+        """The base's run pushes its measurement again, under another key, while this restore downloads it."""
+
+        def download_many(self, pairs: list[tuple[Path, str]]) -> None:
+            super().download_many(pairs)
+            if any(name == f"measurement/{COMPLETE_FILE}" for _path, name in pairs):
+                self.write(f"measurement/{COMPLETE_FILE}", b'{"key": "made again"}')
+
+    run = tmp_path / "run"
+    with pytest.raises(RuntimeError, match="measurement changed on the base gs://ops/svpgs/base/run"):
+        restore(run, DirectoryRemote(tmp_path / "mirror"), None, bases=[Base(Pushed(tmp_path / "base-mirror"), base.url, base.mount)])
+    assert (run / "store" / COMPLETE_FILE).is_file() and not (run / "measurement").exists()
+
+
+def test_a_run_reads_the_bases_its_mirror_names_and_those_each_base_names(tmp_path: Path) -> None:
+    """A run whose samples and store a base carries makes its measurement, and is itself named as a third run's base:
+    the third run, given only that one, reads both, and once it has pushed it needs neither given."""
+    opened = {name: Base(DirectoryRemote(tmp_path / name), f"gs://ops/svpgs/{name}/run", tmp_path / name) for name in ("s", "a", "r")}
+    open_base = lambda url: opened[url.split("/")[-2]]
+    store = _stores(tmp_path / "store-run", ("store",))
+    _write(store / "samples" / COMPLETE_FILE, '{"key": "samples"}')
+    push(store, opened["s"].remote)
+    first = tmp_path / "first-run"
+    restore(first, opened["a"].remote, None, bases=bases_of(opened["a"].url, opened["a"].remote, [opened["s"].url], open_base))
+    _stores(first, ("measurement",))
+    push(first, opened["a"].remote, bases=bases_of(opened["a"].url, opened["a"].remote, [opened["s"].url], open_base))
+    assert set(_tree(tmp_path / "a")) == {".bases/ops/svpgs/s/run", "measurement.directories.json"} | {
+        f"measurement/{name}" for name in _tree(first / "measurement")
+    }
+    # A base that names the run reading it is not read twice.
+    opened["s"].remote.write(opened["r"].reference, b"")
+    bases = bases_of(opened["r"].url, opened["r"].remote, [opened["a"].url], open_base)
+    assert bases == [opened["a"], opened["s"]]
+    third = tmp_path / "third-run"
+    restore(third, opened["r"].remote, None, bases=bases)
+    assert _followed(third) == _tree(first) and (third / "store" / "store").is_symlink()
+    push(third, opened["r"].remote, bases=bases)
+    assert set(_tree(tmp_path / "r")) == {".bases/ops/svpgs/a/run", ".bases/ops/svpgs/s/run"}
+    assert bases_of(opened["r"].url, opened["r"].remote, [], open_base) == [opened["a"], opened["s"]]

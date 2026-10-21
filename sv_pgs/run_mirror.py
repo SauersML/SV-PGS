@@ -33,6 +33,14 @@ the design workload), and only the next of them reads it: the fit, score, effect
 launcher/workspace does), a restore links each store a later completed step's replaces to its mirrored copy on the
 mount instead of downloading it, so a job start fetches one copy, not three. A step made again that reads a linked
 store reads it through the mount.
+
+A run can name base mirrors (``Base``): other runs' mirrors that carry its completed steps before the fit (CARRIED; the
+samples, the store and the steps that recalibrate it, which runs of other traits or other fit code share by key). A
+restore takes such a step from the first base that holds it whole where this run's mirror holds none of it, and a push
+does not send a completed step a base holds whole under the same COMPLETE_FILE; it removes this mirror's own stale copy
+and names the base instead (BASES), which later jobs of the run read as a base, as they do the bases a base names
+(``bases_of``). So a new run's mirror needs no copy of the 0.5-1.5 TB store chain. A base is only read: a run never
+writes or deletes there, and it must be kept while the runs it carries are.
 """
 from __future__ import annotations
 
@@ -41,7 +49,8 @@ import logging
 import multiprocessing
 import os
 import shutil
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from itertools import repeat
@@ -74,6 +83,13 @@ STORE_CHROMOSOME_FILES = ("fill", "reported", "calibration")
 """The store step's per-chromosome files beside its store, <directory>/<chromosome>.<suffix>; inside store/, a
 chromosome's files are those under a directory named for it (dosage/half<i>/<chromosome>, stats/half<i>/<chromosome>,
 variants/<chromosome>, loci/<chromosome>)."""
+CARRIED = STEP_NAMES[: STEP_NAMES.index("fit")]
+"""The steps a base mirror can carry for a run: those before the fit. The fit and the steps after it are each run's own
+results, which a run of other traits or code would only download to set aside."""
+BASES = ".bases"
+"""In a run's mirror, an empty object .bases/<bucket>/<prefix> for each base gs://<bucket>/<prefix> that carries one of
+its completed steps, so a listing of the bucket shows which runs a base must outlive
+(launcher/workspace/mirror_sizes.py)."""
 
 
 def _of_chromosome(relative: str, chromosome: str) -> bool:
@@ -100,6 +116,21 @@ class Remote(Protocol):
     def download_many(self, pairs: list[tuple[Path, str]]) -> None: ...
 
     def delete(self, names: Iterable[str]) -> None: ...
+
+
+@dataclass(frozen=True)
+class Base:
+    """Another run's mirror at ``url`` that carries completed steps (CARRIED) for this run, which only reads it;
+    ``mount`` is where it shows on this machine (``mounted``)."""
+
+    remote: Remote
+    url: str
+    mount: Path | None = None
+
+    @property
+    def reference(self) -> str:
+        """Its name in a mirror it carries steps for (BASES)."""
+        return f"{BASES}/{self.url.split('://', 1)[-1].strip('/')}"
 
 
 class GcsRemote:
@@ -261,16 +292,28 @@ def _files(directory: Path) -> list[Path]:
     return sorted(path for path in directory.rglob("*") if path.is_file())
 
 
-def _push_step(remote: Remote, final: Path, name: str) -> None:
+def _push_step(remote: Remote, final: Path, name: str, bases: Sequence[Base] = ()) -> Base | None:
+    """A completed step, whole, its COMPLETE_FILE last; or, where a base holds it whole under the same COMPLETE_FILE,
+    nothing, and that base is returned."""
     marker = final / COMPLETE_FILE
     content = marker.read_bytes()
     batches = final / "batches" if name in ("score", "effects") else None
     files = [path for path in _files(final) if path != marker and (batches is None or not path.is_relative_to(batches))]
     held = remote.sizes(f"{name}/")
-    if remote.read(f"{name}/{COMPLETE_FILE}") == content:
+    mirrored = remote.read(f"{name}/{COMPLETE_FILE}")
+    for base in bases if mirrored != content and name in CARRIED else ():
+        if base.remote.read(f"{name}/{COMPLETE_FILE}") == content:
+            carried = base.remote.sizes(f"{name}/")
+            if all(carried.get(f"{name}/{path.relative_to(final).as_posix()}") == path.stat().st_size for path in files):
+                if held:
+                    LOGGER.info("run mirror: %s is carried by the base %s; this mirror's stale copy is removed", name, base.url)
+                remote.delete(held)
+                remote.delete(remote.sizes(f"{name}{PARTIAL}/"))
+                return base
+    if mirrored == content:
         files = [path for path in files if held.get(f"{name}/{path.relative_to(final).as_posix()}") != path.stat().st_size]
         if not files:
-            return
+            return None
         # A completion marker alone is not a whole step after an interrupted manual copy. Repair only its missing
         # companions, but withdraw that marker while doing so, as for a partial's saved-model unit.
         remote.delete([f"{name}/{COMPLETE_FILE}"])
@@ -284,6 +327,7 @@ def _push_step(remote: Remote, final: Path, name: str) -> None:
     remote.upload(marker, f"{name}/{COMPLETE_FILE}")
     remote.delete(remote.sizes(f"{name}{PARTIAL}/"))
     LOGGER.info("run mirror: pushed %s, %d files, %.1f GB", name, len(files) + 1, sum(path.stat().st_size for path in files) / 1e9)
+    return None
 
 
 def _partial_units(partial: Path) -> list[tuple[list[Path], Path]]:
@@ -366,10 +410,11 @@ def _push_partial(remote: Remote, partial: Path, step: str) -> None:
         LOGGER.info("run mirror: pushed %d durable units of %s", pushed, name)
 
 
-def push(run_directory: Path, remote: Remote) -> None:
-    """Copy the run's durable state to the mirror, skipping what it already holds. A file the driver moves away during
-    the push (a partial renamed to its step, a step set aside) ends that directory's push for this time; the next push
-    sees where it went."""
+def push(run_directory: Path, remote: Remote, bases: Sequence[Base] = ()) -> None:
+    """Copy the run's durable state to the mirror, skipping what it already holds and the completed steps a base
+    carries (``Base``), which the mirror names instead (BASES). A file the driver moves away during the push (a partial
+    renamed to its step, a step set aside) ends that directory's push for this time; the next push sees where it went."""
+    references: set[str] = set()
     for step in STEP_NAMES:
         final, partial = run_directory / step, run_directory / f"{step}{PARTIAL}"
         if final.is_symlink():
@@ -377,11 +422,17 @@ def push(run_directory: Path, remote: Remote) -> None:
             continue
         try:
             if (final / COMPLETE_FILE).is_file():
-                _push_step(remote, final, step)
+                carrier = _push_step(remote, final, step, bases)
+                if carrier is not None:
+                    references.add(carrier.reference)
             elif (partial / KEY_FILE).is_file():
                 _push_partial(remote, partial, step)
         except FileNotFoundError as moved:
             LOGGER.info("run mirror: %s moved during the push (%s); it is pushed next time", step, moved)
+    if references:
+        named = remote.sizes(f"{BASES}/")
+        for reference in sorted(references - named.keys()):
+            remote.write(reference, b"")
     regions = run_directory / REGIONS_DIRECTORY
     for region in sorted(regions.iterdir()) if regions.is_dir() else ():
         push(region, _Within(remote, f"{REGIONS_DIRECTORY}/{region.name}/"))
@@ -416,6 +467,20 @@ def _matches(relative: str, pattern: str) -> bool:
     return len(parts) == len(wanted) and all(fnmatchcase(part, want) for part, want in zip(parts, wanted))
 
 
+def bases_of(url: str, remote: Remote, urls: Sequence[str], opened: Callable[[str], Base]) -> list[Base]:
+    """The bases the run whose mirror is ``remote`` at ``url`` reads, each once: ``urls`` first, then those its mirror
+    names (BASES), then those each base names in turn, whose steps that base does not hold itself. So a run need be
+    given its base only until its first push names it, and a run based on another based run reads both."""
+    found: dict[str, Base | None] = {url: None}
+    pending = [*urls, *("gs://" + name.removeprefix(f"{BASES}/") for name in sorted(remote.sizes(f"{BASES}/")))]
+    while pending:
+        named = pending.pop(0)
+        if named not in found:
+            base = found[named] = opened(named)
+            pending.extend("gs://" + name.removeprefix(f"{BASES}/") for name in sorted(base.remote.sizes(f"{BASES}/")))
+    return [base for base in found.values() if base is not None]
+
+
 def mounted(url: str) -> Path | None:
     """Where the mirror ``url`` (gs://bucket/prefix) shows on this machine's bucket mounts (GCS_MOUNTS), or None."""
     bucket, _, prefix = url.removeprefix("gs://").partition("/")
@@ -435,33 +500,54 @@ def _replaced_stores(names: dict[str, int]) -> set[str]:
     return set(stores[:-1])
 
 
-def restore(run_directory: Path, remote: Remote, mount: Path | None = None) -> None:
+def restore(run_directory: Path, remote: Remote, mount: Path | None = None, bases: Sequence[Base] = ()) -> None:
     """Fill a run directory from the mirror: every completed step, and each partial step's durable units, for every step
     this run directory does not hold already. Each is downloaded aside and renamed into place, so an interrupted restore
     leaves no step directory the driver would take for its own. ``mount`` is where the mirror shows on this machine
     (``mounted``): a completed step's store payload that a later completed step's replaces is linked there, not
-    downloaded."""
+    downloaded. A step before the fit (CARRIED) that the mirror holds neither completed nor partial comes from the first
+    of ``bases`` that holds it completed, its replaced store linked on that base's mount. A completed step whose
+    COMPLETE_FILE is gone or changed after its download (a push or removal where it lies) stops the restore: what was
+    downloaded could mix two steps."""
     names = remote.sizes("")
     run_directory.mkdir(parents=True, exist_ok=True)
-    linked = _replaced_stores(names) if mount is not None else set()
+    # The mirror's objects, a carried step's those of the base that carries it.
+    objects = dict(names)
+    carriers: dict[str, Base] = {}
+    for base in bases:
+        held = base.remote.sizes("")
+        for step in CARRIED:
+            if step in carriers or f"{step}/{COMPLETE_FILE}" in names or f"{step}{PARTIAL}/{KEY_FILE}" in names:
+                continue
+            if f"{step}/{COMPLETE_FILE}" in held:
+                carriers[step] = base
+                objects = {entry: size for entry, size in objects.items() if not entry.startswith(f"{step}/")}
+                objects.update((entry, size) for entry, size in held.items() if entry.startswith(f"{step}/"))
+    linked = _replaced_stores(objects)
     for step in STEP_NAMES:
         final, partial = run_directory / step, run_directory / f"{step}{PARTIAL}"
         if final.exists() or partial.exists():
             continue
-        if f"{step}/{COMPLETE_FILE}" in names:
+        carrier = carriers.get(step)
+        source, shown = (remote, mount) if carrier is None else (carrier.remote, carrier.mount)
+        if f"{step}/{COMPLETE_FILE}" in objects:
             name, target = step, final
-            chosen = sorted(entry for entry in names if entry.startswith(f"{step}/"))
+            chosen = sorted(entry for entry in objects if entry.startswith(f"{step}/"))
         elif f"{step}{PARTIAL}/{KEY_FILE}" in names:
             name, target = f"{step}{PARTIAL}", partial
             chosen = _restorable_partial(names, name)
         else:
             continue
+        origin = "this run's mirror" if carrier is None else f"the base {carrier.url}"
+        marker = source.read(f"{step}/{COMPLETE_FILE}") if target == final else None
+        if target == final and marker is None:
+            raise RuntimeError(f"{step}'s {COMPLETE_FILE} left {origin} after it was listed; restore again.")
         aside = run_directory / f"{name}{RESTORING}"
         if aside.exists():
             shutil.rmtree(aside)
         aside.mkdir()
-        listed = json.loads(remote.read(f"{name}{DIRECTORIES}") or "[]") if target == final else []
-        payload = mount / step / STORE if mount is not None and target == final and step in linked else None
+        listed = json.loads(source.read(f"{name}{DIRECTORIES}") or "[]") if target == final else []
+        payload = shown / step / STORE if shown is not None and target == final and step in linked else None
         if payload is not None and payload.is_dir():
             chosen = [entry for entry in chosen if not entry.startswith(f"{step}/{STORE}/")]
             listed = [directory for directory in listed if Path(directory).parts[0] != STORE]
@@ -472,10 +558,12 @@ def restore(run_directory: Path, remote: Remote, mount: Path | None = None) -> N
         # Largest first: a store's codes are one file per half and chromosome (``dosage_store.write_half_codes``), 44
         # files and 547 GB at the AoU whole-genome workload, each downloaded as one stream; in name order a large one
         # could start last and download alone while the other workers idle.
-        chosen.sort(key=lambda entry: -names[entry])
-        remote.download_many([(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen])
+        chosen.sort(key=lambda entry: -objects[entry])
+        source.download_many([(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen])
+        if target == final and source.read(f"{step}/{COMPLETE_FILE}") != marker:
+            raise RuntimeError(f"{step} changed on {origin} while it was restored; restore again.")
         os.rename(aside, target)
-        LOGGER.info("run mirror: restored %s, %d files, %.1f GB", name, len(chosen), sum(names[entry] for entry in chosen) / 1e9)
+        LOGGER.info("run mirror: restored %s from %s, %d files, %.1f GB", name, origin, len(chosen), sum(objects[entry] for entry in chosen) / 1e9)
     # Each region's own steps; the driver links the run's steps before the fit into its directory again.
     for region in sorted({entry.split("/")[1] for entry in names if entry.startswith(f"{REGIONS_DIRECTORY}/") and entry.count("/") >= 2}):
         restore(run_directory / REGIONS_DIRECTORY / region, _Within(remote, f"{REGIONS_DIRECTORY}/{region}/"))

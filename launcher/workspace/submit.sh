@@ -60,7 +60,16 @@ fi
 # for the staged uv.lock, and to publish it otherwise (run_step.sh.template, launcher/workspace/runtime_pack.py).
 SHARED_RUNTIME="${SHARED_RUNTIME:-}"
 [[ "$SHARED_RUNTIME" =~ ^1?$ ]] || { echo "SHARED_RUNTIME is 1 or empty" >&2; exit 2; }
-export TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME
+# BASE_RUN (optional): another run of this ops bucket whose mirror carries this run's completed steps before the fit
+# (samples, store, phenotypes, cohort, measurement, direct_sv) where this run's mirror holds none of a step, in place of
+# a copy of its 0.5-1.5 TB store chain: run-mirror --base (sv_pgs/run_mirror.py), which the staged source must have.
+# The base is only read, and must be kept while this run is: this run's mirror names it under run/.bases/ from its first
+# push on, and the run's later jobs read it from there, as they do the bases the base names.
+BASE_RUN="${BASE_RUN:-}"
+if [ -n "$BASE_RUN" ] && { [[ ! "$BASE_RUN" =~ ^[a-z][a-z0-9-]{0,25}$ ]] || [ "$BASE_RUN" = "${RUN_ID:?}" ]; }; then
+  echo "BASE_RUN is another run's RUN_ID in the ops bucket" >&2; exit 2
+fi
+export TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME BASE_RUN
 if [[ ! "${RUN_DISK_GB:?}" =~ ^[1-9][0-9]*$ ]]; then
   echo "RUN_DISK_GB is the size in GB of the new disk each job works on (the run's stores, with room to write the next)" >&2; exit 2
 fi
@@ -102,7 +111,7 @@ done
 export IMPUTED_BUCKET PANEL_BUCKET
 # The slot's task script, run_step.sh in the slot's launcher directory.
 python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
-  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME
+  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME BASE_RUN
 variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROVISIONING_MODEL PROJECT_ID RUN_DISK_GB RUN_DISK_TYPE REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
 if [ "$spec" = fit ]; then variables+=(GPU_TYPE GPU_COUNT); else variables+=(TASK_COUNT); fi
 variables+=(CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET GOOGLE_PROJECT)

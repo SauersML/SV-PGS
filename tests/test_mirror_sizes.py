@@ -38,6 +38,8 @@ def _whole_genome_run(run: str, date: str, final_crc: str = "final==") -> list[d
 def test_the_script_s_layout_is_the_pipeline_s_and_the_mirror_s() -> None:
     assert mirror_sizes.STEP_NAMES == STEP_NAMES and mirror_sizes.COMPLETE_FILE == COMPLETE_FILE
     assert mirror_sizes.PARTIAL == run_mirror.PARTIAL and mirror_sizes.STORE == run_mirror.STORE
+    assert mirror_sizes.BASES == run_mirror.BASES and run_mirror.CARRIED == STEP_NAMES[: STEP_NAMES.index("fit")]
+    assert run_mirror.Base(run_mirror.DirectoryRemote(Path(".")), "gs://ops/svpgs/base/run").reference == f"{run_mirror.BASES}/ops/svpgs/base/run"
 
 
 def test_each_run_is_sized_by_part_and_a_store_several_runs_hold_is_named_once() -> None:
@@ -59,6 +61,22 @@ def test_each_run_is_sized_by_part_and_a_store_several_runs_hold_is_named_once()
     assert len(shared) == 2 and shared[0].strip().startswith("0.400 TB held 3 times, 0.800 TB beyond one copy")
     assert "0.500 TB held 2 times, 0.500 TB beyond one copy" in shared[1]
     assert "asthma/run/direct_sv/store" in shared[1] and "hypertension/run/direct_sv/store" in shared[1] and "gout" not in shared[1]
+
+
+def test_a_base_mirror_is_named_with_the_runs_it_carries_and_flagged_once_it_holds_no_completed_step() -> None:
+    """A run whose mirror a base carries steps for names it under run/.bases/ (sv_pgs.run_mirror.Base.reference)."""
+    named = lambda run, base: _object(f"{run}/run/.bases/workspace/svpgs/{base}/run", 0, "AAAAAA==", "2026-10-19")
+    objects = _whole_genome_run("hypertension", "2026-10-19") + [_object("ldl/run/fit.partial/_KEY", 1, "k==", "2026-10-19")]
+    objects += [named("ldl", "hypertension"), named("gout", "hypertension"), named("asthma", "pruned")]
+    # gout still holds a copy of the base's store step object for object (a server-side copy), and its own direct_sv.
+    objects += [entry for entry in _whole_genome_run("gout", "2026-10-19", final_crc="other==") if "/run/store/" in entry["name"] or "/run/direct_sv/" in entry["name"]]
+    text = mirror_sizes.report(objects, 0.02, datetime.date(2026, 10, 20))
+    assert text.split("base mirrors that carry other runs' completed steps (keep each while those runs are kept):\n")[1].splitlines()[:2] == [
+        "  hypertension: carries gout, ldl",
+        "  pruned: carries asthma  HOLDS NO COMPLETED STEP: their next restores make those steps again",
+    ]
+    (removable,) = [line for line in text.splitlines() if line.startswith("  gout/run/")]
+    assert removable == f"  gout/run/store/ as hypertension/run/store/: 0.400 TB, ${(400 * 10**9 + 1) / 2**30 * 0.02:.2f}/month"
 
 
 def test_the_bucket_is_only_listed(tmp_path: Path) -> None:

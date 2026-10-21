@@ -10,7 +10,9 @@ they are read only to make a later step again.
 
 For each run it prints the bytes by part, the days since the run last wrote an object, and the monthly cost at the price
 given; then each store payload that several runs hold byte for byte (every object's size and CRC32C alike), which one
-shared copy could replace. Cloud Storage bills stored bytes by the GiB-month at the bucket's location and class.
+shared copy could replace; then each base mirror that carries other runs' completed steps (their run/.bases/ names it),
+which must be kept while they are, and any such base that holds nothing. Cloud Storage bills stored bytes by the
+GiB-month at the bucket's location and class.
 
   python3 launcher/workspace/mirror_sizes.py --bucket "$OPS_BUCKET" --usd-per-gib-month 0.020
   gcloud storage objects list "gs://$OPS_BUCKET/svpgs/**" --format=json > objects.json
@@ -31,6 +33,9 @@ STEP_NAMES = ("samples", "store", "phenotypes", "cohort", "measurement", "direct
 COMPLETE_FILE = "_COMPLETE.json"
 PARTIAL = ".partial"
 STORE = "store"
+BASES = ".bases"
+CARRIED = STEP_NAMES[: STEP_NAMES.index("fit")]
+"""sv_pgs.run_mirror.CARRIED: the steps a base mirror carries for the runs that name it, those before the fit."""
 ROOT = "svpgs/"
 STAGED = ("source", "env.tar", "run_config.json")
 PARTS = ("restored", "linked stores", "partial", "staged", "logs")
@@ -114,6 +119,14 @@ def report(objects: list[dict], usd_per_gib_month: float, today: datetime.date) 
         + "".join(f"{totals[name] / 1e12:>18.3f}" for name in PARTS)
     )
     shared = sorted((group for group in holders.values() if len(group) > 1), key=lambda group: -group[0][2] * (len(group) - 1))
+    # sv_pgs.run_mirror.Base.reference: run/.bases/<bucket>/<prefix>, svpgs/<base>/run for a run of this bucket.
+    carried: dict[str, list[str]] = defaultdict(list)
+    for run, entries in runs.items():
+        for inside, _size, _crc, _date in entries:
+            parts = inside.split("/")
+            if parts[:2] == ["run", BASES] and len(parts) > 2:
+                base = parts[4] if len(parts) == 6 and parts[3] == ROOT.strip("/") and parts[5] == "run" else "gs://" + "/".join(parts[2:])
+                carried[base].append(run)
     if shared:
         lines.append("")
         lines.append("store payloads several runs hold byte for byte (one copy could serve them all):")
@@ -123,6 +136,31 @@ def report(objects: list[dict], usd_per_gib_month: float, today: datetime.date) 
                 f"  {group[0][2] / 1e12:.3f} TB held {len(group)} times, {spare / 1e12:.3f} TB beyond one copy "
                 f"(${spare / 2**30 * usd_per_gib_month:.2f}/month): " + ", ".join(f"{run}/run/{step}/{STORE}" for run, step, _size in group)
             )
+    if carried:
+        lines.append("")
+        lines.append("base mirrors that carry other runs' completed steps (keep each while those runs are kept):")
+        redundant = []
+        for base in sorted(carried):
+            kept = {inside: (size, crc) for inside, size, crc, _date in runs.get(base, ())}
+            gone = not base.startswith("gs://") and not any(f"run/{step}/{COMPLETE_FILE}" in kept for step in CARRIED)
+            lines.append(
+                f"  {base}: carries {', '.join(sorted(carried[base]))}"
+                + ("  HOLDS NO COMPLETED STEP: their next restores make those steps again" if gone else "")
+            )
+            for run in sorted(carried[base]):
+                for step in CARRIED:
+                    own = {inside: (size, crc) for inside, size, crc, _date in runs[run] if inside.startswith(f"run/{step}/")}
+                    if f"run/{step}/{COMPLETE_FILE}" in own and own == {inside: held for inside, held in kept.items() if inside.startswith(f"run/{step}/")}:
+                        redundant.append((run, step, base, sum(size for size, _crc in own.values())))
+        if redundant:
+            lines.append("")
+            lines.append(
+                "completed steps a run holds as its base does, object for object (size and CRC32C): its jobs that read the "
+                "base (BASE_RUN, run-mirror --base) restore them from there, so this copy can be deleted once no job of "
+                "the run runs older code:"
+            )
+            for run, step, base, size in redundant:
+                lines.append(f"  {run}/run/{step}/ as {base}/run/{step}/: {size / 1e12:.3f} TB, ${size / 2**30 * usd_per_gib_month:.2f}/month")
     return "\n".join(lines)
 
 

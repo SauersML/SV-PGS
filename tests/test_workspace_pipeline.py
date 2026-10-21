@@ -1056,6 +1056,33 @@ def test_store_shards_on_their_own_disks_meet_in_the_mirror_and_make_the_store_o
         run_pipeline(config, _bindings(_Recorder(), client), BUDGET, store_shard=len(CHROMOSOMES))
 
 
+def test_a_run_restored_from_a_base_mirror_makes_none_of_its_steps_again_and_pushes_none_of_them(workspace, monkeypatch) -> None:
+    """A new run whose mirror is empty names another run's mirror as its base (run_mirror.Base): restored from it, the
+    driver finds the samples and store steps under its own keys and skips them, and its pushes send neither to its own
+    mirror, which names the base instead."""
+    from sv_pgs.run_mirror import Base, DirectoryRemote, push, restore
+
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    run = config.run_directory
+    whole = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="store")
+    base = Base(DirectoryRemote(run.with_name("base")), "gs://ops/svpgs/base/run", run.with_name("base"))
+    push(run, base.remote)
+    shutil.rmtree(run)
+    shutil.rmtree(config.marker_directory)
+    remote = DirectoryRemote(run.with_name("mirror"))
+    restore(run, remote, run.with_name("mirror"), bases=[base])
+    monkeypatch.setattr(workspace_pipeline, "_convert_chromosome", lambda *arguments: pytest.fail("the base's store was converted again"))
+    again = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="store")
+    assert again["store"] == whole["store"]
+    events = {path.name.split("_", 1)[1] for path in config.marker_directory.iterdir()}
+    assert {"samples_skipped", "store_skipped"} <= events and not any(event.endswith("_started") for event in events)
+    push(run, remote, bases=[base])
+    assert sorted(path.relative_to(run.with_name("mirror")).as_posix() for path in run.with_name("mirror").rglob("*") if path.is_file()) == [
+        ".bases/ops/svpgs/base/run"
+    ]
+
+
 def test_each_arm_can_be_fitted_by_its_own_run(workspace) -> None:
     """A run given fit_arms fits only those and leaves the fit step to the run that finds every arm on disk."""
     synthetic, client = workspace
