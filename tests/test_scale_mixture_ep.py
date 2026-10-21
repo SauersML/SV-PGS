@@ -1337,6 +1337,60 @@ def test_the_first_trust_region_trial_is_bounded_by_the_cauchy_step():
     assert float(np.linalg.norm(engine._proposal(newton, radius))) <= radius * (1.0 + 1e-9)
 
 
+def test_a_joint_step_halved_with_no_certified_value_at_rho_hat_moves_its_weights_too(monkeypatch):
+    """A refused joint step halved at rho-hat tends to (x_k, rho-hat) as the fraction falls, not to the certified state,
+    so where V's formula has no certified value at rho-hat no halving need have one: on the whole-genome fits [real,
+    aou-ws6 snv_indel] a polished state's step had none at fractions 1 to 0.0625, 45 minutes a trial, and halved on to
+    x's resolution. Here every plan's step moves the finite weights down by one (x where the hyper step placed it), and
+    V's formula has no certified value beyond 40% of that move: after one halving at rho-hat the halvings move the
+    weights with x, toward the certified state, and reach a certified value."""
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    start = replace(initial_hyperparameters(prior), log_smoothing=np.full(len(prior.smoothing_blocks), 2.0))
+    real_step, real_state = engine.hyper_step, engine._outer_state
+    planned: dict[str, np.ndarray] = {}
+
+    def step(view, hyperparameters, *arguments, **keywords):
+        found = real_step(view, hyperparameters, *arguments, **keywords)
+        weights = np.array(hyperparameters.log_smoothing, copy=True)
+        planned["from"], planned["to"] = weights, np.where(np.isfinite(weights), weights - 1.0, weights)
+        return replace(found, hyperparameters=MixtureHyperparameters(coefficients=found.hyperparameters.coefficients, log_smoothing=planned["to"]))
+
+    def walled(view, hyperparameters, *arguments, **keywords):
+        if planned:
+            weights = hyperparameters.log_smoothing
+            finite = np.isfinite(planned["from"]) & np.isfinite(weights)
+            move = planned["to"][finite] - planned["from"][finite]
+            if float((weights[finite] - planned["from"][finite]) @ move) > 0.4 * float(move @ move):
+                return None
+        return real_state(view, hyperparameters, *arguments, **keywords)
+
+    monkeypatch.setattr(engine, "hyper_step", step)
+    monkeypatch.setattr(engine, "_outer_state", walled)
+    lines: list[str] = []
+    monkeypatch.setattr(engine, "log", lines.append)
+
+    def fixed_points(hyperparameters):
+        points = []
+        for model in hyperparameters:
+            moments = tilted_moments(prior, model, cavity, _WORKING_BYTES)
+            points.append(FixedPoint(
+                cavity=cavity, posterior=diagonal_posterior(moments.variance), mean=moments.mean,
+                precision_norm=lambda direction, variance=moments.variance: float(np.sum(np.square(direction) / variance)),
+                effective_effects=float(np.sum(cavity.precision * moments.variance)),
+            ))
+        return points
+
+    fit_hyperparameters(prior, [start], fixed_points, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    trials = [line for line in lines if " joint trial at fraction " in line]
+    run = longest = 0
+    for line in trials:
+        run = run + 1 if line.endswith(": no certified value") and " (x and weights) " not in line else 0
+        longest = max(longest, run)
+    # The whole step and one halving at rho-hat (on 11470d5 the polished state's step had 27, to x's resolution).
+    assert longest <= 2, "\n".join(trials)
+    assert any(" (x and weights) " in line and line.endswith((": accepted", ": refused")) for line in trials), "\n".join(trials)
+
+
 def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
     prior, cavity = _problem(variant_count=40, seed=48, node_count=10)
     coefficients = _hyperparameters(prior, 49).coefficients
