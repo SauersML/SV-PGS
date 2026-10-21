@@ -4,6 +4,7 @@
 #
 #   submit.sh store      # steps samples .. direct_sv, on CPUs
 #   submit.sh fit        # steps fit .. export, on GPUs
+#   submit.sh merge      # the steps fit .. export finished from two arm runs' parts (FIT_ARMS, PARTNER_RUN), on CPUs
 #
 # PROVISIONING_MODEL is SPOT or STANDARD for either job. Batch places the job in any zone of REGION with capacity, and has
 # no fallback from one model to the other (it uses a job's first instance policy only). A task is retried, up to
@@ -23,9 +24,14 @@
 # Batch limits task runtime; separately billed resources use the plan's non-task reserve.
 set -euo pipefail
 job="${1:-}"
+# A merge job is a store job's CPU machine finishing one run (MERGE=1 in its task script, run_step.sh): it restores no
+# store, adopts the other arm's parts from PARTNER_RUN's mirror and finishes the steps from the fit on with no store. It
+# is needed only where neither arm's job finished the run itself, as the later of the two does when given PARTNER_RUN.
+MERGE=""
 case "$job" in
   store|fit) spec="$job" ;;
-  *) echo "usage: submit.sh store|fit" >&2; exit 2 ;;
+  merge) spec=store; MERGE=1 ;;
+  *) echo "usage: submit.sh store|fit|merge" >&2; exit 2 ;;
 esac
 here="$(cd "$(dirname "$0")" && pwd)"
 : "${PROJECT_ID:?}" "${REGION:?}" "${OPS_BUCKET:?}" "${RUN_ID:?}" "${HOURLY_USD:?}" "${BUDGET_SLOT:?}"
@@ -75,7 +81,17 @@ STAGED_SOURCE="${STAGED_SOURCE:-}"
 if [ -n "$STAGED_SOURCE" ] && [[ ! "$STAGED_SOURCE" =~ ^[a-z_][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*$ ]]; then
   echo "STAGED_SOURCE is a directory under svpgs/ in the ops bucket, such as _rounds/r7" >&2; exit 2
 fi
-export TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME BASE_RUN STAGED_SOURCE
+# PARTNER_RUN (optional for a fit job given FIT_ARMS, required for a merge job): the run of this ops bucket that fits
+# the other arm, with the same run config but its run directory. The job that holds both arms' parts finishes the run
+# (sv-pgs run-mirror adopt, workspace-run --finish), a few minutes after its own fit: no merge VM, store restore or digest.
+PARTNER_RUN="${PARTNER_RUN:-}"
+if [ -n "$PARTNER_RUN" ] && { [[ ! "$PARTNER_RUN" =~ ^[a-z][a-z0-9-]{0,25}$ ]] || [ "$PARTNER_RUN" = "${RUN_ID:?}" ] || { [ "$job" = fit ] && [ -z "$FIT_ARMS" ]; } || [ "$job" = store ]; }; then
+  echo "PARTNER_RUN is the RUN_ID of the run that fits the other arm, for a fit job given FIT_ARMS or a merge job" >&2; exit 2
+fi
+if [ "$job" = merge ] && { [ -z "$PARTNER_RUN" ] || [ "$TASK_COUNT" != 1 ] || [ -n "$STORE_SHARDS" ]; }; then
+  echo "a merge job finishes one run from its arms' parts: it needs PARTNER_RUN and has one task" >&2; exit 2
+fi
+export TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME BASE_RUN STAGED_SOURCE PARTNER_RUN MERGE
 if [[ ! "${RUN_DISK_GB:?}" =~ ^[1-9][0-9]*$ ]]; then
   echo "RUN_DISK_GB is the size in GB of the new disk each job works on (the run's stores, with room to write the next)" >&2; exit 2
 fi
@@ -118,7 +134,7 @@ export IMPUTED_BUCKET PANEL_BUCKET
 # The slot's task script, run_step.sh in the slot's launcher directory.
 python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
   --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME BASE_RUN \
-  STAGED_SOURCE
+  STAGED_SOURCE PARTNER_RUN MERGE
 variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROVISIONING_MODEL PROJECT_ID RUN_DISK_GB RUN_DISK_TYPE REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
 if [ "$spec" = fit ]; then variables+=(GPU_TYPE GPU_COUNT); else variables+=(TASK_COUNT); fi
 variables+=(CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET GOOGLE_PROJECT)

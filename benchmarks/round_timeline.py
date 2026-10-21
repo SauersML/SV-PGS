@@ -18,7 +18,8 @@ interleaved, cannot be read this way). It prints:
    step's key line in another step, a reused step that did work beyond its key, a fitted group (a ``stage2 wiring:
    group i of G`` line) without its own Stage 0, far field and summary band line or without a solve and an empirical
    Bayes loop, a computed fit that filtered an arm for the fitter and fitted or resumed no group, and a computed score
-   step without a scoring batch. A phase silently skipped is one of these: its work happened, or had to, and its line
+   step with neither a scoring batch nor an arm's scores (a run joining arms scored in their own runs reads only the
+   latter). A phase silently skipped is one of these: its work happened, or had to, and its line
    is missing.
 With --save the log's signature, its steps' states and each phase's count, sweeps, rounds and models (the counts of the
 run's own work, which a deterministic fixture repeats exactly) and seconds, goes to a JSON file; with --baseline each is
@@ -74,7 +75,9 @@ FIT_PHASES = ("fit_open", "fit_filter")
 KEY_PHASES = (*(name + "_key" for name in STEP_NAMES), "file_digest", "genotype_file_fingerprint")
 """A step's key (``timing: <step>_key``, ``workspace_pipeline._run_step``) and its inputs' identities (``_each``): every
 step pays them, a reused one too, so they are its key's work, not the step's."""
-SCORE_PHASES = ("score_batch",)
+SCORE_PHASES = ("score_batch", "score_arm")
+"""A scoring batch (its models loaded, read with the store and committed) and an arm's whole (its batches made or read
+back, ``workspace_pipeline._arm_scores``)."""
 OTHER_PHASES = ("store_restore", "tree_digest")
 """The job's restore (run_step.sh, before the driver's first step) and a store's digest (a fit's, a score's)."""
 JOB_PHASES = ("store_restore", "canary_generate", "canary_prepare", "canary_snv_indel", "canary_with_sv", "canary_merge")
@@ -201,8 +204,8 @@ def problems(timeline: Timeline) -> list:
             # whose every model was on disk (a merge of the arms' runs) has no filter line and fits nothing.
             if step.groups + step.resumed == 0 and step.state == "computed" and "fit_filter" in names:
                 found.append("fit: computed with no group fitted or resumed")
-        if step.name == "score" and step.state == "computed" and "score_batch" not in names:
-            found.append("score: computed with no scoring batch")
+        if step.name == "score" and step.state == "computed" and "score_batch" not in names and "score_arm" not in names:
+            found.append("score: computed with no scoring batch and no arm's scores")
     if timeline.outside and timeline.steps:
         found.append(f"{len(timeline.outside)} phase lines after the last step's line: a step stopped before its line")
     return found

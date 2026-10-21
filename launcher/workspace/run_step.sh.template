@@ -154,13 +154,17 @@ mkdir -p "$TMPDIR"
 # time. A fit job given FIT_ARMS restores and pushes only those arms' restart units. With BASE_RUN ("${BASE_RUN}"),
 # that run's mirror carries this run's completed steps before the fit where this run's mirror holds none of a step, and
 # no push copies them here.
+# MERGE ("${MERGE}"), when 1: this job only finishes the run from its arms' parts (see PARTNER_RUN below), on any machine:
+# its restore takes no store and no fit checkpoint (run-mirror restore --finishing).
 base=()
 [ -z "${BASE_RUN}" ] || base=(--base "gs://${OPS_BUCKET}/svpgs/${BASE_RUN}/run")
 mirror() {
   flock "$RUN/mirror.lock" "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" --mirror "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run" \
-    ${base[@]+"${base[@]}"} ${fit_arm[@]+"${fit_arm[@]}"}
+    ${base[@]+"${base[@]}"} ${fit_arm[@]+"${fit_arm[@]}"} "${@:2}"
 }
-mirror restore || { mark "exit-restore"; exit 1; }
+finishing=()
+[ "${MERGE}" != 1 ] || finishing=(--finishing)
+mirror restore ${finishing[@]+"${finishing[@]}"} || { mark "exit-restore"; exit 1; }
 mark restored
 # A loop's sleep goes first: killed alone, the subshell left it running, and the task (and its log) ended only when the
 # sleep did. A push in progress is left to finish; the last push below waits on its lock.
@@ -175,24 +179,52 @@ pusher=$!
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] timing: store_restore $((SECONDS - restore_started)) s" >> "$RUN/driver.log"
 progress="$(dirname "$0")/progress-task${BATCH_TASK_INDEX}.log"
 copy_progress() { tail -n 300 "$RUN/driver.log" > "$progress" 2>/dev/null; cp "$RUN/driver.log" "${progress%.log}.full.log" 2>/dev/null; }
-"$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} ${fit_arm[@]+"${fit_arm[@]}"} \
-  2> >(tee -a "$RUN/driver.log" >&2) &
-driver=$!
 ( while sleep 300; do copy_progress; done ) &
 progressor=$!
-wait "$driver"
-status=$?
+# The driver runs in the background and is waited for, so the TERM trap runs at once.
+drive() {
+  "$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} ${fit_arm[@]+"${fit_arm[@]}"} "$@" \
+    2> >(tee -a "$RUN/driver.log" >&2) &
+  wait "$!"
+}
+# An arm-only driver exits successfully with its arm's parts (StepPart): its models in fit.partial, its scores and
+# effects in score.partial and effects.partial, made while the store was on this disk. Its success is not a completed
+# run, which holds both arms and reaches the requested final step, in every region's directory when the run fits regions
+# (workspace_pipeline.completed_through).
+completed() {
+  "$RUN/venv/bin/python" -c 'import sys; from sv_pgs.workspace_pipeline import WorkspaceConfig, completed_through; sys.exit(0 if completed_through(WorkspaceConfig.read(sys.argv[1]), sys.argv[2]) else 1)' "$OPS/run_config.json" "${THROUGH}"
+}
+# PARTNER_RUN ("${PARTNER_RUN}"): the run of this ops bucket that fits the other arm. Once this job's parts are pushed,
+# the partner's are adopted from its mirror if they are all there (run-mirror adopt), and the driver finishes the run
+# here with no store (--finish): the fit from both arms' records, the score and effects from their batches, the report
+# and export. Otherwise the job leaves the run to the partner's job, which finishes it when its own parts are done; as
+# each job pushes before it looks, the later of the two always finds the other's. A MERGE job that does not find them
+# fails.
+finish() {
+  local adopted
+  adopted=$(mirror adopt --partner "gs://${OPS_BUCKET}/svpgs/${PARTNER_RUN}/run") || { mark "exit-adopt"; status=1; return; }
+  case "$adopted" in
+    *adopted) mark "merge-started"; fit_arm=(); drive --finish; status=$? ;;
+    *) mark "merge-$1"; [ "$1" = deferred ] || status=1 ;;
+  esac
+}
+if [ "${MERGE}" = 1 ]; then
+  status=0
+  finish waiting
+else
+  drive
+  status=$?
+  if [ "$status" -eq 0 ] && [ -n "${PARTNER_RUN}" ] && ! completed; then
+    mirror push || mark "push-failed"
+    finish deferred
+  fi
+fi
 kill "$sampler" 2>/dev/null
 stop "$progressor"
 copy_progress
 # AFTER_SCRIPT ("${AFTER_SCRIPT}"), a script of the source tree, runs once the driver has finished, with RUN and OPS set,
-# its output beside the progress log: benchmarks/bench_real/aou_ldpred2.sh reads the steps the driver left.
-# An arm-only driver exits successfully with fit.partial (StepPart). Its success is not a completed run: the
-# comparison script must wait for the resubmission that holds both arms and reaches the requested final step, in every
-# region's directory when the run fits regions (workspace_pipeline.completed_through).
-completed() {
-  "$RUN/venv/bin/python" -c 'import sys; from sv_pgs.workspace_pipeline import WorkspaceConfig, completed_through; sys.exit(0 if completed_through(WorkspaceConfig.read(sys.argv[1]), sys.argv[2]) else 1)' "$OPS/run_config.json" "${THROUGH}"
-}
+# its output beside the progress log: benchmarks/bench_real/aou_ldpred2.sh reads the steps the driver left. It runs only
+# in the job that holds the completed run.
 if [ "$status" -eq 0 ] && [ -n "${AFTER_SCRIPT}" ] && ! completed; then
   mark "after-deferred"
 elif [ "$status" -eq 0 ] && [ -n "${AFTER_SCRIPT}" ]; then

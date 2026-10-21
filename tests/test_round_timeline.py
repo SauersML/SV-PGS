@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -195,16 +196,39 @@ def test_the_signature_saves_and_reads_back_as_the_baseline(tmp_path: Path, caps
 
 
 def test_a_step_s_line_says_when_it_stopped_after_its_part_or_failed(workspace, capsys: pytest.CaptureFixture[str]) -> None:  # noqa: F811
-    """The step lines of runs with the dry run's fitter double: an arm-only run's fit is a part, and a fit that raises
-    is failed, and either way the run's steps before it are each logged once."""
+    """The step lines of runs with the dry run's fitter double: an arm-only run's fit is a part, and so are its score
+    and effects (ARM_PARTS), and a fit that raises is failed, and either way the run's steps before it are each logged
+    once. A finishing run then computes every step from the fit on, its score from the arms' own scores alone."""
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping(synthetic.raw)
     run_pipeline(config, _bindings(_Recorder(), client), BUDGET, fit_arms=("snv_indel",))
     timeline = round_timeline.read(capsys.readouterr().err.splitlines())
-    assert [(step.name, step.state) for step in timeline.steps][-2:] == [("direct_sv", "computed"), ("fit", "part")]
+    assert [(step.name, step.state) for step in timeline.steps][-4:] == [
+        ("direct_sv", "computed"), ("fit", "part"), ("score", "part"), ("effects", "part"),
+    ]
     assert round_timeline.problems(timeline) == []
     with pytest.raises(RuntimeError, match="preempted"):
         run_pipeline(dataclasses.replace(config), _bindings(_Recorder(fits_before_failing=0), client), BUDGET)
     timeline = round_timeline.read(capsys.readouterr().err.splitlines())
     assert [step.state for step in timeline.steps] == ["reused"] * STEP_NAMES.index("fit") + ["failed"]
+    # The other arm's run, on a disk restored from this run's mirror, and this run finishing from its parts.
+    from sv_pgs.run_mirror import DirectoryRemote, adopt, push, restore
+
+    root = config.run_directory.parent
+    partner, mine, theirs = dataclasses.replace(config, run_directory=root / "partner"), DirectoryRemote(root / "mine"), DirectoryRemote(root / "theirs")
+    push(config.run_directory, mine)
+    restore(partner.run_directory, mine)
+    for step in ("fit", "score", "effects"):
+        shutil.rmtree(partner.run_directory / f"{step}.partial")
+    run_pipeline(partner, _bindings(_Recorder(), client), BUDGET, fit_arms=("with_sv",))
+    push(partner.run_directory, theirs)
+    assert adopt(config.run_directory, theirs) is True
+    run_pipeline(dataclasses.replace(config), _bindings(_Recorder(fits_before_failing=0), client), BUDGET, finish=True)
+    timeline = round_timeline.read(capsys.readouterr().err.splitlines())
+    finishing = timeline.drivers()[-1]
+    fit = STEP_NAMES.index("fit")
+    assert [(step.name, step.state) for step in finishing] == [(name, "reused") for name in STEP_NAMES[:fit]] + [(name, "computed") for name in STEP_NAMES[fit:]]
+    score = finishing[STEP_NAMES.index("score")]
+    assert [phase.name for phase in score.inside if phase.name in round_timeline.SCORE_PHASES] == ["score_arm", "score_arm"]
+    assert round_timeline.problems(timeline) == []
     assert workspace_pipeline._run_step.__doc__ and "round_timeline" in workspace_pipeline._run_step.__doc__

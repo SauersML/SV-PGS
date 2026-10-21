@@ -1992,7 +1992,9 @@ def test_postfit_resumes_after_a_mirrored_batch_and_keeps_every_output(workspace
     run = config.run_directory
     expected = _postfit_outputs(run / step)
     report = _postfit_outputs(run / "report")
-    total = len(list((run / step / "batches").glob("*/complete.json")))
+    # A model batch's payload: the score step's batches beside each arm's record of them (workspace_pipeline.arm_scores).
+    payload_name = "predictions.npz" if step == "score" else "summary.json"
+    total = len(list((run / step / "batches").glob(f"*/{payload_name}")))
     assert total > 1
     fit_time = _completed_at(run, "fit")
     for name in STEP_NAMES[STEP_NAMES.index(step):]:
@@ -2059,7 +2061,7 @@ def test_postfit_resumes_after_a_mirrored_batch_and_keeps_every_output(workspace
     # A same-size damaged payload is a single batch to redo, even with every completion record still present.
     (run / step).rename(partial)
     (partial / COMPLETE_FILE).unlink()
-    record = next((partial / "batches").glob("*/complete.json"))
+    record = next(path for path in sorted((partial / "batches").glob("*/complete.json")) if (path.parent / payload_name).exists())
     payload = record.parent / ("predictions.npz" if step == "score" else next(record.parent.glob("*.tsv.gz")).name)
     damaged = bytearray(payload.read_bytes())
     damaged[0] ^= 1
@@ -2241,6 +2243,147 @@ def test_two_runs_merge_their_finished_arms_and_reach_the_report_without_fitting
     restore(config.run_directory, DirectoryRemote(mirror_a))
     run_pipeline(config, _artifact_bindings(resumed, client), BUDGET)
     assert not resumed.fit_calls
+
+
+def _finished_outputs(run: Path) -> dict[str, dict[str, bytes | dict[str, np.ndarray]]]:
+    """Every output of the steps from the fit on that a reader sees: each step's files (``_postfit_outputs``) and the fit's
+    summary."""
+    outputs: dict[str, dict] = {step: _postfit_outputs(run / step) for step in ("score", "effects", "report", "export")}
+    outputs["fit"] = {"summary": json.dumps(json.loads((run / "fit" / COMPLETE_FILE).read_text())["summary"], sort_keys=True).encode()}
+    return outputs
+
+
+def _assert_finished_outputs(run: Path, expected) -> None:
+    for step, outputs in expected.items():
+        if step == "fit":
+            assert _finished_outputs(run)["fit"] == outputs
+        else:
+            _assert_postfit_outputs(run / step, outputs)
+
+
+def _fail(*args, **kwargs):
+    pytest.fail("a finishing run fits, predicts or reads the store or the measurement model")
+
+
+@pytest.mark.parametrize("likelihood,cross_fit", [("bernoulli", False), ("gaussian_working", True)])
+def test_arm_runs_score_their_own_arm_and_either_finishes_the_run_with_one_run_s_tables(workspace, monkeypatch, likelihood, cross_fit) -> None:
+    """Each arm's run scores and summarizes its own arm after its fit, with the store on its disk (ARM_PARTS), and leaves
+    those parts in its mirror; a run holding the other arm's parts too (adopted from that run's mirror) finishes the
+    steps from the fit on with no store, no fitter, no prediction and no measurement model, on a disk restored without
+    the store or any restart unit. Every report, effects, score and export file is bitwise the one a run holding both arms' models makes
+    today (both arms scored in one job), and the arms' parts survive a new disk without being made again."""
+    from sv_pgs.run_mirror import DirectoryRemote, adopt, push, restore
+
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "disease_likelihood": likelihood, "cross_fit": cross_fit,
+                                           "calibration_fraction": 0.25 if likelihood == "bernoulli" else 0.0})
+    root = config.run_directory.parent
+
+    def runs(name: str) -> WorkspaceConfig:
+        return dataclasses.replace(config, run_directory=root / name)
+
+    first, second = runs("arm-a"), runs("arm-b")
+    recorder = _Recorder()
+    summaries = run_pipeline(first, _artifact_bindings(recorder, client), BUDGET, fit_arms=(ARMS[0],))
+    assert len(recorder.fit_calls) == 1 and {"fit", "score", "effects", "report"}.isdisjoint(summaries)
+    for step in ("fit", "score", "effects"):
+        assert (first.run_directory / f"{step}.partial").is_dir() and not (first.run_directory / step).exists()
+    mirror_a, mirror_b = DirectoryRemote(root / "mirror-a"), DirectoryRemote(root / "mirror-b")
+    push(first.run_directory, mirror_a)
+    # The other arm's job starts from the same steps before the fit and makes its own arm's parts.
+    restore(second.run_directory, mirror_a)
+    for step in ("fit", "score", "effects"):
+        shutil.rmtree(second.run_directory / f"{step}.partial")
+    run_pipeline(second, _artifact_bindings(recorder, client), BUDGET, fit_arms=(ARMS[1],))
+    assert len(recorder.fit_calls) == 2
+
+    # Today's path: one run holding both arms' saved models scores both and makes every table.
+    single = runs("single")
+    restore(single.run_directory, mirror_a)
+    for step in ("score", "effects"):
+        shutil.rmtree(single.run_directory / f"{step}.partial")
+    shutil.copytree(second.run_directory / "fit.partial" / "models" / ARMS[1], single.run_directory / "fit.partial" / "models" / ARMS[1])
+    run_pipeline(single, _artifact_bindings(recorder, client), BUDGET)
+    assert len(recorder.fit_calls) == 2
+    expected = _finished_outputs(single.run_directory)
+
+    # The first arm's parts survive a new disk: restored from its mirror, its run makes none of them again.
+    shutil.rmtree(first.run_directory)
+    restore(first.run_directory, mirror_a)
+    run_pipeline(first, dataclasses.replace(_artifact_bindings(recorder, client), fit=_fail, predict=_fail), BUDGET, fit_arms=(ARMS[0],))
+    assert not (first.run_directory / "effects").exists()
+
+    # A finishing job elsewhere restores no store and no fit checkpoint, and waits while the partner has no parts.
+    finishing = runs("finishing")
+    restore(finishing.run_directory, mirror_a, finishing=True)
+    for step in STEP_NAMES[: STEP_NAMES.index("fit")]:
+        restored = sorted(path.name for path in (finishing.run_directory / step).iterdir())
+        assert restored == [COMPLETE_FILE] or step in workspace_pipeline.FINISH_INPUTS
+    assert not (finishing.run_directory / workspace_pipeline.RESTART_DIRECTORY).exists()
+    assert adopt(finishing.run_directory, DirectoryRemote(root / "empty-mirror")) is False
+    push(second.run_directory, mirror_b)
+    assert adopt(finishing.run_directory, mirror_b) is True
+    assert adopt(finishing.run_directory, mirror_b) is True
+    unpredicting = dataclasses.replace(_artifact_bindings(recorder, client), fit=_fail, predict=_fail, load_measurement_model=_fail)
+    with monkeypatch.context() as patched:
+        patched.setattr(DosageStore, "open", _fail)
+        summaries = run_pipeline(finishing, unpredicting, BUDGET, finish=True)
+        assert set(summaries) == set(STEP_NAMES)
+        _assert_finished_outputs(finishing.run_directory, expected)
+        # The first arm's own job, its parts on its disk, finishes the same way.
+        assert adopt(first.run_directory, mirror_b) is True
+        run_pipeline(first, unpredicting, BUDGET, finish=True)
+        _assert_finished_outputs(first.run_directory, expected)
+    assert len(recorder.fit_calls) == 2
+
+    # A finishing run fits nothing and makes no step before the fit, and a partner of another key is not adopted.
+    unfinished = runs("unfinished")
+    restore(unfinished.run_directory, mirror_a, finishing=True)
+    with pytest.raises(ValueError, match="adopt"):
+        run_pipeline(unfinished, unpredicting, BUDGET, finish=True)
+    shutil.copytree(root / "mirror-b", root / "mirror-c")
+    (root / "mirror-c" / "effects.partial" / workspace_pipeline.KEY_FILE).write_text("another key")
+    with pytest.raises(ValueError, match="keyed"):
+        adopt(unfinished.run_directory, DirectoryRemote(root / "mirror-c"))
+    # The handoff names the arm's batches; an adopted batch damaged on the disk is adopted again whole.
+    (handoff,) = (root / "mirror-b" / "effects.partial" / "batches").glob("*/handoff.json")
+    listed = json.loads(handoff.read_text())
+    assert listed["arm"] == ARMS[1]
+    assert sorted(listed["models"]) == sorted(path.stem for path in (second.run_directory / "fit.partial" / "models" / ARMS[1]).glob("*.json"))
+    assert adopt(unfinished.run_directory, mirror_b) is True
+    batch = unfinished.run_directory / "score.partial" / "batches" / listed["score"][-1]
+    payload = next(path for path in batch.iterdir() if path.name != "complete.json")
+    damaged = bytearray(payload.read_bytes())
+    damaged[0] ^= 1
+    payload.write_bytes(damaged)
+    shutil.rmtree(unfinished.run_directory / "effects.partial" / "batches" / handoff.parent.name)
+    assert adopt(unfinished.run_directory, mirror_b) is True
+    assert payload.read_bytes() == (root / "mirror-b" / "score.partial" / "batches" / listed["score"][-1] / payload.name).read_bytes()
+    shutil.rmtree(unfinished.run_directory / "cohort")
+    with pytest.raises(ValueError, match="before the fit"):
+        run_pipeline(unfinished, unpredicting, BUDGET, finish=True)
+
+
+def test_records_carry_the_arms_offsets_and_a_disagreement_or_their_absence_stops_a_finishing_fit(workspace) -> None:
+    """The arms' expected record offsets travel in their records, read once from the store by each arm's run: records
+    that disagree stop the fit, and a finishing run, which reads no store, stops at a record without them."""
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    bindings = _artifact_bindings(_Recorder(), client)
+    run_pipeline(config, bindings, BUDGET, through="fit", fit_arms=(ARMS[0],))
+    records = sorted((config.run_directory / "fit.partial" / "models" / ARMS[0]).glob("*.json"))
+    contents = [json.loads(record.read_text()) for record in records]
+    assert len(records) > 1 and all(set(content["offset_digests"]) == set(ARMS) for content in contents)
+    assert contents[0]["offset_digests"][ARMS[0]] != contents[0]["offset_digests"][ARMS[1]]
+    disagreeing = {**contents[0], "offset_digests": {arm: "another store" for arm in ARMS}}
+    records[0].write_text(json.dumps(disagreeing))
+    with pytest.raises(ValueError, match="disagree on the arms' record offsets"):
+        run_pipeline(config, bindings, BUDGET, through="fit", fit_arms=(ARMS[0],))
+    for record, content in zip(records, contents):
+        content.pop("offset_digests")
+        record.write_text(json.dumps(content))
+    with pytest.raises(ValueError, match="no arm offsets"):
+        run_pipeline(config, bindings, BUDGET, finish=True)
 
 
 @pytest.mark.parametrize("damage", ["missing_directory", "missing_trait", "wrong_key", "wrong_names", "wrong_covariates", "wrong_record", "truncated_file"])

@@ -36,6 +36,13 @@ The durable state is what the driver resumes from:
 Any other partial work is redone, as after a preemption on one disk. GCS creates an object only when its upload
 completes, so a mirrored file is whole or absent.
 
+Two runs that fit one arm each (``workspace_pipeline.run_pipeline``'s ``fit_arms``) each leave their arm's parts in
+their partials: its saved models in the fit's, its score batches and their record in the score step's, its effects
+batches and, last, its handoff (``workspace_pipeline.arm_handoff``) in the effects step's. ``adopt`` brings the other
+run's into this one from that run's mirror, so either run finishes the steps from the fit on (``run_pipeline``'s
+``finish``) with no store; a finishing job elsewhere first restores only what that reads (``restore``'s ``finishing``):
+the summaries of the steps before the fit, the cohort step whole, and the parts, a few GB where the whole run is a TB.
+
 The store, measurement and direct_sv steps each write a full copy of the genotype codes (``<step>/store``, 1.7 TB at
 the design workload), and only the next of them reads it: the fit, score, effects and report steps read the last one
 (``workspace_pipeline._final_store``). Where the job mounts the mirror's bucket (content_identity.GCS_MOUNTS, as
@@ -58,6 +65,7 @@ of it again.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import multiprocessing
@@ -72,8 +80,11 @@ from pathlib import Path
 from typing import Protocol
 
 from sv_pgs.content_identity import GCS_MOUNTS, record_restored
+from sv_pgs.postfit_checkpoint import RECORD
 from sv_pgs.restart_store import FORMAT, KINDS, MANIFEST, RestartStore
-from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE, REGIONS_DIRECTORY, RESTART_DIRECTORY, STEP_NAMES
+from sv_pgs.workspace_pipeline import (
+    ARM_PARTS, ARMS, COMPLETE_FILE, FINISH_INPUTS, HANDOFF, KEY_FILE, REGIONS_DIRECTORY, RESTART_DIRECTORY, STEP_NAMES, arm_handoff,
+)
 
 LOGGER = logging.getLogger(__name__)
 PARTIAL = ".partial"
@@ -639,6 +650,7 @@ def _replaced_stores(names: dict[str, int]) -> set[str]:
 
 def restore(
     run_directory: Path, remote: Remote, mount: Path | None = None, bases: Sequence[Base] = (), arms: Sequence[str] | None = None,
+    finishing: bool = False,
 ) -> None:
     """Fill a run directory from the mirror: every completed step, and each partial step's durable units, for every step
     this run directory does not hold already, and the restart units of ``arms`` (every arm's where None). Each is
@@ -647,7 +659,11 @@ def restore(
     payload that a later completed step's replaces is linked there, not downloaded. A step before the fit (CARRIED)
     that the mirror holds neither completed nor partial comes from the first of ``bases`` that holds it completed, its
     replaced store linked on that base's mount. A completed step whose COMPLETE_FILE is gone or changed after its
-    download (a push or removal where it lies) stops the restore: what was downloaded could mix two steps."""
+    download (a push or removal where it lies) stops the restore: what was downloaded could mix two steps.
+
+    With ``finishing``, for a run that only finishes (``workspace_pipeline.run_pipeline``'s ``finish``), a completed
+    step before the fit is restored as its COMPLETE_FILE alone, but those it reads (FINISH_INPUTS), and no restart unit:
+    no store and no fit state, only the models, the scores and the effects."""
     names = remote.sizes("")
     run_directory.mkdir(parents=True, exist_ok=True)
     # The mirror's objects, a carried step's those of the base that carries it.
@@ -669,9 +685,10 @@ def restore(
             continue
         carrier = carriers.get(step)
         source, shown = (remote, mount) if carrier is None else (carrier.remote, carrier.mount)
+        summary_only = finishing and step in CARRIED and step not in FINISH_INPUTS
         if f"{step}/{COMPLETE_FILE}" in objects:
             name, target = step, final
-            chosen = sorted(entry for entry in objects if entry.startswith(f"{step}/"))
+            chosen = [f"{step}/{COMPLETE_FILE}"] if summary_only else sorted(entry for entry in objects if entry.startswith(f"{step}/"))
         elif f"{step}{PARTIAL}/{KEY_FILE}" in names:
             name, target = f"{step}{PARTIAL}", partial
             chosen = _restorable_partial(names, name)
@@ -685,8 +702,8 @@ def restore(
         if aside.exists():
             shutil.rmtree(aside)
         aside.mkdir()
-        listed = json.loads(source.read(f"{name}{DIRECTORIES}") or "[]") if target == final else []
-        payload = shown / step / STORE if shown is not None and target == final and step in linked else None
+        listed = json.loads(source.read(f"{name}{DIRECTORIES}") or "[]") if target == final and not summary_only else []
+        payload = shown / step / STORE if shown is not None and target == final and step in linked and not summary_only else None
         if payload is not None and payload.is_dir():
             chosen = [entry for entry in chosen if not entry.startswith(f"{step}/{STORE}/")]
             listed = [directory for directory in listed if Path(directory).parts[0] != STORE]
@@ -706,10 +723,11 @@ def restore(
         record_restored((path, digest) for (path, _entry), digest in zip(pairs, digests or ()) if digest is not None)
         os.rename(aside, target)
         LOGGER.info("run mirror: restored %s from %s, %d files, %.1f GB", name, origin, len(chosen), sum(objects[entry] for entry in chosen) / 1e9)
-    _restore_restart(run_directory, remote, {name: size for name, size in names.items() if name.startswith(f"{RESTART}/")}, arms)
+    if not finishing:
+        _restore_restart(run_directory, remote, {name: size for name, size in names.items() if name.startswith(f"{RESTART}/")}, arms)
     # Each region's own steps; the driver links the run's steps before the fit into its directory again.
     for region in sorted({entry.split("/")[1] for entry in names if entry.startswith(f"{REGIONS_DIRECTORY}/") and entry.count("/") >= 2}):
-        restore(run_directory / REGIONS_DIRECTORY / region, _Within(remote, f"{REGIONS_DIRECTORY}/{region}/"), arms=arms)
+        restore(run_directory / REGIONS_DIRECTORY / region, _Within(remote, f"{REGIONS_DIRECTORY}/{region}/"), arms=arms, finishing=finishing)
 
 
 # ---------------------------------------------------------------------------
@@ -883,3 +901,137 @@ def _restore_restart(run_directory: Path, remote: Remote, names: dict[str, int],
         (root / RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
     if pending:
         LOGGER.info("run mirror: restored %d restart units, %.1f GB", len(pending), sum(names[name] for _path, name in pairs + parts) / 1e9)
+
+
+def _step_key(run_directory: Path, step: str) -> str | None:
+    """The key ``step`` holds here: its completed directory's, else its partial's, else None."""
+    complete = run_directory / step / COMPLETE_FILE
+    if complete.is_file():
+        return str(json.loads(complete.read_text(encoding="utf-8"))["key"])
+    key = run_directory / f"{step}{PARTIAL}" / KEY_FILE
+    return key.read_text(encoding="utf-8") if key.is_file() else None
+
+
+def _whole_batch(directory: Path) -> bool:
+    """Whether a batch directory (``postfit_checkpoint``) holds every file its record lists, at its size and digest."""
+    try:
+        files = json.loads((directory / RECORD).read_text(encoding="utf-8"))["files"]
+        for name, expected in files.items():
+            digest = hashlib.sha256()
+            with (directory / name).open("rb") as handle:
+                for block in iter(lambda: handle.read(io.DEFAULT_BUFFER_SIZE), b""):
+                    digest.update(block)
+            if expected != {"bytes": (directory / name).stat().st_size, "sha256": digest.hexdigest()}:
+                return False
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+    return True
+
+
+def _adopt_unit(partner: Remote, held: dict[str, int], prefix: str, target: Path) -> bool:
+    """Download the partner's objects under ``prefix`` (a directory, '/'-ended) aside, then rename them into ``target``;
+    False where the partner lists none. A ``target`` here already is left as it is, unless it is a batch its record does
+    not certify (``_whole_batch``), which is replaced."""
+    if target.exists() and not ((target / RECORD).exists() and not _whole_batch(target)):
+        return True
+    entries = sorted(name for name in held if name.startswith(prefix))
+    if not entries:
+        return False
+    aside = target.with_name(f".{target.name}.adopting")
+    if aside.exists():
+        shutil.rmtree(aside)
+    partner.download_many([(aside / entry.removeprefix(prefix), entry) for entry in entries])
+    if target.exists():
+        shutil.rmtree(target)
+    os.rename(aside, target)
+    return True
+
+
+def _adopt_arm(run_directory: Path, partner: Remote, arm: str, listed: dict, unit: str, handoff: Path) -> bool:
+    """The units the partner's handoff of ``arm`` lists (``adopt``), then the handoff itself at ``unit``; False where one
+    is not in the partner's mirror."""
+    held = {name: size for step in ("fit", *ARM_PARTS) for name, size in partner.sizes(f"{step}{PARTIAL}/").items()}
+    models = run_directory / f"fit{PARTIAL}" / "models" / arm
+    for trait in [] if (run_directory / "fit" / COMPLETE_FILE).is_file() else listed["models"]:
+        if (models / f"{trait}.json").is_file():
+            continue
+        record = f"fit{PARTIAL}/models/{arm}/{trait}.json"
+        if record not in held:
+            return False
+        # A model directory without its record is an adoption cut short, made again whole.
+        if (models / trait).exists():
+            shutil.rmtree(models / trait)
+        if not _adopt_unit(partner, held, f"fit{PARTIAL}/models/{arm}/{trait}/", models / trait):
+            return False
+        aside = models / f".{trait}.json.adopting"
+        partner.download(record, aside)
+        os.replace(aside, models / f"{trait}.json")
+    for step in ARM_PARTS:
+        if (run_directory / step / COMPLETE_FILE).is_file():
+            continue
+        for name in listed[step]:
+            prefix = f"{step}{PARTIAL}/batches/{name}/"
+            if f"{prefix}{RECORD}" not in held or not _adopt_unit(partner, held, prefix, run_directory / f"{step}{PARTIAL}" / "batches" / name):
+                return False
+    return _adopt_unit(partner, partner.sizes(f"{unit}/"), f"{unit}/", handoff)
+
+
+def adopt(run_directory: Path, partner: Remote) -> bool:
+    """Bring the other arm's parts from ``partner``, the mirror of the run that fitted it (``workspace_pipeline.
+    run_pipeline``'s ``fit_arms``), into this run's partials, so the run can finish (``run_pipeline``'s ``finish``) with no
+    store; whether every arm's parts are then here. For each arm whose handoff (``workspace_pipeline.arm_handoff``) this
+    run lacks, the partner's handoff, checked against its record, names the units to bring: the arm's saved models with
+    their records in the fit's partial, and its batches in the score and effects steps' partials. Each is downloaded aside
+    and renamed into place, a model's record after it and the handoff last, so an interrupted adoption leaves nothing the
+    driver takes for whole and is resumed by the next. A step this run has completed takes nothing.
+
+    False where the partner's mirror holds no handoff of the arm, or loses it during the adoption: its job has not
+    finished its parts, or has finished the run itself (its parts are then no longer partial). The partner's partials
+    must be keyed as this run's (one fit, one score and one effects key), else this stops; each adopted model is checked
+    again when the fit step ends (``_check_fit_records``: its source fit key, its files' sizes and its arrays' digest,
+    its arm's record offsets and its training problem). A run of regions adopts each region's parts in its own."""
+    regions = run_directory / REGIONS_DIRECTORY
+    if regions.is_dir():
+        return all([adopt(region, _Within(partner, f"{REGIONS_DIRECTORY}/{region.name}/")) for region in sorted(regions.iterdir()) if region.is_dir()])
+    if (run_directory / "effects" / COMPLETE_FILE).is_file():
+        return True
+    keys = {step: _step_key(run_directory, step) for step in ("fit", *ARM_PARTS)}
+    for step, key in keys.items():
+        if (run_directory / step / COMPLETE_FILE).is_file():
+            continue
+        if key is None:
+            raise ValueError(f"{run_directory} holds no {step} part to finish from: its own arm's job has not done its parts.")
+        mirrored = partner.read(f"{step}{PARTIAL}/{KEY_FILE}")
+        if mirrored is None:
+            LOGGER.info("run mirror: the partner holds no %s part: its job has not done its parts, or it finished the run", step)
+            return False
+        if mirrored.decode() != key:
+            raise ValueError(f"the partner's {step} part is keyed {mirrored.decode()[:16]}, not {key[:16]} as this run's: the runs differ in config or code.")
+    effects = run_directory / f"effects{PARTIAL}"
+    for arm in ARMS:
+        handoff = arm_handoff(effects, str(keys["effects"]), arm)
+        if handoff.read() is not None:
+            continue
+        unit = handoff.path.relative_to(run_directory).as_posix()
+        record, content = partner.read(f"{unit}/{RECORD}"), partner.read(f"{unit}/{HANDOFF}")
+        if record is None or content is None:
+            LOGGER.info("run mirror: the partner's mirror holds no %s handoff yet", arm)
+            return False
+        written = json.loads(record)
+        if written.get("identity") != handoff.identity or written.get("files", {}).get(HANDOFF) != {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}:
+            raise ValueError(f"the partner's {arm} handoff does not match its record or this run's effects key.")
+        listed = json.loads(content)
+        if listed.get("arm") != arm:
+            raise ValueError(f"the partner's {arm} handoff names the arm {listed.get('arm')!r}.")
+        try:
+            whole = _adopt_arm(run_directory, partner, arm, listed, unit, handoff.path)
+        except Exception:
+            # Objects that vanish with the handoff were the partner's parts of a run it has since finished.
+            if partner.read(f"{unit}/{RECORD}") is not None:
+                raise
+            whole = False
+        if not whole or handoff.read() is None:
+            LOGGER.info("run mirror: the partner's %s parts are not all mirrored; nothing is finished from them yet", arm)
+            return False
+        LOGGER.info("run mirror: adopted the %s parts: %d models, %d score and %d effects batches", arm, len(listed["models"]), len(listed["score"]), len(listed["effects"]))
+    return True

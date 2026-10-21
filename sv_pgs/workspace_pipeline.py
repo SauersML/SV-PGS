@@ -895,6 +895,13 @@ class _Run:
     """This source tree's code digest of each step before the fit (``step_code.code_digests``), once read."""
     earlier: dict[str, Any] | None = None
     """What ``_accepted`` reads of ``accept_steps_from``'s tree, once read (``_earlier``)."""
+    finish: bool = False
+    """Whether this run only finishes the steps from the fit on from the parts its arms' runs left in it (``run_pipeline``'s
+    ``finish``): it makes no step before the fit, fits nothing and reads no store."""
+    parts: set[str] = dataclasses.field(default_factory=set)
+    """The steps this driver stopped after their part (StepPart); each of ARM_PARTS then does its own part of its step."""
+    store: DosageStore | None = None
+    """The final store, opened once for the score and effects steps (``_opened_store``) and closed with the run."""
 
     def output(self, step: str) -> Path:
         return self.config.run_directory / step
@@ -1073,29 +1080,50 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
             _mark(run.config, step.name, kept)
             timing(f"step_{step.name}", time.perf_counter() - started, state="reused")
             return dict(record["summary"])
+        if run.finish and STEP_NAMES.index(step.name) < STEP_NAMES.index("fit"):
+            raise ValueError(f"{step.name} is complete here under another key, and a finishing run makes no step before the fit.")
         _set_aside(final, record["key"])
     elif final.exists():
         raise RuntimeError(f"{final} exists without {COMPLETE_FILE}, so this driver did not write it; move it away first.")
+    elif run.finish and STEP_NAMES.index(step.name) < STEP_NAMES.index("fit"):
+        raise ValueError(
+            f"{step.name} is not complete here, and a finishing run makes no step before the fit: restore it first "
+            "(run-mirror restore --finishing)."
+        )
     partial = root / f"{step.name}.partial"
     if partial.exists():
         written_key = (partial / KEY_FILE).read_text(encoding="utf-8") if (partial / KEY_FILE).is_file() else "unkeyed"
+        if written_key != key and run.finish and step.name in ("fit", *ARM_PARTS):
+            raise ValueError(
+                f"the {step.name} parts here are keyed {written_key[:16]}, not {key[:16]}: the arms' runs ran other code "
+                "or config than this finishing run, which makes none of them."
+            )
         if written_key != key:
             _set_aside(partial, written_key)
     partial.mkdir(parents=True, exist_ok=True)
     (partial / KEY_FILE).write_text(key, encoding="utf-8")
     _mark(run.config, step.name, "started")
     try:
+        summary = None
         if step.name == "fit":
             _check_fit_records(run, partial, key)
             checked = _fit_records_state(partial)
-        summary = step.body(run, partial)
-        # A body that saved or recorded nothing (a merge, whose arms were all handed over) leaves the models just
-        # checked: checking them again loaded every model and read the store's variant table a second time.
-        if step.name == "fit" and _fit_records_state(partial) != checked:
-            _check_fit_records(run, partial, key)
+            summary = _recorded_fit(run, partial)
+        if summary is None:
+            try:
+                summary = step.body(run, partial)
+            except StepPart:
+                if step.name == "fit":
+                    _check_fit_records(run, partial, key)
+                raise
+            # A body that saved or recorded nothing (a merge, whose arms were all handed over) leaves the models just
+            # checked: checking them again loaded every model and read the store's variant table a second time.
+            if step.name == "fit" and _fit_records_state(partial) != checked:
+                _check_fit_records(run, partial, key)
     except StepPart:
-        if step.name == "fit":
-            _check_fit_records(run, partial, key)
+        # The steps after this one key their parts by it (ARM_PARTS), as they would key their whole steps.
+        run.keys[step.name] = key
+        run.parts.add(step.name)
         _mark(run.config, step.name, "part-done")
         timing(f"step_{step.name}", time.perf_counter() - started, state="part")
         raise
@@ -3450,7 +3478,9 @@ def fit_request(
 
 
 def _fitted_model_directory(run: _Run, arm: str, trait_name: str) -> Path:
-    return run.output("fit") / "models" / arm / trait_name
+    """One (arm, trait)'s saved model: in the completed fit, or in its partial where this driver stopped the fit after its
+    part (``_Run.parts``), whose own arms the steps after it score and summarize there (ARM_PARTS)."""
+    return run.output("fit.partial" if "fit" in run.parts else "fit") / "models" / arm / trait_name
 
 
 def _checked_trait_model(run: _Run, cohort: _Cohort, arm: str, trait: int, folder: Path) -> Any:
@@ -3491,9 +3521,21 @@ def _check_fit_records(run: _Run, directory: Path, key: str) -> None:
 
     This validation belongs to the driver boundary, outside _fit_step's source digest: a post-fit validation fix
     does not change a fitted coefficient. The fit's existing key still checks every engine and input dependency.
+
+    Each arm's expected record offsets are read from the store once, by the run that fitted the arm, and written into
+    each record it checks in a partial (``offset_digests``, both arms'), so a run finishing the step from two arms' runs
+    (``run_pipeline``'s ``finish``) checks each model against them with no store: records of one fit key that disagree
+    on them stop it, and so does a run that would need the store to find them.
     """
     cohort = _fit_cohort(run)
     expected_offsets, expected_problem = None, None
+    paths = [directory / "models" / arm / (name + ".json") for arm in ARMS for name in cohort.trait_names]
+    records = [json.loads(path.read_text(encoding="utf-8")) for path in paths if path.is_file()]
+    recorded = {json.dumps(record["offset_digests"], sort_keys=True) for record in records if "offset_digests" in record and record.get("fit_key", key) == key}
+    if len(recorded) > 1:
+        raise ValueError("the fit's model records disagree on the arms' record offsets; the arms were fitted on other stores or filters.")
+    if recorded:
+        expected_offsets = json.loads(recorded.pop())
     for arm in ARMS:
         root = directory / "models" / arm
         present = [name for name in cohort.trait_names if (root / name).exists() or (root / (name + ".json")).exists()]
@@ -3518,6 +3560,8 @@ def _check_fit_records(run: _Run, directory: Path, key: str) -> None:
             fitted = _checked_trait_model(run, cohort, arm, trait, folder)
             if hasattr(fitted, "provenance"):
                 if expected_offsets is None:
+                    if run.finish:
+                        raise ValueError(f"model record {record_path} carries no arm offsets, and a finishing run reads no store to find them.")
                     # Both arms have the same model names and training problem. Their record offsets distinguish
                     # them; copying snv_indel into with_sv must not turn a paired comparison into a self-comparison.
                     measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
@@ -3553,6 +3597,8 @@ def _check_fit_records(run: _Run, directory: Path, key: str) -> None:
             record[CERTIFICATE_STATUS] = [bool(met) for met in np.asarray(fitted.certificate[CERTIFICATE_STATUS])]
             if directory.name.endswith(".partial"):
                 record["fit_key"] = key
+                if expected_offsets is not None:
+                    record["offset_digests"] = expected_offsets
                 if record != json.loads(record_path.read_text(encoding="utf-8")):
                     _write_json(record_path, record)
             elif record["acceptance"] != json.loads(record_path.read_text(encoding="utf-8")).get("acceptance"):
@@ -3622,6 +3668,44 @@ def _warm_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequ
             seeds[model] = found.get(request.model_names[model], released)
         LOGGER.info("workspace pipeline: the %s fit of %s starts from %s (%d candidates)", arm, trait_name, released.source, len(candidates))
     return tuple(seeds)
+
+
+def _recorded_fit(run: _Run, directory: Path) -> dict[str, Any] | None:
+    """The fit step's summary, as ``_fit_step`` gives it, where its partial records every arm's models, so the step ends
+    without the fit's body, which opens the store and loads the measurement model before it finds nothing to fit. None
+    where an arm this run fits has a trait to fit; StepPart where only another run's arms (``fit_arms``) are missing;
+    and a finishing run (``finish``), which fits nothing, stops at a missing arm. Outside the fit's key, as
+    ``_check_fit_records`` is: it changes no fitted value."""
+    cohort = _fit_cohort(run)
+    missing = [arm for arm in ARMS if not all((directory / "models" / arm / (name + ".json")).is_file() for name in cohort.trait_names)]
+    if missing and run.finish:
+        raise ValueError(f"the fit's partial lacks {missing}'s models, and a finishing run fits nothing: adopt them first (run-mirror adopt).")
+    if missing and run.fit_arms is not None and not set(missing) & set(run.fit_arms):
+        raise StepPart(f"the fit holds its arms but {missing}, which are another run's.")
+    if missing:
+        return None
+    _remove_own(directory / "work", directory)
+    records = {
+        arm: {name: json.loads((directory / "models" / arm / (name + ".json")).read_text(encoding="utf-8")) for name in cohort.trait_names}
+        for arm in ARMS
+    }
+    # _fit_step's summary, whose source its key covers.
+    return {
+        "arms": {
+            arm: {
+                "models": sum(len(record["models"]) for record in by_trait.values()),
+                "outer_criterion_met": sum(sum(record[CERTIFICATE_STATUS]) for record in by_trait.values()),
+                "refusals": sum(len(record["refusals"]) for record in by_trait.values()),
+                "uncertified": [trait_name for trait_name, record in by_trait.items() if not record["acceptance"]["accepted"]],
+            }
+            for arm, by_trait in records.items()
+        },
+        "measurement_terms": (
+            "log_variance_offset: the log reliability of the groups' measurement models pooled over the fit rows' "
+            "ancestry groups (-inf on the records an arm leaves out); the fit has no target-variance term, so every "
+            "target is taken as measured exactly, and none for the measurement model's residual variances or leakage maps"
+        ),
+    }
 
 
 def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
@@ -3920,14 +4004,15 @@ def gathered_models(models: Sequence[Any], store: DosageStore) -> tuple[list[Any
     return gathered, GatheredRows(store, rows)
 
 
-def _fit_verdicts(run: _Run, cohort: _Cohort, unscorable: bool) -> dict[str, list[str]]:
+def _fit_verdicts(run: _Run, cohort: _Cohort, unscorable: bool, arms: Sequence[str] = ARMS) -> dict[str, list[str]]:
     """From the acceptance each fit record holds (written when the fit ended): with ``unscorable``, the traits that
     cannot be scored (``model_acceptance.unscorable_codes``: non-finite parameters, or a fit that failed and returned its
     covariates alone), else the traits with an uncertified fit; each with its arms and their models' fatal codes. A trait
     is compared across the arms, so an unscorable model in either arm takes the trait out of every table. An uncertified
-    trait is scored and reported like any other: held-out accuracy measures a fit whatever its convergence."""
+    trait is scored and reported like any other: held-out accuracy measures a fit whatever its convergence. ``arms``
+    reads those arms' records alone."""
     found: dict[str, list[str]] = {}
-    for arm in ARMS:
+    for arm in arms:
         for trait_name in cohort.trait_names:
             folder = _fitted_model_directory(run, arm, trait_name)
             verdict = json.loads(folder.with_name(folder.name + ".json").read_text(encoding="utf-8"))["acceptance"]
@@ -3937,169 +4022,277 @@ def _fit_verdicts(run: _Run, cohort: _Cohort, unscorable: bool) -> dict[str, lis
     return found
 
 
-def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
-    """Every model of both arms scored for the whole cohort (``predict_models``), in as few reads of the store as the
-    host's memory allows the saved models to be held together (``score_batches``). An unscorable trait
-    (``_fit_verdicts``) is not read: its scores stay NaN, and the step's summary names it with its codes under
-    ``quarantined``; the summary names each uncertified trait, scored like the rest, under ``uncertified``.
+SCORE_COLUMNS = ("predictive_mean", "predictive_variance", "linear_predictor", "genetic_mean")
+"""The prediction's columns the score step keeps for every model of each arm."""
+ARM_SCORES = "arm.json"
+"""An arm's record in the score step's partial (``arm_scores``)."""
 
-    Each completed model batch is durable in the keyed partial: a restart fills its columns from that batch before
-    loading any fitted model. The exact ordered membership and output columns belong to the batch key, so a different
-    memory plan cannot mistake an earlier batch number for its own models. Final calibration and held-out assembly
-    run again from these same float64 values; neither the prediction call nor its arithmetic changes. A batch's read of
-    the store is kept part way through as well (``postfit_checkpoint.batch_reads``), so a restart reads only its rest
-    and scores it to the bit; its kept reads go once the batch is committed."""
+
+def arm_scores(directory: Path, step_key: str, arm: str, traits: Sequence[str], shape: Sequence[int]) -> Any:
+    """The record of one arm's scores in the score step's ``directory`` (a ``postfit_checkpoint.BatchCheckpoint`` with
+    ARM_SCORES), keyed by the step, the arm, its scored ``traits`` and the [cohort rows, models] ``shape``: the arm's model
+    batches in the order they were made, each by its traits, its traits whose predictions were not finite, and its
+    count of prediction batches. Written once every batch of the arm is, it is the arm's part of the step (ARM_PARTS):
+    a run holding the other arm joins them from the batches it lists, with no store."""
+    from sv_pgs.postfit_checkpoint import BatchCheckpoint
+
+    return BatchCheckpoint(directory, step_key, {"arm": arm, "traits": list(traits), "shape": list(shape)}, (ARM_SCORES,))
+
+
+def _scored_traits(run: _Run, cohort: _Cohort, arm: str) -> list[int]:
+    """The traits ``arm``'s fit can score by its own records (``_fit_verdicts``), in cohort order. An arm's run scores
+    its part before the other arm's fit has a verdict, so a trait only the other arm cannot score is scored here, and
+    the step leaves it out when it joins the arms."""
+    unscorable = _fit_verdicts(run, cohort, unscorable=True, arms=(arm,))
+    return [trait for trait, name in enumerate(cohort.trait_names) if name not in unscorable]
+
+
+def _score_batch(directory: Path, step_key: str, cohort: _Cohort, arm: str, traits: Sequence[int]) -> tuple[Any, list[int], list[int], list[int]]:
+    """One batch of ``arm``'s models, those of ``traits``: its checkpoint in the score step's ``directory`` (a
+    ``postfit_checkpoint.BatchCheckpoint``), keyed by its ordered traits and their columns, and those columns: the traits'
+    models, the traits whose structural parts it scores (``with_sv``'s, by trait) and their models that hold someone out."""
+    from sv_pgs.postfit_checkpoint import BatchCheckpoint
+
+    targets = [int(index) for trait in traits for index in cohort.trait_models(trait)]
+    part_traits = list(traits) if arm == "with_sv" else []
+    part_models = [int(index) for trait in part_traits for index in cohort.trait_models(trait) if cohort.held_out[:, index].any()]
+    checkpoint = BatchCheckpoint(directory, step_key, {
+        "arm": arm, "traits": [cohort.trait_names[trait] for trait in traits], "targets": targets, "parts": part_traits,
+        "model_parts": part_models, "shape": [cohort.store_columns.shape[0], len(cohort.model_names)],
+    }, ("predictions.npz",))
+    return checkpoint, targets, part_traits, part_models
+
+
+def _opened_store(run: _Run, needed: str) -> DosageStore:
+    """The final store (``_final_store``), opened once a driver for the score and effects steps, and closed with the run
+    (``run_pipeline``). A finishing run (``_Run.finish``) reads no store: ``needed``, what the store would make, is a part
+    the arm's run did not leave, so the run stops there."""
+    if run.finish:
+        raise ValueError(
+            f"{needed} is not in this run, and a finishing run reads no store: finish the run where the arm was fitted, "
+            "or adopt that run's parts first (run-mirror adopt)."
+        )
+    if run.store is None:
+        run.store = DosageStore.open(_final_store(run))
+    return run.store
+
+
+def _arm_scores(run: _Run, directory: Path, step_key: str, cohort: _Cohort, arm: str) -> tuple[dict[str, F64Array], tuple[F64Array, F64Array], list[str], int]:
+    """One arm's scores: each of SCORE_COLUMNS [cohort rows, models]; the structural parts (STRUCTURAL_PART) of its
+    models, by trait [cohort rows, traits] and by model [cohort rows, models] (NaN outside ``with_sv``, ``_score_step``);
+    the traits whose predictions were not finite; and its prediction batches.
+
+    The arm's scored traits (``_scored_traits``) are read in as few reads of the store as the host's memory allows the
+    saved models to be held together (``score_batches``). Each batch of models is durable in the keyed partial, its exact
+    ordered membership and output columns in its key: a restart fills a batch's columns from it before loading any fitted
+    model. A failed fused read is retried a trait at a time, so one overflow cannot hide the other traits' valid
+    predictions. Once every batch is made, the arm's record (``arm_scores``) lists them, so a run that holds them reads
+    the same values with no store (``_opened_store``). Each arm is batched on its own, in the same order in every run, so
+    a run scoring both arms and two runs scoring one each make the same batches, with the same memory, and the same
+    float64 values. A batch's read of the store is kept part way through as well (``postfit_checkpoint.batch_reads``),
+    so a restart reads only its rest and scores it to the bit; its kept reads go once the batch is committed."""
     from sv_pgs.phase_timer import timing
-    from sv_pgs.postfit_checkpoint import BatchCheckpoint, batch_reads, discard_reads
+    from sv_pgs.postfit_checkpoint import batch_reads, discard_reads
+
+    begun = time.perf_counter()
+    traits = _scored_traits(run, cohort, arm)
+    shape = (cohort.store_columns.shape[0], len(cohort.model_names))
+    record = arm_scores(directory, step_key, arm, [cohort.trait_names[trait] for trait in traits], shape)
+    recorded = record.read()
+    plan = None if recorded is None else json.loads((recorded / ARM_SCORES).read_text(encoding="utf-8"))
+    columns = {name: np.full(shape, np.nan) for name in SCORE_COLUMNS}
+    structural_genetic = np.full((shape[0], len(cohort.trait_names)), np.nan)
+    # [cohort rows, models]: the structural part of each with_sv model that holds someone out.
+    model_structural = np.full(shape, np.nan)
+    directories = [_fitted_model_directory(run, arm, cohort.trait_names[trait]) for trait in traits]
+    if plan is None:
+        batches = [list(batch) for batch in score_batches([sum(path.stat().st_size for path in folder.iterdir()) for folder in directories], run.budget.host_bytes)]
+        invalid: list[str] = []
+    else:
+        batches = [[traits.index(cohort.trait_names.index(name)) for name in batch] for batch in plan["batches"]]
+        invalid = list(plan["invalid_predictions"])
+    made: list[list[int]] = []
+    restored_batches = 0
+    structural = None
+    for batch in batches:
+        batch_traits = [traits[position] for position in batch]
+        checkpoint, targets, part_traits, part_models = _score_batch(directory, step_key, cohort, arm, batch_traits)
+        saved = checkpoint.read()
+        if saved is not None:
+            with np.load(saved / "predictions.npz", allow_pickle=False) as arrays:
+                for name in columns:
+                    columns[name][:, targets] = arrays[name]
+                structural_genetic[:, part_traits] = arrays["structural_genetic"]
+                model_structural[:, part_models] = arrays["model_structural"]
+            made.append(batch)
+            restored_batches += 1
+            discard_reads(directory, checkpoint)
+            continue
+        store = _opened_store(run, f"the {arm} scores of {[cohort.trait_names[trait] for trait in batch_traits]}")
+        started = time.perf_counter()
+        fitted = [_checked_trait_model(run, cohort, arm, traits[position], directories[position]) for position in batch]
+        # Each fitted model's column in the arm's models, from its own names.
+        for position, model in zip(batch, fitted):
+            require_scorable(model)
+            trait = traits[position]
+            expected = tuple(cohort.model_names[index] for index in cohort.trait_models(trait))
+            if tuple(model.model_names) != expected:
+                raise ValueError(f"the {arm} model of {cohort.trait_names[trait]} holds {model.model_names}, not its trait's models {expected}.")
+        if structural is None:
+            structural = structural_records(store.variant_table)
+        # The structural part of each trait's all-rows with_sv model, by trait, and of each of its models that
+        # holds someone out, by model, scored in the same read as the models themselves, after them.
+        parts = {}
+        for position, model in zip(batch, fitted):
+            trait = traits[position]
+            if arm == "with_sv":
+                all_rows_name = cohort.model_names[cohort.all_rows_model(trait)]
+                parts[trait] = model_part(model, all_rows_name, structural, f"{all_rows_name}/{STRUCTURAL_PART}")
+        held_parts = {}
+        for position, model in zip(batch, fitted):
+            for index in part_models:
+                if cohort.model_traits[index] == traits[position]:
+                    held_parts[index] = model_part(model, cohort.model_names[index], structural, f"{cohort.model_names[index]}/{STRUCTURAL_PART}")
+        models = [*fitted, *parts.values(), *held_parts.values()]
+        # Scored on their used rows gathered into one run (``GatheredRows``); the renumbered models share every
+        # array with ``models`` but their row numbers, which the budget counts with the gathered rows themselves.
+        gathered, reader = gathered_models(models, store)
+        try:
+            budget = _prediction_budget(run.budget, cohort, gathered, columns, (structural_genetic, model_structural, models, reader.rows))
+        except MemoryError:
+            if len(batch) == 1:
+                raise
+            batches.extend([position] for position in batch)
+            del fitted, parts, held_parts, models, model, gathered, reader
+            continue
+        try:
+            loaded = time.perf_counter()
+            failure = None
+            try:
+                prediction = run.bindings.predict(gathered, reader, cohort.store_columns, cohort.covariates[:, 1:], budget, checkpoint=batch_reads(checkpoint))
+            except MemoryError:
+                raise
+            except Exception as error:
+                # A non-finite prediction is the models' own, whichever rows they are read on (quarantined below).
+                if isinstance(error, ValueError) and str(error).startswith("Non-finite predictions"):
+                    raise
+                failure = f"{type(error).__name__}: {error}"
+            if failure is not None:
+                # Any other failure of the gathered read must not cost a job its attempt: the batch is scored as it was
+                # before GatheredRows, from the store's own rows with its own budget, once the failed read's frames (its
+                # buffers and device arrays) are gone with the exception.
+                LOGGER.warning("workspace pipeline: scoring on gathered rows failed (%s); scoring the batch from the store's rows", failure)
+                gathered = reader = None
+                budget = _prediction_budget(run.budget, cohort, models, columns, (structural_genetic, model_structural))
+                prediction = run.bindings.predict(models, store, cohort.store_columns, cohort.covariates[:, 1:], budget, checkpoint=batch_reads(checkpoint))
+            # Production prediction checks these too; bindings must obey the same contract. A failed fused read
+            # is retried one trait at a time so one overflow cannot hide the other traits' valid predictions.
+            values_to_check = (prediction.predictive_mean, prediction.predictive_variance, prediction.linear_predictor, prediction.genetic.means)
+            expected_shape = (shape[0], sum(len(model.model_names) for model in models))
+            if any(np.shape(values) != expected_shape for values in values_to_check):
+                raise ValueError("misaligned prediction columns")
+            if any(not np.all(np.isfinite(values)) for values in values_to_check) or np.any(prediction.predictive_variance < 0):
+                raise ValueError("Non-finite predictions or invalid predictive variances")
+            predicted = time.perf_counter()
+        except ValueError as error:
+            if not str(error).startswith("Non-finite predictions"):
+                raise
+            if len(batch) > 1:
+                batches.extend([position] for position in batch)
+            else:
+                invalid.append(cohort.trait_names[batch_traits[0]])
+            # A previous successful iteration must not keep a model or prediction alive into the retry.
+            prediction, values_to_check = None, ()
+            del fitted, parts, held_parts, models, model, gathered, reader
+            continue
+        for name, values in (
+            ("predictive_mean", prediction.predictive_mean), ("predictive_variance", prediction.predictive_variance),
+            ("linear_predictor", prediction.linear_predictor), ("genetic_mean", prediction.genetic.means),
+        ):
+            columns[name][:, targets] = np.asarray(values, dtype=np.float64)[:, : len(targets)]
+        means = np.asarray(prediction.genetic.means, dtype=np.float64)
+        structural_genetic[:, list(parts)] = means[:, len(targets) : len(targets) + len(parts)]
+        model_structural[:, list(held_parts)] = means[:, len(targets) + len(parts) :]
+        del fitted, parts, held_parts, prediction, models, model, values, values_to_check, means, gathered, reader
+        with checkpoint.write() as temporary:
+            np.savez(temporary / "predictions.npz", **{name: values[:, targets] for name, values in columns.items()},
+                     structural_genetic=structural_genetic[:, part_traits], model_structural=model_structural[:, part_models])
+        discard_reads(directory, checkpoint)
+        made.append(batch)
+        # The batch's models loaded (and checked), then read from the store in one prediction, then committed.
+        timing("score_batch", time.perf_counter() - started, models=len(batch), load=loaded - started, predict=predicted - loaded)
+    outcome = {
+        "batches": [[cohort.trait_names[traits[position]] for position in batch] for batch in made], "invalid_predictions": invalid,
+        "prediction_batches": len(batches) if plan is None else plan["prediction_batches"],
+    }
+    if plan is None or (plan["batches"], plan["invalid_predictions"]) != (outcome["batches"], outcome["invalid_predictions"]):
+        with record.write() as temporary:
+            _write_json(temporary / ARM_SCORES, outcome)
+    # The arm's whole, its batches made here (each with its line above) or read back: a run joining arms scored in their
+    # own runs has only these lines in its score step.
+    timing("score_arm", time.perf_counter() - begun, arm=arm, models=sum(len(cohort.trait_models(trait)) for trait in traits),
+           batches=len(batches), reused=restored_batches)
+    return columns, (structural_genetic, model_structural), invalid, int(outcome["prediction_batches"])
+
+
+def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
+    """Every model of both arms scored for the whole cohort (``predict_models``), an arm at a time (``_arm_scores``). An
+    unscorable trait (``_fit_verdicts``) is not read: its scores stay NaN, and the step's summary names it with its codes
+    under ``quarantined``; the summary names each uncertified trait, scored like the rest, under ``uncertified``.
+
+    A run that fitted some arms (``fit_arms``), whose fit stopped after its part, scores those arms here while their
+    store is on its disk, and stops after that part (StepPart): their records and batches are what a run holding every
+    arm (the other arm's run, or a finishing run of either, ``run_pipeline``'s ``finish``) joins with no store, minutes
+    after the slower arm's fit rather than after a restore of the store and a second scoring.
+
+    Final calibration and held-out assembly run again from the batches' float64 values; neither the prediction call
+    nor its arithmetic changes."""
+    from sv_pgs.postfit_checkpoint import discard_reads
 
     step_key = (directory / KEY_FILE).read_text(encoding="utf-8")
     cohort = _fit_cohort(run)
+    if "fit" in run.parts:
+        arms = tuple(run.fit_arms or ARMS)
+        for arm in arms:
+            _arm_scores(run, directory, step_key, cohort, arm)
+        # A batch split after a failed read leaves that read's kept part behind.
+        discard_reads(directory)
+        raise StepPart(f"the score step holds the scores of {list(arms)}; the run that holds every arm joins them.")
     quarantined = _fit_verdicts(run, cohort, unscorable=True)
     uncertified = {name: arms for name, arms in _fit_verdicts(run, cohort, unscorable=False).items() if name not in quarantined}
     for trait_name, arms in quarantined.items():
         LOGGER.warning("workspace pipeline: %s is not scored or reported: its %s fit cannot be scored", trait_name, "; ".join(arms))
     for trait_name, arms in uncertified.items():
         LOGGER.warning("workspace pipeline: %s is scored and reported, uncertified: %s", trait_name, "; ".join(arms))
-    trait_count = len(cohort.trait_names)
-    scored = [(arm_index, trait) for arm_index in range(len(ARMS)) for trait in range(trait_count) if cohort.trait_names[trait] not in quarantined]
-    directories = [_fitted_model_directory(run, ARMS[arm_index], cohort.trait_names[trait]) for arm_index, trait in scored]
+    unscorable = set(quarantined)
     shape = (len(ARMS), cohort.store_columns.shape[0], len(cohort.model_names))
-    columns = {name: np.full((shape[1], shape[0] * shape[2]), np.nan) for name in ("predictive_mean", "predictive_variance", "linear_predictor", "genetic_mean")}
-    structural_genetic = np.full((shape[1], trait_count), np.nan)
-    # [cohort rows, models]: the structural part of each with_sv model that holds someone out.
+    columns = {name: np.full(shape, np.nan) for name in SCORE_COLUMNS}
+    structural_genetic = np.full((shape[1], len(cohort.trait_names)), np.nan)
     model_structural = np.full((shape[1], shape[2]), np.nan)
-    batches = score_batches([sum(path.stat().st_size for path in folder.iterdir()) for folder in directories], run.budget.host_bytes)
-    restored_batches = 0
-    with DosageStore.open(_final_store(run)) as store:
-        structural = structural_records(store.variant_table) if batches else None
-        for batch in batches:
-            batch_models = [scored[position] for position in batch]
-            targets = [arm_index * shape[2] + int(index) for arm_index, trait in batch_models for index in cohort.trait_models(trait)]
-            part_traits = [trait for arm_index, trait in batch_models if ARMS[arm_index] == "with_sv"]
-            part_models = [int(index) for trait in part_traits for index in cohort.trait_models(trait) if cohort.held_out[:, index].any()]
-            checkpoint = BatchCheckpoint(directory, step_key, {
-                "models": batch_models, "targets": targets, "parts": part_traits, "model_parts": part_models, "shape": shape,
-            }, ("predictions.npz",))
-            saved = checkpoint.read()
-            if saved is not None:
-                with np.load(saved / "predictions.npz", allow_pickle=False) as arrays:
-                    for name in columns:
-                        columns[name][:, targets] = arrays[name]
-                    structural_genetic[:, part_traits] = arrays["structural_genetic"]
-                    model_structural[:, part_models] = arrays["model_structural"]
-                restored_batches += 1
-                discard_reads(directory, checkpoint)
-                continue
-            started = time.perf_counter()
-            fitted = [_checked_trait_model(run, cohort, ARMS[scored[position][0]], scored[position][1], directories[position]) for position in batch]
-            # Each fitted model's column in [arms x models] (arm-major), from its own names.
-            for position, model in zip(batch, fitted):
-                require_scorable(model)
-                arm_index, trait = scored[position]
-                expected = tuple(cohort.model_names[index] for index in cohort.trait_models(trait))
-                if tuple(model.model_names) != expected:
-                    raise ValueError(f"the {ARMS[arm_index]} model of {cohort.trait_names[trait]} holds {model.model_names}, not its trait's models {expected}.")
-            # The structural part of each trait's all-rows with_sv model, by trait, and of each of its models that
-            # holds someone out, by model, scored in the same read as the models themselves, after them.
-            parts = {}
-            for position, model in zip(batch, fitted):
-                arm_index, trait = scored[position]
-                if ARMS[arm_index] == "with_sv":
-                    all_rows_name = cohort.model_names[cohort.all_rows_model(trait)]
-                    parts[trait] = model_part(model, all_rows_name, structural, f"{all_rows_name}/{STRUCTURAL_PART}")
-            held_parts = {}
-            for position, model in zip(batch, fitted):
-                arm_index, trait = scored[position]
-                for index in (part_models if ARMS[arm_index] == "with_sv" else []):
-                    if cohort.model_traits[index] == trait:
-                        held_parts[index] = model_part(model, cohort.model_names[index], structural, f"{cohort.model_names[index]}/{STRUCTURAL_PART}")
-            models = [*fitted, *parts.values(), *held_parts.values()]
-            # Scored on their used rows gathered into one run (``GatheredRows``); the renumbered models share every
-            # array with ``models`` but their row numbers, which the budget counts with the gathered rows themselves.
-            gathered, reader = gathered_models(models, store)
-            try:
-                budget = _prediction_budget(run.budget, cohort, gathered, columns, (structural_genetic, model_structural, models, reader.rows))
-            except MemoryError:
-                if len(batch) == 1:
-                    raise
-                batches.extend(range(position, position + 1) for position in batch)
-                del fitted, parts, held_parts, models, model, gathered, reader
-                continue
-            try:
-                loaded = time.perf_counter()
-                failure = None
-                try:
-                    prediction = run.bindings.predict(gathered, reader, cohort.store_columns, cohort.covariates[:, 1:], budget, checkpoint=batch_reads(checkpoint))
-                except MemoryError:
-                    raise
-                except Exception as error:
-                    # A non-finite prediction is the models' own, whichever rows they are read on (quarantined below).
-                    if isinstance(error, ValueError) and str(error).startswith("Non-finite predictions"):
-                        raise
-                    failure = f"{type(error).__name__}: {error}"
-                if failure is not None:
-                    # Any other failure of the gathered read must not cost a merge job its attempt: the batch is scored as
-                    # it was before GatheredRows, from the store's own rows with its own budget, once the failed read's
-                    # frames (its buffers and device arrays) are gone with the exception.
-                    LOGGER.warning("workspace pipeline: scoring on gathered rows failed (%s); scoring the batch from the store's rows", failure)
-                    gathered = reader = None
-                    budget = _prediction_budget(run.budget, cohort, models, columns, (structural_genetic, model_structural))
-                    prediction = run.bindings.predict(models, store, cohort.store_columns, cohort.covariates[:, 1:], budget, checkpoint=batch_reads(checkpoint))
-                # Production prediction checks these too; bindings must obey the same contract. A failed fused read
-                # is retried one trait at a time so one overflow cannot hide the other traits' valid predictions.
-                values_to_check = (prediction.predictive_mean, prediction.predictive_variance, prediction.linear_predictor, prediction.genetic.means)
-                expected_shape = (shape[1], sum(len(model.model_names) for model in models))
-                if any(np.shape(values) != expected_shape for values in values_to_check):
-                    raise ValueError("misaligned prediction columns")
-                if any(not np.all(np.isfinite(values)) for values in values_to_check) or np.any(prediction.predictive_variance < 0):
-                    raise ValueError("Non-finite predictions or invalid predictive variances")
-                predicted = time.perf_counter()
-            except ValueError as error:
-                if not str(error).startswith("Non-finite predictions"):
-                    raise
-                if len(batch) > 1:
-                    batches.extend(range(position, position + 1) for position in batch)
-                else:
-                    arm_index, trait = scored[batch.start]
-                    quarantined.setdefault(cohort.trait_names[trait], []).append(f"{ARMS[arm_index]} (invalid_predictions)")
-                    uncertified.pop(cohort.trait_names[trait], None)
-                # A previous successful iteration must not keep a model or prediction alive into the retry.
-                prediction, values_to_check = None, ()
-                del fitted, parts, held_parts, models, model, gathered, reader
-                continue
-            for name, values in (
-                ("predictive_mean", prediction.predictive_mean), ("predictive_variance", prediction.predictive_variance),
-                ("linear_predictor", prediction.linear_predictor), ("genetic_mean", prediction.genetic.means),
-            ):
-                columns[name][:, targets] = np.asarray(values, dtype=np.float64)[:, : len(targets)]
-            means = np.asarray(prediction.genetic.means, dtype=np.float64)
-            structural_genetic[:, list(parts)] = means[:, len(targets) : len(targets) + len(parts)]
-            model_structural[:, list(held_parts)] = means[:, len(targets) + len(parts) :]
-            del fitted, parts, held_parts, prediction, models, model, values, values_to_check, means, gathered, reader
-            with checkpoint.write() as temporary:
-                np.savez(temporary / "predictions.npz", **{name: values[:, targets] for name, values in columns.items()},
-                         structural_genetic=structural_genetic[:, part_traits], model_structural=model_structural[:, part_models])
-            discard_reads(directory, checkpoint)
-            # The batch's models loaded (and checked), then read from the store in one prediction, then committed.
-            timing("score_batch", time.perf_counter() - started, models=len(batch), load=loaded - started, predict=predicted - loaded)
-    # A batch split after a failed read leaves that read's kept part behind.
+    prediction_batches = 0
+    for arm_index, arm in enumerate(ARMS):
+        arm_columns, (arm_structural, arm_model_structural), invalid, batches = _arm_scores(run, directory, step_key, cohort, arm)
+        for name in SCORE_COLUMNS:
+            columns[name][arm_index] = arm_columns[name]
+        if arm == "with_sv":
+            structural_genetic, model_structural = arm_structural, arm_model_structural
+        for trait_name in invalid:
+            if trait_name not in unscorable:
+                quarantined.setdefault(trait_name, []).append(f"{arm} (invalid_predictions)")
+                uncertified.pop(trait_name, None)
+        prediction_batches += batches
     discard_reads(directory)
-    # Comparisons need the same trait in both arms. If one arm failed during prediction, erase the other arm's
-    # already computed columns too; every downstream table uses this trait-wide quarantine.
+    # Comparisons need the same trait in both arms. If one arm cannot be scored or failed during prediction, erase the
+    # other arm's computed columns too; every downstream table uses this trait-wide quarantine.
     for trait, name in enumerate(cohort.trait_names):
         if name in quarantined:
-            for arm_index in range(len(ARMS)):
-                targets = arm_index * shape[2] + cohort.trait_models(trait)
-                for values in columns.values():
-                    values[:, targets] = np.nan
+            for values in columns.values():
+                values[:, :, cohort.trait_models(trait)] = np.nan
             structural_genetic[:, trait] = np.nan
             model_structural[:, cohort.trait_models(trait)] = np.nan
-    LOGGER.info("workspace pipeline: submitted %d models in %d prediction batches, reused %d batches",
-                sum(len(cohort.trait_models(trait)) for _arm, trait in scored), len(batches) - restored_batches, restored_batches)
-
-    def by_arm(values: Any) -> F64Array:
-        # [rows, arms x models] in arm-major model order, as [arms, rows, models].
-        return np.asarray(values, dtype=np.float64).reshape(shape[1], shape[0], shape[2]).transpose(1, 0, 2)
+    reported = [trait for trait, name in enumerate(cohort.trait_names) if name not in quarantined]
+    LOGGER.info("workspace pipeline: the arms' %d reported models were scored in %d prediction batches",
+                len(ARMS) * sum(len(cohort.trait_models(trait)) for trait in reported), prediction_batches)
 
     def held_out(values: F64Array) -> F64Array:
         own = np.full((len(ARMS), shape[1], len(cohort.trait_names)), np.nan)
@@ -4108,9 +4301,9 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
             own[:, rows, trait] = values[:, rows, model]
         return own
 
-    predictive_mean = by_arm(columns["predictive_mean"])
-    linear_predictor = by_arm(columns["linear_predictor"])
-    genetic_mean = by_arm(columns["genetic_mean"])
+    predictive_mean = columns["predictive_mean"]
+    linear_predictor = columns["linear_predictor"]
+    genetic_mean = columns["genetic_mean"]
     calibrated_logits = np.full_like(linear_predictor, np.nan)
     calibrators = []
     from sv_pgs.probability_calibration import FrozenCalibration
@@ -4132,7 +4325,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
         arms=np.array(ARMS),
         model_names=np.array(cohort.model_names),
         predictive_mean=predictive_mean,
-        predictive_variance=by_arm(columns["predictive_variance"]),
+        predictive_variance=columns["predictive_variance"],
         linear_predictor=linear_predictor,
         genetic_mean=genetic_mean,
         held_out_predictive_mean=held_out(predictive_mean),
@@ -4144,7 +4337,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
         held_out_calibrated_logits=held_out(calibrated_logits),
     )
     return {
-        "arms": list(ARMS), "models": sum(len(cohort.trait_models(trait)) for _arm, trait in scored if cohort.trait_names[trait] not in quarantined), "prediction_batches": len(batches),
+        "arms": list(ARMS), "models": len(ARMS) * sum(len(cohort.trait_models(trait)) for trait in reported), "prediction_batches": prediction_batches,
         "scored_rows": int(cohort.store_columns.shape[0]), "quarantined": quarantined, "uncertified": uncertified,
     }
 
@@ -4548,6 +4741,48 @@ def genetic_variance_decomposition(total: F64Array, structural: F64Array) -> dic
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _StoreRecords:
+    """The store's columns the effects step reads for every record: its variant table, each record's class name, length
+    and length bin (``length_bins``), row source (ROW_SOURCES) and codes per unit, and the store's sample count."""
+
+    table: VariantTable
+    classes: NDArray
+    lengths: F64Array
+    bins: NDArray
+    row_sources: NDArray
+    codes_per_unit: F64Array
+    sample_count: int
+
+    @classmethod
+    def read(cls, store: DosageStore) -> _StoreRecords:
+        table = store.variant_table
+        lengths = np.asarray(table.annotations["sv_length"], dtype=np.float64)
+        # A store without direct rows holds imputed records only.
+        row_sources = np.asarray(ROW_SOURCES, dtype=object)[
+            np.asarray(table.annotations[ROW_SOURCE], dtype=np.int64) if ROW_SOURCE in table.annotations else np.zeros(lengths.shape[0], dtype=np.int64)
+        ]
+        return cls(
+            table, np.asarray(VARIANT_CLASS_LEGEND, dtype=object)[np.asarray(table.variant_class)], lengths, length_bins(lengths), row_sources,
+            np.asarray(table.codes_per_unit, dtype=np.float64), store.n_samples,
+        )
+
+
+HANDOFF = "handoff.json"
+"""An arm's handoff in the effects step's partial (``arm_handoff``)."""
+
+
+def arm_handoff(directory: Path, step_key: str, arm: str) -> Any:
+    """The handoff of one arm's parts (ARM_PARTS) in the effects step's ``directory`` (a ``postfit_checkpoint.
+    BatchCheckpoint`` with HANDOFF), keyed by the step and the arm. The arm's run writes it last, once the arm's models,
+    scores and effects are all in their partials, and it names them for a run holding the other arm to adopt
+    (``run_mirror.adopt``): the traits whose models and records are the arm's in the fit's partial, and the arm's batch
+    directories in the score step's partial and in this step's."""
+    from sv_pgs.postfit_checkpoint import BatchCheckpoint
+
+    return BatchCheckpoint(directory, step_key, {"handoff": arm}, (HANDOFF,))
+
+
 def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Each trait's all-rows model, in both arms: every fitted record's effect (``effects/<trait>.<arm>.tsv.gz``, kept in
     the workspace: it carries each record's mean dosage, from which a rare record's carrier count follows), two
@@ -4561,11 +4796,99 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
     A batch is one (arm, trait)'s all-rows model: its compressed per-record table and its already formatted summary
     rows are committed together. A restart reuses only whole, matching batches, in the original arm/trait order;
     the small score-derived variance table and final summary tables are assembled again. Per-record tables link to
-    their durable copies on the local disk, so keeping a partial does not hold a second copy of the largest files."""
+    their durable copies on the local disk, so keeping a partial does not hold a second copy of the largest files.
+
+    A run whose score step stopped after its part (``fit_arms``) makes its arms' batches here while its store is on its
+    disk, for the traits its scores hold, writes each arm's handoff (``arm_handoff``) and stops after that part
+    (StepPart); the run that holds every arm then reads every batch and opens no store (``_opened_store``)."""
     from sv_pgs.postfit_checkpoint import BatchCheckpoint
 
     step_key = (directory / KEY_FILE).read_text(encoding="utf-8")
     cohort = _fit_cohort(run)
+    loci = [] if run.config.locus_panel is None else read_locus_panel(run.config.locus_panel)
+    # The store's record columns, read for the first batch this run makes.
+    records: list[_StoreRecords] = []
+
+    def batch(arm: str, trait: int) -> Path:
+        """The (arm, trait)'s batch, made where the partial does not hold it whole."""
+        trait_name = cohort.trait_names[trait]
+        table_name = f"{trait_name}.{arm}.tsv.gz"
+        checkpoint = BatchCheckpoint(directory, step_key, {"arm": arm, "trait": trait_name}, (table_name, "summary.json"))
+        saved = checkpoint.read()
+        if saved is not None:
+            return saved
+        store = _opened_store(run, f"the {arm} effects of {trait_name}")
+        if not records:
+            records.append(_StoreRecords.read(store))
+        table, classes, lengths, bins, row_sources, codes_per_unit = (
+            records[0].table, records[0].classes, records[0].lengths, records[0].bins, records[0].row_sources, records[0].codes_per_unit,
+        )
+        working_bytes = run.budget.host_bytes // 2
+        with checkpoint.write() as temporary:
+            fitted = _checked_trait_model(run, cohort, arm, trait, _fitted_model_directory(run, arm, trait_name))
+            require_scorable(fitted)
+            scoring = fitted.scoring[list(fitted.model_names).index(cohort.model_names[cohort.all_rows_model(trait)])]
+            effects = variant_effects(scoring, codes_per_unit, working_bytes)
+            rows = effects.store_rows
+            pd.DataFrame(
+                {
+                    "chromosome": np.asarray(table.chromosome)[rows].astype(np.int64),
+                    "position": np.asarray(table.position)[rows],
+                    "id": table.variant_ids(rows),
+                    "variant_class": classes[rows],
+                    "length": lengths[rows],
+                    "row_source": row_sources[rows],
+                    "mean_value": (np.asarray(scoring.signed_means) + SIGNED_CODE_OFFSET) / codes_per_unit[rows] + np.asarray(table.value_origin)[rows],
+                    "effect": effects.mean,
+                    "posterior_sd": effects.standard_deviation,
+                    "likelihood": "bernoulli" if scoring.trait_type == TraitType.BINARY else "gaussian",
+                    "effect_scale": "log_odds" if scoring.trait_type == TraitType.BINARY else ("observed_status" if cohort.trait_types[trait] == TraitType.BINARY else "trait_units"),
+                    "sign_method": "analytic_represented_mixture" if hasattr(scoring.posterior_draws, "marginal_summary") else "monte_carlo",
+                    "sign_draw_count": 0 if hasattr(scoring.posterior_draws, "marginal_summary") else scoring.draw_count,
+                    "sign_probability_resolution": 0.0 if hasattr(scoring.posterior_draws, "marginal_summary") else 1.0 / scoring.draw_count,
+                    "probability_positive": effects.probability_positive,
+                    "probability_negative": effects.probability_negative,
+                }
+            ).to_csv(
+                temporary / table_name, sep="\t", index=False, float_format="%.6g",
+                # gzip's fastest level: a genome's records are tens of millions of rows per table.
+                compression={"method": "gzip", "compresslevel": 1},
+            )
+            unit = codes_per_unit[rows] / np.asarray(scoring.signed_scales, dtype=np.float64)
+            prior = prior_moments(scoring, unit)
+            tables = effect_summaries(trait_name, arm, classes[rows], bins[rows], lengths[rows], effects, unit, prior)
+            if loci:
+                frequency = np.asarray(table.sum_code, dtype=np.float64)[rows] / (2.0 * CODES_PER_DOSAGE * records[0].sample_count)
+                trained = int(cohort.training[:, cohort.all_rows_model(trait)].sum())
+                tables["locus_variance.tsv"] = locus_variance(
+                    trait_name, arm, loci, np.asarray(table.chromosome)[rows].astype(np.int64), np.asarray(table.position)[rows].astype(np.int64),
+                    locus_classes(classes[rows], bins[rows]), (effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation) / (unit * unit),
+                    trained * np.minimum(frequency, 1.0 - frequency),
+                )
+            _write_json(temporary / "summary.json", {"tables": tables, "prior": prior is not None})
+        return checkpoint.path
+
+    if "score" in run.parts:
+        arms = tuple(run.fit_arms or ARMS)
+        score_directory, score_key = run.output("score.partial"), run.keys["score"]
+        shape = (cohort.store_columns.shape[0], len(cohort.model_names))
+        for arm in arms:
+            handoff = arm_handoff(directory, step_key, arm)
+            if handoff.read() is not None:
+                continue
+            traits = _scored_traits(run, cohort, arm)
+            recorded = arm_scores(score_directory, score_key, arm, [cohort.trait_names[trait] for trait in traits], shape).read()
+            if recorded is None:
+                raise ValueError(f"the score step's partial holds no record of the {arm} scores.")
+            plan = json.loads((recorded / ARM_SCORES).read_text(encoding="utf-8"))
+            made = [batch(arm, trait) for trait in traits if cohort.trait_names[trait] not in plan["invalid_predictions"]]
+            scored = [_score_batch(score_directory, score_key, cohort, arm, [cohort.trait_names.index(name) for name in names])[0].path for names in plan["batches"]]
+            with handoff.write() as temporary:
+                _write_json(temporary / HANDOFF, {
+                    "arm": arm, "models": list(cohort.trait_names), "score": [recorded.name, *(path.name for path in scored)],
+                    "effects": [path.name for path in made],
+                })
+        raise StepPart(f"the effects step holds the effects of {list(arms)}; the run that holds every arm joins them.")
     scores = _read_scores(run)
     quarantined = run.summary("score")["quarantined"]
     reported = [(trait, trait_name) for trait, trait_name in enumerate(cohort.trait_names) if trait_name not in quarantined]
@@ -4583,78 +4906,20 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
         "effects_by_class.tsv": [EFFECT_SUMMARY_COLUMNS], "effect_length_correlation.tsv": [LENGTH_CORRELATION_COLUMNS],
         "prior_by_length.tsv": [PRIOR_BY_LENGTH_COLUMNS], "prior_enrichment.tsv": [PRIOR_ENRICHMENT_COLUMNS],
     }
-    loci = [] if run.config.locus_panel is None else read_locus_panel(run.config.locus_panel)
     if run.config.locus_panel is not None:
         summaries["locus_variance.tsv"] = [LOCUS_VARIANCE_COLUMNS]
     priors = 0
-    if reported:
-        with DosageStore.open(_final_store(run)) as store:
-            table = store.variant_table
-            classes = np.asarray(VARIANT_CLASS_LEGEND, dtype=object)[np.asarray(table.variant_class)]
-            lengths = np.asarray(table.annotations["sv_length"], dtype=np.float64)
-            bins = length_bins(lengths)
-            # A store without direct rows holds imputed records only.
-            row_sources = np.asarray(ROW_SOURCES, dtype=object)[
-                np.asarray(table.annotations[ROW_SOURCE], dtype=np.int64) if ROW_SOURCE in table.annotations else np.zeros(lengths.shape[0], dtype=np.int64)
-            ]
-            codes_per_unit = np.asarray(table.codes_per_unit, dtype=np.float64)
-            working_bytes = run.budget.host_bytes // 2
-            for arm in ARMS:
-                for trait, trait_name in reported:
-                    table_name = f"{trait_name}.{arm}.tsv.gz"
-                    checkpoint = BatchCheckpoint(directory, step_key, {"arm": arm, "trait": trait_name}, (table_name, "summary.json"))
-                    saved = checkpoint.read()
-                    if saved is None:
-                        with checkpoint.write() as temporary:
-                            fitted = _checked_trait_model(run, cohort, arm, trait, _fitted_model_directory(run, arm, trait_name))
-                            require_scorable(fitted)
-                            scoring = fitted.scoring[list(fitted.model_names).index(cohort.model_names[cohort.all_rows_model(trait)])]
-                            effects = variant_effects(scoring, codes_per_unit, working_bytes)
-                            rows = effects.store_rows
-                            pd.DataFrame(
-                                {
-                                    "chromosome": np.asarray(table.chromosome)[rows].astype(np.int64),
-                                    "position": np.asarray(table.position)[rows],
-                                    "id": table.variant_ids(rows),
-                                    "variant_class": classes[rows],
-                                    "length": lengths[rows],
-                                    "row_source": row_sources[rows],
-                                    "mean_value": (np.asarray(scoring.signed_means) + SIGNED_CODE_OFFSET) / codes_per_unit[rows] + np.asarray(table.value_origin)[rows],
-                                    "effect": effects.mean,
-                                    "posterior_sd": effects.standard_deviation,
-                                    "likelihood": "bernoulli" if scoring.trait_type == TraitType.BINARY else "gaussian",
-                                    "effect_scale": "log_odds" if scoring.trait_type == TraitType.BINARY else ("observed_status" if cohort.trait_types[trait] == TraitType.BINARY else "trait_units"),
-                                    "sign_method": "analytic_represented_mixture" if hasattr(scoring.posterior_draws, "marginal_summary") else "monte_carlo",
-                                    "sign_draw_count": 0 if hasattr(scoring.posterior_draws, "marginal_summary") else scoring.draw_count,
-                                    "sign_probability_resolution": 0.0 if hasattr(scoring.posterior_draws, "marginal_summary") else 1.0 / scoring.draw_count,
-                                    "probability_positive": effects.probability_positive,
-                                    "probability_negative": effects.probability_negative,
-                                }
-                            ).to_csv(
-                                temporary / table_name, sep="\t", index=False, float_format="%.6g",
-                                # gzip's fastest level: a genome's records are tens of millions of rows per table.
-                                compression={"method": "gzip", "compresslevel": 1},
-                            )
-                            unit = codes_per_unit[rows] / np.asarray(scoring.signed_scales, dtype=np.float64)
-                            prior = prior_moments(scoring, unit)
-                            tables = effect_summaries(trait_name, arm, classes[rows], bins[rows], lengths[rows], effects, unit, prior)
-                            if loci:
-                                frequency = np.asarray(table.sum_code, dtype=np.float64)[rows] / (2.0 * CODES_PER_DOSAGE * store.n_samples)
-                                trained = int(cohort.training[:, cohort.all_rows_model(trait)].sum())
-                                tables["locus_variance.tsv"] = locus_variance(
-                                    trait_name, arm, loci, np.asarray(table.chromosome)[rows].astype(np.int64), np.asarray(table.position)[rows].astype(np.int64),
-                                    locus_classes(classes[rows], bins[rows]), (effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation) / (unit * unit),
-                                    trained * np.minimum(frequency, 1.0 - frequency),
-                                )
-                            _write_json(temporary / "summary.json", {"tables": tables, "prior": prior is not None})
-                        saved = checkpoint.path
-                    record = json.loads((saved / "summary.json").read_text(encoding="utf-8"))
-                    for name, lines in record["tables"].items():
-                        summaries[name].extend(lines)
-                    priors += bool(record["prior"])
-                    output = directory / table_name
-                    output.unlink(missing_ok=True)
-                    os.link(saved / table_name, output)
+    for arm in ARMS:
+        for trait, trait_name in reported:
+            table_name = f"{trait_name}.{arm}.tsv.gz"
+            saved = batch(arm, trait)
+            record = json.loads((saved / "summary.json").read_text(encoding="utf-8"))
+            for name, lines in record["tables"].items():
+                summaries[name].extend(lines)
+            priors += bool(record["prior"])
+            output = directory / table_name
+            output.unlink(missing_ok=True)
+            os.link(saved / table_name, output)
     summaries["genetic_variance.tsv"] = variance_lines
     for name, lines in summaries.items():
         with (directory / name).open("w", newline="", encoding="utf-8") as handle:
@@ -5704,14 +5969,19 @@ _STEPS = (
         *(() if config.test_fold is None else (("test_fold", config.test_fold),)),
         *(() if not config.warm_start_models else (("warm_start_models", config.warm_start_models),)),
     ), (_fit_step, fit_filtered, listed_sites, region_records, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
-    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _split_cohort, _fit_verdicts, _checked_trait_model, _prediction_budget, _array_bytes, _final_store, score_batches, structural_records, model_part, GatheredRows, gathered_models, importlib.import_module("sv_pgs.postfit_checkpoint")), _score_step),
+    _Step("score", ("cohort", "fit"), lambda config: None, (
+        _score_step, _arm_scores, arm_scores, _score_batch, _scored_traits, _opened_store, _fitted_model_directory, _split_cohort, _fit_verdicts,
+        _checked_trait_model, _prediction_budget, _array_bytes, _final_store, score_batches, structural_records, model_part, GatheredRows,
+        gathered_models, importlib.import_module("sv_pgs.postfit_checkpoint"),
+    ), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: {
             "jackknife_blocks": JACKKNIFE_BLOCKS, "confidence": CONFIDENCE_LEVEL,
             "locus_panel": None if config.locus_panel is None else _file_digest(Path(config.locus_panel)),
         },
         (
-            _effects_step, _read_scores, _split_cohort, _checked_trait_model, _final_store, variant_effects, length_bins, genetic_variance_decomposition,
+            _effects_step, _StoreRecords, arm_handoff, arm_scores, _score_batch, _scored_traits, _fit_verdicts, _opened_store, _fitted_model_directory,
+            _read_scores, _split_cohort, _checked_trait_model, _final_store, variant_effects, length_bins, genetic_variance_decomposition,
             _shown, PriorMoments, prior_moments, jackknife_ratio, effect_summaries, suppressed_levels, _hidden_counts, _hidden_records, _number,
             read_locus_panel, locus_classes, locus_variance, _checked_exportable, check_exportable, ExportRule, export_rules,
             importlib.import_module("sv_pgs.postfit_checkpoint"),
@@ -5736,17 +6006,56 @@ _STEPS = (
 )
 
 
+ARM_PARTS = ("score", "effects")
+"""The steps after the fit that a run fitting some arms (``run_pipeline``'s ``fit_arms``) does its part of when its fit
+stops after its own arms: each scores or summarizes those arms while the store is on the run's disk, and stops after
+that part, which the run holding every arm finishes from with no store."""
+FINISH_INPUTS = ("samples", "cohort")
+"""The steps before the fit whose files a finishing run reads: the samples step's, which the store's key reads
+(``_store_sample_layout``), and the cohort (``_read_cohort``); of the others it reads only their COMPLETE_FILE, for
+their keys (``run_mirror.restore``'s ``finishing``)."""
+
+
+def _steps(run: _Run, steps: Sequence[_Step], through: str | None, label: str) -> dict[str, dict[str, Any]]:
+    """Run ``steps`` in order for ``run``, through ``through`` when given. A step stopped after its part (StepPart) ends the
+    run there, except that the steps of ARM_PARTS do their own parts after it; the run's opened store is closed at the
+    end, however it ends."""
+    summaries = {}
+    try:
+        for step in steps:
+            if run.parts and step.name not in ARM_PARTS:
+                break
+            try:
+                summaries[step.name] = _run_step(run, step)
+            except StepPart as part:
+                LOGGER.info("workspace pipeline: %s%s stopped after its part: %s", label, step.name, part)
+            if step.name == through:
+                break
+    finally:
+        if run.store is not None:
+            run.store.close()
+            run.store = None
+    return summaries
+
+
 def run_pipeline(
     config: WorkspaceConfig, bindings: WorkspaceBindings, budget: ComputeBudget, *, through: str | None = None, store_shard: int | None = None,
-    fit_arms: Sequence[str] | None = None,
+    fit_arms: Sequence[str] | None = None, finish: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Run every step in order, through ``through`` when given, resuming from the run directory's checkpoints.
 
     With ``store_shard`` the run is one of a fan-out over the config's chromosomes: its store step converts only the
     chromosome at that index, and the run stops there unless the store is then whole. The store step's key does not
     name the shard, so every shard's converted chromosomes belong to one store. With ``fit_arms`` the fit step fits only
-    those of ARMS, and the run stops there unless every arm is then on disk; the fit step's key does not name them either.
-    On the All of Us chr22 store an arm took half an hour on two A100s, the second waiting on the first.
+    those of ARMS; unless every arm is then on disk, the run scores and summarizes its own arms while the store is on its
+    disk (ARM_PARTS) and stops there. The fit step's key does not name them either. On the All of Us chr22 store an arm
+    took half an hour on two A100s, the second waiting on the first.
+
+    With ``finish`` the run finishes the steps from the fit on from the parts its arms' runs left in it (each arm's
+    models, scores and effects, which ``run_mirror.adopt`` brings from the other arm's run): it makes no step before
+    the fit (each must be complete under its key), fits nothing and reads no store, so it needs only the samples and
+    cohort steps' files and the others' records (FINISH_INPUTS, ``run_mirror.restore``'s ``finishing``), and runs on any
+    machine.
 
     With ``fit_regions`` the steps before the fit are made once, in the run directory, and each region's fit and the
     steps after it in the region's own, in the config's order (``_region_steps``); a region's summaries are named
@@ -5758,20 +6067,20 @@ def run_pipeline(
     config.run_directory.mkdir(parents=True, exist_ok=True)
     if fit_arms is not None and (not fit_arms or not set(fit_arms) <= set(ARMS)):
         raise ValueError(f"fit_arms names some of {ARMS}; got {fit_arms}.")
-    run = _Run(config, bindings, budget, {}, None if store_shard is None else (config.chromosomes[store_shard],), None if fit_arms is None else tuple(fit_arms))
-    summaries = {}
-    for step in _STEPS:
-        if step.name == "fit" and config.fit_regions is not None:
-            for name, region in config.region_runs():
-                summaries.update({f"{REGIONS_DIRECTORY}/{name}/{done}": summary for done, summary in _region_steps(run, region, through).items()})
-            break
-        try:
-            summaries[step.name] = _run_step(run, step)
-        except StepPart as part:
-            LOGGER.info("workspace pipeline: %s stopped after its part: %s", step.name, part)
-            break
-        if step.name == through:
-            break
+    if finish and (store_shard is not None or fit_arms is not None):
+        raise ValueError("a finishing run neither converts a store shard nor fits an arm.")
+    run = _Run(
+        config, bindings, budget, {}, None if store_shard is None else (config.chromosomes[store_shard],), None if fit_arms is None else tuple(fit_arms),
+        finish=finish,
+    )
+    if config.fit_regions is None:
+        return _steps(run, _STEPS, through, "")
+    before_fit = STEP_NAMES[: STEP_NAMES.index("fit")]
+    summaries = _steps(run, [step for step in _STEPS if step.name in before_fit], through, "")
+    if run.parts or through in before_fit:
+        return summaries
+    for name, region in config.region_runs():
+        summaries.update({f"{REGIONS_DIRECTORY}/{name}/{done}": summary for done, summary in _region_steps(run, region, through).items()})
     return summaries
 
 
@@ -5779,7 +6088,8 @@ def _region_steps(shared: _Run, config: WorkspaceConfig, through: str | None) ->
     """One region's fit and the steps after it (``WorkspaceConfig.region_runs``), on the shared run's steps before the
     fit. Each of those is linked into the region's run directory, where the later steps read it as their own
     (``_final_store`` names the store by its path in the run directory), and keeps the shared run's key, so no region
-    makes it again. A region's fit stopped after its part (``fit_arms``) ends that region's steps alone."""
+    makes it again. A region's fit stopped after its part (``fit_arms``) leaves that region's later steps at their own
+    parts (ARM_PARTS); the other regions go on."""
     config.run_directory.mkdir(parents=True, exist_ok=True)
     later = [step for step in _STEPS if STEP_NAMES.index(step.name) >= STEP_NAMES.index("fit")]
     for name in STEP_NAMES[:STEP_NAMES.index("fit")]:
@@ -5788,17 +6098,8 @@ def _region_steps(shared: _Run, config: WorkspaceConfig, through: str | None) ->
             raise RuntimeError(f"{link} is not the shared run's {name}; move it away first.")
         if not link.is_symlink():
             link.symlink_to(os.path.relpath(shared.output(name), config.run_directory), target_is_directory=True)
-    run = _Run(config, shared.bindings, shared.budget, dict(shared.keys), None, shared.fit_arms)
-    summaries = {}
-    for step in later:
-        try:
-            summaries[step.name] = _run_step(run, step)
-        except StepPart as part:
-            LOGGER.info("workspace pipeline: region %s: %s stopped after its part: %s", config.run_directory.name, step.name, part)
-            break
-        if step.name == through:
-            break
-    return summaries
+    run = _Run(config, shared.bindings, shared.budget, dict(shared.keys), None, shared.fit_arms, finish=shared.finish)
+    return _steps(run, later, through, f"region {config.run_directory.name}: ")
 
 
 def completed_through(config: WorkspaceConfig, through: str) -> bool:

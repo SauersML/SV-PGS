@@ -303,7 +303,7 @@ def test_a_job_given_a_base_run_names_its_mirror_in_every_restore_and_push(tmp_p
         assert submitted.returncode == 0, submitted.stderr
         script = json.loads((tmp_path / "objects.json").read_text())[f"gs://workspace/svpgs/study/launcher/{slot}/run_step.sh"]
         # The script's mirror command, run with sv-pgs stubbed.
-        mirror = script[script.index("base=()"):script.index("mirror restore ||")]
+        mirror = script[script.index("base=()"):script.index('mirror restore ${finishing')]
         run = tmp_path / slot
         (run / "venv/bin").mkdir(parents=True)
         (run / "venv/bin/sv-pgs").write_text('#!/bin/bash\necho "$*" >> "$(dirname "$0")/calls"\n')
@@ -439,6 +439,94 @@ def test_a_shared_runtime_is_built_and_published_once_then_unpacked_instead_of_s
             assert not (run / "uv-calls").exists() and not (run / "tools/staged").exists() and not (run / "uv-cache").exists()
             assert os.readlink(run / "venv/bin/python") == sys.executable
             assert (run / "venv/lib/python3.12/site-packages/module.py").read_text() == "VALUE = 1\n"
+
+
+_UV_ADOPTING = """#!/bin/bash
+# uv sync, as far as run_step.sh sees it: the venv with its interpreter and an sv-pgs that logs its calls and answers
+# run-mirror adopt with ADOPTED ("adopted" or "waiting").
+mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
+ln -sfn "PYTHON" "$UV_PROJECT_ENVIRONMENT/bin/python"
+cat > "$UV_PROJECT_ENVIRONMENT/bin/sv-pgs" <<'STUB'
+#!/bin/bash
+echo "$*" >> "$(dirname "$0")/../../sv-pgs-calls"
+[ "$1 $2" != "run-mirror adopt" ] || printf 'partner\\t%s\\n' "$ADOPTED"
+STUB
+chmod +x "$UV_PROJECT_ENVIRONMENT/bin/sv-pgs"
+"""
+
+
+def _ran_task(tmp_path: Path, script: str, name: str, adopted: str) -> tuple[list[str], set[str], int]:
+    """The rendered task script run once on a new run disk against its own ops directory, with uv and sv-pgs stubbed:
+    sv-pgs's calls, the task's markers and its exit status."""
+    ops = tmp_path / name / "ops"
+    (ops / "source").mkdir(parents=True)
+    (ops / "source/uv.lock").write_text("version = 1\n")
+    (ops / "source/pyproject.toml").write_text("[project]\nname = 'sv-pgs'\n")
+    (ops / "run_config.json").write_text(json.dumps({"run_directory": str(tmp_path / name / "pipeline")}))
+    staged = tmp_path / name / "staged"
+    (staged / "bin").mkdir(parents=True)
+    (staged / "bin/uv").write_text(_UV_ADOPTING.replace("PYTHON", sys.executable))
+    (staged / "python/cpython-3.12-linux/bin").mkdir(parents=True)
+    (staged / "python/cpython-3.12-linux/bin/python3.12").write_text("#!/bin/sh\n")
+    with tarfile.open(ops / "env.tar", "w") as archive:
+        for part in ("bin", "python"):
+            archive.add(staged / part, arcname=part)
+    run = tmp_path / name / "run"
+    run.mkdir()
+    task = tmp_path / name / "launcher/run_step.sh"
+    task.parent.mkdir(parents=True)
+    task.write_text(script.replace("OPS=/mnt/disks/ops/svpgs/study\n", f"OPS={ops}\n").replace("RUN=/mnt/disks/run\n", f"RUN={run}\n"))
+    ran = subprocess.run(["bash", str(task)], env=dict(os.environ, BATCH_TASK_INDEX="0", ADOPTED=adopted), capture_output=True, text=True, timeout=120)
+    markers = {path.name.split("_task_", 1)[1] for path in (ops / "markers").iterdir()}
+    return (run / "sv-pgs-calls").read_text().splitlines(), markers, ran.returncode
+
+
+@pytest.mark.skipif(shutil.which("flock") is None or shutil.which("pkill") is None, reason="run_step.sh runs on Linux")
+def test_an_arm_job_given_its_partner_finishes_the_run_from_both_arms_parts_or_leaves_it_to_the_partner(tmp_path):
+    """PARTNER_RUN names the run fitting the other arm: an arm job pushes its parts, adopts the partner's and finishes the
+    run with no store (workspace-run --finish), or leaves it to the partner when its parts are not mirrored yet. A merge
+    job (submit.sh merge, CPUs) restores only what finishing reads, and fails where the partner's parts are missing."""
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(THROUGH="report", UV_EXTRAS="", FIT_ARMS="with_sv", BUDGET_SLOT="train-1")
+    for refused in ({"PARTNER_RUN": "study"}, {"PARTNER_RUN": "Other"}, {"PARTNER_RUN": "partner", "FIT_ARMS": ""}):
+        refusing = subprocess.run(["bash", str(launcher), "fit"], env={**environment, **refused}, capture_output=True, text=True)
+        assert refusing.returncode != 0 and "PARTNER_RUN" in refusing.stderr
+    refusing = subprocess.run(["bash", str(launcher), "merge"], env={**environment, "FIT_ARMS": ""}, capture_output=True, text=True)
+    assert refusing.returncode != 0 and "PARTNER_RUN" in refusing.stderr
+    environment["PARTNER_RUN"] = "partner"
+    submitted = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    objects = json.loads((tmp_path / "objects.json").read_text())
+    arm_script = objects["gs://workspace/svpgs/study/launcher/train-1/run_step.sh"]
+    environment.update(FIT_ARMS="", BUDGET_SLOT="evaluate")
+    submitted = subprocess.run(["bash", str(launcher), "merge"], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
+    assert spec["taskGroups"][0]["taskCount"] == 1 and "accelerators" not in json.dumps(spec)
+    merge_script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/evaluate/run_step.sh"]
+    mirrored = "--config {ops}/run_config.json --mirror gs://workspace/svpgs/study/run"
+    partner = "--partner gs://workspace/svpgs/partner/run"
+
+    calls, markers, status = _ran_task(tmp_path, arm_script, "adopting", "adopted")
+    # The arm job's mirror calls name its arm until it finishes the run, which holds every arm.
+    arm = "--fit-arm with_sv"
+    expected = [
+        f"run-mirror restore {mirrored} {arm}", f"workspace-run --config {{ops}}/run_config.json --through report {arm}", f"run-mirror push {mirrored} {arm}",
+        f"run-mirror adopt {mirrored} {arm} {partner}", "workspace-run --config {ops}/run_config.json --through report --finish", f"run-mirror push {mirrored}",
+    ]
+    assert calls == [call.format(ops=tmp_path / "adopting" / "ops") for call in expected]
+    assert status == 0 and {"merge-started", "exit-0"} <= markers
+    calls, markers, status = _ran_task(tmp_path, arm_script, "deferring", "waiting")
+    assert calls == [call.format(ops=tmp_path / "deferring" / "ops") for call in [*expected[:4], expected[2]]]
+    assert status == 0 and {"merge-deferred", "exit-0"} <= markers and "merge-started" not in markers
+
+    calls, markers, status = _ran_task(tmp_path, merge_script, "merging", "adopted")
+    expected = [f"run-mirror restore {mirrored} --finishing", f"run-mirror adopt {mirrored} {partner}", expected[4], expected[5]]
+    assert calls == [call.format(ops=tmp_path / "merging" / "ops") for call in expected]
+    assert status == 0 and {"merge-started", "exit-0"} <= markers
+    calls, markers, status = _ran_task(tmp_path, merge_script, "waiting", "waiting")
+    assert calls == [call.format(ops=tmp_path / "waiting" / "ops") for call in (expected[0], expected[1], expected[3])]
+    assert status == 1 and {"merge-waiting", "exit-1"} <= markers
 
 
 @pytest.mark.parametrize("job, slot, through", [("store", "prepare", "direct_sv"), ("fit", "pilot", "fit")])

@@ -114,7 +114,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workspace_parser.add_argument(
         "--fit-arm", action="append", choices=ARMS, default=None,
-        help="Fit only this arm in the fit step (repeatable), one machine's part of the arms (run_pipeline).",
+        help=(
+            "Fit only this arm in the fit step (repeatable), one machine's part of the arms, then score and summarize "
+            "it while the store is on this disk (run_pipeline)."
+        ),
+    )
+    workspace_parser.add_argument(
+        "--finish", action="store_true",
+        help=(
+            "Finish the steps from the fit on from the arms' parts in the run directory (run-mirror adopt brings the other "
+            "arm's), making no step before the fit, fitting nothing and reading no store (run_pipeline)."
+        ),
     )
 
     mirror_parser = subparsers.add_parser(
@@ -124,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(restore), which carries the run from one Batch job to the next (sv_pgs/run_mirror.py)."
         ),
     )
-    mirror_parser.add_argument("action", choices=("push", "restore"))
+    mirror_parser.add_argument("action", choices=("push", "restore", "adopt"))
     mirror_parser.add_argument("--config", required=True, help="The run config JSON, whose run_directory is mirrored.")
     mirror_parser.add_argument("--mirror", required=True, help="The mirror, gs://<workspace bucket>/<prefix>.")
     mirror_parser.add_argument(
@@ -140,6 +150,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--fit-arm", action="append", choices=ARMS, default=None,
         help="The arms whose restart units this job restores and pushes (repeatable; every arm's when omitted): a fit job "
              "given --fit-arm, so jobs fitting other arms of the run at once never touch each other's units.",
+    )
+    mirror_parser.add_argument(
+        "--finishing", action="store_true",
+        help="restore: only what a finishing run reads (workspace-run --finish): no store and no fit checkpoint.",
+    )
+    mirror_parser.add_argument(
+        "--partner", default=None,
+        help=(
+            "adopt: the mirror of the run that fitted the other arm, gs://<bucket>/<prefix>, whose arm's parts are copied "
+            "into this run's partials; prints 'partner<TAB>adopted' when every arm's parts are then here, else "
+            "'partner<TAB>waiting' (the partner's job has not done its parts, or it finished the run)."
+        ),
     )
 
     subparsers.add_parser(
@@ -207,21 +229,26 @@ def _main_impl(argv: list[str] | None = None) -> int:
             sample_quiet_stacks(float(os.environ[QUIET_STACK_SECONDS]))
         summaries = run_pipeline(
             WorkspaceConfig.read(args.config), workspace_bindings(), detect_compute_budget(), through=args.through, store_shard=args.store_shard,
-            fit_arms=args.fit_arm,
+            fit_arms=args.fit_arm, finish=args.finish,
         )
         for step in summaries:
             print(f"{step}\tcomplete")
         return 0
 
     if args.command == "run-mirror":
-        from sv_pgs.run_mirror import Base, GcsRemote, bases_of, mounted, push, restore
+        from sv_pgs.run_mirror import Base, GcsRemote, adopt, bases_of, mounted, push, restore
 
         run_directory, remote = WorkspaceConfig.read(args.config).run_directory, GcsRemote(args.mirror)
+        if args.action == "adopt":
+            if args.partner is None or args.partner.rstrip("/") == args.mirror.rstrip("/"):
+                raise SystemExit("run-mirror adopt needs --partner, the other arm's run mirror.")
+            print("partner\t" + ("adopted" if adopt(run_directory, GcsRemote(args.partner)) else "waiting"))
+            return 0
         bases = bases_of(args.mirror, remote, args.base or (), lambda url: Base(GcsRemote(url), url, mounted(url)))
         if args.action == "push":
             push(run_directory, remote, bases=bases, arms=args.fit_arm)
         else:
-            restore(run_directory, remote, mounted(args.mirror), bases=bases, arms=args.fit_arm)
+            restore(run_directory, remote, mounted(args.mirror), bases=bases, arms=args.fit_arm, finishing=args.finishing)
         return 0
 
     if args.command == "census-all-of-us-traits":
