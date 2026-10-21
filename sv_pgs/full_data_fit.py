@@ -451,12 +451,52 @@ def _norm_bounds(products: F64Array, bound: F64Array) -> tuple[F64Array, F64Arra
     return lower, upper
 
 
+class _SolveStarts(dict):
+    """An oracle's warm starts (``_hold_start``: (model, directions' digest, columns) -> (duals, cache lease)), each
+    stamped with the oracle call it was last stored after; ``age``, at each call, releases every start not stored
+    again over the last two calls, and ``close``, when the oracle's outer loop ends (``_timed_hyperparameters``), every
+    start, keeping none until the oracle is called again. A key digests the directions solved for, which move with the
+    state, so a start is asked for again only at the next fixed point, or at its anchor's after one refused trial,
+    never later, and never by another oracle (each stage of a fit has its own). The ledger drops a cache only when a
+    mandatory lease needs its bytes, and the cache's evict callback kept the dict alive in the ledger after its oracle
+    was gone: on the whole-genome canary's two-arm fixture every solve's start held a lease of its own to the end of
+    the fit (none of the first 33 asked for again), which kept the next caches from being admitted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.stored: dict = {}
+        self.closed = False
+
+    def age(self) -> None:
+        self.calls += 1
+        self.closed = False
+        for key in [key for key, call in self.stored.items() if key not in self or self.calls - call > 2]:
+            self._drop(key)
+
+    def close(self) -> None:
+        self.closed = True
+        for key in list(self.stored) + list(self):
+            self._drop(key)
+
+    def _drop(self, key: tuple) -> None:
+        held = self.pop(key, None)
+        self.stored.pop(key, None)
+        if held is not None and held[1] is not None:
+            held[1].release()
+
+
 def _hold_start(starts: dict, key: tuple, duals: Any) -> None:
     """Keep ``duals`` as the warm start for ``key``: a cache lease of the current ledger (its device's pool, or the
-    host's), dropped when a mandatory lease needs the bytes; outside a ledger's scope only the latest per model."""
+    host's), dropped when a mandatory lease needs the bytes or, in an oracle's ``_SolveStarts``, when no later solve
+    asks for it; outside a ledger's scope only the latest per model."""
     previous = starts.pop(key, None)
     if previous is not None and previous[1] is not None:
         previous[1].release()
+    if isinstance(starts, _SolveStarts):
+        if starts.closed:
+            return
+        starts.stored[key] = starts.calls
     broker = current_broker()
     if broker is None:
         for held in [held for held in starts if held[0] == key[0]]:
@@ -1690,7 +1730,7 @@ class _FullDataMeanField:
         self._layout: SweepLayout | bool | None = None
         self.version = 0
         # The curvature's posterior solves' last duals per (model, directions), their warm starts (``_posterior``).
-        self._solve_starts: dict = {}
+        self._solve_starts = _SolveStarts()
         # Which state each model's column of the dual solver was last factored at (``_ensure``).
         self._solver_version = np.zeros(model_count, dtype=np.int64)
         self.undecided_blocks = 0
@@ -2443,6 +2483,7 @@ class _FullDataMeanField:
         (``restore_best``). Its first refusal is logged, counted in ``unresolved`` and marked in ``allowance_spent``
         (``fit_full_data`` gives the certificate its reason)."""
         _collect_cycles()
+        self._solve_starts.age()
         at_held = [
             model for model, (point, state) in enumerate(zip(self._held, self._at))
             if point is not None and state is point[1]
@@ -2977,12 +3018,15 @@ def _timed_hyperparameters(
     prior: ScaleMixturePrior, starts: Sequence[MixtureHyperparameters], oracle: Callable, working_bytes: int, tolerance: float,
 ) -> list:
     """``fit_hyperparameters`` on ``oracle``, its rounds and its whole timed in the progress log (``phase_timer.TimedOracle``:
-    each round's solve and the rest, written as the loop runs); the fits are the unwrapped oracle's."""
+    each round's solve and the rest, written as the loop runs); the fits are the unwrapped oracle's. The oracle's
+    curvature warm starts are released when the loop ends (``_SolveStarts``)."""
     timed = TimedOracle(oracle)
     try:
         return fit_hyperparameters(prior, starts, timed, working_bytes, tolerance)
     finally:
         timed.close()
+        if isinstance(getattr(oracle, "_solve_starts", None), _SolveStarts):
+            oracle._solve_starts.close()
 
 
 def _ended_fits(oracle: "_FullDataMeanField", tolerance: float) -> list[OuterFit]:

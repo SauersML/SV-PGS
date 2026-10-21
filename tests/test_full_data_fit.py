@@ -828,6 +828,50 @@ def test_relative_solve_retries_from_its_latest_duals_for_the_unfinished_columns
     np.testing.assert_array_equal(solved, right)
 
 
+def test_warm_starts_no_later_solve_asks_for_are_released_after_two_oracle_calls(monkeypatch):
+    """A warm start's key digests its directions, which move with the state: one stored again is kept, one not stored
+    again over two oracle calls gives back its cache lease, an evicted one leaves no stamp behind, and a closed cache
+    (its oracle's outer loop has ended) holds nothing until the oracle is called again."""
+    from types import SimpleNamespace
+    from sv_pgs import full_data_fit
+    from sv_pgs.full_data_fit import _SolveStarts, _hold_start
+
+    released, evictions = [], {}
+
+    def admit(pool, nbytes, purpose, evict, allocated=False):
+        lease = SimpleNamespace(name=len(evictions))
+        lease.release = lambda: released.append(lease.name)
+        evictions[lease.name] = evict
+        return lease
+
+    monkeypatch.setattr(full_data_fit, "current_broker", lambda: SimpleNamespace(capacities={"host": 1}, admit=admit))
+    first, second, third = (0, b"first", 1), (0, b"second", 1), (0, b"third", 1)
+    starts = _SolveStarts()
+    starts.age()
+    _hold_start(starts, first, np.zeros((2, 1)))
+    _hold_start(starts, second, np.zeros((2, 1)))
+    starts.age()
+    _hold_start(starts, second, np.ones((2, 1)))
+    _hold_start(starts, third, np.ones((2, 1)))
+    assert released == [1]
+    starts.age()
+    assert set(starts) == {first, second, third}
+    evictions[3]()
+    starts.age()
+    assert set(starts) == {second} and released == [1, 0] and set(starts.stored) == {second}
+    np.testing.assert_array_equal(starts[second][0], np.ones((2, 1)))
+    starts.age()
+    assert not starts and not starts.stored and released == [1, 0, 2]
+    # The outer loop's end releases every start and keeps none until the oracle is called again.
+    _hold_start(starts, first, np.zeros((2, 1)))
+    starts.close()
+    _hold_start(starts, second, np.zeros((2, 1)))
+    assert not starts and not starts.stored and released == [1, 0, 2, 4]
+    starts.age()
+    _hold_start(starts, second, np.zeros((2, 1)))
+    assert set(starts) == {second}
+
+
 def test_mean_field_posterior_does_not_hold_an_unused_refreshs_device_cross_products():
     """Mean-field curvature uses only Sigma R. Replacing the shared solver's refresh must release its old window
     cross-products even while an outer anchor still owns the old mean-field posterior."""

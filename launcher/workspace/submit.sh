@@ -69,7 +69,13 @@ BASE_RUN="${BASE_RUN:-}"
 if [ -n "$BASE_RUN" ] && { [[ ! "$BASE_RUN" =~ ^[a-z][a-z0-9-]{0,25}$ ]] || [ "$BASE_RUN" = "${RUN_ID:?}" ]; }; then
   echo "BASE_RUN is another run's RUN_ID in the ops bucket" >&2; exit 2
 fi
-export TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME BASE_RUN
+# STAGED_SOURCE (optional): the directory under svpgs/ in the ops bucket whose source/ and env.tar the job builds from,
+# such as a round's one staging (launcher/workspace/round.py: _rounds/<round>); empty, the run's own svpgs/$RUN_ID.
+STAGED_SOURCE="${STAGED_SOURCE:-}"
+if [ -n "$STAGED_SOURCE" ] && [[ ! "$STAGED_SOURCE" =~ ^[a-z_][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*$ ]]; then
+  echo "STAGED_SOURCE is a directory under svpgs/ in the ops bucket, such as _rounds/r7" >&2; exit 2
+fi
+export TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME BASE_RUN STAGED_SOURCE
 if [[ ! "${RUN_DISK_GB:?}" =~ ^[1-9][0-9]*$ ]]; then
   echo "RUN_DISK_GB is the size in GB of the new disk each job works on (the run's stores, with room to write the next)" >&2; exit 2
 fi
@@ -111,7 +117,8 @@ done
 export IMPUTED_BUCKET PANEL_BUCKET
 # The slot's task script, run_step.sh in the slot's launcher directory.
 python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
-  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME BASE_RUN
+  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME BASE_RUN \
+  STAGED_SOURCE
 variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROVISIONING_MODEL PROJECT_ID RUN_DISK_GB RUN_DISK_TYPE REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
 if [ "$spec" = fit ]; then variables+=(GPU_TYPE GPU_COUNT); else variables+=(TASK_COUNT); fi
 variables+=(CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET GOOGLE_PROJECT)

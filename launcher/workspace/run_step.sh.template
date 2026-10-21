@@ -1,13 +1,21 @@
 #!/bin/bash
 # TEMPLATE, never launched by an agent: launching is the user's decision (submit.sh fills and submits it).
 # The Batch task. It builds the locked environment offline with uv from what the user staged under
-# svpgs/${RUN_ID}/ in the ops bucket (the source tree, and env.tar: the uv binary, a uv cache holding every
-# locked wheel, and a uv-installed CPython 3.12), then runs the pipeline through ${THROUGH}. The VM has no external IP,
+# svpgs/${RUN_ID}/ in the ops bucket, or under the round's one staging (STAGED_SOURCE, below) (the source tree, and
+# env.tar: the uv binary, a uv cache holding every locked wheel, and a uv-installed CPython 3.12), then runs the
+# pipeline through ${THROUGH}. The VM has no external IP,
 # and the image's own Python is not the 3.12 sv-pgs needs, so nothing is fetched and the image's Python is never used.
 # Status goes only to empty marker files in the workspace's ops bucket mount.
 set -uo pipefail
 OPS=/mnt/disks/ops/svpgs/${RUN_ID}
 RUN=/mnt/disks/run
+# STAGED_SOURCE ("${STAGED_SOURCE}"), when set, is the directory under svpgs/ in the ops bucket whose source/ and env.tar
+# this job builds from: one staging every run of a round shares (launcher/workspace/round.py), where each run had its
+# own, copied to it one run at a time. Empty, it is the run's own, svpgs/${RUN_ID}. The run's config, markers, launcher
+# and mirror stay the run's own either way.
+staged_source="${STAGED_SOURCE}"
+STAGED="$OPS"
+[ -z "$staged_source" ] || STAGED="$(dirname "$OPS")/$staged_source"
 # A store job of ${TASK_COUNT} tasks is a fan-out over the run config's chromosomes: Batch's task i converts chromosome i
 # on its own VM and disk (the driver's --store-shard), or the i-th of STORE_SHARDS' chromosome indices where it names
 # them ("${STORE_SHARDS}"), the mirror carries each task's chromosomes to the next job, and each task's markers carry
@@ -28,7 +36,13 @@ trap 'mark "terminated"; exit 75' TERM
 mark started
 # The environment runs from this task's own copy of the staged source: the editable build writes sv_pgs.egg-info into
 # the project, and 22 fan-out tasks writing it on the shared bucket mount failed with "Stale file handle".
-rm -rf "$RUN/source" && cp -r "$OPS/source" "$RUN/source" || { mark "exit-install"; exit 1; }
+rm -rf "$RUN/source" && cp -r "$STAGED/source" "$RUN/source" || { mark "exit-install"; exit 1; }
+# A staging that lists its files' digests (source.sha256, sha256sum's form, which round.py writes) is checked against
+# this task's copy before anything runs from it: a copy of the tree that was cut short, or a file changed since, stops
+# the job here instead of running other code than the round staged.
+if [ -f "$STAGED/source.sha256" ]; then
+  (cd "$RUN/source" && sha256sum --quiet --strict -c "$STAGED/source.sha256") || { mark "exit-source"; exit 1; }
+fi
 # SHARED_RUNTIME ("${SHARED_RUNTIME}"), when 1: a job takes its environment ($RUN/venv and $RUN/python) prebuilt from
 # the ops bucket's svpgs/_runtime/<key>/<publisher>/ if a job has published one there for this uv.lock, pyproject.toml
 # and extras (key), instead of extracting env.tar and syncing; and a job that built its own publishes it there once its
@@ -62,7 +76,7 @@ if [ -z "$prebuilt" ]; then
     # uv, Python and the cache come as one tarball read in one stream: copied file by file over the bucket mount, the
     # cache's tens of thousands of files took over 20 minutes. The marker is written last, so an extraction a
     # preemption cut short is redone.
-    rm -rf "$RUN/tools" "$RUN/bin" "$RUN/python" "$RUN/uv-cache" && mkdir -p "$RUN/tools" && tar -xf "$OPS/env.tar" -C "$RUN" \
+    rm -rf "$RUN/tools" "$RUN/bin" "$RUN/python" "$RUN/uv-cache" && mkdir -p "$RUN/tools" && tar -xf "$STAGED/env.tar" -C "$RUN" \
       && mv "$RUN/bin/uv" "$RUN/tools/uv" && chmod +x "$RUN/tools/uv" "$RUN"/python/*/bin/* && : > "$RUN/tools/staged" \
       || { mark "exit-install"; exit 1; }
   fi

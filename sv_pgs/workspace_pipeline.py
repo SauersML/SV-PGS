@@ -1041,6 +1041,10 @@ def _fit_records_state(directory: Path) -> list[tuple[str, int, int]]:
 
 
 def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
+    """Run ``step`` unless its key's output is complete. Whichever way it ends, one line ``timing: step_<name> <seconds> s
+    state=<reused|computed|part|failed>`` (``phase_timer``) says so, its seconds from before its key: a step reused costs
+    its key's input digests, and a step made again where a copy of it was meant to be reused shows as computed. So a
+    run's progress log names each step it passed, and benchmarks/round_timeline.py checks that no step went unlogged."""
     from sv_pgs.phase_timer import timing
 
     # Every run keys every step, a completed one too, so a resumed run's start pays each step's input identities
@@ -1067,6 +1071,7 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
             run.keys[step.name] = key
             run.kept.add(step.name)
             _mark(run.config, step.name, kept)
+            timing(f"step_{step.name}", time.perf_counter() - started, state="reused")
             return dict(record["summary"])
         _set_aside(final, record["key"])
     elif final.exists():
@@ -1092,14 +1097,17 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
         if step.name == "fit":
             _check_fit_records(run, partial, key)
         _mark(run.config, step.name, "part-done")
+        timing(f"step_{step.name}", time.perf_counter() - started, state="part")
         raise
     except BaseException as error:
         _mark(run.config, step.name, f"failed-{type(error).__name__}")
+        timing(f"step_{step.name}", time.perf_counter() - started, state="failed")
         raise
     _write_json(partial / COMPLETE_FILE, {"key": key, "summary": summary, "finished": _utc()})
     os.rename(partial, final)
     run.keys[step.name] = key
     _mark(run.config, step.name, "completed")
+    timing(f"step_{step.name}", time.perf_counter() - started, state="computed")
     return summary
 
 
