@@ -14,9 +14,14 @@ def test_the_host_harness_runs_its_checks_and_passes(capfd):
     for check in (
         "new sweep 1 of 3 models", "new sweep 3 of 3 models", "new sweep, host share (no kernels)", "model 0 alone is its sweep among three, bit for bit",
         "new sweep 1 of 9 models: model 0 is its sweep among three, bit for bit", "new sweep 2 of 9 models",
+        "an arm's 11 traits, each standardized on its training rows (ArmTraits)",
+        "arm sweep 1 of 11 traits, each its own standardization, members and lattice (builds the panel Grams)", "arm sweep 3 of 11 traits",
+        "arm trait 0 alone is its sweep among 11, bit for bit", "arm sweep 2 of trait 0 alone",
     ):
         assert f"PASS {check}" in out
-    assert "INFO new: cold" in out and "INFO new, 9 models a launch" in out and "RESULT seconds per sweep" in out
+    assert "INFO new: cold" in out and "INFO new, 9 models a launch" in out and "INFO arm, 11 traits a launch" in out
+    result = next(line for line in out.splitlines() if line.startswith("RESULT seconds per sweep"))
+    assert "; arm: " in result and "for 11 traits in one pass against" in result
 
 
 def test_a_failed_worker_or_a_deadline_fails_the_command(monkeypatch, capsys):

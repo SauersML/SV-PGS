@@ -42,7 +42,9 @@ from typing import Any, Callable, Iterator, Sequence
 import numpy as np
 
 from sv_pgs.compute_budget import _cupy_device_context
+from sv_pgs.config import ModelConfig
 from sv_pgs.device_plan import moved
+from sv_pgs.genotype_buffers import SIGNED_CODE_OFFSET
 from sv_pgs.memory_broker import device_pool
 from sv_pgs.phase_timer import launch_timer
 
@@ -438,10 +440,12 @@ _BATCH_SOURCE = r"""
 
 // Each (member, model, node)'s h-free terms of a piece (``panel_sweep``'s phase 0, the same expressions in the same
 // order), every member of the piece at once, so that no panel's chain waits for them: rows ``first`` to
-// ``first + width`` of the device's layout, written as [member][model][node].
+// ``first + width`` of the device's layout, written as [member][model][node]. ``grid_stride`` is 0 where the models
+// share one lattice and ``node_count`` where each has its own (padded to ``node_count``; the chain reads a model's
+// first ``node_counts[model]`` nodes only).
 extern "C" __global__ void node_terms(
     const double* __restrict__ log_scale, const double* __restrict__ squares, const long long* __restrict__ class_index,
-    const double* __restrict__ log_density, const double* __restrict__ grid, const double* __restrict__ noise,
+    const double* __restrict__ log_density, const double* __restrict__ grid, const int grid_stride, const double* __restrict__ noise,
     const long long first, const int width, const int models, const int node_count, const int class_count,
     double* __restrict__ conditional, double* __restrict__ base)
 {
@@ -453,7 +457,7 @@ extern "C" __global__ void node_terms(
         const long long member = first + rest / models;
         const long long at = member * models + model;
         const double omega = squares[at] / noise[model];
-        const double log_variance_node = log_scale[at] + grid[node];
+        const double log_variance_node = log_scale[at] + grid[(long long)model * grid_stride + node];
         const double variance_node = exp(log_variance_node);
         const double ratio = variance_node * omega;
         const double density = log_density[((long long)model * class_count + class_index[member]) * node_count + node];
@@ -484,16 +488,21 @@ extern "C" __global__ void node_terms(
 //      node terms held in registers, the next member's loaded while this one runs), writing the steps and u = A s for
 //      the next launch.
 // Members are positions in the device's layout: ``rows`` their code rows in the tile, ``signs`` their tie signs;
-// member arrays are [position][model] and sample arrays [model][sample].
+// member arrays are [position][model] and sample arrays [model][sample]. With ``standardized`` 0 every model reads
+// the tile's own means and scales (``code_means``, ``code_scales`` per code row); with 1 they are each model's, per
+// [position][model] (traits standardized on their own training rows over one arm's codes). A member not ``live`` for a
+// model takes no step there (its moments stay as they are, its ELBO pieces 0), and a model reads its first
+// ``node_counts[model]`` nodes.
 extern "C" __global__ void panel_step(
     const signed char* __restrict__ codes, const long long stride, const double* __restrict__ code_means,
-    const double* __restrict__ code_scales, const long long* __restrict__ rows, const double* __restrict__ signs,
+    const double* __restrict__ code_scales, const int standardized, const unsigned char* __restrict__ live,
+    const long long* __restrict__ rows, const double* __restrict__ signs,
     const long long applied, const int applied_width, const long long projected, const int projected_width,
     const double* __restrict__ covariates, const int covariate_count, const double* __restrict__ masks,
     double* residuals, const int models, const int sample_count, double* steps, double* covariate_steps,
     double* partials, double* partial_totals, unsigned int* counter,
     const double* __restrict__ conditional, const double* __restrict__ base, const long long node_first, const int node_count,
-    const double* __restrict__ squares, const double* __restrict__ noise, const double* __restrict__ grams,
+    const int* __restrict__ node_counts, const double* __restrict__ squares, const double* __restrict__ noise, const double* __restrict__ grams,
     const double* __restrict__ couplings, const long long panel,
     double* mean, double* variance, double* shift, double* third, double* fourth, double* pieces)
 {
@@ -512,14 +521,11 @@ extern "C" __global__ void panel_step(
     const int warp = threadIdx.x / PANEL;
     // the warp's tile: member j's codes at the warp's samples in row j, PANEL + 1 bytes apart (lane j's reads along
     // its row then fall in 32 different banks)
-    signed char* tile = (signed char*)(centers + PANEL) + warp * PANEL * (PANEL + 1);
+    signed char* tile = (signed char*)(centers + 2 * PANEL) + warp * PANEL * (PANEL + 1);
     const int block_first = blockIdx.x * threads;
     const int sample = block_first + threadIdx.x;
     const int covered = min(threads, sample_count - block_first);
-    for (int j = threadIdx.x; j < applied_width; j += threads) {
-        applied_rows[j] = rows[applied + j];
-        centers[j] = code_means[applied_rows[j]];
-    }
+    for (int j = threadIdx.x; j < applied_width; j += threads) applied_rows[j] = rows[applied + j];
     for (int j = threadIdx.x; j < projected_width; j += threads) projected_rows[j] = rows[projected + j];
     __syncthreads();
     if (projected_width > 0) {
@@ -528,13 +534,21 @@ extern "C" __global__ void panel_step(
         __syncwarp();
     }
     for (int model = 0; model < models; ++model) {
-        // this model's a_j, in one of two buffers by its parity: every thread passes the barrier after them only once
-        // it has read the buffer's previous model's, so a block's shared memory is the same whatever the models
+        // this model's a_j and mu_j, in one of two buffers by its parity: every thread passes the barrier after them
+        // only once it has read the buffer's previous model's, so a block's shared memory is the same whatever the models
         double* scaled_step = scaled_steps + (model % 2) * PANEL;
+        double* center = centers + (model % 2) * PANEL;
         if (applied_width > 0) {
             if (threadIdx.x < PANEL) {
                 const int j = threadIdx.x;
-                scaled_step[j] = j < applied_width ? signs[applied + j] * steps[(long long)model * PANEL + j] / code_scales[applied_rows[j]] : 0.0;
+                if (j < applied_width) {
+                    const long long standard = standardized ? (applied + j) * models + model : applied_rows[j];
+                    scaled_step[j] = signs[applied + j] * steps[(long long)model * PANEL + j] / code_scales[standard];
+                    center[j] = code_means[standard];
+                } else {
+                    scaled_step[j] = 0.0;
+                    center[j] = 0.0;
+                }
             }
             __syncthreads();
         }
@@ -545,7 +559,7 @@ extern "C" __global__ void panel_step(
             double residual = residuals[at];
             if (applied_width > 0) {
                 double moved = 0.0;
-                for (int j = 0; j < applied_width; ++j) moved += scaled_step[j] * ((double)codes[applied_rows[j] * stride + sample] - centers[j]);
+                for (int j = 0; j < applied_width; ++j) moved += scaled_step[j] * ((double)codes[applied_rows[j] * stride + sample] - center[j]);
                 const double* covariate_step = covariate_steps + (long long)model * covariate_count;
                 double covariate = 0.0;
                 for (int c = 0; c < covariate_count; ++c) covariate += covariates[(long long)c * sample_count + sample] * covariate_step[c];
@@ -593,34 +607,38 @@ extern "C" __global__ void panel_step(
         if (lane < projected_width) {
             double product = 0.0;
             for (int block = 0; block < (int)gridDim.x; ++block) product += __ldcg(partials + ((long long)model * gridDim.x + block) * PANEL + lane);
-            const long long row = projected_rows[lane];
-            c = signs[projected + lane] * (product - code_means[row] * total) / code_scales[row];
+            const long long standard = standardized ? (projected + lane) * models + model : projected_rows[lane];
+            c = signs[projected + lane] * (product - code_means[standard] * total) / code_scales[standard];
         }
         const double model_noise = noise[model];
+        const int model_nodes = node_counts[model];
         const double* gram = grams + (panel * models + model) * (long long)(PANEL * PANEL);
         const double* coupling = couplings + (panel * models + model) * (long long)covariate_count * PANEL;
         double* step_out = steps + (long long)model * PANEL;
         // The next member's terms, its square, mean and Gram entry, loaded a member ahead: the chain never waits on memory.
         double next_held[NODES_PER_LANE], next_base[NODES_PER_LANE];
         double next_square = 0.0, next_mean = 0.0, next_gram = 0.0;
+        unsigned char next_live = 0;
         {
             const long long at = projected * models + model;
             const long long terms = (node_first * models + model) * (long long)node_count;
             #pragma unroll
             for (int slot = 0; slot < NODES_PER_LANE; ++slot) {
                 const int node = lane + PANEL * slot;
-                next_held[slot] = node < node_count ? conditional[terms + node] : 0.0;
-                next_base[slot] = node < node_count ? base[terms + node] : 0.0;
+                next_held[slot] = node < model_nodes ? conditional[terms + node] : 0.0;
+                next_base[slot] = node < model_nodes ? base[terms + node] : 0.0;
             }
             next_square = squares[at];
             next_mean = mean[at];
             next_gram = lane < projected_width ? gram[lane * PANEL] : 0.0;
+            next_live = live[at];
         }
         for (int member = 0; member < projected_width; ++member) {
             const long long at = (projected + member) * models + model;
             const double square = next_square;
             const double old_mean = next_mean;
             const double gram_entry = next_gram;
+            const bool member_live = next_live != 0;
             double held[NODES_PER_LANE];
             double weight[NODES_PER_LANE];
             #pragma unroll
@@ -634,12 +652,18 @@ extern "C" __global__ void panel_step(
                 #pragma unroll
                 for (int slot = 0; slot < NODES_PER_LANE; ++slot) {
                     const int node = lane + PANEL * slot;
-                    next_held[slot] = node < node_count ? conditional[terms + node] : 0.0;
-                    next_base[slot] = node < node_count ? base[terms + node] : 0.0;
+                    next_held[slot] = node < model_nodes ? conditional[terms + node] : 0.0;
+                    next_base[slot] = node < model_nodes ? base[terms + node] : 0.0;
                 }
                 next_square = squares[next_at];
                 next_mean = mean[next_at];
                 next_gram = lane < projected_width ? gram[lane * PANEL + member + 1] : 0.0;
+                next_live = live[next_at];
+            }
+            if (!member_live) {
+                // not this model's member: no step, so no other member's c_j moves either
+                if (lane == 0) step_out[member] = 0.0;
+                continue;
             }
             const double omega = square / model_noise;
             const double h = (__shfl_sync(FULL_MASK, c, member) + square * old_mean) / model_noise;
@@ -647,7 +671,7 @@ extern "C" __global__ void panel_step(
             double peak = __longlong_as_double(0xfff0000000000000ULL);  // -inf: NVRTC has no INFINITY
             #pragma unroll
             for (int slot = 0; slot < NODES_PER_LANE; ++slot) {
-                if (lane + PANEL * slot < node_count) {
+                if (lane + PANEL * slot < model_nodes) {
                     const double log_weight = weight[slot] + 0.5 * h * h * held[slot];
                     weight[slot] = log_weight;
                     peak = fmax(peak, log_weight);
@@ -658,7 +682,7 @@ extern "C" __global__ void panel_step(
             double total_weight = 0.0, first = 0.0;
             #pragma unroll
             for (int slot = 0; slot < NODES_PER_LANE; ++slot) {
-                if (lane + PANEL * slot < node_count) {
+                if (lane + PANEL * slot < model_nodes) {
                     const double node_weight = exp(weight[slot] - peak);
                     weight[slot] = node_weight;
                     total_weight += node_weight;
@@ -674,7 +698,7 @@ extern "C" __global__ void panel_step(
             double second = 0.0, third_sum = 0.0, fourth_sum = 0.0;
             #pragma unroll
             for (int slot = 0; slot < NODES_PER_LANE; ++slot) {
-                if (lane + PANEL * slot < node_count) {
+                if (lane + PANEL * slot < model_nodes) {
                     const double conditional_value = held[slot];
                     const double node_weight = weight[slot] / total_weight;
                     const double offset_value = h * conditional_value - new_mean;
@@ -738,10 +762,10 @@ def _batch_kernels(cupy: Any, node_count: int) -> tuple[Any, Any]:
 
 def _panel_step_shared_bytes(threads: int) -> int:
     """``panel_step``'s dynamic shared memory: a weighted residual per thread, a sum per (warp, lane), one per warp, the
-    previous panel's scaled steps of two models per lane and its members' code means, then each warp's tile of the
-    panel's codes (PANEL rows of PANEL + 1 bytes). No share depends on the models, so neither does a block."""
+    previous panel's scaled steps and code means of two models per lane, then each warp's tile of the panel's codes
+    (PANEL rows of PANEL + 1 bytes). No share depends on the models, so neither does a block."""
     warps = threads // PANEL
-    return (threads + warps * PANEL + warps + 2 * PANEL + PANEL) * np.dtype(np.float64).itemsize + warps * PANEL * (PANEL + 1)
+    return (threads + warps * PANEL + warps + 2 * PANEL + 2 * PANEL) * np.dtype(np.float64).itemsize + warps * PANEL * (PANEL + 1)
 
 
 class CudaPanelKernels:
@@ -792,10 +816,12 @@ class HostPanelKernels:
         return self._threads
 
     def node_terms(self, arguments: tuple, total: int) -> None:
-        log_scale, squares, class_index, log_density, grid, noise, first, width, models, _node_count, _class_count, conditional, base = arguments
+        (log_scale, squares, class_index, log_density, grid, grid_stride, noise, first, width, models, node_count, _class_count, conditional,
+         base) = arguments
         rows = slice(int(first), int(first) + int(width))
         omega = (squares[rows] / noise[None, :])[:, :, None]
-        log_variance = log_scale[rows][:, :, None] + grid[None, None, :]
+        grids = grid.reshape(int(models), int(node_count)) if int(grid_stride) else grid[None, :]
+        log_variance = log_scale[rows][:, :, None] + grids[None, :, :]
         with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
             variance = np.exp(log_variance)
             ratio = variance * omega
@@ -805,20 +831,26 @@ class HostPanelKernels:
             base[: int(width)] = np.where(overflow, density - 0.5 * (log_variance + np.log(omega)), density - 0.5 * np.log1p(ratio))
 
     def panel_step(self, blocks: int, threads: int, models: int, arguments: tuple) -> None:
-        (codes, _stride, code_means, code_scales, rows, signs, applied, applied_width, projected, projected_width, covariates,
-         covariate_count, masks, residuals, _models, sample_count, steps, covariate_steps, partials, partial_totals, _counter,
-         conditional, base, node_first, _node_count, squares, noise, grams, couplings, panel, mean, variance, shift, third, fourth,
-         pieces) = arguments
+        (codes, _stride, code_means, code_scales, standardized, live, rows, signs, applied, applied_width, projected, projected_width,
+         covariates, covariate_count, masks, residuals, _models, sample_count, steps, covariate_steps, partials, partial_totals, _counter,
+         conditional, base, node_first, _node_count, node_counts, squares, noise, grams, couplings, panel, mean, variance, shift, third,
+         fourth, pieces) = arguments
         count, models = int(sample_count), int(models)
         applied, applied_width, projected, projected_width = int(applied), int(applied_width), int(projected), int(projected_width)
+
+        def standard(values, first, width, code_rows):
+            # each model's (members, models) or the tile's own per code row, broadcast over the models
+            return values[first:first + width].T if int(standardized) else np.broadcast_to(values[code_rows][None, :], (models, width))
+
         if applied_width:
             applied_rows = rows[applied:applied + applied_width].astype(np.int64)
-            scaled_steps = signs[applied:applied + applied_width][None, :] * steps[:, :applied_width] / code_scales[applied_rows][None, :]
+            centers = standard(code_means, applied, applied_width, applied_rows)
+            scaled_steps = signs[applied:applied + applied_width][None, :] * steps[:, :applied_width] / standard(code_scales, applied, applied_width, applied_rows)
             for model in range(models):
                 moved = np.zeros(count)
                 for member in range(applied_width):
                     row = int(applied_rows[member])
-                    moved += scaled_steps[model, member] * (codes[row, :count].astype(np.float64) - code_means[row])
+                    moved += scaled_steps[model, member] * (codes[row, :count].astype(np.float64) - centers[model, member])
                 covariate = np.zeros(count)
                 for index in range(int(covariate_count)):
                     covariate += covariates[index] * covariate_steps[model, index]
@@ -826,6 +858,8 @@ class HostPanelKernels:
         if not projected_width:
             return
         code_rows = rows[projected:projected + projected_width].astype(np.int64)
+        centers = standard(code_means, projected, projected_width, code_rows)
+        scales = standard(code_scales, projected, projected_width, code_rows)
         for model in range(models):
             weighted = masks[model] * residuals[model]
             for block in range(int(blocks)):
@@ -835,16 +869,20 @@ class HostPanelKernels:
         for model in range(models):
             total = np.sum(partial_totals[model, : int(blocks)])
             product = np.sum(partials[model, : int(blocks), :projected_width], axis=0)
-            c = signs[projected:projected + projected_width] * (product - code_means[code_rows] * total) / code_scales[code_rows]
+            c = signs[projected:projected + projected_width] * (product - centers[model] * total) / scales[model]
             gram, coupling, model_noise = grams[int(panel), model], couplings[int(panel), model], float(noise[model])
+            nodes = int(node_counts[model])
             for member in range(projected_width):
                 at = projected + member
+                if not live[at, model]:
+                    steps[model, member] = 0.0
+                    continue
                 square = float(squares[at, model])
                 omega = square / model_noise
                 old_mean = float(mean[at, model])
                 h = (c[member] + square * old_mean) / model_noise
-                held = conditional[int(node_first) + member, model]
-                log_weight = base[int(node_first) + member, model] + 0.5 * h * h * held
+                held = conditional[int(node_first) + member, model, :nodes]
+                log_weight = base[int(node_first) + member, model, :nodes] + 0.5 * h * h * held
                 peak = np.max(log_weight)
                 weight = np.exp(log_weight - peak)
                 total_weight = np.sum(weight)
@@ -935,17 +973,84 @@ class SweepLayout:
         return sum(-(-(last - first) // PANEL) for block in self.blocks for first, last in block.pieces)
 
 
+@dataclass(frozen=True)
+class ArmTraits:
+    """Each trait's own standardization of one arm's codes, for its traits' sweeps in one pass (``sweep_models``'
+    ``standardization`` and ``live``): per code row and trait (rows x traits), Stage 0's mean and scale on the trait's
+    training rows and whether the row is one of the trait's members there.
+
+    Every trait of an arm reads the same store rows over the arm's samples; what its own fit holds apart is its training
+    rows (its mask), its standardization on them, which rows are its members (a row constant on its training rows is
+    not), its prior and its noise. Held once for the arm, the codes serve every trait's sweep in one read: each model of
+    the pass is a trait, its mask zero off its training rows, its columns standardized as its own Stage 0 standardizes
+    them, its other rows skipped. A row a trait does not have carries mean 0 and scale 1 there (finite, never read
+    into a step)."""
+
+    centers: np.ndarray
+    scales: np.ndarray
+    live: np.ndarray
+
+    @classmethod
+    def from_tiles(cls, xp: Any, tiles: Iterator[tuple[int, int, Any, int]], training: np.ndarray, config: ModelConfig, chunk_rows: int) -> ArmTraits:
+        """Over the arm's blocks ``tiles`` ((start, stop, tile, device), ``device_plan.native_blocks``) and each trait's
+        training rows ``training`` (traits x n, bool): ``genotype_statistics._project_block``'s standardization on
+        them, from the exact sums S = sum c and Q = sum c^2 over the rows (integers, so every order of the float64
+        sums gives the same bits): the variance numerator n Q - S^2, the mean S / n and the scale sqrt(n Q - S^2) / n,
+        and a row is live where the numerator is positive, its frequency's minor side at least
+        ``config.minimum_minor_allele_frequency`` and its scale at least ``config.minimum_scale`` code offsets.
+        ``chunk_rows`` code rows are decoded at a time."""
+        weights = np.asarray(training, dtype=bool).astype(np.float64)
+        counts = weights.sum(axis=1)
+        sample_count = int(weights.shape[1])
+        sums, squares = [], []
+        for _start, _stop, tile, device in tiles:
+            with _cupy_device_context(xp, int(device)):
+                held = xp.asarray(weights)
+                codes = tile.aligned_codes
+                for first in range(0, int(tile.variant_count), int(chunk_rows)):
+                    values = codes[first:min(first + int(chunk_rows), int(tile.variant_count)), :sample_count].astype(xp.float64)
+                    sums.append(_to_host(values @ held.T))
+                    squares.append(_to_host((values * values) @ held.T))
+                    del values
+        total, square = np.concatenate(sums), np.concatenate(squares)
+        numerator = counts[None, :] * square - total * total
+        means = total / counts[None, :]
+        with np.errstate(invalid="ignore"):
+            scales = np.sqrt(numerator) / counts[None, :]
+        frequency = (means + SIGNED_CODE_OFFSET) / (2 * SIGNED_CODE_OFFSET)
+        live = (numerator > 0) & (np.minimum(frequency, 1.0 - frequency) >= config.minimum_minor_allele_frequency)
+        live &= np.where(numerator > 0, scales, 0.0) / SIGNED_CODE_OFFSET >= config.minimum_scale
+        return cls(np.where(live, means, 0.0), np.where(live, scales, 1.0), live)
+
+
+def trait_lattices(grids: Sequence[np.ndarray], log_densities: Sequence[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Each trait's lattice and its classes' log densities (C x K_t) as ``sweep_models`` takes several: (grid (traits x
+    K), node counts (traits), log density (traits x C x K)), K the widest lattice, each padded past its own nodes with
+    its last node and log density -inf (no mass; the sweep reads a trait's own nodes only)."""
+    grids = [np.asarray(grid, dtype=np.float64) for grid in grids]
+    log_densities = [np.asarray(density, dtype=np.float64) for density in log_densities]
+    if len(grids) != len(log_densities) or any(density.shape[1] != grid.shape[0] for grid, density in zip(grids, log_densities)):
+        raise ValueError("each trait's log densities are over its own lattice")
+    widest = max(grid.shape[0] for grid in grids)
+    counts = np.array([grid.shape[0] for grid in grids], dtype=np.int32)
+    padded_grid = np.stack([np.pad(grid, (0, widest - grid.shape[0]), mode="edge") for grid in grids])
+    padded_density = np.stack([np.pad(density, ((0, 0), (0, widest - density.shape[1])), constant_values=-np.inf) for density in log_densities])
+    return padded_grid, counts, padded_density
+
+
 class NoCodes(TypeError):
     """A block's tile holds no codes (``CodePanels.supports``): its sweeps decode it (``sweep_piece``)."""
 
 
 def _piece_grams(
     xp: Any, tile: Any, rows: Any, signs: Any, mask: Any, masked_covariates: Any, covariate_pinv: Any, columns: int,
+    standardization: tuple[Any, Any] | None = None,
 ) -> tuple[Any, Any]:
     """One model's panel Grams and couplings of a piece (members ``rows`` of ``tile``, signed), (panels, PANEL, PANEL)
     and (panels, k, PANEL), each panel's zero-padded to PANEL: ``sweep_piece``'s Gram and coupling, A = (C'M^2 C)^+
     C'M^2 X_P and Xp_P' Xp_P, the columns decoded ``columns`` at a time (a multiple of PANEL) and each chunk's Grams
-    one batched product (a GEMM per panel was three submissions per 32 columns: 280k at 1.0e6 members x 3 models)."""
+    one batched product (a GEMM per panel was three submissions per 32 columns: 280k at 1.0e6 members x 3 models).
+    ``standardization`` is the model's own (means, scales) per piece member, where it is not the tile's."""
     width = int(rows.shape[0])
     sample_count = int(mask.shape[0])
     covariate_count = int(masked_covariates.shape[1])
@@ -955,7 +1060,14 @@ def _piece_grams(
     for first in range(0, width, columns):
         last = min(first + columns, width)
         count = -(-(last - first) // PANEL)
-        dense = xp.asarray(tile.columns(rows[first:last]), dtype=xp.float64) * signs[first:last][None, :]
+        if standardization is None:
+            dense = xp.asarray(tile.columns(rows[first:last]), dtype=xp.float64) * signs[first:last][None, :]
+        else:
+            # ``CodeBlockTile.columns``' expression with the model's own means and scales
+            codes = tile.aligned_codes[rows[first:last], :sample_count].astype(xp.float64)
+            means, scales = standardization
+            dense = ((codes - means[first:last][:, None]) / scales[first:last][:, None]).T * signs[first:last][None, :]
+            del codes
         projected = dense * mask[:, None]
         del dense
         # The chunk's columns padded to whole panels with zero columns: a short last panel's Gram and coupling are then
@@ -977,6 +1089,7 @@ def sweep_models(
     xp: Any, kernels: Any, layout: SweepLayout, tiles: Iterator[tuple[int, int, Any, int]], *, grams: PanelGrams, keys: Sequence[tuple],
     masks: np.ndarray, residuals: np.ndarray, noise: np.ndarray, log_density: np.ndarray, grid: np.ndarray, log_scale: np.ndarray,
     squares: np.ndarray, state: dict[str, np.ndarray], covariates: Any, covariate_pinvs: Sequence[Any], gram_columns: Callable[[int], int],
+    node_counts: np.ndarray | None = None, standardization: tuple[np.ndarray, np.ndarray] | None = None, live: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """One sweep of each of M models over every member, in place on the host arrays ``state`` (name -> (members, M):
     mean, variance, shift, third, fourth); returns (each model's residual (n), the ELBO pieces' totals (M,
@@ -991,6 +1104,14 @@ def sweep_models(
     from one block's device to the next (``moved``), the panel Grams built there on a miss (``gram_columns(width)``
     columns decoded at once) and named by that device's pool.
 
+    One arm's traits in one pass (every trait reads the same codes over all the arm's samples; ``ArmTraits``): ``grid``
+    is then (M x K) with each model's lattice padded to the widest and ``node_counts`` each model's own count (its
+    ``log_density`` padded alike); ``standardization`` each model's (means, scales) per member (members x M each), its
+    training rows' own in place of the tile's; and ``live`` (members x M, bool) which members are each model's: a
+    member that is not takes no step in that model (its moments stay, its ELBO pieces are 0), and it must carry a
+    finite nonzero scale. A model's sweep in such a pass is its own sweep on the members it has, in their order, over
+    its own training rows (its mask zero elsewhere), to rounding.
+
     The arithmetic is ``sweep_piece``'s with ``CodePanels`` per member and per panel, the same piece and panel
     boundaries and member order; its sums are in other orders: c_P over each block's warps of 32 samples, the blocks
     then in order (``panel_project``: one tree over 1,024 threads), u = A s in member order (a cuBLAS GEMV), the
@@ -1001,7 +1122,20 @@ def sweep_models(
     the bit whichever models share it."""
     model_count = len(keys)
     sample_count = int(masks.shape[1])
-    node_count = int(grid.shape[0])
+    grid = np.asarray(grid, dtype=np.float64)
+    node_count = int(grid.shape[-1])
+    # one lattice for every model (read at stride 0), or each model's own row
+    grid_stride = node_count if grid.ndim == 2 else 0
+    if grid.ndim == 2 and grid.shape[0] != model_count:
+        raise ValueError("a grid per model needs one row per model")
+    node_counts = np.full(model_count, node_count, dtype=np.int32) if node_counts is None else np.asarray(node_counts, dtype=np.int32)
+    if node_counts.shape != (model_count,) or np.any(node_counts < 1) or np.any(node_counts > node_count):
+        raise ValueError("each model's node count is between 1 and the grid's width")
+    live = np.ones((int(squares.shape[0]), model_count), dtype=bool) if live is None else np.asarray(live, dtype=bool)
+    if standardization is not None:
+        centers, scales = (np.asarray(values, dtype=np.float64) for values in standardization)
+        if not np.all(np.isfinite(scales) & (scales != 0.0)):
+            raise ValueError("every member's scale is finite and nonzero in every model (a member a model does not have included)")
     class_count = int(log_density.shape[1])
     covariate_count = int(covariates.shape[1])
     runtime = getattr(getattr(xp, "cuda", None), "runtime", None)
@@ -1019,8 +1153,11 @@ def sweep_models(
             held = {name: put(state[name][members]) for name in MOMENTS}
             held.update(
                 log_scale=put(log_scale[members]), squares=put(squares[members]), pieces=xp.zeros((members.shape[0], model_count, PIECE_COLUMNS)),
-                masks=put(masks), noise=put(noise), log_density=put(log_density), grid=put(grid),
+                masks=put(masks), noise=put(noise), log_density=put(log_density), grid=put(grid), node_counts=put(node_counts),
+                live=put(live[members].astype(np.uint8)),
             )
+            if standardization is not None:
+                held.update(centers=put(centers[members]), scales=put(scales[members]))
             if device.covariates is None:
                 device.covariates = moved(xp, covariates, device.device_id)
                 device.covariates_t = xp.ascontiguousarray(device.covariates.T)
@@ -1046,7 +1183,11 @@ def sweep_models(
             residual = moved(xp, residual, device.device_id)
             codes = tile.aligned_codes
             # Every launch of the block reads these; only the panels' positions (and each piece's Grams) change.
-            fixed = (codes, np.int64(codes.shape[1]), xp.ascontiguousarray(tile.means), xp.ascontiguousarray(tile.scales), device.rows, device.signs)
+            if standardization is None:
+                standards = (xp.ascontiguousarray(tile.means), xp.ascontiguousarray(tile.scales), np.int32(0))
+            else:
+                standards = (held["centers"], held["scales"], np.int32(1))
+            fixed = (codes, np.int64(codes.shape[1]), *standards, held["live"], device.rows, device.signs)
             moving = (
                 device.covariates_t, np.int32(covariate_count), held["masks"], residual, np.int32(model_count), np.int32(sample_count),
                 work["steps"], work["covariate_steps"], work["partials"], work["partial_totals"], work["counter"], work["conditional"], work["base"],
@@ -1064,9 +1205,12 @@ def sweep_models(
                         if index not in work["masked_covariates"]:
                             work["masked_covariates"][index] = device.covariates * held["masks"][index][:, None]
                             work["pinvs"][index] = moved(xp, covariate_pinvs[index], device.device_id)
+                        own = None if standardization is None else tuple(
+                            xp.ascontiguousarray(held[name][offset:offset + width, index]) for name in ("centers", "scales")
+                        )
                         return _piece_grams(
                             xp, tile, piece_rows, piece_signs, held["masks"][index], work["masked_covariates"][index], work["pinvs"][index],
-                            gram_columns(width),
+                            gram_columns(width), own,
                         )
 
                     # A piece's stack, named apart from ``sweep_piece``'s one-panel Grams (a piece of at most PANEL members
@@ -1076,11 +1220,11 @@ def sweep_models(
                 piece_couplings = xp.ascontiguousarray(xp.stack([part[1] for part in parts], axis=1))
                 del parts
                 kernels.node_terms(
-                    (held["log_scale"], held["squares"], device.classes, held["log_density"], held["grid"], held["noise"], np.int64(offset),
+                    (held["log_scale"], held["squares"], device.classes, held["log_density"], held["grid"], np.int32(grid_stride), held["noise"], np.int64(offset),
                      np.int32(width), np.int32(model_count), np.int32(node_count), np.int32(class_count), work["conditional"], work["base"]),
                     width * model_count * node_count,
                 )
-                chain = (np.int32(node_count), held["squares"], held["noise"], piece_grams, piece_couplings)
+                chain = (np.int32(node_count), held["node_counts"], held["squares"], held["noise"], piece_grams, piece_couplings)
                 for panel_first in range(0, width, PANEL):
                     projected, projected_width = offset + panel_first, min(PANEL, width - panel_first)
                     kernels.panel_step(work["blocks"], work["threads"], model_count, (

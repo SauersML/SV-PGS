@@ -15,16 +15,28 @@ them (``device_plan.plan_blocks``), one piece per block:
   launches' submissions, the state's copies, the Grams' stacking: where it is below the full sweep's time the GPU is
   the bottleneck); and two of nine models (three groups' models, or three traits' groups, read in one pass of the
   codes).
+- arm: one arm's eleven traits [real] in one pass (``device_sweep.ArmTraits``, ``trait_lattices``): the codes over
+  every sample, each trait with its own training rows (39-100% of the samples [real: 1.7e4 to 4.4e4 a trait]; the
+  last a binary trait's root weights on them), its own Stage 0 standardization on those rows (``ArmTraits``, timed:
+  an arm pays it once), its members and its own lattice (136-146 nodes). Three sweeps of the eleven (the first builds
+  their Grams), then two of trait 0 alone in the same layout: the one-trait sweep the arm's traits would take one at a
+  time. That reads every sample, where a trait's own fit reads only its training rows, so it overstates the smaller
+  traits' sweeps by the sample reads' share of a panel's time (the members' chain is the larger share and does not
+  depend on the samples).
 
 Each warm time is extrapolated per member to the All of Us whole-genome fits' 1.0e6 members [real], three models a
 group [real]: a sweep's work is per panel, and every panel has the same work. The codes are uniform random int8 (no
 participant data; a panel's chain does not depend on their values), 146 lattice nodes and 21 covariates [real], 44,000
 samples [real: 1.7e4 to 4.4e4 per group], blocks of ~18,700 members (1.0e6 members in ~55 LD blocks [real]). At the
-defaults the codes take 23 GB of one A100-40GB, and the whole command about 2-4 minutes.
+defaults the codes take 23 GB of one A100-40GB and the arm's Grams 2.4 GB more, and the whole command about 3-6
+minutes.
 
 Checks print PASS/FAIL with their times: model 0's old sweep against its new sweep from the same start (rtol 1e-8:
 the same members, order and panels, other summation orders), and model 0 swept alone and among nine models against its
-sweep among three (bit for bit). A RESULT line gives old and new seconds per sweep at 1.0e6 members. A ten-minute
+sweep among three (bit for bit); every arm trait's residual zero off its training rows and its moments zero on the
+members it does not have, and trait 0 swept alone against its sweep among eleven (bit for bit). A RESULT line gives
+old and new seconds per sweep at 1.0e6 members, and the arm's eleven traits in one pass against eleven one-trait
+sweeps. A ten-minute
 subprocess deadline includes imports, the codes' synthesis and kernel compilation; a timeout is a FAIL. ``--host``
 runs the new route's harness on numpy with its reference kernels (``HostPanelKernels``), at a size the host can take,
 and skips the old route, which needs CUDA.
@@ -57,6 +69,9 @@ WORKSPACE_BYTES = 1 << 26
 CODE_ROWS_PER_DRAW = 1024
 GRAM_COLUMNS = 2048
 MASK_FRACTIONS = (0.9, 0.8, 0.7)
+ARM_TRAITS = 11
+ARM_TRAINING = (0.39, 1.0)
+BINARY_ROOT_WEIGHTS = (0.2, 0.5)
 EMPTY_SOURCE = 'extern "C" __global__ void empty_step() {}'
 
 
@@ -133,18 +148,59 @@ def _problem(xp, device_ids, samples, members, blocks, models):
     )
 
 
-def _new(xp, problem, kernels, models, state, residuals, grams, layout):
+def _arm(xp, problem, samples, members):
+    """An arm's traits over the problem's codes (synthetic): each trait's training rows (the last a binary trait's root
+    weights on them), covariate pseudo-inverse, starting residual, prior on its own lattice and log scales, and their
+    ``ArmTraits`` (each trait's standardization of the codes on its training rows, and its members)."""
+    import numpy as np
+    from sv_pgs.config import ModelConfig
+    from sv_pgs.device_plan import native_blocks
+    from sv_pgs.device_sweep import ArmTraits, trait_lattices
+
+    rng = np.random.default_rng(31)
+    covariates = problem["covariates"]
+    masks = np.zeros((ARM_TRAITS, samples))
+    for trait, fraction in enumerate(np.linspace(*ARM_TRAINING, ARM_TRAITS)):
+        masks[trait, rng.choice(samples, int(round(fraction * samples)), replace=False)] = 1.0
+    masks[-1] = np.where(masks[-1] > 0, rng.uniform(*BINARY_ROOT_WEIGHTS, samples), 0.0)
+    pinvs, residuals, grids, densities = [], [], [], []
+    for trait, mask in enumerate(masks):
+        masked = covariates * mask[:, None]
+        pinv = np.linalg.pinv(masked.T @ masked)
+        target = rng.normal(size=samples) * mask
+        residuals.append(target - masked @ (pinv @ (masked.T @ target)))
+        pinvs.append(pinv)
+        nodes = NODES - (ARM_TRAITS - 1 - trait)
+        grids.append(np.linspace(np.log(1e-6), 0.0, nodes))
+        density = rng.normal(size=(1, nodes))
+        densities.append(density - np.log(np.exp(density).sum(axis=1, keepdims=True)))
+    grid, node_counts, log_density = trait_lattices(grids, densities)
+    standards = ArmTraits.from_tiles(xp, native_blocks(problem["sharded"], xp), masks > 0, ModelConfig(), CODE_ROWS_PER_DRAW)
+    return dict(
+        training=masks > 0, masks=masks, pinvs=pinvs, residuals=np.stack(residuals), grid=grid, node_counts=node_counts, log_density=log_density,
+        log_scale=rng.normal(-2.0, 0.5, (members, ARM_TRAITS)), squares=np.tile((masks * masks).sum(axis=1), (members, 1)), noise=np.ones(ARM_TRAITS),
+        standards=standards,
+    )
+
+
+def _new(xp, problem, kernels, models, state, residuals, grams, layout, arm=None):
+    """One ``sweep_models`` pass of ``models`` (columns of the problem's models, or with ``arm`` of its traits, each
+    with its own standardization, members and lattice)."""
     import numpy as np
     from sv_pgs.device_plan import native_blocks
     from sv_pgs.device_sweep import sweep_models
 
     columns = list(models)
+    fit, own = (problem, {}) if arm is None else (arm, dict(
+        node_counts=arm["node_counts"][columns], live=np.ascontiguousarray(arm["standards"].live[:, columns]),
+        standardization=(np.ascontiguousarray(arm["standards"].centers[:, columns]), np.ascontiguousarray(arm["standards"].scales[:, columns])),
+    ))
     return sweep_models(
         xp, kernels, layout, native_blocks(problem["sharded"], xp), grams=grams, keys=[(model, b"") for model in columns],
-        masks=problem["masks"][columns], residuals=residuals, noise=problem["noise"][columns], log_density=problem["log_density"][columns],
-        grid=problem["grid"], log_scale=np.ascontiguousarray(problem["log_scale"][:, columns]),
-        squares=np.ascontiguousarray(problem["squares"][:, columns]), state=state, covariates=xp.asarray(problem["covariates"]),
-        covariate_pinvs=[xp.asarray(problem["pinvs"][model]) for model in columns], gram_columns=lambda width: GRAM_COLUMNS,
+        masks=fit["masks"][columns], residuals=residuals, noise=fit["noise"][columns], log_density=fit["log_density"][columns],
+        grid=problem["grid"] if arm is None else arm["grid"][columns], log_scale=np.ascontiguousarray(fit["log_scale"][:, columns]),
+        squares=np.ascontiguousarray(fit["squares"][:, columns]), state=state, covariates=xp.asarray(problem["covariates"]),
+        covariate_pinvs=[xp.asarray(fit["pinvs"][model]) for model in columns], gram_columns=lambda width: GRAM_COLUMNS, **own,
     )
 
 
@@ -261,12 +317,14 @@ def _worker(samples, members, blocks, devices, host):
     times = {}
     first_sweep = {}
 
-    def start(models):
-        return {"state": {name: np.zeros((members, models)) for name in MOMENTS}, "residuals": problem["residuals"][:models].copy(), "grams": PanelGrams()}
+    def start(models, source=problem):
+        return {"state": {name: np.zeros((members, models)) for name in MOMENTS}, "residuals": source["residuals"][:models].copy(), "grams": PanelGrams()}
 
-    def sweep(run, models, label, sweep_kernels=None):
+    def sweep(run, models, label, sweep_kernels=None, arm=None):
         started = time.perf_counter()
-        swept, totals, squares = _new(xp, problem, kernels if sweep_kernels is None else sweep_kernels, range(models), run["state"], run["residuals"], run["grams"], layout)
+        swept, totals, squares = _new(
+            xp, problem, kernels if sweep_kernels is None else sweep_kernels, range(models), run["state"], run["residuals"], run["grams"], layout, arm,
+        )
         synchronize()
         times[label] = time.perf_counter() - started
         if sweep_kernels is None:
@@ -338,6 +396,43 @@ def _worker(samples, members, blocks, devices, host):
     checks.run(f"new sweep 2 of {WIDE_MODELS} models", lambda: sweep(wide, WIDE_MODELS, "wide warm"))
     del wide
 
+    def traits():
+        started = time.perf_counter()
+        made = _arm(xp, problem, samples, members)
+        times["arm traits"] = time.perf_counter() - started
+        return made
+
+    arm = checks.run(f"an arm's {ARM_TRAITS} traits, each standardized on its training rows (ArmTraits)", traits)
+    if arm is not None:
+        whole = start(ARM_TRAITS, arm)
+        arm_first = {}
+
+        def arm_cold():
+            swept, totals = sweep(whole, ARM_TRAITS, "arm cold", arm=arm)
+            for trait in range(ARM_TRAITS):
+                _require(not np.any(swept[trait][~arm["training"][trait]]), f"trait {trait}'s residual is not zero off its training rows")
+                for name in MOMENTS:
+                    _require(not np.any(whole["state"][name][~arm["standards"].live[:, trait], trait]), f"trait {trait} moved a member it does not have")
+            arm_first.update(residual=swept[0].copy(), totals=totals[0].copy(), state={name: values[:, 0].copy() for name, values in whole["state"].items()})
+
+        checks.run(f"arm sweep 1 of {ARM_TRAITS} traits, each its own standardization, members and lattice (builds the panel Grams)", arm_cold)
+        checks.run(f"arm sweep 2 of {ARM_TRAITS} traits", lambda: sweep(whole, ARM_TRAITS, "arm warm 2", arm=arm))
+        checks.run(f"arm sweep 3 of {ARM_TRAITS} traits", lambda: sweep(whole, ARM_TRAITS, "arm warm 3", arm=arm))
+        del whole
+        one = start(1, arm)
+
+        def one_cold():
+            swept, totals = sweep(one, 1, "arm one cold", arm=arm)
+            _require(bool(arm_first), "the first arm sweep failed")
+            np.testing.assert_array_equal(swept[0], arm_first["residual"])
+            np.testing.assert_array_equal(totals[0], arm_first["totals"])
+            for name in MOMENTS:
+                np.testing.assert_array_equal(one["state"][name][:, 0], arm_first["state"][name])
+
+        checks.run(f"arm trait 0 alone is its sweep among {ARM_TRAITS}, bit for bit", one_cold)
+        checks.run("arm sweep 2 of trait 0 alone", lambda: sweep(one, 1, "arm one warm", arm=arm))
+        del one
+
     scale = WHOLE_GENOME_MEMBERS / members
     name = "host" if host else xp.cuda.runtime.getDeviceProperties(0)["name"].decode()
     print(f"INFO {members} members in {panels} panels over {blocks} blocks, {samples} samples, {NODES} nodes, {COVARIATES} covariates, "
@@ -350,6 +445,11 @@ def _worker(samples, members, blocks, devices, host):
     if "wide warm" in times:
         print(f"INFO new, {WIDE_MODELS} models a launch: cold {times.get('wide cold', float('nan')):.3f} s, warm {times['wide warm']:.3f} s "
               f"({1e6 * times['wide warm'] / panels:.1f} us a panel)", flush=True)
+    arm_warm = min(times.get("arm warm 2", float("inf")), times.get("arm warm 3", float("inf")))
+    if arm_warm < float("inf"):
+        print(f"INFO arm, {ARM_TRAITS} traits a launch: standardization {times.get('arm traits', float('nan')):.3f} s, cold "
+              f"{times.get('arm cold', float('nan')):.3f} s, warm {arm_warm:.3f} s ({1e6 * arm_warm / panels:.1f} us a panel); trait 0 alone: "
+              f"cold {times.get('arm one cold', float('nan')):.3f} s, warm {times.get('arm one warm', float('nan')):.3f} s", flush=True)
     if "old warm" in times:
         print(f"INFO old: cold {times.get('old cold', float('nan')):.3f} s, warm {times['old warm']:.3f} s a sweep of one model "
               f"({1e3 * times['old warm'] / panels:.2f} ms a panel)", flush=True)
@@ -362,6 +462,12 @@ def _worker(samples, members, blocks, devices, host):
             result.append(f"({times['wide warm'] * scale:.2f} s for {WIDE_MODELS})")
         if "old warm" in times:
             result.append(f"; speedup {MODELS * times['old warm'] / warm:.0f}x")
+    if arm_warm < float("inf") and "arm one warm" in times:
+        one_at_a_time = ARM_TRAITS * times["arm one warm"]
+        result.append(f"; arm: {arm_warm * scale:.2f} s for {ARM_TRAITS} traits in one pass against {one_at_a_time * scale:.2f} s one trait at a time "
+                      f"({one_at_a_time / arm_warm:.1f}x)")
+        if "old warm" in times:
+            result.append(f"and {ARM_TRAITS * times['old warm'] * scale:.0f} s on the old route ({ARM_TRAITS * times['old warm'] / arm_warm:.0f}x)")
     print(" ".join(result), flush=True)
     return int(checks.failures > 0)
 
