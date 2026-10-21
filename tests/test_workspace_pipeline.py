@@ -1460,6 +1460,116 @@ def test_fit_keeps_listed_substitutions_and_every_structural_record(tmp_path: Pa
         WorkspaceConfig.from_mapping({**synthetic.raw, "fit_variant_sites": 7})
 
 
+def test_the_steps_name_their_input_files_by_the_same_values_when_read_together(tmp_path: Path, monkeypatch, capsys) -> None:
+    """The samples, store and direct_sv keys name each input file as one file at a time did, in the config's order: the
+    keys of steps a finished run holds must not move when their files are read on several threads."""
+    synthetic = _write_inputs(tmp_path / "inputs")
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "direct_sv": {**DIRECT_SV_NULL, "gatksv_calls": synthetic.gatksv_pattern}})
+
+    def whole(path) -> str:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def fingerprint(path) -> tuple[int, str]:
+        return Path(path).stat().st_size, whole(path)
+
+    chromosomes = config.chromosomes
+    assert workspace_pipeline._samples_inputs(config) == {
+        "chromosomes": chromosomes,
+        "halves": [(half.label, half.batches, [fingerprint(half.path(chromosome, batch)) for chromosome in chromosomes for batch in half.batches]) for half in config.imputed_halves],
+        "truth": [fingerprint(config.truth_path(chromosome)) for chromosome in chromosomes],
+        "imputation_reference_ids": whole(config.imputation_reference_ids),
+        "crosswalk": (whole(config.crosswalk), config.crosswalk_columns),
+        "ancestry": whole(config.ancestry),
+        "relatedness": (whole(config.relatedness), config.relatedness_columns),
+        "folds": (config.fold_count, config.seed),
+    }
+    assert workspace_pipeline._samples_inputs(dataclasses.replace(config, imputation_reference_ids=None))["imputation_reference_ids"] is None
+    monkeypatch.setattr(workspace_pipeline, "_store_sample_layout", lambda _config: "the samples step's layout")
+    assert workspace_pipeline._store_inputs(config) == {
+        "input": "popped",
+        "genome_build": config.genome_build,
+        "chromosomes": chromosomes,
+        "halves": [(half.label, half.batches, [fingerprint(half.path(chromosome, batch)) for chromosome in chromosomes for batch in half.batches]) for half in config.imputed_halves],
+        "truth": [fingerprint(config.truth_path(chromosome)) for chromosome in chromosomes],
+        "strata": [whole(workspace_pipeline.strata_manifest(config.popped.strata_directory, chromosome)) for chromosome in chromosomes],
+        "bubble_split": [fingerprint(config.popped.bubble_split_path(chromosome)) for chromosome in chromosomes],
+        "genetic_map": None,
+        "tandem_repeats": whole(config.tandem_repeats),
+        "gene_annotation": whole(config.gene_annotation),
+        "codec": config.codec,
+        "samples": "the samples step's layout",
+    }
+    paths = [config.direct_sv.gatksv_path(chromosome) for chromosome in chromosomes]
+    assert workspace_pipeline._direct_sv_inputs(config) == {
+        "gatksv_calls": [(path.name, fingerprint(path)) for path in paths], "codec": config.codec, "genome_build": config.genome_build,
+    }
+    # Each batch of identities has its timing line: which identity, its files and its slowest file's seconds.
+    timed = [line.split("timing: ", 1)[1].split() for line in capsys.readouterr().err.splitlines() if "timing: " in line]
+    assert timed and all(fields[2] == "s" and fields[3].startswith("files=") and fields[4].startswith("slowest=") for fields in timed)
+    assert timed[0][:1] + timed[0][3:4] == ["file_digest", "files=4"]
+    assert {fields[0] for fields in timed} == {"file_digest", "genotype_file_fingerprint"}
+    # Whole 256 KiB pieces, a part piece and no piece at all.
+    generator = np.random.default_rng(5)
+    for size in (0, 1, 2**18, 3 * 2**18 + 5):
+        path = tmp_path / f"bytes_{size}"
+        path.write_bytes(generator.integers(0, 256, size, dtype=np.uint8).tobytes())
+        assert workspace_pipeline._file_digest(path) == whole(path)
+
+
+def test_a_mounted_input_file_is_hashed_from_its_object_and_never_through_the_mount(tmp_path: Path, monkeypatch) -> None:
+    """A step key's whole-file digest of a file on a bucket mount is the SHA-256 of the object's bytes at the generation
+    its metadata names, the bytes the mount shows, read through the storage API; a gzip-encoded object, which the API
+    would decompress, is read through the mount as before."""
+    from sv_pgs import content_identity
+
+    generator = np.random.default_rng(11)
+    stored = generator.integers(0, 256, 3 * 2**18 + 5, dtype=np.uint8).tobytes()
+    compressed = gzip.compress(b"chr1\t10\t20\tTR\n")
+    mount = tmp_path / "mount"
+    (mount / "cdr").mkdir(parents=True)
+    (mount / "cdr" / "ancestry.tsv").write_bytes(stored)
+    (mount / "cdr" / "repeats.bed.gz").write_bytes(compressed)
+    objects = {("ops-bucket", "copies/cdr/ancestry.tsv"): (stored, None), ("ops-bucket", "copies/cdr/repeats.bed.gz"): (compressed, "gzip")}
+    downloads, mounted = [], []
+
+    def blob(bucket: str, name: str, user_project: str | None):
+        if (bucket, name) not in objects:
+            return None
+        content, encoding = objects[(bucket, name)]
+
+        def download_as_bytes(**options):
+            downloads.append((bucket, name, user_project, options))
+            return content if encoding is None else gzip.decompress(content)
+
+        return SimpleNamespace(generation=5, size=len(stored), content_encoding=encoding, download_as_bytes=download_as_bytes)
+
+    client = SimpleNamespace(bucket=lambda bucket, user_project=None: SimpleNamespace(get_blob=lambda name: blob(bucket, name, user_project)))
+    monkeypatch.setattr(content_identity, "_storage_client", lambda: client)
+    monkeypatch.setenv("GOOGLE_PROJECT", "workspace-project")
+    monkeypatch.setenv(content_identity.GCS_MOUNTS, json.dumps({str(mount): "gs://ops-bucket/copies"}))
+    opened = Path.open
+
+    def recorded(self, *args, **kwargs):
+        if self.resolve().is_relative_to(mount.resolve()):
+            mounted.append(self.name)
+        return opened(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", recorded)
+    assert workspace_pipeline._file_digest(mount / "cdr" / "ancestry.tsv") == hashlib.sha256(stored).hexdigest()
+    assert downloads == [("ops-bucket", "copies/cdr/ancestry.tsv", "workspace-project", {"if_generation_match": 5})] and mounted == []
+    assert workspace_pipeline._file_digest(mount / "cdr" / "repeats.bed.gz") == hashlib.sha256(compressed).hexdigest()
+    assert len(downloads) == 1 and mounted == ["repeats.bed.gz"]
+    # Files off the mounts are read from the disk, as before.
+    (tmp_path / "local.tsv").write_bytes(b"local bytes")
+    assert workspace_pipeline._file_digest(tmp_path / "local.tsv") == hashlib.sha256(b"local bytes").hexdigest() and len(downloads) == 1
+    with pytest.raises(FileNotFoundError, match="gs://ops-bucket/copies/cdr/absent.tsv"):
+        workspace_pipeline._file_digest(mount / "cdr" / "absent.tsv")
+    # A download short of the size the metadata gives is refused.
+    objects[("ops-bucket", "copies/cdr/ancestry.tsv")] = (stored[:-1], None)
+    with pytest.raises(RuntimeError, match="bytes of its"):
+        workspace_pipeline._file_digest(mount / "cdr" / "ancestry.tsv")
+
+
 def test_a_fit_region_keeps_the_records_in_its_window_of_every_class(workspace, caplog) -> None:
     # (chromosome, POS, ID, REF length, ALT length, SVLEN, class): a substitution, a short deletion and a structural
     # deletion inside chr5:100-200 (its ends included), a substitution before it, after it and at its position on chr2.

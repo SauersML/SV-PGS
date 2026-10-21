@@ -142,9 +142,14 @@ def store_measurement(store: DosageStore, log_variance_offset: F64Array | None) 
         )
     else:
         reliability, source = checked_log_reliability(log_variance_offset, "the caller's log_variance_offset"), "the caller's log reliability (the measurement model's)"
+    # Each record's label is a reference to one of two shared strings. A string per record (np.where's fixed-width array,
+    # then a new object for each of its entries, ~72 bytes a record) was ~14 GB built and ~9 GB held through the fit at
+    # the All of Us genome's 126.7M records, for the same labels; np.full makes a string per entry too, fill does not.
+    raw_unit = np.empty(store.n_variants, dtype=object)
+    raw_unit.fill("ALT allele")
+    raw_unit[copy_number] = "copy"
     return ColumnMeasurement.build(
-        store.n_variants, log_reliability=reliability, codes_per_unit=table.codes_per_unit,
-        raw_unit=np.where(copy_number, "copy", "ALT allele").astype(object), reliability_source=source,
+        store.n_variants, log_reliability=reliability, codes_per_unit=table.codes_per_unit, raw_unit=raw_unit, reliability_source=source,
     )
 
 

@@ -69,7 +69,6 @@ import gzip
 import hashlib
 import importlib
 import inspect
-import io
 import json
 import logging
 import multiprocessing
@@ -700,11 +699,29 @@ def _digest(value: Any) -> str:
 
 
 def _file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
+    """The SHA-256 of every byte of ``path``. A file on a bucket mount (``content_identity.GCS_MOUNTS``) is read from its
+    object through the storage API, the generation its metadata names, with the API's own checksum check, and not
+    through the mount: the same bytes, as an object without a content encoding has no other. One with a content
+    encoding (gzip), which the API would hand over decoded, is read through the mount as before. A run keys every
+    step at its start, a completed one too, and the samples and store steps' keys read their single files whole
+    (crosswalk, ancestry and relatedness; strata manifests, tandem repeats and gene annotation): on a resumed
+    whole-genome run those two keys took 3.3 and 1.6 minutes, and the direct_sv step's, 22 generation lookups on the
+    same mounts and no read, under a second [real]."""
+    from sv_pgs.content_identity import _mounted_object, _storage_client
+
+    located = _mounted_object(Path(path).resolve())
+    if located is not None:
+        bucket, name = located
+        blob = _storage_client().bucket(bucket, user_project=os.environ.get("GOOGLE_PROJECT")).get_blob(name)
+        if blob is None:
+            raise FileNotFoundError(f"gs://{bucket}/{name} does not exist")
+        if not blob.content_encoding:
+            content = blob.download_as_bytes(if_generation_match=blob.generation)
+            if len(content) != blob.size:
+                raise RuntimeError(f"gs://{bucket}/{name} gave {len(content)} bytes of its {blob.size}.")
+            return hashlib.sha256(content).hexdigest()
     with Path(path).open("rb") as handle:
-        for block in iter(lambda: handle.read(io.DEFAULT_BUFFER_SIZE), b""):
-            digest.update(block)
-    return digest.hexdigest()
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def genotype_file_fingerprint(path: Path) -> tuple[int, str]:
@@ -712,6 +729,34 @@ def genotype_file_fingerprint(path: Path) -> tuple[int, str]:
     from sv_pgs.content_identity import file_digest
 
     return path.stat().st_size, file_digest(path)
+
+
+def _each(identity: Callable[[Path], Any], paths: Sequence[Path]) -> list[Any]:
+    """``identity`` (``genotype_file_fingerprint``, ``_file_digest``) of each of ``paths``, in their order, several at
+    a time. A step's key names its input files by their contents, and every run computes each step's key, a completed
+    step's too: on the workspace's bucket mounts each file is a request to the storage API (its generation, or its
+    bytes), which the samples, store and direct_sv steps' keys made one at a time for every chromosome's batch, strata
+    and call files before a resumed run reached its fit. The threads are as many as the storage client's connections
+    (requests' DEFAULT_POOLSIZE), past which it drops a connection with a warning line apiece. Each call ends with a
+    ``timing: <identity> <s>`` line (``phase_timer``) giving its files and its slowest file's seconds: a resumed
+    whole-genome run's samples and store keys took 5.1 minutes with no line between them [real], so which files cost
+    what was left to code reading."""
+    from requests.adapters import DEFAULT_POOLSIZE
+
+    from sv_pgs.phase_timer import timing
+
+    if not paths:
+        return []
+
+    def timed(path: Path) -> tuple[Any, float]:
+        started = time.perf_counter()
+        return identity(path), time.perf_counter() - started
+
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=min(len(paths), len(os.sched_getaffinity(0)), DEFAULT_POOLSIZE)) as pool:
+        identities = list(pool.map(timed, paths))
+    timing(identity.__name__.lstrip("_"), time.perf_counter() - started, files=len(paths), slowest=max(seconds for _value, seconds in identities))
+    return [value for value, _seconds in identities]
 
 
 _FIT_FILTER_KEYS = ("fit_minimum_minor_allele_frequency", "fit_minimum_r2")
@@ -842,6 +887,11 @@ class _Step:
 
 
 def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
+    from sv_pgs.phase_timer import timing
+
+    # Every run keys every step, a completed one too, so a resumed run's start pays each step's input identities
+    # (``_each``): ``timing: <step>_key`` gives what each one cost.
+    started = time.perf_counter()
     key = _digest(
         {
             "step": step.name,
@@ -850,6 +900,7 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
             "code": _source_digest(step.code),
         }
     )
+    timing(f"{step.name}_key", time.perf_counter() - started)
     root = run.config.run_directory
     final = root / step.name
     if (final / COMPLETE_FILE).is_file():
@@ -1013,17 +1064,20 @@ def calibrating_pairs(
 
 
 def _samples_inputs(config: WorkspaceConfig) -> Any:
+    crosswalk, ancestry, relatedness, *reference = _each(
+        _file_digest, [config.crosswalk, config.ancestry, config.relatedness, *([] if config.imputation_reference_ids is None else [config.imputation_reference_ids])],
+    )
     return {
         "chromosomes": config.chromosomes,
         "halves": [
-            (half.label, half.batches, [genotype_file_fingerprint(half.path(chromosome, batch)) for chromosome in config.chromosomes for batch in half.batches])
+            (half.label, half.batches, _each(genotype_file_fingerprint, [half.path(chromosome, batch) for chromosome in config.chromosomes for batch in half.batches]))
             for half in config.imputed_halves
         ],
-        "truth": None if config.truth_calls is None else [genotype_file_fingerprint(config.truth_path(chromosome)) for chromosome in config.chromosomes],
-        "imputation_reference_ids": None if config.imputation_reference_ids is None else _file_digest(config.imputation_reference_ids),
-        "crosswalk": (_file_digest(config.crosswalk), config.crosswalk_columns),
-        "ancestry": _file_digest(config.ancestry),
-        "relatedness": (_file_digest(config.relatedness), config.relatedness_columns),
+        "truth": None if config.truth_calls is None else _each(genotype_file_fingerprint, [config.truth_path(chromosome) for chromosome in config.chromosomes]),
+        "imputation_reference_ids": reference[0] if reference else None,
+        "crosswalk": (crosswalk, config.crosswalk_columns),
+        "ancestry": ancestry,
+        "relatedness": (relatedness, config.relatedness_columns),
         "folds": (config.fold_count, config.seed),
     }
 
@@ -2142,20 +2196,21 @@ def _convert_chromosome(
 
 def _store_inputs(config: WorkspaceConfig) -> Any:
     popped = config.popped
+    tandem_repeats, gene_annotation = _each(_file_digest, [config.tandem_repeats, config.gene_annotation])
     return {
         "input": "plain" if popped is None else "popped",
         "genome_build": config.genome_build,
         "chromosomes": config.chromosomes,
         "halves": [
-            (half.label, half.batches, [genotype_file_fingerprint(half.path(chromosome, batch)) for chromosome in config.chromosomes for batch in half.batches])
+            (half.label, half.batches, _each(genotype_file_fingerprint, [half.path(chromosome, batch) for chromosome in config.chromosomes for batch in half.batches]))
             for half in config.imputed_halves
         ],
-        "truth": None if config.truth_calls is None else [genotype_file_fingerprint(config.truth_path(chromosome)) for chromosome in config.chromosomes],
-        "strata": None if popped is None else [_file_digest(strata_manifest(popped.strata_directory, chromosome)) for chromosome in config.chromosomes],
-        "bubble_split": None if popped is None else [genotype_file_fingerprint(popped.bubble_split_path(chromosome)) for chromosome in config.chromosomes],
-        "genetic_map": None if config.genetic_map is None else [_file_digest(config.genetic_map_path(chromosome)) for chromosome in config.chromosomes],
-        "tandem_repeats": _file_digest(config.tandem_repeats),
-        "gene_annotation": _file_digest(config.gene_annotation),
+        "truth": None if config.truth_calls is None else _each(genotype_file_fingerprint, [config.truth_path(chromosome) for chromosome in config.chromosomes]),
+        "strata": None if popped is None else _each(_file_digest, [strata_manifest(popped.strata_directory, chromosome) for chromosome in config.chromosomes]),
+        "bubble_split": None if popped is None else _each(genotype_file_fingerprint, [popped.bubble_split_path(chromosome) for chromosome in config.chromosomes]),
+        "genetic_map": None if config.genetic_map is None else _each(_file_digest, [config.genetic_map_path(chromosome) for chromosome in config.chromosomes]),
+        "tandem_repeats": tandem_repeats,
+        "gene_annotation": gene_annotation,
         "codec": config.codec,
         "samples": _store_sample_layout(config),
     }
@@ -2883,11 +2938,9 @@ def _direct_sv_inputs(config: WorkspaceConfig) -> Any:
         return {"direct_sv": None}
     if config.direct_sv.gatksv_calls is None:
         return {"gatksv_calls": None}
+    paths = [config.direct_sv.gatksv_path(chromosome) for chromosome in config.chromosomes]
     return {
-        "gatksv_calls": [
-            (config.direct_sv.gatksv_path(chromosome).name, genotype_file_fingerprint(config.direct_sv.gatksv_path(chromosome)))
-            for chromosome in config.chromosomes
-        ],
+        "gatksv_calls": [(path.name, fingerprint) for path, fingerprint in zip(paths, _each(genotype_file_fingerprint, paths))],
         "codec": config.codec,
         "genome_build": config.genome_build,
     }
@@ -3360,6 +3413,9 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     The arms run in ARMS order, each whole before the next, so a run its budget stops (``launcher/workspace``: each
     job's runtime is bounded) holds the first arm's every trait before the second begins; the comparison of the arms
     needs both. After each arm the log gives the hours its fit took and the step's projected total."""
+    from sv_pgs.phase_timer import timing
+
+    opened = time.perf_counter()
     cohort = _read_cohort(run)
     # The measurement model reaches the fit as the records' log reliabilities (its scales already rewrote the store's
     # dosages in the measurement step). The fit has no term for its residual variances or its leakage maps, and none for
@@ -3368,7 +3424,12 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     records: dict[str, dict[str, Any]] = {arm: {} for arm in ARMS}
     fitted_seconds: list[float] = []
     trait_model_names = {trait: tuple(cohort.model_names[model] for model in cohort.trait_models(trait)) for trait in range(len(cohort.trait_names))}
+    loaded = time.perf_counter()
     with DosageStore.open(_final_store(run)) as store:
+        # The fit's setup before Stage 0, in the progress log's timing lines (``phase_timer``): the cohort, the
+        # measurement model and the store's variant table here, each arm's filters and request below; the store's
+        # digest has its own line (``content_identity.tree_digest``).
+        timing("fit_open", time.perf_counter() - opened, load=loaded - opened)
         others = []
         for position, arm in enumerate(ARMS):
             targets = [directory / "models" / arm / trait_name for trait_name in cohort.trait_names]
@@ -3383,6 +3444,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                 work.mkdir(parents=True, exist_ok=True)
                 unsaved = [trait for trait in unrecorded if not targets[trait].is_dir()]
                 if unsaved:
+                    filtering = time.perf_counter()
                     kept = fit_filtered(
                         store.variant_table, store.n_samples, measurement.log_reliability, run.config.fit_minimum_minor_allele_frequency, run.config.fit_minimum_r2,
                         run.config.fit_variant_sites, run.config.fit_region,
@@ -3391,6 +3453,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                         cohort, store, arm_log_reliability(store.variant_table, kept, arm), run.budget, work, run.config.seed,
                         run.config.disease_likelihood, run.config.annotated_prior, run.config.length_by_class, run.config.ld_score_prior,
                     )
+                    timing("fit_filter", time.perf_counter() - filtering)
                     LOGGER.info("workspace pipeline: fitting %s: %d models of %d traits", arm, len(request.model_names), len(cohort.trait_names))
                     started = time.perf_counter()
                     fitted = run.bindings.fit(request)

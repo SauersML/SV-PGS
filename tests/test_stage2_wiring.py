@@ -6,6 +6,7 @@ store reproduces the fitted model's in-sample predictor. Accuracy comes from ben
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import weakref
 from pathlib import Path
@@ -345,6 +346,30 @@ def test_the_candidate_prefilter_keeps_every_record_stage0_keeps(tmp_path: Path)
     )
     assert set(np.asarray(statistics.active_rows).tolist()) <= set(candidates.tolist())
     assert candidates.shape[0] < records
+
+
+def test_the_unit_contract_labels_every_record_with_one_of_two_shared_strings() -> None:
+    """store_measurement's raw units are each record's label, as the per-record strings were, held as references to two
+    strings: the prior's schema digest reads the same labels."""
+    from sv_pgs.config import VariantClass
+    from sv_pgs.dosage_store import VARIANT_CLASSES
+    from sv_pgs.stage2_wiring import _prior_schema_digest, store_measurement
+
+    classes = np.array([VARIANT_CLASSES.index(VariantClass.SNV), VARIANT_CLASSES.index(VariantClass.COPY_NUMBER)] * 3, dtype=np.uint8)
+    store = SimpleNamespace(
+        n_variants=classes.shape[0],
+        variant_table=SimpleNamespace(variant_class=classes, codes_per_unit=np.full(classes.shape[0], 127, dtype=np.uint8), annotations={}),
+    )
+    measurement = store_measurement(store, np.log(np.linspace(1.0, 0.5, classes.shape[0])))
+    copy_number = classes == VARIANT_CLASSES.index(VariantClass.COPY_NUMBER)
+    per_record = np.where(copy_number, "copy", "ALT allele").astype(object)
+    assert measurement.raw_unit.dtype == object and measurement.raw_unit.tolist() == per_record.tolist()
+    assert len({id(label) for label in measurement.raw_unit}) == 2
+    rows = np.array([0, 1, 4], dtype=np.int64)
+    schema = {"nodes": np.zeros(3), "floor": np.zeros(1), "top": np.zeros(1), "class_index": np.zeros(3, dtype=np.int64), "offsets": np.zeros(3), "rows": rows}
+    assert _prior_schema_digest(**schema, measurement=measurement) == _prior_schema_digest(
+        **schema, measurement=dataclasses.replace(measurement, raw_unit=per_record),
+    )
 
 
 def test_models_with_the_same_rows_covariates_and_likelihood_form_one_group() -> None:
