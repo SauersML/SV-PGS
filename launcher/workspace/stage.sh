@@ -39,10 +39,9 @@ uv python install 3.12
 (cd "$work/source" && UV_PROJECT_ENVIRONMENT="$work/venv" uv sync --frozen --extra gpu --python 3.12)
 cp "$config" "$work/run_config.json"
 destination="gs://${OPS_BUCKET}/svpgs/${RUN_ID}"
-# each part removed before its copy, so a restage at a later commit leaves no file of the earlier one behind
-# uv, Python and the cache go as one tarball (env.tar), which a job reads in one stream: copied file by file over the
-# bucket mount, the cache took over 20 minutes.
+# One tarball, which a job reads in one stream rather than file by file over the bucket mount.
 tar -C "$work" -cf "$work/env.tar" bin python uv-cache
+# Each part is removed before its copy, so a restage at a later commit leaves no file of the earlier one behind.
 for part in source bin python uv-cache; do
   if gcloud storage ls "$destination/$part" > /dev/null 2>&1; then gcloud storage rm -r "$destination/$part"; fi
 done

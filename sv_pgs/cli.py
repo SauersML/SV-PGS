@@ -26,10 +26,7 @@ from sv_pgs.workspace_pipeline import ARMS, STEP_NAMES, WorkspaceConfig, run_pip
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sv-pgs")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser(
-        "list-all-of-us-diseases",
-        help="List built-in All of Us disease presets.",
-    )
+    subparsers.add_parser("list-all-of-us-diseases", help="List built-in All of Us disease presets.")
 
     aou_parser = subparsers.add_parser(
         "prepare-all-of-us-disease",
@@ -43,10 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     aou_parser.add_argument("--output", required=True, help="Output TSV path for the prepared sample table.")
 
-    subparsers.add_parser(
-        "list-all-of-us-traits",
-        help="List built-in All of Us quantitative traits (EHR labs and physical measurements).",
-    )
+    subparsers.add_parser("list-all-of-us-traits", help="List built-in All of Us quantitative traits (EHR labs and physical measurements).")
 
     aou_trait_parser = subparsers.add_parser(
         "prepare-all-of-us-trait",
@@ -164,21 +158,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    subparsers.add_parser(
-        "version",
-        help="Print sv-pgs package version and git commit sha.",
-    )
-
+    subparsers.add_parser("version", help="Print sv-pgs package version and git commit sha.")
     return parser
 
 
 def _resolve_version_info() -> tuple[str, str]:
-    """The installed package version and the source checkout's commit.
-
-    Either is "unknown" when it does not exist: a source tree that was never
-    installed has no package metadata, and an installed wheel has no git
-    checkout (or no git on PATH) beside it.
-    """
+    """The installed package version and the source checkout's commit, each "unknown" where there is none: a source
+    tree never installed has no package metadata, and an installed wheel no git checkout (or no git on PATH) beside it."""
     try:
         pkg_ver = package_version("sv-pgs")
     except PackageNotFoundError:
@@ -255,21 +241,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print("census\t" + str(prepare_all_of_us_measurement_census(Path(args.output))))
         return 0
 
-    if args.command == "prepare-all-of-us-trait":
-        prepared_outputs = prepare_all_of_us_measurement_sample_table(
-            trait=args.trait,
-            output_path=Path(args.output),
-        )
-        print("sample_table\t" + str(prepared_outputs.sample_table_path))
-        print("sql\t" + str(prepared_outputs.sql_path))
-        print("metadata\t" + str(prepared_outputs.metadata_path))
-        return 0
-
-    if args.command == "prepare-all-of-us-disease":
-        prepared_outputs = prepare_all_of_us_disease_sample_table(
-            disease=args.disease,
-            output_path=Path(args.output),
-        )
+    if args.command in ("prepare-all-of-us-trait", "prepare-all-of-us-disease"):
+        if args.command == "prepare-all-of-us-trait":
+            prepared_outputs = prepare_all_of_us_measurement_sample_table(trait=args.trait, output_path=Path(args.output))
+        else:
+            prepared_outputs = prepare_all_of_us_disease_sample_table(disease=args.disease, output_path=Path(args.output))
         print("sample_table\t" + str(prepared_outputs.sample_table_path))
         print("sql\t" + str(prepared_outputs.sql_path))
         print("metadata\t" + str(prepared_outputs.metadata_path))
@@ -287,10 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         return _main_impl(argv)
     except KeyboardInterrupt as exc:
         detail = str(exc).strip()
-        if detail:
-            sys.stderr.write(f"[sv-pgs] interrupted: {detail}\n")
-        else:
-            sys.stderr.write("[sv-pgs] interrupted\n")
+        sys.stderr.write(f"[sv-pgs] interrupted{': ' + detail if detail else ''}\n")
         sys.stderr.flush()
         return 130
 

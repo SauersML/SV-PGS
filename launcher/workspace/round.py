@@ -6,14 +6,11 @@ anything (it stages, writes, copies and submits); without it the command only re
     python3 launcher/workspace/round.py ROUND.json --execute
     python3 launcher/workspace/round.py ROUND.json --follow [--execute] [--watch MINUTES]
 
-A round was launched by hand-written scripts, run by run: each run's source copied on its own (one at a time, since
-copies run at once left short trees), its completed steps copied, its config written and a job submitted per arm, with
-a watcher merging each trait's two arms. This does the same from one spec (ROUND.json, below) and prints first what it
-will do: the runs, the steps each takes from its base run and the ones its job makes, the jobs with each one's
-environment, the minutes of each phase of a job on a timeline (the round's budget, today's, the owners' projections or
-a measured one), the round's wall clock, its dollars (launcher/workspace/round_cost.py's projection against today's
-layout where the module is there, else spend.py's prices times the minutes), and the checks it made and will make
-before it submits anything. A check marked FAIL stops --execute before it changes anything.
+From one spec (ROUND.json, below) it prints first what it will do: the runs, the steps each takes from its base run
+and the ones its job makes, the jobs with each one's environment, the minutes of each phase of a job on a timeline (the
+round's budget, today's, the owners' projections or a measured one), the round's wall clock, its dollars
+(launcher/workspace/round_cost.py's projection against today's layout), and the checks it made and will make before it
+submits anything. A check marked FAIL stops --execute before it changes anything.
 
 What a round uses:
 - One staged source, svpgs/_rounds/<round>/ in the ops bucket: the commit's tree (git archive), the digests of its
@@ -46,15 +43,15 @@ What a round uses:
 
 LAYOUTS: arm_jobs, one run per trait and arm (FIT_ARMS); trait_jobs, one run per trait whose one VM fits both arms at
 once (PARALLEL_ARMS=1, one GPU each); arm_vms, one store job (submit.sh store) that makes the cohort of every trait and
-its steps up to the fit once, then one run per arm whose VM fits every trait (ag-share's: cross_fit false, the compact
-fit store and the arm pass, each where the commit's driver has it), its groups in turn until a fit calls
+its steps up to the fit once, then one run per arm whose VM fits every trait (cross_fit false, the compact fit store
+and the arm pass, each where the commit's driver has it), its groups in turn until a fit calls
 device_sweep's 11-trait sweep. A trait's two arms (arm_jobs), or the round's (arm_vms), come together in one of two
 ways, by what the commit's task knows:
-- with PARTNER_RUN (ag-score's), each arm's job scores its own arm and the later of the two finishes the run on its VM,
+- with PARTNER_RUN, each arm's job scores its own arm and the later of the two finishes the run on its VM,
   minutes after its fit: no merge VM, restore or digest. A merge job on CPUs (submit.sh merge) is submitted by --follow
   only where both fit jobs have ended, neither run holds the round's last step and each holds its arm's handoff, in
   the run that got further;
-- without it, as the hand-launched rounds did: once both fit jobs have SUCCEEDED with one fit key, --follow copies the
+- without it: once both fit jobs have SUCCEEDED with one fit key, --follow copies the
   other arm's models into one run's fit partial and submits that run on the merge slot (a merge job: its restore,
   digest, both arms' scoring and the report).
 --follow also submits arm_vms' fit jobs once its store job has SUCCEEDED; with --watch it looks again every so many
@@ -97,22 +94,16 @@ import time
 from pathlib import Path
 
 try:
-    from launcher.workspace import spend
+    from launcher.workspace import round_cost, spend
 except ImportError:  # run as a script, from its own directory
+    import round_cost
     import spend
-try:
-    from launcher.workspace import round_cost
-except ImportError:
-    try:
-        import round_cost
-    except ImportError:  # ag-cost's projection is not in this checkout: spend.py's prices times the minutes
-        round_cost = None
 
 HERE = Path(__file__).resolve().parent
 ARMS = ("snv_indel", "with_sv")
 """workspace_pipeline.ARMS."""
 ARM_DIGITS = {"snv_indel": "1", "with_sv": "2"}
-"""A run's arm in its RUN_ID, as the hand-launched rounds named them (aou-wl1, aou-wl2)."""
+"""A run's arm in its RUN_ID (aou-wl1, aou-wl2)."""
 STEPS = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv", "fit", "score", "effects", "report", "export")
 """workspace_pipeline.STEP_NAMES (tests/test_round.py checks they agree)."""
 UPSTREAM = {
@@ -126,8 +117,8 @@ CONFIG_OVERRIDES = (
     "fit_region", "fit_regions", "export", "compact_fit_store", "warm_start_models",
 )
 """The run config's keys a round may set apart from its base runs' without moving a step before the fit's key: the
-fit's and the export's own, which no step before the fit reads (compact_fit_store keys only ag-share's fit_store step,
-after direct_sv; warm_start_models, saved-model patterns such as "/mnt/disks/ops/svpgs/<earlier run>/run/fit/models/
+fit's and the export's own, which no step before the fit reads (compact_fit_store keys only the fit_store step, after
+direct_sv; warm_start_models, saved-model patterns such as "/mnt/disks/ops/svpgs/<earlier run>/run/fit/models/
 {arm}/{trait}", starts each arm's empirical Bayes from an earlier round's model, warm_seeds: set here, it replaces the
 patterns of the traits' warm_from runs and goes unchecked). A key the commit's driver does not name fails the plan."""
 WARM_PATTERN = "{run}/run/fit*/models/{{arm}}/{{trait}}"
@@ -137,10 +128,9 @@ its own."""
 MEAN_FIELD = "product_mixture"
 """The draw law of a saved mean-field model, the only kind ``_warm_seeds`` starts a fit from (model.json's draw_laws)."""
 ARM_VMS_CONFIG = {"cross_fit": False, "compact_fit_store": True, "arm_pass": True}
-"""An arm_vms run's config apart from its traits' bases (ag-share's layout): one fold split for every trait, the fit on
-the compact fit store and every trait's groups in one pass (ag-sweep's arm_pass). A key the commit's driver does not
-name is left out, with a warning. cross_fit moves the cohort's key, which the store job makes anew for the union of
-the traits anyway."""
+"""An arm_vms run's config apart from its traits' bases: one fold split for every trait, the fit on the compact fit
+store and every trait's groups in one pass (arm_pass). A key the commit's driver does not name is left out, with a
+warning. cross_fit moves the cohort's key, which the store job makes anew for the union of the traits anyway."""
 SHARED_FIELDS = (
     "chromosomes", "imputed_halves", "truth_calls", "imputation_reference_ids", "crosswalk", "crosswalk_columns", "ancestry",
     "relatedness", "relatedness_columns", "fold_count", "seed", "genome_build", "strata_directory", "bubble_split",
@@ -166,29 +156,26 @@ LOCAL_SSD_GB = 375
 UV_EXTRAS = "--extra gpu"
 """A fit job's extras, which key its shared runtime (run_step.sh.template); a CPU job has none."""
 ONE_GPU = {"machine_type": "a2-highgpu-1g", "gpu_type": "nvidia-tesla-a100", "gpu_count": 1, "run_disk_type": "local-ssd", "run_disk_gb": 4 * LOCAL_SSD_GB}
-"""A fit job's shape by default (ag-cost's one-GPU layout, the lead's choice for the next round): every logged arm's
-resident codes, 16.6-29.6 GB [real], fit one A100-40 beside the fit's own ~4 GB, and the fused sweep is one serial
-chain that a second device only shards. Four local SSDs hold an arm of the whole 547 GB store (~830-880 GB); two will
-do once the compact fit store is on."""
+"""A fit job's shape by default (round_cost's one-GPU layout): every logged arm's resident codes, 16.6-29.6 GB [real],
+fit one A100-40 beside the fit's own ~4 GB, and the fused sweep is one serial chain that a second device only shards.
+Four local SSDs hold an arm of the whole 547 GB store (~830-880 GB); two will do once the compact fit store is on."""
 TWO_GPU = dict(ONE_GPU, machine_type="a2-highgpu-2g", gpu_count=2)
 """Every arm's shape but the canaries' while canaries are named: the live rounds' machine, on the same disks; and
 trait_jobs' default, one GPU an arm."""
 ARM_VM = {"machine_type": "a2-ultragpu-1g", "gpu_type": "nvidia-a100-80gb", "gpu_count": 1, "run_disk_type": "pd-balanced", "run_disk_gb": 3500}
-"""arm_vms' default (ag-share's): the arm pass holds ~47-53 GB of every trait's codes, one A100-80; every trait's LD
-store and band at once, 11 x ~240-267 GB [real per trait], need ~3.5 TB of disk, pd-balanced (whose throughput grows
-with its size) since how Batch mounts this machine's bundled local SSD is undocumented."""
+"""arm_vms' default: the arm pass holds ~47-53 GB of every trait's codes, one A100-80; every trait's LD store and band
+at once, 11 x ~240-267 GB [real per trait], need ~3.5 TB of disk, pd-balanced (whose throughput grows with its size)
+since how Batch mounts this machine's bundled local SSD is undocumented."""
 CPU_MERGE = {"machine_type": "n2d-standard-16", "run_disk_type": "pd-balanced", "run_disk_gb": 200}
 """A merge job's shape with PARTNER_RUN (submit.sh merge, on the store job's CPU template): it restores no store, only
 what finishing reads (the steps' records, the cohort and both arms' parts), so a small disk; 16 vCPUs for the report
 is a choice, not a measurement."""
-GPU_TYPES = {"a2-highgpu": "nvidia-tesla-a100", "a2-ultragpu": "nvidia-a100-80gb"}
-"""Each A2 family's GPU, for a spec that names its machine but not the GPU."""
 STORE_DISK = {"run_disk_type": "pd-balanced", "run_disk_gb": 2000}
 """arm_vms' store job's disk: the AoU rounds' run disk [real], which held the store and the steps that rewrite it
-(ag-share: direct_sv's 547 GB store, the fit store's copy and measurement's outputs)."""
+(direct_sv's 547 GB store, the fit store's copy and measurement's outputs)."""
 STORE_MACHINE = "n2d-highmem-32"
-"""arm_vms' store job's machine by default (ag-share's, priced by ag-cost: the fit store's pass, one streamed CPU read
-of direct_sv's store and a 20-53 GB write, ~30 min there). Its high memory is for the measurement and direct_sv steps
+"""arm_vms' store job's machine by default (the fit store's pass, one streamed CPU read of direct_sv's store and a
+20-53 GB write, ~30 min there). Its high memory is for the measurement and direct_sv steps
 the job makes again for the 11-trait cohort, whose minutes on it nobody has measured."""
 
 PHASES = (
@@ -201,38 +188,32 @@ PHASES = (
     ("eb", "empirical Bayes", "ag-sweep, ag-eb, ag-curv, ag-prior, ag-recover"),
     ("score", "the job's scoring and effects of its own arm", "ag-score"),
 )
-"""A fit job's phases in order: (name, what, the agents whose patches set its minutes; ag-prof's S/eta_table.txt)."""
+"""A fit job's phases in order: (name, what, the owners of its minutes, shown beside them)."""
 MERGE = ("merge", "a merge job, its start to every report", "ag-score, ag-live")
 FINISH = ("finish", "the later arm's job finishing the run on its VM", "ag-score")
 PREEMPTION = ("preemption", "what one preemption of the slowest job adds", "ag-restart, ag-resume")
 PER_TRAIT = ("fit_setup", "stage0", "band_fill", "eb", "score")
 """The phases a run of every trait (arm_vms) goes through once a trait, in turn."""
 TIMELINES = {
-    # [real] Minutes (low, high) from the whole-genome rounds before and the live one (eta_budget.txt and ag-prof's
-    # eta_table.txt v3, 2026-10-20): queue, boot and environment ~10; restore 17 (547 GB on pd-balanced); the store's
-    # digest 12; set-up ~5; Stage 0 43-50 earlier, 65-73 live; band 9-14, moment starts 25+ and fill ~20; EB 1-5 h;
-    # scoring in the merge job, 1-1.5 h with its own restore and digest; a preemption restarts the arm (~1.5 h). No job
-    # of today's scores its own arm or finishes the run, so score and finish are ag-score's estimates (projected's),
-    # which count only where the commit's jobs do (PARTNER_RUN).
+    # [real] The whole-genome rounds' minutes: restore 17 is 547 GB on pd-balanced; Stage 0 43-50 earlier, 65-73 in
+    # the live round; band 9-14, moment starts 25+ and fill ~20; scoring in the merge job, with its own restore and
+    # digest; a preemption restarts the arm. No job of today's scores its own arm or finishes the run, so score and
+    # finish are projected's, which count only where the commit's jobs do (PARTNER_RUN).
     "today": {
         "start": (10, 10), "restore": (17, 17), "store_digest": (12, 12), "fit_setup": (5, 5), "stage0": (43, 73),
         "band_fill": (54, 59), "eb": (60, 300), "score": (4, 10), "merge": (60, 90), "finish": (3, 4), "preemption": (90, 90),
     },
-    # The round's budget (eta_budget.txt; eta_table.txt v3's budget column), slowest arm: start 5, restore 8, digest 0,
-    # set-up 1, Stage 0 8, band to fill 10, EB 75, score and report 15 (with PARTNER_RUN each arm scores its own
-    # held-out rows in its job, 10 here, and the later one finishes the run in 5; without it a merge job of 15 does
-    # both), a preemption 10.
+    # The round's budget for its slowest arm. Score and report take 15: with PARTNER_RUN each arm scores its own held-out
+    # rows in its job (10) and the later one finishes the run (5); without it a merge job of 15 does both.
     "budget": {
         "start": (5, 5), "restore": (8, 8), "store_digest": (0, 0), "fit_setup": (1, 1), "stage0": (8, 8),
         "band_fill": (10, 10), "eb": (75, 75), "score": (10, 10), "merge": (15, 15), "finish": (5, 5), "preemption": (10, 10),
     },
-    # The owners' projections, estimates not run on a GPU or on Batch (eta_table.txt v3): start 6-9.5; restore 6.5-8.5
-    # (the whole store, local SSD); digest 0 (restore receipts, not on main); set-up 0.5-5 (ag-setup: 0.5-1 once its
-    # identity calls run at once, today's 5 if they do not); Stage 0 2.5-4 on local SSD; band 0.2 and fill 0-20 (20
-    # without ag-fill's tee or the compact store); EB 2-28; with PARTNER_RUN, the arm's own scoring 3-8 and effects 1-2
-    # on the whole store in its job, then 3-4 to push, adopt the other arm's parts, finish and push again (ag-score's);
-    # without it, scoring in the merge job, 23-26 on local SSD and 35-40 on pd-balanced (ag-live's merge); a preemption
-    # 16.5-24.
+    # The owners' projections, not run on a GPU or on Batch: restore 6.5-8.5 is the whole store on local SSD; digest 0
+    # with restore receipts; set-up 0.5 with the identity calls run at once, 5 without; band 0.2 and fill 0-20 (20
+    # without the Stage 0 tee or the compact store); with PARTNER_RUN, the arm's own scoring 3-8 and effects 1-2 in its
+    # job, then 3-4 to push, adopt the other arm's parts, finish and push again; without it, a merge job of 23-26 on
+    # local SSD and 35-40 on pd-balanced.
     "projected": {
         "start": (6, 9.5), "restore": (6.5, 8.5), "store_digest": (0, 0), "fit_setup": (0.5, 5), "stage0": (2.5, 4),
         "band_fill": (0.2, 20.2), "eb": (2, 28), "score": (4, 10), "merge": (23, 40), "finish": (3, 4), "preemption": (16.5, 24),
@@ -338,7 +319,7 @@ def read_spec(raw: dict) -> dict:
     spec.setdefault("machine_type", default["machine_type"])
     if isinstance(spec["machine_type"], str):
         spec.setdefault("gpu_count", _gpus(spec["machine_type"], default["gpu_count"]))
-        spec.setdefault("gpu_type", GPU_TYPES.get(spec["machine_type"].rsplit("-", 1)[0], default["gpu_type"]))
+        spec.setdefault("gpu_type", round_cost.GPU_TYPE.get(spec["machine_type"].rsplit("-", 1)[0], default["gpu_type"]))
     for key in SHAPE_KEYS:
         spec.setdefault(key, default[key])
     _shape(spec, "the round")
@@ -967,6 +948,7 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
             plan.jobs.append(_job(run_id, spec["fit_slot"], "fit", environment, after=[plan.store["name"]]))
             continue
         base = traits[0]["base_run"]
+        known = all(trait["base_run"] in bases for trait in traits)
         wanted = list(spec["reuse_steps"])
         if len(traits) > 1:
             # A run of several traits has its own phenotypes and every step after them: no trait's base holds them.
@@ -992,16 +974,14 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
                     downloaded[source] = cloud.download(source, plan.work / "bases" / str(len(downloaded)))
                     plan.check(downloaded[source] is not None, f"source: svpgs/{source}, {holder}'s, read whole")
             # Which phenotype queries the run makes follows from which of its lists are empty (step_code.left_out).
-            lists = run_config(bases, run_id, traits, spec, None) if base in bases and all(trait["base_run"] in bases for trait in traits) else None
+            lists = run_config(bases, run_id, traits, spec, None) if known else None
             lists = None if lists is None else {key: lists.get(key) or [] for key in ("diseases", "traits")}
+            listed_as = json.dumps(lists)
             for source in {sources.get(holder) for holder in held.values()}:
                 tree = downloaded.get(source)
-                if tree is not None and (source, json.dumps(lists)) not in trees:
-                    trees[source, json.dumps(lists)] = same_code(commit, tree, lists)
-            verdicts = {}
-            for step, holder in held.items():
-                verdict = trees.get((sources.get(holder), json.dumps(lists)))
-                verdicts[step] = None if not verdict else verdict.get(step)
+                if tree is not None and (source, listed_as) not in trees:
+                    trees[source, listed_as] = same_code(commit, tree, lists)
+            verdicts = {step: (trees.get((sources.get(holder), listed_as)) or {}).get(step) for step, holder in held.items()}
             code = {step: verdict for step, verdict in verdicts.items() if verdict is not None}
             taken, made = reusable(wanted, set(held), code)
             made.update({step: "the run's own traits" for step in spec["reuse_steps"] if step not in wanted})
@@ -1018,7 +998,7 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
             if unchecked:
                 plan.check(False, f"{run_id}: the code of {', '.join(unchecked)} is unchecked against the base's source "
                            "(sv_pgs differs and the commit has no launcher/workspace/step_codes.py)")
-        config = run_config(bases, run_id, traits, spec, accept_from, warm) if base in bases and all(trait["base_run"] in bases for trait in traits) else None
+        config = run_config(bases, run_id, traits, spec, accept_from, warm) if known else None
         if config is not None and run_id == store_id:
             config.update(arm_keys)
         if run_id == store_id:
@@ -1080,23 +1060,14 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
 
 
 def projection(plan: Plan) -> dict:
-    """The round's minutes and dollars on the plan's timeline: a fit job's phases (every job at the slowest arm's
-    minutes, so the dollars are an upper bound), what follows the slowest arm (its in-job finish, a merge job, or
-    nothing), the wall clock without and with one preemption, and the VM and disk dollars of every job but arm_vms'
-    store job, which no timeline has minutes for."""
+    """The round's minutes on the plan's timeline: a fit job's phases at the slowest arm's minutes, what follows the
+    slowest arm (its in-job finish, a merge job, or nothing), and the wall clock without and with one preemption."""
     rows = fit_rows(plan.timeline, plan.spec, plan.arms_in_turn, plan.partner)
     job = (sum(row[1] for row in rows), sum(row[2] for row in rows))
     after = plan.timeline[FINISH[0]] if plan.finishes else plan.timeline[MERGE[0]] if plan.merges else (0, 0)
     preemption = plan.timeline[PREEMPTION[0]]
-    fit_usd = tuple(sum(entry["rate"] * minutes / 60 for entry in plan.jobs) for minutes in job)
-    merging = [entry["finisher"] for entry in plan.finishes] or plan.merges
-    merge_usd = tuple(sum(entry["rate"] * minutes / 60 for entry in merging) for minutes in after)
     wall = (job[0] + after[0], job[1] + after[1])
-    return {
-        "rows": rows, "job": job, "merge": after, "preemption": preemption, "wall": wall,
-        "wall_preempted": (wall[0] + preemption[0], wall[1] + preemption[1]),
-        "fit_usd": fit_usd, "merge_usd": merge_usd, "usd": (fit_usd[0] + merge_usd[0], fit_usd[1] + merge_usd[1]),
-    }
+    return {"rows": rows, "job": job, "merge": after, "wall": wall, "wall_preempted": (wall[0] + preemption[0], wall[1] + preemption[1])}
 
 
 def _cost(name: str, environment: dict, phases: dict, extra: dict) -> tuple:
@@ -1104,7 +1075,7 @@ def _cost(name: str, environment: dict, phases: dict, extra: dict) -> tuple:
 
 
 def cost_jobs(plan: Plan) -> list:
-    """Each job for ag-cost's round_cost.from_planner: (name, machine, provisioning model, disk type, disk GB, {phase:
+    """Each job for round_cost.from_planner: (name, machine, provisioning model, disk type, disk GB, {phase:
     (low, high) minutes}, {"trait", "kind", "after"}). A trait's in-job finish is a merge of its own, minutes on the
     dearer of its arms' machines after both (round_cost.layout_one_gpu's). arm_vms' store job has no minutes on any
     timeline and is left out, and so are the CPU merge jobs, submitted only where no arm's job finished its run."""
@@ -1139,16 +1110,10 @@ def _digits(pair) -> int:
 def dollars(plan: Plan) -> list:
     """The round's dollars: round_cost.py's projection at the high end of each phase (its expected preemptions, $ by
     phase, and per arm, merge, trait and round against today's layout for the same traits with the target of a fifth),
-    with the low end's round; spend.py's prices times the minutes where round_cost.py is not in this checkout."""
-    spec = plan.spec
-    if round_cost is None:
-        projected = projection(plan)
-        return [f"dollars, VM and disk at spend.py's {spec['provisioning_model']} prices, every job at the slowest arm's minutes, no preemption: "
-                f"fit jobs {_span(projected['fit_usd'])}" + (f", merges {_span(projected['merge_usd'])}" if plan.merges or plan.finishes else "")
-                + f"; round {_span(projected['usd'])} (launcher/workspace/round_cost.py is not here)"]
+    with the low end's round."""
     listed, per_hour = cost_jobs(plan), round_cost.PREEMPTIONS_PER_HOUR
     high, low = (round_cost.project(round_cost.from_planner(listed, end), per_hour) for end in (1, 0))
-    today = round_cost.project(round_cost.layout_today([trait["name"] for trait in spec["traits"]], round_cost.MINUTES["today"]), per_hour)
+    today = round_cost.project(round_cost.layout_today([trait["name"] for trait in plan.spec["traits"]], round_cost.MINUTES["today"]), per_hour)
     return [f"dollars (launcher/workspace/round_cost.py, every job at the high end of each phase; at the low end the round is ${low['usd']:.2f}):",
             *("  " + line if line else "" for line in round_cost.report(high, per_hour, today).splitlines())]
 
@@ -1328,7 +1293,7 @@ def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str)
       models are copied into its run's fit partial (each model's files, then its record);
     - a CPU merge job with PARTNER_RUN only where both fit jobs have ended, neither run holds the round's last step (the
       later arm's job finished neither) and each holds its arm's handoff (effects.partial's handoff.json, written last).
-      Its RUN_ID is the run that got further (ag-score's rule): one whose fit is complete or that holds both arms'
+      Its RUN_ID is the run that got further: one whose fit is complete or that holds both arms'
       handoffs pushed its adoption, so the merge finishes in it, its partner's models being gone from a completed fit's
       partial; otherwise the plan's order.
     Returns what still waits, with why."""

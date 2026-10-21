@@ -3,8 +3,8 @@ gcloud over a local directory, never a cloud account: the plan of an 11-trait ro
 and dollars, which steps each run takes from its base and why the others are its job's, each arm's warm or cold start
 and why, that a dry run changes nothing, that --execute stages once and checks it, copies a step's record last and submits each job with the round's
 settings, the shapes (one GPU by default, canaries), the merges with and without PARTNER_RUN and arm_vms' store job
-(--follow), the dollars through ag-cost's round_cost where it is there, and a job built from a round's staging that
-checks its copy of the source."""
+(--follow), the dollars through round_cost, and a job built from a round's staging that checks its copy of the
+source."""
 from __future__ import annotations
 
 import ast
@@ -20,7 +20,6 @@ from pathlib import Path
 import pytest
 
 from launcher.workspace import round as planner
-from launcher.workspace import spend
 from sv_pgs import workspace_pipeline
 from tests.test_study_budget import _UV, _fake_cloud
 
@@ -248,10 +247,9 @@ def test_a_spec_takes_the_round_s_defaults_and_refuses_what_would_move_a_key_or_
             planner.read_spec(_spec("abc1234", **changes))
 
 
-def test_the_eleven_trait_round_on_each_timeline_with_its_minutes_and_dollars(tmp_path, capsys) -> None:
+def test_the_eleven_trait_round_on_each_timeline_with_its_minutes(tmp_path, capsys) -> None:
     """Offline (no bucket read): 22 runs and jobs and 11 merge jobs (the fixture's task has no PARTNER_RUN), every job
-    with the round's settings, the budget's minutes inside the 150-minute goal and today's not, and the dollars at
-    spend.py's prices."""
+    with the round's settings, and the budget's minutes inside the 150-minute goal and today's not."""
     repository, commit = _repository(tmp_path / "repo")
     (tmp_path / "round.json").write_text(json.dumps(_spec(commit)))
     plans = {}
@@ -273,9 +271,6 @@ def test_the_eleven_trait_round_on_each_timeline_with_its_minutes_and_dollars(tm
     # goal of 150, 132 preempted once.
     assert plans["budget"]["job"] == (107, 107) and plans["budget"]["wall"] == (122, 122) and plans["budget"]["wall_preempted"] == (132, 132)
     assert plans["today"]["wall"] == (261, 566) and plans["today"]["wall"][0] > planner.TARGET_MINUTES
-    rate = spend.MACHINE_USD_PER_HOUR["a2-highgpu-2g"][1] + spend.DISK_USD_PER_GIB_MONTH["local-ssd"][1] * 1500 / spend.HOURS_PER_MONTH
-    assert plans["budget"]["usd"] == pytest.approx(((22 * 107 + 11 * 15) * rate / 60,) * 2)
-    assert plans["today"]["usd"] == pytest.approx(((22 * 201 + 11 * 60) * rate / 60, (22 * 476 + 11 * 90) * rate / 60))
     assert planner.main([str(tmp_path / "round.json"), "--offline", "--repository", str(repository), "--timeline", "today"]) == 0
     shown = capsys.readouterr().out
     assert "goal 150: not met" in shown and "over its budget of 75" in shown and "svpgs-aou-r7-l1-train-1" in shown
@@ -409,15 +404,10 @@ def test_arm_vms_submits_its_store_job_first_and_its_fit_jobs_after_it(tmp_path,
     assert (fake / "commands.log").read_text().split() == ["store", "fit", "fit"]
 
 
-def test_the_dollars_come_from_round_cost_where_it_is_there(tmp_path, monkeypatch) -> None:
-    """ag-cost's round_cost.py prices the plan's jobs (cost_jobs) against today's layout where it is in the checkout;
-    without it the plan prices the minutes at spend.py's rates."""
+def test_the_dollars_come_from_round_cost(tmp_path) -> None:
+    """round_cost.py prices the plan's jobs (cost_jobs) against today's layout."""
     repository, commit = _repository(tmp_path / "repo", partner=True)
     plan = planner.build(planner.read_spec(_spec(commit)), *planner.read_timeline("budget"), None, repository)
-    monkeypatch.setattr(planner, "round_cost", None)
-    assert "round_cost.py is not here" in "\n".join(planner.dollars(plan))
-    round_cost = pytest.importorskip("launcher.workspace.round_cost")
-    monkeypatch.setattr(planner, "round_cost", round_cost)
     shown = "\n".join(planner.dollars(plan))
     assert "launcher/workspace/round_cost.py" in shown and "svpgs-aou-r7-l1-finish" in shown and "today $" in shown
 

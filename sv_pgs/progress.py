@@ -46,10 +46,9 @@ def log(message: str) -> None:
 
 
 def sample_quiet_stacks(seconds: float) -> threading.Event:
-    """Whenever ``seconds`` pass with no progress line, log where the main thread is: its stack's frames in this
-    package, innermost first, and the innermost frame wherever it is. A silent stretch then shows what ran, a sampling
-    profile at that period: the AoU disease fits went twenty minutes between lines, and a whole-genome measurement step
-    an hour, with no sign of what they did. Setting the returned event stops the sampling."""
+    """Whenever ``seconds`` pass with no progress line, log where the main thread is (its frames in this package,
+    innermost first, and the innermost frame wherever it is), so a silent stretch shows what ran. Setting the returned
+    event stops the sampling."""
     main, stop = threading.main_thread().ident, threading.Event()
 
     def watch() -> None:

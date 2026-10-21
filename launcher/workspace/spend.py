@@ -165,20 +165,13 @@ def job_hours(job: dict, now: datetime.datetime) -> tuple[float, str]:
 
 
 def task_hours(tasks: list[dict], now: datetime.datetime) -> float:
-    """Every task's spans on a VM: from each assignment to the attempt's end, and to now for a task still on one."""
+    """Every task's spans on a VM (attempts_of), to now for a task still on one."""
     total = 0.0
     for task in tasks:
-        status = task.get("status", {})
-        start = None
-        for event in sorted(status.get("statusEvents", []), key=lambda event: moment(event["eventTime"])):
-            state = event.get("taskState")
-            if state in ON_VM:
-                start = start or moment(event["eventTime"])
-            elif state is not None and start is not None:
-                total += hours_between(start, moment(event["eventTime"]))
-                start = None
-        if start is not None and status.get("state") in ON_VM:
-            total += hours_between(start, now)
+        still = task.get("status", {}).get("state") in ON_VM
+        for assigned, _running, ended, _code in attempts_of(task):
+            if ended is not None or still:
+                total += hours_between(assigned, ended or now)
     return total
 
 
@@ -200,7 +193,7 @@ def markers_of(lines: list[str]) -> dict[str, list[tuple[datetime.datetime, str]
 
 def attempts_of(task: dict) -> list[tuple[datetime.datetime, datetime.datetime | None, datetime.datetime | None, int | None]]:
     """A task's attempts on a VM, as (assigned, running, ended, exit code): from its assignment to a VM to the first
-    state off one (task_hours' spans), with None for what Batch has not reported yet."""
+    state off one, with None for what Batch has not reported yet."""
     spans = []
     assigned = running = None
     for event in sorted(task.get("status", {}).get("statusEvents", []), key=lambda event: moment(event["eventTime"])):

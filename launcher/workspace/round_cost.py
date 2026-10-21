@@ -88,7 +88,7 @@ today [real]: per arm, boot and environment ~10 (an estimate, unmeasured), resto
 (key checks 4.9, store open and wiring 0.4), Stage 0 43-50 (53-73 projected in the live round), band 9-14 + moment starts
 25+ + fill ~20, and EB 1-5 h (2 h here). A merge job per trait runs 1-1.5 h: its own restore and digest, then scoring
 both arms.
-one-gpu, the owners' estimates for the next round (scratchpad eta_table.txt), none measured on a GPU yet:
+one-gpu, the owners' estimates, none measured on a GPU yet:
 - start 5-9.5 (SHARED_RUNTIME);
 - restore 0.6-1.6 of the 20-53 GB compact store, digest 0 with restore receipts (0.4-1.2 without);
 - set-up 0.5-1 with the identity calls run concurrently;
@@ -175,10 +175,9 @@ def _job(name, trait, kind, machine, disk, minutes, *, after=(), resumable=False
 
 def layout_today(traits: list[str], minutes: dict) -> list[dict]:
     jobs = []
-    disk = TODAY_DISK
     for trait in traits:
-        arms = [_job(f"{trait}-{arm}", trait, "fit", "a2-highgpu-2g", disk, minutes["fit"]) for arm in ARMS]
-        merge = _job(f"{trait}-merge", trait, "merge", "a2-highgpu-2g", disk, minutes["merge"], after=[job["name"] for job in arms])
+        arms = [_job(f"{trait}-{arm}", trait, "fit", "a2-highgpu-2g", TODAY_DISK, minutes["fit"]) for arm in ARMS]
+        merge = _job(f"{trait}-merge", trait, "merge", "a2-highgpu-2g", TODAY_DISK, minutes["merge"], after=[job["name"] for job in arms])
         jobs += [*arms, merge]
     return jobs
 
@@ -318,7 +317,7 @@ def submit_environment(jobs: list[dict]) -> str:
 
 def minutes_of(layout: str, changes: list[str]) -> dict:
     """The layout's MINUTES with each phase=minutes change applied to every job kind that has the phase."""
-    minutes = json.loads(json.dumps(MINUTES[layout]))
+    minutes = {kind: dict(phases) for kind, phases in MINUTES[layout].items()}
     for change in changes:
         phase, _, value = change.partition("=")
         found = [kind for kind in minutes if phase in minutes[kind]]
