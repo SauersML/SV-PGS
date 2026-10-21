@@ -49,7 +49,7 @@ from sv_pgs.config import TraitType
 from sv_pgs.compute_budget import detect_compute_budget
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.workspace_pipeline import (
-    COMPLETE_FILE, STEP_NAMES, WorkspaceConfig, _cases_text, _final_measurement_model, _final_store, _fold_weighted, _partial_r2, _read_cohort,
+    COMPLETE_FILE, STEP_NAMES, WorkspaceConfig, _cases_text, _final_measurement_model, _final_store, _fold_weighted, _partial_r2, _fit_cohort,
     _Run, _shown, arm_log_reliability, fit_filtered, workspace_bindings, write_baseline_scores,
 )
 
@@ -243,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     config = WorkspaceConfig.read(args.config)
     run = _Run(config, workspace_bindings(), detect_compute_budget(), {})
     units = None if args.units is None else FoldUnits(pathlib.Path(args.units), run_identity(run))
-    cohort = _read_cohort(run)
+    cohort = _fit_cohort(run)
     measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
     lines = []
     if args.baselines is not None:

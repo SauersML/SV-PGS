@@ -1328,6 +1328,103 @@ def test_the_prior_switches_reach_every_fit_call(workspace):
             WorkspaceConfig.from_mapping({**synthetic.raw, key: 1})
 
 
+def test_warm_start_models_key_the_fit_and_seed_it_only_where_a_saved_model_matches(workspace):
+    """``warm_start_models`` is a list of saved-model patterns, in the fit step's key: a run given them after its fit
+    completed fits again (a start elsewhere can end at another mode), and a request is seeded only where a pattern finds
+    a saved model (``test_warm_seeds`` fits from real ones); a run without them keeps its fit key as it was."""
+    synthetic, client = workspace
+    for wrong in ("fit/models/{arm}/{trait}", [""], [7]):
+        with pytest.raises(ValueError, match="warm_start_models"):
+            WorkspaceConfig.from_mapping({**synthetic.raw, "warm_start_models": wrong})
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    assert config.warm_start_models == ()
+    steps = {step.name: step for step in workspace_pipeline._STEPS}
+    assert all(not isinstance(value, tuple) or value[:1] != ("warm_start_models",) for value in steps["fit"].inputs(config))
+    recorder = _Recorder()
+    run_pipeline(config, _bindings(recorder, client), BUDGET, through="fit")
+    assert recorder.fit_calls and all(getattr(call, "seeds", None) is None for call in recorder.fit_calls)
+    pattern = str(config.run_directory.parent / "earlier" / "fit" / "models" / "{arm}" / "{trait}")
+    seeded = WorkspaceConfig.from_mapping({**synthetic.raw, "warm_start_models": [pattern]})
+    assert seeded.warm_start_models == (pattern,) and steps["fit"].inputs(seeded) != steps["fit"].inputs(config)
+    assert all(steps[name].inputs(seeded) == steps[name].inputs(config) for name in STEP_NAMES[:STEP_NAMES.index("fit")])
+    again = _Recorder()
+    run_pipeline(seeded, _bindings(again, client), BUDGET, through="fit")
+    assert again.fit_calls and all(getattr(call, "seeds", None) is None for call in again.fit_calls)
+    assert any(path.name.startswith("fit.superseded-") for path in config.run_directory.iterdir())
+
+
+def _earlier_tree(tmp_path: Path) -> Path:
+    """A copy of this source tree that keys its steps before the fit by the earlier formula, the source of the code it
+    lists (here its roots' names, each listed string standing as its own source)."""
+    tree = tmp_path / "earlier"
+    shutil.copytree(workspace_pipeline.SOURCE_TREE / "sv_pgs", tree / "sv_pgs", ignore=shutil.ignore_patterns("__pycache__"))
+    pipeline = tree / "sv_pgs" / "workspace_pipeline.py"
+    text = pipeline.read_text()
+    listed = "        digest.update(inspect.getsource(item).encode())"
+    assert text.count(listed) == 1
+    pipeline.write_text(text.replace(listed, "        digest.update((item if isinstance(item, str) else inspect.getsource(item)).encode())"))
+    return tree
+
+
+def test_steps_kept_under_the_earlier_key_formula_where_their_tree_made_them_from_these_inputs_and_code(workspace, tmp_path: Path) -> None:
+    """accept_steps_from: a run whose steps before the fit hold the earlier formula's keys keeps each one the named tree
+    made from this run's inputs and whose code is this tree's by today's formula, in step order; it makes again a step
+    whose code moved and every step after it. The records stay as they are, so the run's next job decides the same.
+    A tree that cannot be read stops the run before anything is set aside."""
+    synthetic, client = workspace
+    run_pipeline(WorkspaceConfig.from_mapping(synthetic.raw), _bindings(_Recorder(), client), BUDGET, through="direct_sv")
+    tree = _earlier_tree(tmp_path)
+    with pytest.raises(ValueError, match="accept_steps_from"):
+        WorkspaceConfig.from_mapping({**synthetic.raw, "accept_steps_from": ""})
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "accept_steps_from": str(tree)})
+    run, before = config.run_directory, STEP_NAMES[:STEP_NAMES.index("fit")]
+    steps = {step.name: step for step in workspace_pipeline._STEPS}
+    assert all(steps[name].inputs(config) == steps[name].inputs(WorkspaceConfig.from_mapping(synthetic.raw)) for name in STEP_NAMES)
+    # The records as the earlier tree wrote them: its own keys, from these inputs.
+    keyed = workspace_pipeline._Run(config, _bindings(_Recorder(), client), BUDGET, {})
+    keyed.inputs.update({name: steps[name].inputs(config) for name in before})
+    earlier = workspace_pipeline._earlier(keyed)
+    for name in before:
+        record = json.loads((run / name / COMPLETE_FILE).read_text())
+        key = workspace_pipeline._earlier_key(keyed, name, earlier)
+        assert key is not None and key != record["key"]
+        (run / name / COMPLETE_FILE).write_text(json.dumps({**record, "key": key}))
+    written = {name: (run / name / COMPLETE_FILE).read_text() for name in before}
+
+    def events() -> set[str]:
+        found = {path.name.split("_", 1)[1] for path in config.marker_directory.iterdir()}
+        shutil.rmtree(config.marker_directory)
+        return found
+
+    events()
+    recorder = _Recorder()
+    run_pipeline(config, _bindings(recorder, client), BUDGET, through="fit")
+    assert {f"{name}_accepted" for name in before} <= events() and recorder.fit_calls
+    assert {name: (run / name / COMPLETE_FILE).read_text() for name in before} == written
+    assert not any(".superseded-" in path.name for path in run.iterdir())
+    # The next job keeps them again and finds the fit made on their keys.
+    again = _Recorder()
+    run_pipeline(config, _bindings(again, client), BUDGET, through="fit")
+    assert not again.fit_calls and "fit_skipped" in events()
+    # The earlier tree's cohort step runs other code: it and the steps after it are made again, the others kept.
+    path = tree / "sv_pgs" / "workspace_pipeline.py"
+    first = "def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:\n    config = run.config\n"
+    assert path.read_text().count(first) == 1
+    path.write_text(path.read_text().replace(first, first + "    config = config\n"))
+    run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="direct_sv")
+    found = events()
+    assert {"samples_accepted", "store_accepted", "phenotypes_accepted", "cohort_completed", "measurement_completed", "direct_sv_completed"} <= found
+    assert {name: (run / name / COMPLETE_FILE).read_text() for name in ("samples", "store", "phenotypes")} == {
+        name: written[name] for name in ("samples", "store", "phenotypes")
+    }
+    assert {path.name.split(".superseded-")[0] for path in run.iterdir() if ".superseded-" in path.name} == {"cohort", "measurement", "direct_sv"}
+    # A tree the driver cannot read: the run stops, and the kept steps stay where they are.
+    missing = WorkspaceConfig.from_mapping({**synthetic.raw, "accept_steps_from": str(tmp_path / "absent")})
+    with pytest.raises(RuntimeError, match="cannot read"):
+        run_pipeline(missing, _bindings(_Recorder(), client), BUDGET, through="direct_sv")
+    assert (run / "samples" / COMPLETE_FILE).read_text() == written["samples"]
+
+
 def test_frozen_probability_calibration_uses_only_reserved_development_families(workspace):
     from sv_pgs.probability_calibration import FrozenCalibration
     synthetic, client = workspace
@@ -2206,7 +2303,7 @@ def test_empty_held_out_folds_keep_named_report_rows_and_do_not_enter_the_panel(
     directory.mkdir()
     panel = workspace_pipeline.PanelInputs(0, tuple((name, 1.0) for name in cohort.trait_names))
     run.config = dataclasses.replace(config, panel=panel)
-    with patch.object(workspace_pipeline, "_read_cohort", return_value=cohort):
+    with patch.object(workspace_pipeline, "_fit_cohort", return_value=cohort):
         summary = workspace_pipeline._report_step(run, directory)
     assert summary["panel"]["left_out"] == list(cohort.trait_names)
     with (directory / "accuracy.tsv").open() as handle:
@@ -2306,7 +2403,7 @@ def test_a_validation_split_tests_another_fold_and_reuses_every_step_before_the_
     # The cohort step's masks are the final split's; every step after the ones before the fit reads the validation split.
     stored = np.load(run / "cohort" / "cohort.npz")
     np.testing.assert_array_equal(stored["held_out"], np.isfinite(stored["targets"]) & (stored["folds"] == 0)[:, None])
-    cohort = workspace_pipeline._read_cohort(workspace_pipeline._Run(config, _bindings(_Recorder(), client), BUDGET, {}))
+    cohort = workspace_pipeline._fit_cohort(workspace_pipeline._Run(config, _bindings(_Recorder(), client), BUDGET, {}))
     assert not np.any(cohort.training & np.isin(cohort.folds, (0, 1))[:, None]) and np.any(cohort.training)
     np.testing.assert_array_equal(cohort.held_out, np.isfinite(cohort.targets)[:, cohort.model_traits] & (cohort.folds == 1)[:, None])
     assert cohort.model_names == tuple(f"{cohort.trait_names[trait]}/fold1" for trait in cohort.model_traits.tolist())
@@ -2320,7 +2417,7 @@ def test_a_validation_split_tests_another_fold_and_reuses_every_step_before_the_
     }
     check_exportable(run / "effects" / "locus_variance.tsv")
     # The final split reuses every step before the fit and refits.
-    reused = [step for step in workspace_pipeline.GENOTYPE_STEPS if (run / step / "_COMPLETE.json").is_file()]
+    reused = [step for step in STEP_NAMES[:STEP_NAMES.index("fit")] if (run / step / "_COMPLETE.json").is_file()]
     assert {"store", "cohort", "measurement"} <= set(reused)
     before = {step: _completed_at(run, step) for step in reused}
     recorder = _Recorder()

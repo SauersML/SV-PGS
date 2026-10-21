@@ -65,6 +65,7 @@ import ast
 import csv
 import dataclasses
 from dataclasses import dataclass
+import glob
 import gzip
 import hashlib
 import importlib
@@ -76,6 +77,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
+import sys
+import tempfile
 import time
 from types import ModuleType
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -87,18 +91,9 @@ from scipy import special, stats
 
 from sv_pgs import (
     all_of_us,
-    cohort as cohort_module,
-    dosage_store,
     fit_model,
-    gatksv_store_rows,
     held_out_comparison,
-    measurement_model,
-    phenotype_measurement,
     probability_calibration,
-    sample_crosswalk,
-    scale_mixture_ep,
-    store_converter,
-    variant_typing,
 )
 from sv_pgs._typing import BoolArray, F64Array, I64Array, NDArray, U8Array
 from sv_pgs.all_of_us import (
@@ -124,7 +119,7 @@ from sv_pgs.cohort import (
     read_predicted_ancestry,
     resolve_cohort_rows,
 )
-from sv_pgs.artifact import CERTIFICATE_STATUS, cohort_digest, model_part, model_subset
+from sv_pgs.artifact import CERTIFICATE_STATUS, cohort_digest, model_part, model_subset, sites_digest
 from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.draw_laws import tile_rows
@@ -184,6 +179,8 @@ from sv_pgs.sv_fusion import MINIMUM_SIZE_RATIO, SvSites, candidate_pairs, seque
 from sv_pgs.variant_typing import COMMUNITY_SV_MINIMUM_LENGTH, alt_is_symbolic_or_breakend, is_sequence_allele, variant_class_and_length
 from sv_pgs.fit_checkpoint import checkpoint_timings
 from sv_pgs.restart_store import RestartStore
+from sv_pgs.step_code import STEP_ROOTS, UNKEYED_MODULES, code_digests, left_out
+from sv_pgs.warm_seeds import Seed, read_seeds
 
 LOGGER = logging.getLogger(__name__)
 
@@ -208,6 +205,8 @@ the fit step aside keeps its Stage 0, band, codes, EB starts and completed model
 KEY_FILE = "_KEY"
 EXPORTABLE_FILE = "_EXPORTABLE.json"
 REGIONS_DIRECTORY = "regions"
+SOURCE_TREE = Path(__file__).resolve().parent.parent
+"""The source tree this driver runs, the directory holding sv_pgs, which keys the steps before the fit (``step_code``)."""
 """The run directory's directory of its regions' runs (``WorkspaceConfig.fit_regions``), one directory each by name."""
 REGION_NAME = re.compile(r"[a-z0-9_]+")
 """A fit region's name, which names its directory (and its mirror's): lowercase letters, digits and underscores."""
@@ -465,6 +464,20 @@ class WorkspaceConfig:
     """A curated panel of genome windows (benchmarks/bench_real/locus_panel.json's format: its ``loci``, each with a
     ``name``, ``kind``, store ``chromosome``, first and last position and the ``traits`` it bears on), whose genetic
     variance the effects step reports per trait, arm and class (``locus_variance``), or None for none."""
+    warm_start_models: tuple[str, ...] = ()
+    """Where earlier fits' saved models are (``warm_seeds``): path patterns (``glob``) over ``{arm}`` and ``{trait}``, such as
+    "/mnt/disks/ops/svpgs/*/run/fit*/models/{arm}/{trait}" for every run in the ops bucket's mirror (``run_mirror``: a
+    completed fit's models and a partial's saved ones); a pattern naming an arm in place of ``{arm}`` seeds every arm
+    from that one. Each fitted model starts its empirical Bayes from the best of them (``_warm_seeds``) instead of the
+    prior's moment start; none keeps the cold start. The patterns are in the fit step's key, since an empirical Bayes
+    started elsewhere can end at another of the evidence's modes. A pattern naming an earlier round's runs (their
+    RUN_IDs in place of the ``*``) matches models that no longer change, so a preempted fit's restart starts from the
+    model its first start did."""
+    accept_steps_from: str | None = None
+    """A source tree (a staged one, such as /mnt/disks/ops/svpgs/<run>/source on a job's ops mount) whose completed
+    steps before the fit this run may keep although their records hold keys of the earlier key formula, which listed
+    whole modules (``_accepted``). Such a step is kept where that tree made it from this run's inputs and runs the same
+    code by today's formula (``step_code``). It is in no key."""
 
     @classmethod
     def read(cls, path: str | Path) -> WorkspaceConfig:
@@ -475,7 +488,8 @@ class WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
         unknown = sorted(set(raw) - set(CONFIG_KEYS) - {
             "genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "length_by_class", "ld_score_prior", "panel", "cross_fit",
-            "fit_variant_sites", "fit_region", "fit_regions", "test_fold", "locus_panel", "baseline_directory", *_FIT_FILTER_KEYS,
+            "fit_variant_sites", "fit_region", "fit_regions", "test_fold", "locus_panel", "baseline_directory", "warm_start_models",
+            "accept_steps_from", *_FIT_FILTER_KEYS,
         })
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
@@ -508,6 +522,11 @@ class WorkspaceConfig:
             # Some fold besides the reserved and the test fold trains.
             if not 0 <= test_fold < raw["fold_count"] or test_fold == reserved or raw["fold_count"] <= len({reserved, test_fold}):
                 raise ValueError(f"test_fold must be a fold in [0, fold_count) other than the reserved test fold {reserved}, with fold_count >= 3 so some fold trains.")
+        patterns = raw.get("warm_start_models", [])
+        if not isinstance(patterns, list) or any(not isinstance(pattern, str) or not pattern for pattern in patterns):
+            raise ValueError("warm_start_models must be a list of saved-model path patterns over {arm} and {trait}")
+        if raw.get("accept_steps_from") is not None and (not isinstance(raw["accept_steps_from"], str) or not raw["accept_steps_from"]):
+            raise ValueError("accept_steps_from must be a source tree's path or null")
         for key, minimum in (("fold_count", 2), ("seed", 0)):
             value = raw[key]
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
@@ -602,6 +621,8 @@ class WorkspaceConfig:
             test_fold=None if test_fold is None else int(test_fold),
             locus_panel=raw.get("locus_panel"),
             baseline_directory=None if raw.get("baseline_directory") is None else Path(raw["baseline_directory"]),
+            warm_start_models=tuple(raw.get("warm_start_models", [])),
+            accept_steps_from=raw.get("accept_steps_from"),
         )
 
     def region_runs(self) -> tuple[tuple[str, WorkspaceConfig], ...]:
@@ -784,13 +805,14 @@ def _fit_window(window: Any, chromosomes: set[int], key: str) -> tuple[int, int,
 def module_closure(*roots: ModuleType) -> tuple[ModuleType, ...]:
     """The ``roots`` and every ``sv_pgs`` module they import, transitively, in name order: the package code a step
     that runs the roots executes, read from their import statements (function-level ones included), and none it does
-    not. A step keyed by the whole package refitted every model on an edit to the report or a docstring; a step keyed
-    by its own functions alone reused a fit across a change to the engine underneath."""
+    not, ``step_code.UNKEYED_MODULES`` (the log) left out. A step keyed by the whole package refitted every model on an
+    edit to the report or a docstring; a step keyed by its own functions alone reused a fit across a change to the
+    engine underneath."""
     found: dict[str, ModuleType] = {}
     pending = list(roots)
     while pending:
         module = pending.pop()
-        if module.__name__ in found:
+        if module.__name__ in found or module.__name__ in UNKEYED_MODULES:
             continue
         found[module.__name__] = module
         for node in ast.walk(ast.parse(inspect.getsource(module))):
@@ -865,8 +887,14 @@ class _Run:
     """The chromosomes this run's store step converts, or None for every one (``run_pipeline``'s ``store_shard``)."""
     fit_arms: tuple[str, ...] | None = None
     """The arms this run's fit step fits, or None for every one (``run_pipeline``'s ``fit_arms``)."""
-    step: str | None = None
-    """The step running now (``_run_step``), which decides the cohort it reads (``_read_cohort``); None outside one."""
+    inputs: dict[str, Any] = dataclasses.field(default_factory=dict)
+    """Each step's inputs as this run keyed it (``_Step.inputs``), by name."""
+    kept: set[str] = dataclasses.field(default_factory=set)
+    """The steps this run kept as it found them (skipped or accepted), not made again."""
+    codes: dict[str, str] | None = None
+    """This source tree's code digest of each step before the fit (``step_code.code_digests``), once read."""
+    earlier: dict[str, Any] | None = None
+    """What ``_accepted`` reads of ``accept_steps_from``'s tree, once read (``_earlier``)."""
 
     def output(self, step: str) -> Path:
         return self.config.run_directory / step
@@ -887,7 +915,120 @@ class _Step:
     upstream: tuple[str, ...]
     inputs: Callable[[WorkspaceConfig], Any]
     code: tuple[Any, ...]
+    """The code the step runs: for a step before the fit, its roots (``step_code.STEP_ROOTS``), whose reach keys it;
+    for the fit and the steps after it, its functions and modules, whose source keys it (``_source_digest``)."""
     body: Callable[[_Run, Path], dict[str, Any]]
+    definitions: bool = False
+    """Whether the step reads the run's trait definitions, which key it in the tables' place (``_definition_entries``)."""
+
+
+def _definition_entries(definitions: ModuleType, diseases: Sequence[str], traits: Sequence[str]) -> list[str]:
+    """The trait definitions a run's phenotypes step reads from ``definitions`` (``all_of_us``'s tables, which no key
+    holds whole, ``step_code.UNKEYED_TABLES``): each disease's, the lab measurements its criteria name, and each
+    trait's, as their reprs. The same function reads an earlier tree's (``_earlier``)."""
+    resolved = [definitions.resolve_disease_definition(name) for name in diseases]
+    named = [definitions.resolve_lab_criterion_measurement(criterion) for definition in resolved for criterion in definition.lab_criteria]
+    return [repr(definition) for definition in [*resolved, *named, *(definitions.resolve_measurement_definition(name) for name in traits)]]
+
+
+def _step_code(run: _Run, step: _Step) -> str:
+    """The code part of ``step``'s key: for a step before the fit, the digest of what its roots reach in this source
+    tree (``step_code``) with the trait definitions it reads; else its listed code's source (``_source_digest``)."""
+    if step.name not in STEP_ROOTS:
+        return _source_digest(step.code)
+    if run.codes is None:
+        run.codes = code_digests(SOURCE_TREE, STEP_ROOTS, left_out(_list_config(run.config)))
+    return _digest([run.codes[step.name], _definition_entries(all_of_us, run.config.diseases, run.config.traits) if step.definitions else None])
+
+
+def _list_config(config: WorkspaceConfig) -> dict[str, list[str]]:
+    """The config's lists ``step_code.left_out`` reads, as a run config spells them."""
+    return {"diseases": list(config.diseases), "traits": list(config.traits)}
+
+
+_EARLIER = """
+from __future__ import annotations
+import json
+import sys
+from sv_pgs import all_of_us, workspace_pipeline as pipeline
+{entries}
+steps = {{}}
+for step in pipeline._STEPS:
+    try:
+        code = pipeline._source_digest(step.code)
+    except (TypeError, OSError):
+        code = None
+    steps[step.name] = {{"upstream": list(step.upstream), "code": code}}
+lists = json.loads(sys.argv[1])
+print(json.dumps({{"file": pipeline.__file__, "steps": steps, "entries": _definition_entries(all_of_us, lists["diseases"], lists["traits"])}}))
+"""
+
+
+def _earlier(run: _Run) -> dict[str, Any]:
+    """What ``_accepted`` reads of the tree ``accept_steps_from`` names: each of its steps' upstream names and code
+    digest under the formula it keys by (``_source_digest`` of its listed code; None where that is not its formula),
+    the trait definitions it holds for this run (``_definition_entries``) and its code digest of each step before
+    the fit by today's formula (``step_code``). The first three come from a Python process that imports that tree's
+    sv_pgs, writing no bytecode and keeping numba's cache in a directory removed afterwards. A tree that cannot be read
+    stops the run before any step is set aside: a run told to keep an earlier tree's steps never makes them again
+    unasked."""
+    if run.earlier is None:
+        tree = Path(run.config.accept_steps_from or "")
+        script = _EARLIER.format(entries=inspect.getsource(_definition_entries))
+        try:
+            with tempfile.TemporaryDirectory() as scratch:
+                environment = {**os.environ, "PYTHONPATH": str(tree), "PYTHONDONTWRITEBYTECODE": "1", "NUMBA_CACHE_DIR": scratch}
+                shown = subprocess.run(
+                    [sys.executable, "-c", script, json.dumps(_list_config(run.config))], cwd=scratch, env=environment, capture_output=True,
+                    check=True, text=True,
+                )
+            read = json.loads(shown.stdout.strip().splitlines()[-1])
+            if not Path(read["file"]).resolve().is_relative_to(tree.resolve()):
+                raise ValueError(f"its import found another sv_pgs, {read['file']}")
+            read["codes"] = code_digests(tree, STEP_ROOTS, left_out(_list_config(run.config)))
+        except (OSError, ValueError, KeyError, IndexError, LookupError, SyntaxError, subprocess.CalledProcessError) as error:
+            detail = getattr(error, "stderr", None) or ""
+            raise RuntimeError(f"accept_steps_from names {tree}, which this driver cannot read: {error} {detail[-2000:]}".strip()) from error
+        run.earlier = read
+    return run.earlier
+
+
+def _earlier_key(run: _Run, name: str, earlier: dict[str, Any]) -> str | None:
+    """The key the earlier tree gave ``name``'s step from this run's inputs, by its own formula and its own steps'
+    upstream; None where it cannot be told (a step it lacks or does not key by its listed code, or one this run did not
+    key)."""
+    step = earlier["steps"].get(name)
+    if step is None or step["code"] is None or name not in run.inputs:
+        return None
+    upstream = {}
+    for before in step["upstream"]:
+        upstream[before] = _earlier_key(run, before, earlier)
+        if upstream[before] is None:
+            return None
+    return _digest({"step": name, "inputs": run.inputs[name], "upstream": upstream, "code": step["code"]})
+
+
+def _accepted(run: _Run, step: _Step, record: dict[str, Any]) -> bool:
+    """Whether a completed step whose record holds another key is kept as this run's. Only a step before the fit
+    qualifies, with ``accept_steps_from`` set and every step it follows kept by this run, where:
+    - the earlier tree made it from this run's inputs: its key there (``_earlier_key``) is the record's;
+    - its code there is this tree's by today's formula (``step_code``, the trait definitions it reads included).
+    The earlier formula keyed a step by whole modules, so the live whole-genome runs' phenotypes, cohort, measurement
+    and direct_sv steps took other keys for an edit to another trait's definition or to ``progress``, which none of
+    them runs. The record is left as it is, as the base run's mirror holds it (``run_mirror``'s BASE_RUN), so each job
+    of the run decides again, from the same tree, the same way."""
+    if run.config.accept_steps_from is None or step.name not in STEP_ROOTS or not set(step.upstream) <= run.kept:
+        return False
+    earlier = _earlier(run)
+    if _earlier_key(run, step.name, earlier) != record["key"]:
+        LOGGER.info("workspace pipeline: %s was not made by %s from this run's inputs", step.name, run.config.accept_steps_from)
+        return False
+    code = _digest([earlier["codes"][step.name], earlier["entries"] if step.definitions else None])
+    if code != _step_code(run, step):
+        LOGGER.info("workspace pipeline: %s runs other code in %s than here", step.name, run.config.accept_steps_from)
+        return False
+    LOGGER.info("workspace pipeline: %s, made by %s from these inputs and this code, is kept", step.name, run.config.accept_steps_from)
+    return True
 
 
 def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
@@ -896,12 +1037,13 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
     # Every run keys every step, a completed one too, so a resumed run's start pays each step's input identities
     # (``_each``): ``timing: <step>_key`` gives what each one cost.
     started = time.perf_counter()
+    run.inputs[step.name] = step.inputs(run.config)
     key = _digest(
         {
             "step": step.name,
-            "inputs": step.inputs(run.config),
+            "inputs": run.inputs[step.name],
             "upstream": {name: run.keys[name] for name in step.upstream},
-            "code": _source_digest(step.code),
+            "code": _step_code(run, step),
         }
     )
     timing(f"{step.name}_key", time.perf_counter() - started)
@@ -909,11 +1051,13 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
     final = root / step.name
     if (final / COMPLETE_FILE).is_file():
         record = json.loads((final / COMPLETE_FILE).read_text(encoding="utf-8"))
-        if record["key"] == key:
+        kept = "skipped" if record["key"] == key else "accepted" if _accepted(run, step, record) else None
+        if kept is not None:
             # A completed fit was checked when its partial was finalized (below); checking it again here would load
             # every saved model on each later pass, which a resumed score or effects step must not do.
             run.keys[step.name] = key
-            _mark(run.config, step.name, "skipped")
+            run.kept.add(step.name)
+            _mark(run.config, step.name, kept)
             return dict(record["summary"])
         _set_aside(final, record["key"])
     elif final.exists():
@@ -926,7 +1070,6 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
     partial.mkdir(parents=True, exist_ok=True)
     (partial / KEY_FILE).write_text(key, encoding="utf-8")
     _mark(run.config, step.name, "started")
-    run.step = step.name
     try:
         if step.name == "fit":
             _check_fit_records(run, partial, key)
@@ -941,8 +1084,6 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
     except BaseException as error:
         _mark(run.config, step.name, f"failed-{type(error).__name__}")
         raise
-    finally:
-        run.step = None
     _write_json(partial / COMPLETE_FILE, {"key": key, "summary": summary, "finished": _utc()})
     os.rename(partial, final)
     run.keys[step.name] = key
@@ -1346,11 +1487,6 @@ class _Cohort:
         return tuple(sorted(int(fold) for fold in self.model_folds[self.model_traits == trait] if fold < fold_count))
 
 
-GENOTYPE_STEPS = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv")
-"""The steps before the fit, which read the cohort step's own masks (``_read_cohort``): measurement and direct SV read
-only its fit rows' genotypes, never a label, so a validation split (``WorkspaceConfig.test_fold``) reuses them."""
-
-
 def _split_cohort(cohort: _Cohort, config: WorkspaceConfig) -> _Cohort:
     """The cohort as a validation split reads it (``WorkspaceConfig.test_fold``): each trait's one model trains on its
     observed rows outside the test fold and the reserved fold, less its disease's calibration families drawn as the cohort
@@ -1370,14 +1506,16 @@ def _split_cohort(cohort: _Cohort, config: WorkspaceConfig) -> _Cohort:
     )
 
 
+def _fit_cohort(run: _Run) -> _Cohort:
+    """The cohort as the fit and every step after it read it, and a baseline method reading a finished run: a
+    validation split's (``_split_cohort``)."""
+    return _split_cohort(_read_cohort(run), run.config)
+
+
 def _read_cohort(run: _Run) -> _Cohort:
-    """The cohort step's cohort, as the running step reads it: a validation split's (``_split_cohort``) in every step
-    after GENOTYPE_STEPS and outside the driver (a baseline method reading a finished run)."""
-    cohort = _read_cohort_step(run)
-    return cohort if run.step in GENOTYPE_STEPS else _split_cohort(cohort, run.config)
-
-
-def _read_cohort_step(run: _Run) -> _Cohort:
+    """The cohort step's cohort with its own masks, the final split's, which the steps before the fit read: measurement
+    and direct SV read only its fit rows' genotypes, never a label, so a validation split (``WorkspaceConfig.test_fold``)
+    reuses them. Its code is the one the earlier whole-genome runs' steps ran, which keeps them (``_accepted``)."""
     directory = run.output("cohort")
     arrays = np.load(directory / "cohort.npz")
     record = json.loads((directory / "cohort.json").read_text(encoding="utf-8"))
@@ -3334,7 +3472,7 @@ def _check_fit_records(run: _Run, directory: Path, key: str) -> None:
     This validation belongs to the driver boundary, outside _fit_step's source digest: a post-fit validation fix
     does not change a fitted coefficient. The fit's existing key still checks every engine and input dependency.
     """
-    cohort = _read_cohort(run)
+    cohort = _fit_cohort(run)
     expected_offsets, expected_problem = None, None
     for arm in ARMS:
         root = directory / "models" / arm
@@ -3402,6 +3540,70 @@ def _check_fit_records(run: _Run, directory: Path, key: str) -> None:
             del fitted
 
 
+def _seed_rank(metadata: Mapping[str, Any], problem: str, offsets: str, modified: float) -> tuple:
+    """A saved model's rank as a seed (``_warm_seeds``), best last: the same records' reliabilities (the same arm and
+    filters), the same fitting problem, an accepted fit, then the newer."""
+    provenance = metadata["provenance"]
+    return (
+        provenance["offset_digest"] == offsets, provenance["problem_digest"] == problem,
+        bool(metadata.get("acceptance", {}).get("accepted", False)), modified,
+    )
+
+
+def _request_problem(request: FitRequest) -> str:
+    """The training-problem digest ``fit_model.fit`` gives ``request``'s fitted model (``artifact.Provenance``)."""
+    return fit_model.problem_digest(
+        research_ids=request.research_ids, store_columns=request.store_columns, model_names=request.model_names, trait_types=request.trait_types,
+        covariate_names=request.covariate_names, covariate_columns=request.covariate_columns, covariates=request.covariates, targets=request.targets,
+        training=request.training, draw_count=fit_model.DRAW_COUNT, seed=request.seed,
+    )
+
+
+def _warm_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequest, arm: str) -> tuple[Seed | None, ...] | None:
+    """Each of ``request``'s models' seed (``warm_seeds``) from the saved models ``WorkspaceConfig.warm_start_models``
+    names for this ``arm``, or None where none is configured: per trait, every saved model the patterns match that
+    indexes this store's sites (``artifact.sites_digest``, which ``warm_start`` maps rows by) and holds a mean-field
+    model, ranked by ``_seed_rank`` from its ``model.json`` alone, and the best read whole. A model takes its own name's
+    seed (the same trait and fold), else the trait's released one (its last model). A pattern that names an arm in
+    place of ``{arm}`` seeds this arm from that one (with_sv from snv_indel: the shared records' effects, the structural
+    records' at zero); the two arms of a comparison started alike (both cold, or each from its own arm) keep their
+    difference the data's, not the starts' (the study's rule: each arm from its own arm's earlier model). The patterns
+    key the fit step and each seed's digest its engine checkpoints (``warm_seeds``), so patterns that name an earlier
+    round's runs, whose models no longer change, start a preempted fit's restart where it first started. An unreadable
+    candidate is skipped (``warm_seeds.read_seeds``) for the next."""
+    if not run.config.warm_start_models:
+        return None
+    sites = sites_digest(store.root)
+    problem = _request_problem(request)
+    offsets = fit_model.offset_digest(request.log_variance_offset)
+    seeds: list[Seed | None] = [None] * len(request.model_names)
+    for trait, trait_name in enumerate(cohort.trait_names):
+        candidates: list[tuple[tuple, str]] = []
+        for pattern in run.config.warm_start_models:
+            for folder in sorted(glob.glob(pattern.replace("{arm}", glob.escape(arm)).replace("{trait}", glob.escape(trait_name)))):
+                path = Path(folder) / "model.json"
+                try:
+                    metadata = json.loads(path.read_text(encoding="utf-8"))
+                    if metadata["provenance"]["sites_digest"] != sites or "product_mixture" not in metadata["draw_laws"]:
+                        continue
+                    candidates.append((_seed_rank(metadata, problem, offsets, path.stat().st_mtime), folder))
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    LOGGER.info("workspace pipeline: %s is no seed (%s)", folder, error)
+        found: dict[str, Seed] = {}
+        for _rank, folder in sorted(candidates, key=lambda candidate: candidate[0], reverse=True):
+            found = read_seeds(folder, run.budget.working_bytes)
+            if found:
+                break
+        if not found:
+            LOGGER.info("workspace pipeline: no warm seed for the %s fit of %s among %d candidates", arm, trait_name, len(candidates))
+            continue
+        released = list(found.values())[-1]
+        for model in cohort.trait_models(trait).tolist():
+            seeds[model] = found.get(request.model_names[model], released)
+        LOGGER.info("workspace pipeline: the %s fit of %s starts from %s (%d candidates)", arm, trait_name, released.source, len(candidates))
+    return tuple(seeds)
+
+
 def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Each arm's fit of every trait's models as one request (``fit_request``), so the models of different traits that
     share training rows and covariates share their store passes (``stage2_wiring.model_groups``); each trait's models
@@ -3426,7 +3628,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     from sv_pgs.phase_timer import timing
 
     opened = time.perf_counter()
-    cohort = _read_cohort(run)
+    cohort = _fit_cohort(run)
     # The measurement model reaches the fit as the records' log reliabilities (its scales already rewrote the store's
     # dosages in the measurement step). The fit has no term for its residual variances or its leakage maps, and none for
     # a target variance, so it is not handed either.
@@ -3465,6 +3667,10 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                         run.config.disease_likelihood, run.config.annotated_prior, run.config.length_by_class, run.config.ld_score_prior,
                     ), restart_dir=run.config.run_directory / RESTART_DIRECTORY / arm)
                     timing("fit_filter", time.perf_counter() - filtering)
+                    # Earlier fits' saved models as the models' starts, where configured and found (``_warm_seeds``).
+                    seeds = _warm_seeds(run, cohort, store, request, arm)
+                    if seeds is not None and any(seed is not None for seed in seeds):
+                        request = dataclasses.replace(request, seeds=seeds)
                     LOGGER.info("workspace pipeline: fitting %s: %d models of %d traits", arm, len(request.model_names), len(cohort.trait_names))
                     started = time.perf_counter()
                     fitted = run.bindings.fit(request)
@@ -3646,7 +3852,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     from sv_pgs.postfit_checkpoint import BatchCheckpoint, batch_reads, discard_reads
 
     step_key = (directory / KEY_FILE).read_text(encoding="utf-8")
-    cohort = _read_cohort(run)
+    cohort = _fit_cohort(run)
     quarantined = _fit_verdicts(run, cohort, unscorable=True)
     uncertified = {name: arms for name, arms in _fit_verdicts(run, cohort, unscorable=False).items() if name not in quarantined}
     for trait_name, arms in quarantined.items():
@@ -3826,7 +4032,7 @@ def _read_scores(run: _Run) -> _Scores:
     arrays = np.load(run.output("score") / "predictions.npz")
     if tuple(str(arm) for arm in arrays["arms"]) != ARMS:
         raise ValueError("the score step's arms are not this driver's.")
-    if tuple(str(name) for name in arrays["model_names"]) != _read_cohort(run).model_names:
+    if tuple(str(name) for name in arrays["model_names"]) != _fit_cohort(run).model_names:
         raise ValueError("the score step's model names or order differ from the cohort's.")
     # A field with a default is absent from an older score step's arrays.
     return _Scores(**{field.name: arrays[field.name] for field in dataclasses.fields(_Scores) if field.name in arrays.files or field.default is dataclasses.MISSING})
@@ -4218,7 +4424,7 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
     from sv_pgs.postfit_checkpoint import BatchCheckpoint
 
     step_key = (directory / KEY_FILE).read_text(encoding="utf-8")
-    cohort = _read_cohort(run)
+    cohort = _fit_cohort(run)
     scores = _read_scores(run)
     quarantined = run.summary("score")["quarantined"]
     reported = [(trait, trait_name) for trait, trait_name in enumerate(cohort.trait_names) if trait_name not in quarantined]
@@ -5060,7 +5266,7 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     (QUARANTINE_COLUMNS). An uncertified trait is in every table, and ``uncertified.tsv`` (UNCERTIFIED_COLUMNS) names it
     with its arms and their models' fatal codes.
     """
-    cohort = _read_cohort(run)
+    cohort = _fit_cohort(run)
     scores = _read_scores(run)
     quarantined = run.summary("score")["quarantined"]
     uncertified = run.summary("score").get("uncertified", {})
@@ -5329,56 +5535,21 @@ def _export_step(run: _Run, directory: Path) -> dict[str, Any]:
 
 
 _STEPS = (
-    _Step(
-        "samples",
-        (),
-        _samples_inputs,
-        (cohort_module, sample_crosswalk, dosage_store, _samples_step, store_half_samples, _calibration_pairs, calibrating_pairs, read_imputation_reference_ids),
-        _samples_step,
-    ),
+    # Each step before the fit is keyed by what its roots reach (``step_code``), not by a list of modules.
+    _Step("samples", (), _samples_inputs, STEP_ROOTS["samples"], _samples_step),
     # The store reads only the samples step's half manifests and groups (``_store_sample_layout``), so it follows samples
     # directly and is keyed by them, not by phenotypes, cohort or the folds.
-    _Step(
-        "store",
-        (),
-        _store_inputs,
-        (
-            store_converter, dosage_store, variant_typing, _store_step, _store_gates, _convert_chromosome, _popped_chromosome_sites,
-            _plain_chromosome_sites, strata_complexity_legend, _strata_names, read_strata_sites, read_popped_sites, _checked_genetic_positions, read_bubble_paths, path_counts,
-            _chromosome_spellings, read_plain_sites, read_genetic_map, interpolated_genetic_positions, read_tandem_repeats,
-            read_gene_annotation, store_core_spans, store_variant_classes, store_group_first, _decode, _decode_tasks, _gather_calibration,
-        ),
-        _store_step,
-    ),
-    # The targets come from the occasion model (``phenotype_measurement``, on ``scale_mixture_ep``'s lattice), so a change
-    # to either is a change to the phenotypes, not only a change to ``all_of_us``.
-    _Step("phenotypes", (), _phenotype_inputs, (all_of_us, phenotype_measurement, scale_mixture_ep, _phenotypes_step), _phenotypes_step),
+    _Step("store", (), _store_inputs, STEP_ROOTS["store"], _store_step),
+    # The targets come from the occasion model (``phenotype_measurement``, on ``scale_mixture_ep``'s lattice), which the
+    # step's roots reach; the trait definitions it reads key it in the tables' place.
+    _Step("phenotypes", (), _phenotype_inputs, STEP_ROOTS["phenotypes"], _phenotypes_step, definitions=True),
     _Step(
         "cohort", ("samples", "phenotypes"),
         lambda config: config.calibration_fraction if config.cross_fit else (config.calibration_fraction, config.model_folds()),
-        (cohort_module, _cohort_step, development_calibration, trait_table), _cohort_step,
+        STEP_ROOTS["cohort"], _cohort_step,
     ),
-    _Step(
-        "measurement",
-        ("samples", "cohort", "store"),
-        lambda config: None,
-        # The measurement model it fits and loads (workspace_bindings) is measurement_model's, which the key covers.
-        (store_converter, dosage_store, _measurement_step, _group_code_moments, _group_calibration, rewrite_recalibrated_store, *module_closure(measurement_model)),
-        _measurement_step,
-    ),
-    _Step(
-        "direct_sv",
-        ("samples", "cohort", "store", "measurement"),
-        _direct_sv_inputs,
-        # The direct rows' measurement model is measurement_model's (workspace_bindings), which the key covers.
-        (
-            _direct_sv_step, _direct_chromosome_task, _direct_chromosome, call_set_columns, _imputed_site_list, imputed_sv_sites, _site_rows, _store_rows, _StackedRows,
-            _merged_code_blocks, merged_measurement_model, read_plain_sites, read_strata_sites, read_popped_sites, store_core_spans,
-            read_gene_annotation, interpolated_genetic_positions, _clear_chromosome,
-            *module_closure(gatksv_store_rows, store_converter, measurement_model),
-        ),
-        _direct_sv_step,
-    ),
+    _Step("measurement", ("samples", "cohort", "store"), lambda config: None, STEP_ROOTS["measurement"], _measurement_step),
+    _Step("direct_sv", ("samples", "cohort", "store", "measurement"), _direct_sv_inputs, STEP_ROOTS["direct_sv"], _direct_sv_step),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
     # A validation split (test_fold) names its fold in the fit's key; the final split's key is as it was.
     _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (
@@ -5386,6 +5557,7 @@ _STEPS = (
         None if config.fit_variant_sites is None else _file_digest(Path(config.fit_variant_sites)), config.fit_region,
         config.length_by_class, config.ld_score_prior,
         *(() if config.test_fold is None else (("test_fold", config.test_fold),)),
+        *(() if not config.warm_start_models else (("warm_start_models", config.warm_start_models),)),
     ), (_fit_step, fit_filtered, listed_sites, region_records, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _split_cohort, _fit_verdicts, _checked_trait_model, _prediction_budget, _array_bytes, _final_store, score_batches, structural_records, model_part, importlib.import_module("sv_pgs.postfit_checkpoint")), _score_step),
     _Step(

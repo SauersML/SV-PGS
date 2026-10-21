@@ -73,7 +73,7 @@ def _panel_run(tmp_path, monkeypatch, weights, primary_fold=1):
     scores = SimpleNamespace(
         held_out_linear_predictor=scores_by_arm, held_out_genetic=scores_by_arm, held_out_calibrated_logits=scores_by_arm - 1.0, held_out_structural=None,
     )
-    monkeypatch.setattr(pipeline, "_read_cohort", lambda run: cohort)
+    monkeypatch.setattr(pipeline, "_fit_cohort", lambda run: cohort)
     monkeypatch.setattr(pipeline, "_read_scores", lambda run: scores)
     panel = pipeline.PanelInputs.from_mapping({"primary_fold": primary_fold, "weights": weights}, cohort.trait_names, 3)
     run = SimpleNamespace(

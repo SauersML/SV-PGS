@@ -36,7 +36,7 @@ from sv_pgs.all_of_us import reportable_count
 from sv_pgs.compute_budget import detect_compute_budget
 from sv_pgs.config import TraitType
 from sv_pgs.workspace_pipeline import (
-    ARMS, COMPLETE_FILE, WorkspaceConfig, _cases_text, _evaluated_counts, _fold_combined, _HeldOutCell, _partial_r2, _read_cohort, _read_scores,
+    ARMS, COMPLETE_FILE, WorkspaceConfig, _cases_text, _evaluated_counts, _fold_combined, _HeldOutCell, _partial_r2, _fit_cohort, _read_scores,
     _residualized, _Run, _scored_folds, _shown, workspace_bindings,
 )
 
@@ -122,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     if not scored:
         print(f"{config.run_directory} holds no scored arms (its driver stopped before the score step): nothing to compare", flush=True)
         return 0
-    cohort = _read_cohort(_Run(config, bindings, budget, {}))
+    cohort = _fit_cohort(_Run(config, bindings, budget, {}))
     with np.load(args.scores, allow_pickle=False) as ldpred2:
         if (
             tuple(ldpred2["regions"].tolist()) != tuple(name for name, _region in regions)
