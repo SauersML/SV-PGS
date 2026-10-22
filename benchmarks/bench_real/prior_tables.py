@@ -1,7 +1,8 @@
-"""The learned prior by variant class and SV length for a finished run whose effects step predates its prior tables:
-``prior_by_length.tsv`` and ``prior_enrichment.tsv``, read from the run's saved all-rows models and its store's record
-annotations with the effects step's own functions (``workspace_pipeline.variant_effects``, ``prior_moments``,
-``effect_summaries``), so each table holds the lines that step writes now, with its suppression of 1 to 20 records.
+"""The learned prior by variant class, SV length and allele frequency for a finished run whose effects step predates
+these tables: ``prior_by_length.tsv``, ``prior_enrichment.tsv``, ``effect_by_frequency.tsv`` and ``frequency_alpha.tsv``,
+read from the run's saved all-rows models and its store's record annotations with the effects step's own functions
+(``workspace_pipeline.variant_effects``, ``prior_moments``, ``effect_summaries``), so each table holds the lines that
+step writes now, with its suppression of 1 to 20 records.
 
 Inputs: these files, relative to the run directory (the run config's ``run_directory``), and nothing else in it.
 - ``fit/models/<arm>/<trait>/model.json`` and ``arrays.npz``, for both arms and every trait: each saved model
@@ -12,14 +13,15 @@ Inputs: these files, relative to the run directory (the run config's ``run_direc
   names it.
 - From that store, its variant table alone (``variant_table``): ``MANIFEST.json``, ``variants/`` (every chromosome's
   columns) and ``stats/half<h>/<chromosome>/sum_code`` and ``sum_code2`` (per-record sums over each half's samples,
-  which the table's reader checks). ``dosage/``, ``samples/``, ``loci/`` and ``FEATURE_IDENTITY.json`` are never
+  which the table's reader checks; each record's allele frequency is its sum over every sample's, as the effects
+  step reads it). ``dosage/``, ``samples/``, ``loci/`` and ``FEATURE_IDENTITY.json`` are never
   opened, so a store copied without them works.
 - ``cohort/cohort.json``: the trait order (its ``trait_names``, nothing else in it), so the lines come in the effects
   step's order; without it, the traits' folder names in sorted order.
 - ``score/_COMPLETE.json``, where it exists: the traits the score step quarantined, which have no lines, as in the
   effects step; without it, a model ``model_acceptance.require_scorable`` refuses is still left out.
 
-Outputs: ``--out`` (default ``<run>/prior_tables``) gets the two tables, each through
+Outputs: ``--out`` (default ``<run>/prior_tables``) gets the four tables, each through
 ``workspace_pipeline.check_exportable``; a table it refuses is removed and its rule printed. Nothing else is written,
 and stdout names the tables, the models read and how many held a prior (every model of the full-data fit's default,
 mean-field inference does; a dense law, from its EP inference, has none and adds no line), never a record. No step
@@ -44,6 +46,7 @@ import numpy as np
 from sv_pgs import artifact
 from sv_pgs.compute_budget import detect_compute_budget
 from sv_pgs.dosage_store import (
+    CODES_PER_DOSAGE,
     VARIANT_CLASS_LEGEND,
     VariantTable,
     _read_variant_table,
@@ -54,6 +57,8 @@ from sv_pgs.workspace_pipeline import (
     ALL_ROWS_MODEL,
     ARMS,
     COMPLETE_FILE,
+    EFFECT_BY_FREQUENCY_COLUMNS,
+    FREQUENCY_ALPHA_COLUMNS,
     PRIOR_BY_LENGTH_COLUMNS,
     PRIOR_ENRICHMENT_COLUMNS,
     check_exportable,
@@ -63,7 +68,10 @@ from sv_pgs.workspace_pipeline import (
     variant_effects,
 )
 
-TABLES = {"prior_by_length.tsv": PRIOR_BY_LENGTH_COLUMNS, "prior_enrichment.tsv": PRIOR_ENRICHMENT_COLUMNS}
+TABLES = {
+    "prior_by_length.tsv": PRIOR_BY_LENGTH_COLUMNS, "prior_enrichment.tsv": PRIOR_ENRICHMENT_COLUMNS,
+    "effect_by_frequency.tsv": EFFECT_BY_FREQUENCY_COLUMNS, "frequency_alpha.tsv": FREQUENCY_ALPHA_COLUMNS,
+}
 
 
 def store_path(run_directory: Path) -> Path:
@@ -113,6 +121,8 @@ def prior_lines(
     lengths = np.asarray(table.annotations["sv_length"], dtype=np.float64)
     bins = length_bins(lengths)
     codes_per_unit = np.asarray(table.codes_per_unit, dtype=np.float64)
+    samples = sum(read_manifest(store)["half_sample_counts"])
+    frequency = np.asarray(table.sum_code, dtype=np.float64) / (2.0 * CODES_PER_DOSAGE * samples)
     for arm in ARMS:
         for trait in names:
             folder = run_directory / "fit" / "models" / arm / trait
@@ -130,7 +140,7 @@ def prior_lines(
             rows = effects.store_rows
             unit = codes_per_unit[rows] / np.asarray(scoring.signed_scales, dtype=np.float64)
             prior = prior_moments(scoring, unit)
-            found = effect_summaries(trait, arm, classes[rows], bins[rows], lengths[rows], effects, unit, prior)
+            found = effect_summaries(trait, arm, classes[rows], bins[rows], lengths[rows], effects, unit, prior, frequency[rows])
             # The effects step keeps a model's lines as JSON before writing them; the same round trip writes the same text.
             found = json.loads(json.dumps({name: found[name] for name in TABLES}, default=str))
             for name in TABLES:
@@ -160,7 +170,7 @@ def write_tables(lines: dict[str, list[list[Any]]], out: Path) -> tuple[list[Pat
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("run_directory", type=Path, help="The finished run's directory (its fit, direct_sv, cohort and score steps).")
-    parser.add_argument("--out", type=Path, help="Where the two tables go (default <run>/prior_tables).")
+    parser.add_argument("--out", type=Path, help="Where the tables go (default <run>/prior_tables).")
     parser.add_argument("--store", type=Path, help="The store the fit read (default the direct_sv step's).")
     args = parser.parse_args(argv)
     run_directory = args.run_directory.resolve()

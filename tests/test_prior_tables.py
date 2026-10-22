@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from benchmarks.bench_real import prior_tables
-from sv_pgs import artifact, fit_model, stage2_wiring, workspace_pipeline
+from sv_pgs import all_of_us, artifact, fit_model, stage2_wiring, workspace_pipeline
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.draw_laws import ProductMixtureDraws
 from sv_pgs.scale_mixture_ep import prior_second_moment
@@ -78,7 +78,9 @@ def test_a_finished_run_s_prior_tables_are_its_effects_step_s_without_the_step_r
 ) -> None:
     """The synthetic store holds 1 to 20 records of most classes, so at the export rule every value is hidden; with the
     rule's threshold at 1 for both the effects step and the script, every value is shown and compared too."""
-    monkeypatch.setattr(workspace_pipeline, "MINIMUM_REPORTED_PARTICIPANTS", threshold)
+    # both modules' rule: all_of_us.reportable_partition hides the parts of the totals the report writes
+    for module in (workspace_pipeline, all_of_us):
+        monkeypatch.setattr(module, "MINIMUM_REPORTED_PARTICIPANTS", threshold)
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping(synthetic.raw)
     recorder = pipeline_tests._Recorder()
@@ -110,7 +112,8 @@ def test_a_full_data_fit_saves_its_learned_prior_and_the_script_reads_it(
     own prior second moment at its fitted hyperparameters, the effects step reads it from every model, and the script's
     tables are the effects step's. A single split, as the All of Us runs are: each trait's one model is the one read. The
     export rule's threshold is 1, so every value shows."""
-    monkeypatch.setattr(workspace_pipeline, "MINIMUM_REPORTED_PARTICIPANTS", 1)
+    for module in (workspace_pipeline, all_of_us):
+        monkeypatch.setattr(module, "MINIMUM_REPORTED_PARTICIPANTS", 1)
     # Each model's prior second moment per record, from the fitted prior and hyperparameters, keyed by its posterior means.
     learned: list[tuple[np.ndarray, np.ndarray]] = []
     scoring_models = stage2_wiring.scoring_models

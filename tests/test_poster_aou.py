@@ -73,7 +73,8 @@ def _prior_tables(directory: Path, trait: str) -> dict:
     unit = np.ones(count)
     prior = workspace_pipeline.prior_moments(SimpleNamespace(posterior_draws=law), unit)
     effects = workspace_pipeline.VariantEffects(np.arange(count, dtype=np.int64), generator.normal(0.0, 0.01, count), np.full(count, 0.01), np.full(count, 0.5), np.full(count, 0.5))
-    lines = workspace_pipeline.effect_summaries(trait, "with_sv", classes, workspace_pipeline.length_bins(lengths), lengths, effects, unit, prior)
+    frequency = np.linspace(0.01, 0.5, count)
+    lines = workspace_pipeline.effect_summaries(trait, "with_sv", classes, workspace_pipeline.length_bins(lengths), lengths, effects, unit, prior, frequency)
     headers = {"prior_by_length.tsv": workspace_pipeline.PRIOR_BY_LENGTH_COLUMNS, "prior_enrichment.tsv": workspace_pipeline.PRIOR_ENRICHMENT_COLUMNS}
     for name, header in headers.items():
         _write(directory / name, [header, *lines[name]])

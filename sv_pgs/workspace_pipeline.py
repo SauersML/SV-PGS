@@ -4474,6 +4474,39 @@ the saved model holds nothing about their uncertainty. A Laplace interval would 
 fit's final state (``scale_mixture_ep``) and every record's annotation design, and the fit saves neither. The
 jackknife over records does not apply: it would measure how the class mean moves with the records in it, not how the
 fitted hyperparameters move with the data."""
+FREQUENCY_EDGES = (0.0, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5)
+"""The minor allele frequency bins of ``effect_by_frequency.tsv``: (low, high], the first from 0 inclusive. A display
+grouping, never an input to any fit; a run's fit floor (``fit_minimum_minor_allele_frequency``) leaves the lower ones
+empty, and an empty bin has no row."""
+FREQUENCY_EXCLUDED_CLASSES = (VariantClass.COPY_NUMBER.value,)
+"""Classes the frequency tables leave out: a copy number's unit is one copy, so its mean is no allele frequency."""
+EFFECT_BY_FREQUENCY_COLUMNS = (
+    "trait", "arm", "variant_class", "frequency_bin", "variants", "heterozygosity", "prior_variance_per_allele",
+    "posterior_second_moment_per_allele",
+)
+"""``effect_by_frequency.tsv``: per (trait, arm, class row as in ``prior_enrichment.tsv``, minor allele frequency bin,
+FREQUENCY_EDGES) the fitted records, their mean 2p(1 - p) (p the counted allele's frequency, so the mean
+true-genotype variance under Hardy-Weinberg), the learned prior's mean variance of one allele's effect, and the mean
+posterior second moment E[beta^2 | data] of one allele's effect, on the fitted likelihood's scale. Frequency-dependent
+architecture reads off it: per-allele effect variance proportional to (2p(1 - p))^alpha, alpha = 0 one variance per
+allele and alpha = -1 one per standardized genotype (Speed et al. 2012, AJHG 91:1011; Schoech et al. 2019, Nat
+Commun 10:790, alpha about -0.38 across UK Biobank traits, negative selection making rarer alleles' effects larger)."""
+FREQUENCY_ALPHA_COLUMNS = (
+    "trait", "arm", "variant_class", "variants", "frequency_bins", "prior_alpha", "posterior_alpha",
+    "posterior_alpha_standard_error", "posterior_alpha_ci_low", "posterior_alpha_ci_high", "alpha_minus_snv",
+    "alpha_minus_snv_standard_error", "alpha_minus_snv_ci_low", "alpha_minus_snv_ci_high", "jackknife_blocks",
+    "interpretation",
+)
+"""``frequency_alpha.tsv``: per (trait, arm, class row as in ``prior_enrichment.tsv``, and every structural record
+together) alpha, the slope of log mean per-allele effect variance on log mean 2p(1 - p) across the row's shown
+frequency bins (``effect_by_frequency.tsv``), each bin weighted by its records: from the learned prior's variances
+(``prior_alpha``, no interval, as the prior columns elsewhere) and from the posterior second moments, with the latter's
+delete-one-block jackknife standard error and normal interval (JACKKNIFE_BLOCKS contiguous runs of the records, as
+``jackknife_ratio``), and the row's posterior alpha less the SNVs' on the same deletions. The prior's own frequency
+term (``annotation_design.frequency_annotation``) is one smooth shared by every class, so a class's prior alpha differs
+from the SNVs' only through its other annotations' covariation with frequency (an SV's length), and a posterior
+difference is the data's. Descriptive: the posterior moments are shrunk toward that prior and spread over records in
+LD, as ``interpretation`` says."""
 JACKKNIFE_BLOCKS = 200
 """The posterior enrichment's jackknife blocks: contiguous runs of the fitted records in store (genome) order, as LD
 score regression's 200-block jackknife (Bulik-Sullivan et al. 2015, Nat Genet 47:291), each long against LD."""
@@ -4517,7 +4550,7 @@ def jackknife_ratio(values: F64Array, member: BoolArray, reference: BoolArray, b
     empty."""
     count = values.shape[0]
     blocks = min(blocks, count)
-    block = np.repeat(np.arange(blocks), np.diff(np.linspace(0, count, blocks + 1).astype(np.int64)))
+    block = jackknife_blocks(count, blocks)
 
     def sums(mask: BoolArray) -> tuple[F64Array, F64Array]:
         return np.bincount(block[mask], weights=values[mask], minlength=blocks), np.bincount(block[mask], minlength=blocks).astype(np.float64)
@@ -4541,12 +4574,34 @@ def _hidden_records(count: int) -> str:
     return _hidden_counts(count, False)[0]
 
 
+def summary_class_rows(classes: NDArray, lengths: F64Array) -> list[tuple[str, BoolArray, bool]]:
+    """The class rows of ``prior_enrichment.tsv`` and ``frequency_alpha.tsv``, each (name, members, hidden): a class's
+    structural records (COMMUNITY_SV_MINIMUM_LENGTH and longer) for a class that has any, its whole (shorter) part for
+    any other, by name, then every structural record together where any record is structural. A class row is hidden as
+    ``effect_summaries`` hides it, and every structural record together where it, or every shorter record together, is
+    1 to 20 records (its count and the fitted records' would give the other back)."""
+    structural = lengths >= COMMUNITY_SV_MINIMUM_LENGTH
+    structural_counts = Counter(classes[structural].tolist())
+    short_counts = Counter(classes[~structural].tolist())
+    hidden = suppressed_levels({name: (members,) for name, members in structural_counts.items()}) | {
+        name for name in suppressed_levels({name: (members,) for name, members in short_counts.items()}) if name not in structural_counts
+    }
+    totals_shown = all(not 0 < int(total) < MINIMUM_REPORTED_PARTICIPANTS for total in (structural.sum(), (~structural).sum()))
+    rows = [(name, (classes == name) & (structural if name in structural_counts else ~structural), name in hidden) for name in sorted(set(classes.tolist()))]
+    if structural.any():
+        rows.append(("all_structural", structural, not totals_shown or int(structural.sum()) < MINIMUM_REPORTED_PARTICIPANTS))
+    return rows
+
+
 def effect_summaries(
     trait: str, arm: str, classes: NDArray, bins: NDArray, lengths: F64Array, effects: VariantEffects, unit: F64Array, prior: PriorMoments | None,
+    frequency: F64Array,
 ) -> dict[str, list[tuple[Any, ...]]]:
     """One model's summary lines by table name (EFFECT_SUMMARY_COLUMNS, LENGTH_CORRELATION_COLUMNS,
-    PRIOR_BY_LENGTH_COLUMNS, PRIOR_ENRICHMENT_COLUMNS), from its fitted records' ``classes``, length ``bins`` and
-    ``lengths``, their ``effects`` and ``unit``s, and the learned ``prior`` at them (no prior lines where it is None).
+    PRIOR_BY_LENGTH_COLUMNS, PRIOR_ENRICHMENT_COLUMNS, and ``frequency_dependence``'s EFFECT_BY_FREQUENCY_COLUMNS and
+    FREQUENCY_ALPHA_COLUMNS), from its fitted records' ``classes``, length ``bins`` and ``lengths``, their ``effects``
+    and ``unit``s, the learned ``prior`` at them (no prior lines where it is None, and blank prior columns in the
+    frequency tables) and their counted allele ``frequency``.
 
     Record counts are held to the participant rule, and every count a table shows is a sum of the parts of one tree, so
     no difference of shown counts isolates 1 to 20 records: every fitted record is in one part, a class's structural
@@ -4604,6 +4659,10 @@ def effect_summaries(
             selected = values[member]
             rho = stats.spearmanr(np.log(lengths[member]), selected).statistic if np.ptp(selected) > 0 else float("nan")
             lines["effect_length_correlation.tsv"].append((trait, arm, name, int(member.sum()), quantity, f"{rho:.6g}", "descriptive_prior_and_LD_dependent"))
+    lines.update(frequency_dependence(
+        trait, arm, classes, lengths, frequency, effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation,
+        None if prior is None else prior.variance * unit * unit,
+    ))
     if prior is None:
         return lines
     reference = classes == PRIOR_REFERENCE_CLASS
@@ -4632,11 +4691,7 @@ def effect_summaries(
             _number(enrichment), _number(standard_error), *interval(enrichment, standard_error), blocks,
         ))
     class_blanks = ("",) * (len(PRIOR_ENRICHMENT_COLUMNS) - PRIOR_ENRICHMENT_COLUMNS.index("prior_variance"))
-    for name in [*sorted(set(classes.tolist())), *(["all_structural"] if structural.any() else [])]:
-        if name == "all_structural":
-            member, hidden = structural, not totals_shown or int(structural.sum()) < MINIMUM_REPORTED_PARTICIPANTS
-        else:
-            member, hidden = (classes == name) & (structural if name in structural_counts else ~structural), name in hidden_classes
+    for name, member, hidden in summary_class_rows(classes, lengths):
         members = int(member.sum())
         if hidden:
             lines["prior_enrichment.tsv"].append((trait, arm, name, _hidden_records(members), *class_blanks))
@@ -4649,6 +4704,122 @@ def effect_summaries(
             _number(prior.variance[member].sum() / prior.variance.sum()), _number(second[member].mean()), _number(enrichment),
             _number(standard_error), *interval(enrichment, standard_error), _number(share), *interval(share, share_error),
             _number(members / classes.shape[0]) if totals_shown else "", _number(heritability), *interval(heritability, heritability_error), blocks,
+        ))
+    return lines
+
+
+def frequency_bins(minor: F64Array) -> NDArray:
+    """Each record's minor allele frequency bin (FREQUENCY_EDGES), labelled "low-high"."""
+    edges = np.asarray(FREQUENCY_EDGES)
+    index = np.searchsorted(edges[1:-1], minor, side="left")
+    labels = np.array([f"{low:g}-{high:g}" for low, high in zip(edges[:-1], edges[1:])], dtype=object)
+    return labels[index]
+
+
+def jackknife_blocks(count: int, blocks: int) -> I64Array:
+    """Each of ``count`` rows' delete-one-block jackknife block: ``blocks`` contiguous runs (fewer where there are fewer
+    rows), as LD score regression's (Bulik-Sullivan et al. 2015, Nat Genet 47:291)."""
+    blocks = min(blocks, count)
+    return np.repeat(np.arange(blocks), np.diff(np.linspace(0, count, blocks + 1).astype(np.int64)))
+
+
+def frequency_alpha(heterozygosity: F64Array, variance: F64Array, counts: F64Array) -> F64Array:
+    """alpha along the last axis: the slope of log(``variance`` / ``counts``) on log(``heterozygosity`` / ``counts``)
+    (bin sums over the bins' record ``counts``), each bin weighted by its records; NaN where fewer than two bins hold
+    records or their mean heterozygosities do not differ."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        held = counts > 0
+        weights = np.where(held, counts, 0.0)
+        x = np.where(held, np.log(heterozygosity / counts), 0.0)
+        y = np.where(held, np.log(variance / counts), 0.0)
+        total = weights.sum(axis=-1, keepdims=True)
+        x_centred = x - (weights * x).sum(axis=-1, keepdims=True) / total
+        y_centred = y - (weights * y).sum(axis=-1, keepdims=True) / total
+        spread = (weights * x_centred * x_centred).sum(axis=-1)
+        slope = (weights * x_centred * y_centred).sum(axis=-1) / spread
+    return np.where((held.sum(axis=-1) >= 2) & (spread > 0), slope, np.nan)
+
+
+def frequency_dependence(
+    trait: str, arm: str, classes: NDArray, lengths: F64Array, frequency: F64Array, second: F64Array, prior: F64Array | None,
+) -> dict[str, list[tuple[Any, ...]]]:
+    """One model's ``effect_by_frequency.tsv`` and ``frequency_alpha.tsv`` lines from its fitted records' ``classes``,
+    ``lengths``, counted allele ``frequency``, posterior second moments of one allele's effect ``second`` and the learned
+    prior's variances of it (``prior``; the prior columns blank where None), in store order (the jackknife's blocks).
+
+    The rows and their hiding are ``prior_enrichment.tsv``'s (``summary_class_rows``), with FREQUENCY_EXCLUDED_CLASSES
+    left out: a hidden class row shows neither its bins nor its alpha. A shown class's bins are a partition of its
+    records, hidden as ``suppressed_levels`` hides levels, so the hidden bins hold 0 or more than 20 records together.
+    Every alpha reads only the records of shown (class, bin) cells, so no value rests on a hidden cell's records; every
+    structural record together has no bins of its own, and its alpha reads its classes' shown cells. Its alpha is also
+    hidden where the copy numbers it leaves out are 1 to 20 records, which its count beside ``prior_enrichment.tsv``'s
+    would give back."""
+    excluded = np.isin(classes, FREQUENCY_EXCLUDED_CLASSES)
+    heterozygosity = 2.0 * frequency * (1.0 - frequency)
+    bins = frequency_bins(np.minimum(frequency, 1.0 - frequency))
+    levels = frequency_bins(np.asarray(FREQUENCY_EDGES[1:])).tolist()
+    block = jackknife_blocks(classes.shape[0], JACKKNIFE_BLOCKS)
+    blocks = int(block.max()) + 1 if block.size else 0
+    quantile = stats.norm.ppf((1.0 + CONFIDENCE_LEVEL) / 2.0)
+    lines: dict[str, list[tuple[Any, ...]]] = {"effect_by_frequency.tsv": [], "frequency_alpha.tsv": []}
+    bin_blanks = ("",) * (len(EFFECT_BY_FREQUENCY_COLUMNS) - EFFECT_BY_FREQUENCY_COLUMNS.index("heterozygosity"))
+    alpha_blanks = ("",) * (FREQUENCY_ALPHA_COLUMNS.index("interpretation") - FREQUENCY_ALPHA_COLUMNS.index("frequency_bins"))
+    interpretation = "descriptive_prior_and_LD_dependent"
+
+    def sums(member: BoolArray, values: F64Array) -> F64Array:
+        """[blocks, levels] sums of ``values`` over ``member``'s records."""
+        return np.stack([np.bincount(block[member & (bins == level)], weights=values[member & (bins == level)], minlength=blocks)
+                         for level in levels], axis=1)
+
+    def alphas(member: BoolArray) -> tuple[float, float, F64Array]:
+        """Over ``member``'s records: the prior's alpha, the posterior's, and the posterior's on each block's deletion."""
+        counts, mixed, moment = sums(member, np.ones(classes.shape[0])), sums(member, heterozygosity), sums(member, second)
+        whole = float(frequency_alpha(mixed.sum(axis=0), moment.sum(axis=0), counts.sum(axis=0)))
+        deleted = frequency_alpha(mixed.sum(axis=0) - mixed, moment.sum(axis=0) - moment, counts.sum(axis=0) - counts)
+        learned = frequency_alpha(mixed.sum(axis=0), sums(member, prior).sum(axis=0), counts.sum(axis=0)) if prior is not None else np.nan
+        return float(learned), whole, deleted
+
+    def jackknife(deleted: F64Array) -> float:
+        if blocks < 2 or not np.all(np.isfinite(deleted)):
+            return float("nan")
+        return float(np.sqrt((blocks - 1) / blocks * np.sum((deleted - deleted.mean()) ** 2)))
+
+    rows = [(name, member & ~excluded, hidden or (name == "all_structural" and 0 < int(np.sum(member & excluded)) < MINIMUM_REPORTED_PARTICIPANTS))
+            for name, member, hidden in summary_class_rows(classes, lengths) if name not in FREQUENCY_EXCLUDED_CLASSES]
+    # the records of shown (class, bin) cells, which every alpha reads
+    readable = np.zeros(classes.shape[0], dtype=bool)
+    for name, member, hidden in rows:
+        if name == "all_structural":
+            continue
+        sizes = {level: (int(np.sum(member & (bins == level))),) for level in levels if np.any(member & (bins == level))}
+        hidden_levels = set(sizes) if hidden else suppressed_levels(sizes)
+        for level, (count,) in sizes.items():
+            chosen = member & (bins == level)
+            if level in hidden_levels:
+                lines["effect_by_frequency.tsv"].append((trait, arm, name, level, _hidden_records(count), *bin_blanks))
+                continue
+            readable |= chosen
+            lines["effect_by_frequency.tsv"].append((
+                trait, arm, name, level, count, _number(heterozygosity[chosen].mean()),
+                _number(prior[chosen].mean()) if prior is not None else "", _number(second[chosen].mean()),
+            ))
+    reference = next((member for name, member, hidden in rows if name == PRIOR_REFERENCE_CLASS and not hidden), None)
+    _learned, reference_whole, reference_deleted = alphas(reference & readable) if reference is not None else (np.nan, np.nan, None)
+    for name, member, hidden in rows:
+        members = int(member.sum())
+        if hidden:
+            lines["frequency_alpha.tsv"].append((trait, arm, name, _hidden_records(members), *alpha_blanks, interpretation))
+            continue
+        read = member & readable
+        learned, whole, deleted = alphas(read)
+        error = jackknife(deleted)
+        compared = reference_deleted is not None and name != PRIOR_REFERENCE_CLASS
+        difference = whole - reference_whole if compared else np.nan
+        difference_error = jackknife(deleted - reference_deleted) if compared else np.nan
+        lines["frequency_alpha.tsv"].append((
+            trait, arm, name, members, len({level for level in bins[read].tolist()}), _number(learned), _number(whole), _number(error),
+            _number(whole - quantile * error), _number(whole + quantile * error), _number(difference), _number(difference_error),
+            _number(difference - quantile * difference_error), _number(difference + quantile * difference_error), blocks, interpretation,
         ))
     return lines
 
@@ -4856,9 +5027,9 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
             )
             unit = codes_per_unit[rows] / np.asarray(scoring.signed_scales, dtype=np.float64)
             prior = prior_moments(scoring, unit)
-            tables = effect_summaries(trait_name, arm, classes[rows], bins[rows], lengths[rows], effects, unit, prior)
+            frequency = np.asarray(table.sum_code, dtype=np.float64)[rows] / (2.0 * CODES_PER_DOSAGE * records[0].sample_count)
+            tables = effect_summaries(trait_name, arm, classes[rows], bins[rows], lengths[rows], effects, unit, prior, frequency)
             if loci:
-                frequency = np.asarray(table.sum_code, dtype=np.float64)[rows] / (2.0 * CODES_PER_DOSAGE * records[0].sample_count)
                 trained = int(cohort.training[:, cohort.all_rows_model(trait)].sum())
                 tables["locus_variance.tsv"] = locus_variance(
                     trait_name, arm, loci, np.asarray(table.chromosome)[rows].astype(np.int64), np.asarray(table.position)[rows].astype(np.int64),
@@ -4905,6 +5076,7 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
     summaries: dict[str, list[tuple[Any, ...]]] = {
         "effects_by_class.tsv": [EFFECT_SUMMARY_COLUMNS], "effect_length_correlation.tsv": [LENGTH_CORRELATION_COLUMNS],
         "prior_by_length.tsv": [PRIOR_BY_LENGTH_COLUMNS], "prior_enrichment.tsv": [PRIOR_ENRICHMENT_COLUMNS],
+        "effect_by_frequency.tsv": [EFFECT_BY_FREQUENCY_COLUMNS], "frequency_alpha.tsv": [FREQUENCY_ALPHA_COLUMNS],
     }
     if run.config.locus_panel is not None:
         summaries["locus_variance.tsv"] = [LOCUS_VARIANCE_COLUMNS]
@@ -5068,7 +5240,7 @@ def _partition_hidden(cells: Sequence[tuple[str, str, _HeldOutCell]], targets: F
     controls are each hidden as ``all_of_us.reportable_partition`` hides the parts of a written total: every part of 1
     to 20, then the smallest others until the hidden parts hold MINIMUM_REPORTED_PARTICIPANTS, and every part of a total
     not written. A disease's total controls are written where its rows and cases are (the one follows from the other
-    two)."""
+    two), as reportable_count writes a count, so 1 to 20 of them hide every level's controls."""
     whole = next(held for cell, _level, held in cells if cell == "all")
 
     def cases_of(held: _HeldOutCell) -> int:
@@ -5078,7 +5250,7 @@ def _partition_hidden(cells: Sequence[tuple[str, str, _HeldOutCell]], targets: F
     if binary:
         totals["cases"] = _cases_text(whole.count, cases_of(whole))
         written = totals["rows"].isdigit() and totals["cases"].isdigit()
-        totals["controls"] = str(whole.count - cases_of(whole)) if written else "suppressed"
+        totals["controls"] = reportable_count(whole.count - cases_of(whole)) if written else "suppressed"
     hidden: dict[tuple[str, str], str] = {}
     for family in dict.fromkeys(cell for cell, _level, _held in cells if cell != "all"):
         members = {level: held for cell, level, held in cells if cell == family}
@@ -5846,6 +6018,10 @@ def export_rules() -> dict[str, ExportRule]:
         "genetic_variance.tsv": ExportRule(("n",), ("value",)),
         "prior_by_length.tsv": ExportRule(("variants",), PRIOR_BY_LENGTH_COLUMNS[PRIOR_BY_LENGTH_COLUMNS.index("prior_variance") :]),
         "prior_enrichment.tsv": ExportRule(("variants",), PRIOR_ENRICHMENT_COLUMNS[PRIOR_ENRICHMENT_COLUMNS.index("prior_variance") :]),
+        "effect_by_frequency.tsv": ExportRule(("variants",), EFFECT_BY_FREQUENCY_COLUMNS[EFFECT_BY_FREQUENCY_COLUMNS.index("heterozygosity") :]),
+        "frequency_alpha.tsv": ExportRule(
+            ("variants",), FREQUENCY_ALPHA_COLUMNS[FREQUENCY_ALPHA_COLUMNS.index("frequency_bins") : FREQUENCY_ALPHA_COLUMNS.index("interpretation")]
+        ),
         # Its record counts are not participants', and every record in a value has 21 or more expected carriers.
         "locus_variance.tsv": ExportRule(),
         # benchmarks/bench_real/aou_compare.py's comparison of the arms and LDpred2 on the same held-out people.

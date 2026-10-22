@@ -77,6 +77,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('workspace_pipeline.py', 'BOOTSTRAP_RESAMPLES'): ('spec', frozenset({2000}), 'Efron and Tibshirani, An Introduction to the Bootstrap (1993), section 19.3: 1,000 to 2,000 resamples for a percentile interval'),
     ('workspace_pipeline.py', 'CONFIDENCE_LEVEL'): ('definitional', frozenset({0.95}), 'the two-sided 95% interval every reported interval is'),
     ('workspace_pipeline.py', 'JACKKNIFE_BLOCKS'): ('spec', frozenset({200}), "LD score regression's 200-block jackknife (Bulik-Sullivan et al. 2015, Nat Genet 47:291)"),
+    ('workspace_pipeline.py', 'FREQUENCY_EDGES'): ('definitional', frozenset({0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2}), 'minor allele frequency display bins of the effects summary at 1-2-5 steps per decade up to 0.5, never a fit input'),
     ('workspace_pipeline.py', 'STACKING_SPLITS'): ('spec', frozenset({5}), 'five-fold cross-fitting of the stacking weights, as in Hastie, Tibshirani and Friedman, The Elements of Statistical Learning (2009), section 7.10.1'),
     ('code_products.py', 'DIGIT_BITS'): ('derived', frozenset({7}), 'the widest balanced digit that fits int8 with room for the sign'),
     ('code_products.py', 'OPERAND_DIGITS'): ('derived', frozenset({8}), '7 x 8 - 2 >= 53 fp64 mantissa bits (math-epeb)'),

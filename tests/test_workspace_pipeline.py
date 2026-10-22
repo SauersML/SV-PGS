@@ -2920,7 +2920,8 @@ def test_effect_summaries_give_the_prior_by_class_and_length_and_hide_what_would
     grid = np.linspace(-12.0, -4.0, 6)
     law = _mixture_law(class_index, 0.3 * np.log(lengths) + 0.5 * (class_index == 1), np.log(generator.dirichlet(np.ones(6), size=4)), grid)
     prior = workspace_pipeline.prior_moments(SimpleNamespace(posterior_draws=law), unit)
-    lines = workspace_pipeline.effect_summaries("ldl", "with_sv", classes, bins, lengths, effects, unit, prior)
+    frequency = generator.uniform(0.01, 0.99, count)
+    lines = workspace_pipeline.effect_summaries("ldl", "with_sv", classes, bins, lengths, effects, unit, prior, frequency)
 
     by_class = {(line[2], line[3]): line for line in lines["effects_by_class.tsv"]}
     # The 8 long deletions are hidden, and the next smallest of the deletions' bins with them; the duplications are
@@ -2972,13 +2973,79 @@ def test_effect_summaries_give_the_prior_by_class_and_length_and_hide_what_would
     headers = {
         "effects_by_class.tsv": workspace_pipeline.EFFECT_SUMMARY_COLUMNS, "effect_length_correlation.tsv": workspace_pipeline.LENGTH_CORRELATION_COLUMNS,
         "prior_by_length.tsv": workspace_pipeline.PRIOR_BY_LENGTH_COLUMNS, "prior_enrichment.tsv": columns,
+        "effect_by_frequency.tsv": workspace_pipeline.EFFECT_BY_FREQUENCY_COLUMNS, "frequency_alpha.tsv": workspace_pipeline.FREQUENCY_ALPHA_COLUMNS,
     }
     for name, table in lines.items():
         with (tmp_path / name).open("w", newline="") as handle:
             csv.writer(handle, delimiter="\t").writerows([headers[name], *table])
         check_exportable(tmp_path / name)
-    without = workspace_pipeline.effect_summaries("ldl", "with_sv", classes, bins, lengths, effects, unit, None)
+    without = workspace_pipeline.effect_summaries("ldl", "with_sv", classes, bins, lengths, effects, unit, None, frequency)
     assert without["prior_by_length.tsv"] == without["prior_enrichment.tsv"] == [] and without["effects_by_class.tsv"] == lines["effects_by_class.tsv"]
+    # The frequency tables' class rows are the enrichment table's, and without a prior their prior columns are blank.
+    assert [line[2:4] for line in lines["frequency_alpha.tsv"]] == [line[2:4] for line in lines["prior_enrichment.tsv"]]
+    assert all(line[6] == "" for line in without["effect_by_frequency.tsv"]) and any(line[6] for line in lines["effect_by_frequency.tsv"])
+
+
+def test_frequency_dependence_gives_alpha_from_shown_cells_only_and_passes_the_export_check(tmp_path: Path) -> None:
+    generator = np.random.default_rng(31)
+    # 3,000 SNVs at minor allele frequencies 1-50%; 600 deletions of 50-499 bp at 2-50% and 12 at 0.3%, a cell of 1 to
+    # 20 records; 15 copy numbers, which the frequency tables leave out, hidden as a class with the 30 insertions. Store
+    # order mixes the classes.
+    frequency = np.r_[generator.uniform(0.01, 0.5, 3000), generator.uniform(0.02, 0.5, 600), np.full(12, 0.003), generator.uniform(0.05, 0.5, 30),
+                      np.full(15, 0.2)]
+    classes = np.array(["snv"] * 3000 + ["deletion"] * 612 + ["insertion"] * 30 + ["copy_number"] * 15, dtype=object)
+    lengths = np.r_[np.ones(3000), generator.uniform(60.0, 400.0, 642), np.full(15, 5000.0)]
+    order = generator.permutation(frequency.shape[0])
+    frequency, classes, lengths = frequency[order], classes[order], lengths[order]
+    frequency[::2] = 1.0 - frequency[::2]  # the counted allele is the major one at half the records
+    heterozygosity = 2.0 * frequency * (1.0 - frequency)
+    # per-allele effect variance (2p(1 - p))^alpha: alpha -0.4 for SNVs, -0.7 for deletions
+    true_alpha = np.where(classes == "snv", -0.4, -0.7)
+    second = heterozygosity**true_alpha * np.exp(generator.normal(0.0, 0.05, frequency.shape[0]))
+    prior = heterozygosity**-0.5
+    lines = workspace_pipeline.frequency_dependence("ldl", "with_sv", classes, lengths, frequency, second, prior)
+
+    by_bin = {(line[2], line[3]): dict(zip(workspace_pipeline.EFFECT_BY_FREQUENCY_COLUMNS, line)) for line in lines["effect_by_frequency.tsv"]}
+    # The 12 rare deletions are hidden, and the deletions' next smallest bin with them, so the hidden cells hold 21 or more.
+    assert by_bin["deletion", "0.002-0.005"]["variants"] == "1-20 (suppressed)" and by_bin["deletion", "0.002-0.005"]["heterozygosity"] == ""
+    assert by_bin["deletion", "0.02-0.05"]["variants"] == "suppressed"
+    assert not any(name == "copy_number" for name, _level in by_bin)
+    assert all(row["heterozygosity"] == "" and not isinstance(row["variants"], int) for (name, _level), row in by_bin.items() if name == "insertion")
+    snv = classes == "snv"
+    top = snv & (np.minimum(frequency, 1.0 - frequency) > 0.2)
+    assert by_bin["snv", "0.2-0.5"]["variants"] == int(top.sum())
+    assert float(by_bin["snv", "0.2-0.5"]["posterior_second_moment_per_allele"]) == pytest.approx(second[top].mean(), rel=1e-5)
+    assert float(by_bin["snv", "0.2-0.5"]["prior_variance_per_allele"]) == pytest.approx(prior[top].mean(), rel=1e-5)
+
+    alpha = {line[2]: dict(zip(workspace_pipeline.FREQUENCY_ALPHA_COLUMNS, line)) for line in lines["frequency_alpha.tsv"]}
+    # Bin means of a power law recover its exponent up to the spread within each bin.
+    assert float(alpha["snv"]["posterior_alpha"]) == pytest.approx(-0.4, abs=0.05)
+    assert float(alpha["deletion"]["posterior_alpha"]) == pytest.approx(-0.7, abs=0.05)
+    assert float(alpha["snv"]["prior_alpha"]) == pytest.approx(-0.5, abs=0.05) and alpha["deletion"]["frequency_bins"] == 3
+    difference = alpha["deletion"]
+    assert float(difference["alpha_minus_snv_ci_high"]) < 0.0 and alpha["snv"]["alpha_minus_snv"] == ""
+    assert float(difference["alpha_minus_snv"]) == pytest.approx(float(difference["posterior_alpha"]) - float(alpha["snv"]["posterior_alpha"]), abs=1e-5)
+    assert float(difference["posterior_alpha_ci_low"]) < float(difference["posterior_alpha"]) < float(difference["posterior_alpha_ci_high"])
+    # The deletions' alpha is the slope over their three shown bins' means, each weighted by its records.
+    deletion = classes == "deletion"
+    shown = [deletion & (workspace_pipeline.frequency_bins(np.minimum(frequency, 1.0 - frequency)) == level) for level in ("0.05-0.1", "0.1-0.2", "0.2-0.5")]
+    expected = workspace_pipeline.frequency_alpha(
+        np.array([heterozygosity[cell].sum() for cell in shown]), np.array([second[cell].sum() for cell in shown]), np.array([float(cell.sum()) for cell in shown])
+    )
+    assert float(difference["posterior_alpha"]) == pytest.approx(float(expected), rel=1e-5)
+    # No alpha reads a hidden cell: the hidden deletions' effects change nothing.
+    hidden = deletion & (np.minimum(frequency, 1.0 - frequency) <= 0.05)
+    changed = workspace_pipeline.frequency_dependence("ldl", "with_sv", classes, lengths, frequency, np.where(hidden, second * 100.0, second), prior)
+    assert changed["frequency_alpha.tsv"] == lines["frequency_alpha.tsv"]
+    # A hidden class shows no alpha; every structural record together leaves out the 15 copy numbers, which its count
+    # would give back, so it is hidden too.
+    assert alpha["insertion"]["variants"] == "suppressed" and alpha["insertion"]["posterior_alpha"] == "" and "copy_number" not in alpha
+    assert alpha["all_structural"]["variants"] == "suppressed" and alpha["all_structural"]["posterior_alpha"] == ""
+
+    for name, columns in (("effect_by_frequency.tsv", workspace_pipeline.EFFECT_BY_FREQUENCY_COLUMNS), ("frequency_alpha.tsv", workspace_pipeline.FREQUENCY_ALPHA_COLUMNS)):
+        with (tmp_path / name).open("w", newline="") as handle:
+            csv.writer(handle, delimiter="\t").writerows([columns, *lines[name]])
+        check_exportable(tmp_path / name)
 
 
 def _held_out_traits(generator: np.random.Generator, rows: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
@@ -3228,7 +3295,8 @@ def _summaries(names: list[str], lengths: np.ndarray) -> dict[str, list[tuple]]:
     law = _mixture_law(np.array([legend.index(name) for name in names]), 0.3 * np.log(lengths), np.log(np.full((len(legend), 3), 1.0 / 3.0)), np.linspace(-10.0, -6.0, 3))
     unit = np.ones(count)
     prior = workspace_pipeline.prior_moments(SimpleNamespace(posterior_draws=law), unit)
-    return workspace_pipeline.effect_summaries("ldl", "with_sv", classes, workspace_pipeline.length_bins(lengths), lengths, effects, unit, prior)
+    frequency = np.linspace(0.01, 0.5, count)
+    return workspace_pipeline.effect_summaries("ldl", "with_sv", classes, workspace_pipeline.length_bins(lengths), lengths, effects, unit, prior, frequency)
 
 
 def test_effect_summary_counts_are_one_tree_whose_shown_parts_never_isolate_one_to_twenty_records() -> None:
