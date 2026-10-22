@@ -1067,6 +1067,111 @@ def gallery_page(pdf: PdfPages, image: Path, caption: str) -> None:
     plt.close(page)
 
 
+COLUMN, EDGE = 11.4, 0.3
+"""Inches: the poster's left column (build_pptx.py's LEFT), where its schematics are placed at full width so their type
+prints at its own size, and the margin kept clear at either side."""
+VARIANTS = (("SNV", INK, 0.09), ("indel", GREEN, 0.3), ("SV", IMPUTED, 1.3))
+"""The variant classes as the left column draws them: name, colour, and the width in inches of the block that stands for
+one variant on a chromosome (one base for an SNV, a few for an indel, many for an SV)."""
+SCHEMATICS = {
+    "poster_model": "An SNV, an indel and an SV on a chromosome, each class with its own effect-size prior (the SV's "
+                    "narrower at low imputation r²), all fitted together into SV-PGS.",
+    "poster_variants": "One stretch of chromosome: SV-PGS scores every SNV, indel and SV; LDpred2-auto scores SNVs at "
+                       "HapMap3 density.",
+}
+"""Each schematic's one-sentence description, which build_pptx.py uses as its picture's alt text."""
+
+
+def canvas(height: float):
+    """A figure the left column's width and ``height`` inches tall, with one bare axes over all of it in inches."""
+    fig = plt.figure(figsize=(COLUMN, height))
+    ax = fig.add_axes((0, 0, 1, 1))
+    ax.set_xlim(0, COLUMN)
+    ax.set_ylim(0, height)
+    ax.axis("off")
+    return fig, ax
+
+
+def chromosome(ax, left: float, right: float, y: float, marks, tall: float = 0.56) -> None:
+    """A stretch of chromosome from ``left`` to ``right`` at height ``y`` (a grey bar) with each variant of ``marks``,
+    (centre, width, colour), a block ``tall`` inches high over it."""
+    ax.add_patch(matplotlib.patches.FancyBboxPatch((left, y - 0.09), right - left, 0.18,
+                                                   boxstyle="round,pad=0,rounding_size=0.09", facecolor=LIGHT,
+                                                   edgecolor="none", zorder=1))
+    for centre, width, colour in marks:
+        ax.add_patch(matplotlib.patches.Rectangle((centre - width / 2, y - tall / 2), width, tall, facecolor=colour,
+                                                  edgecolor="none", zorder=2))
+
+
+def poster_model_figure():
+    """The SV-PGS model for the poster's Methods: an SNV, an indel and an SV on a chromosome, each class with its own
+    effect-size prior (the SV's also at a low imputation r², which narrows it), all fitted together into one score."""
+    height = 4.4
+    fig, ax = canvas(height)
+    # the priors' centre line and half-width, and the score's box, in inches
+    centre, reach = 5.75, 1.45
+    box_left, box_middle, box_tall = 8.3, 2.05, 1.25
+    bases = (2.85, 1.65, 0.25)
+    # each class's prior SD in inches, a schematic (empirical Bayes learns the real ones); every prior encloses the
+    # same area, so a narrower one stands taller, the SNV's 0.9 in
+    spreads = (0.2, 0.28, 0.5)
+    area = 0.9 * spreads[0] * math.sqrt(2 * math.pi)
+    effect = np.linspace(-reach, reach, 400)
+    ax.text(centre, height - 0.04, "Effect-size prior", ha="center", va="top", color=INK)
+    for (name, colour, block), base, spread in zip(VARIANTS, bases, spreads):
+        middle = base + 0.4
+        ax.text(EDGE, middle, name, ha="left", va="center", color=colour, fontsize=POSTER_NAME, fontweight="bold")
+        chromosome(ax, 2.1, 4.0, middle, [(3.05, block, colour)])
+        ax.plot([centre - reach, centre + reach], [base, base], color=LIGHT, linewidth=3.2, zorder=1,
+                solid_capstyle="round")
+        # each curve drawn where it stands clear of its baseline, so the tails leave the baseline bare
+        density = area * stats.norm.pdf(effect, scale=spread)
+        shown = density > 0.03
+        ax.fill_between(centre + effect, base, base + density, color=colour, alpha=0.22, linewidth=0, zorder=2)
+        ax.plot(centre + effect[shown], base + density[shown], color=colour, linewidth=6.0, zorder=3,
+                solid_capstyle="round")
+        if name == "SV":
+            # the same prior for an SV imputed with r^2 = 0.3: its variance scales by r^2
+            low = area * stats.norm.pdf(effect, scale=spread * math.sqrt(0.3))
+            shown = low > 0.03
+            ax.plot(centre + effect[shown], base + low[shown], color=colour, linewidth=5.0, linestyle=(0, (1.4, 1.1)),
+                    zorder=3)
+            ax.text(centre, base + low.max() + 0.05, "low r²", ha="center", va="bottom", color=INK)
+        # every class into the one model
+        ax.annotate("", xy=(box_left - 0.08, box_middle + (middle - box_middle) * 0.4),
+                    xytext=(centre + reach + 0.2, middle),
+                    arrowprops={"arrowstyle": "-|>,head_length=0.55,head_width=0.28", "color": INK, "linewidth": 4.0,
+                                "shrinkA": 0, "shrinkB": 0})
+    ax.add_patch(matplotlib.patches.FancyBboxPatch((box_left, box_middle - box_tall / 2), COLUMN - EDGE - box_left,
+                                                   box_tall, boxstyle="round,pad=0,rounding_size=0.2",
+                                                   facecolor=SV_PGS, edgecolor="none"))
+    ax.text((box_left + COLUMN - EDGE) / 2, box_middle, "SV-PGS", ha="center", va="center", color="white",
+            fontsize=POSTER_NAME, fontweight="bold")
+    return fig
+
+
+def poster_variants_figure():
+    """The variants each method scores on one stretch of chromosome: every SNV, indel and SV for SV-PGS, a sparse
+    subset of the SNVs for LDpred2-auto (HapMap3 density)."""
+    height = 2.25
+    fig, ax = canvas(height)
+    start, end = 4.9, COLUMN - EDGE
+    # SVs, then indels clear of them, then SNVs every 0.155 in clear of both; LDpred2-auto keeps every fourth SNV
+    svs = ((5.6, 0.75), (8.0, 1.0), (10.05, 0.6))
+    indels = [x for x in (6.35, 7.0, 9.05, 10.65) if all(abs(x - centre) > width / 2 + 0.1 for centre, width in svs)]
+    snvs = [x for x in np.arange(start + 0.1, end - 0.05, 0.155)
+            if all(abs(x - centre) > width / 2 + 0.06 for centre, width in svs)
+            and all(abs(x - indel) > 0.13 for indel in indels)]
+    rows = ((height - 0.4, "SV-PGS", SV_PGS, [(c, w, IMPUTED) for c, w in svs] + [(c, 0.16, GREEN) for c in indels]
+             + [(c, 0.05, INK) for c in snvs]),
+            (height - 1.3, "LDpred2-auto", LDPRED2, [(c, 0.05, INK) for c in snvs[2::4]]))
+    for y, name, colour, marks in rows:
+        ax.text(EDGE, y, name, ha="left", va="center", color=colour, fontsize=POSTER_NAME, fontweight="bold")
+        chromosome(ax, start, end, y, marks, tall=0.6)
+    ax.text(start, 0.28, "HapMap3-density SNVs", ha="left", va="center", color=INK)
+    return fig
+
+
 def main() -> None:
     grids = load_results()
     with open(SUMMARY) as handle:
@@ -1094,10 +1199,13 @@ def main() -> None:
         for name, panel in (("poster_accuracy_by_training_size", poster_accuracy_figure(grids, summary)),
                             ("poster_wins", poster_wins_figure(grids)),
                             ("poster_sv_gain", poster_sv_gain_figure(grids)),
-                            ("poster_imputation_accuracy", poster_imputation_figure(summary))):
+                            ("poster_imputation_accuracy", poster_imputation_figure(summary)),
+                            ("poster_model", poster_model_figure()), ("poster_variants", poster_variants_figure())):
             # transparent, so the page shows through: an opaque white ground renders a shade off the page white in a PDF
             panel.savefig(OUT / f"{name}.png", transparent=True)
             plt.close(panel)
+    for name, words in SCHEMATICS.items():
+        (OUT / f"{name}.txt").write_text(words + "\n")
     text = json.dumps(rounded(NUMBERS), indent=1, ensure_ascii=False)
     # each [mean, lower, upper, n] on one line
     text = re.sub(r"\[\s*([^\[\]{}]*?)\s*\]", lambda match: "[" + " ".join(match.group(1).split()) + "]", text)

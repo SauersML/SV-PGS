@@ -1,0 +1,1 @@
+One stretch of chromosome: SV-PGS scores every SNV, indel and SV; LDpred2-auto scores SNVs at HapMap3 density.

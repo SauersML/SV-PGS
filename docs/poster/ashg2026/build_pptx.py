@@ -141,7 +141,6 @@ def copy(numbers: dict) -> dict:
     # the smallest training set on which SV-PGS clears LDpred2-auto trained on the largest
     sooner = next((size for size, cell in zip(sizes, ours) if cell[1] > theirs[-1][2]), None)
     every = wins["wins"] == wins["replicates"]
-    rare = svs["rare_r2"]
     share = gain["imputed_sum"] / gain["true_sum"]
     imputed_well = gain["rows"]["tagged_sv_fold3"]
     kept_well = imputed_well["imputed"][0] / imputed_well["true"][0]
@@ -149,21 +148,19 @@ def copy(numbers: dict) -> dict:
     return {
         "introduction": [
             "Polygenic scores (PGSs) rarely include structural variants (SVs)",
-            "Many SVs are rare and hard to genotype",
             "We test whether adding SVs makes PGSs more accurate",
         ],
-        "methods": ["Fit by empirical Bayes on GPUs"],
+        "methods": ["Prior variance depends on imputation r², allele frequency and SV length",
+                    "Priors fit by empirical Bayes on GPUs"],
         "code": ["Code:", "github.com/", "SauersML/SV-PGS"],
         "design": [
-            f"{people(svs['people'])} people simulated from 1000 Genomes chr22; SVs imputed by Beagle",
-            f"Baseline: binary trait, liability h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}, "
+            f"{people(svs['people'])} people from 1000 Genomes chr22: train on {people(sizes[0])}–{people(sizes[-1])}, "
+            f"test on {people(accuracy['test_people'])}",
+            f"Binary trait: liability h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}, "
             f"{accuracy['causal']} causal variants",
-            f"{gain['shown']} genetic architectures vary the causal SVs or the trait",
-            f"Train on {people(sizes[0])}–{people(sizes[-1])} people; test on {people(accuracy['test_people'])} others",
-            "LDpred2-auto uses SNVs at HapMap3 density",
+            f"{gain['shown']} genetic architectures vary the causal SVs or the trait; SVs imputed by Beagle",
         ],
         "svs_title": "Rare SVs impute poorly",
-        "svs": [f"Below 1% MAF, mean r² is **{rare['SV']:.2f}** for SVs and **{rare['SNV']:.2f}** for SNVs"],
         # the three key numbers, each over the figure that shows it
         "accuracy_number": [(thousand(sooner), "b blue"), ("  beats  ", f"b pt{CLAIM}"), (thousand(sizes[-1]), "b vermillion")]
                            if sooner and sooner < sizes[-1] and ahead else None,
@@ -188,19 +185,6 @@ def copy(numbers: dict) -> dict:
         ],
     }
 
-
-# The model: (formula runs, its plain-language gloss); flags as in run()
-EQUATION = [
-    ([("logit P(", ""), ("y", "i"), (" = 1) = Σ", ""), ("j", "i sub"), (" x", "i"), ("j", "i sub"), ("β", ""),
-      ("j", "i sub"), (" + covariates", "")],
-     "One model for all SNVs, indels and SVs"),
-    ([("β", ""), ("j", "i sub"), (" ~ N(0, ", ""), ("s", "i"), ("j", "i sub"), ("τ", ""), ("j", "i sub"), (")   τ", ""),
-      ("j", "i sub"), (" ~ ", ""), ("g", "i"), ("class", "sub")],
-     "Each variant class has its own effect-size prior"),
-    ([("log ", ""), ("s", "i"), ("j", "i sub"), (" = log ", ""), ("r", "i"), ("2", "sup"), ("j", "i sub"), (" + ", ""),
-      ("h", "i"), ("(freq.) + ", ""), ("f", "i"), ("(length) + …", "")],
-     "Prior variance depends on imputation r², frequency and SV length"),
-]
 
 # ------------------------------------------------------------------ DrawingML
 
@@ -679,17 +663,15 @@ def build() -> None:
     xml = duplicate(duplicate(xml, 93, 118, "Simulation results bar"), 93, 119, "All of Us bar")
 
     gallery = {name: GALLERY / f"{name}.png" for name in (
-        "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy")}
-    model = [para for formula, gloss in EQUATION for para in (
-        Para(formula, BODY, bullet=False, after=4), Para([(gloss, "")], GLOSS, bullet=False, after=20))]
+        "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy",
+        "poster_model", "poster_variants")}
     columns = [
         [
             bar(97, "Introduction"), text(bullets(words["introduction"])),
-            bar(91, "Methods"), text(model), text(bullets(words["methods"])),
-            bar(93, "Simulation design"), text(bullets(words["design"])),
+            bar(91, "Methods"), figure(gallery["poster_model"]), text(bullets(words["methods"])),
+            bar(93, "Simulation design"), text(bullets(words["design"])), figure(gallery["poster_variants"]),
             headline(words["svs_title"]),
             figure(gallery["poster_imputation_accuracy"], flex=True, legend=GALLERY / "fig5_simulated_svs.txt"),
-            text(bullets(words["svs"])),
         ],
         [
             bar(118, "Simulation results"),
