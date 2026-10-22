@@ -8,10 +8,12 @@ NUMBERS holds:
   relative_ci_high: the family-clustered bootstrap's percentile interval), one row a trait;
 - "enrichment": prior_enrichment.tsv's rows of arm with_sv: a class's mean posterior E[beta^2 | data] per record over
   the SNVs' (posterior_enrichment, its jackknife standard error and interval) and the learned prior's (prior_enrichment);
+- "by_length": prior_by_length.tsv's rows of arm with_sv: the same enrichment per class and length bin;
 - "alpha", optionally: frequency_alpha.tsv's rows of arm with_sv.
 
-Outputs, in figures/: aou_1_gain.png and aou_2_classes.png (transparent, at the width of the poster's right column),
-each with its .txt, whose first line build_pptx.py sets as the figure's headline.
+Outputs, in figures/: aou_1_gain.png, aou_2_classes.png, aou_3_length.png and aou_4_alpha.png, each drawn when NUMBERS
+holds its rows (transparent, at the width of the poster's right column), each with its .txt, whose first line
+build_pptx.py sets as the figure's headline.
 
     uv run --with matplotlib --with scipy python docs/poster/ashg2026/aou_gallery.py
 """
@@ -225,29 +227,10 @@ def length_figure(by_length: list[dict]) -> tuple:
     return fig, ["Longer SVs have larger effects"]
 
 
-def ablation_figure(ablation: list[dict]) -> tuple:
-    """Each trait's gain in held-out partial r² from its SV-PGS model's own SVs (the full score against the same score
-    without its SV terms, on the same held-out people), with its bootstrap 95% interval, in units of 10⁻⁴, on one
-    axis: a row per trait, the trait whose interval lies furthest above 0 first; filled where the interval excludes 0."""
-    rows = sorted(((trait_name(row["trait"]), row["estimate"] * 1e4, row["ci_low"] * 1e4, row["ci_high"] * 1e4)
-                   for row in ablation if row["cell"] == "all"), key=lambda row: -row[2])
-    ends = [end for _, _, low, high in rows for end in (low, high)] + [0.0]
-    step = next(step for step in (1.0, 2.0, 5.0, 10.0, 20.0, 50.0)
-                if math.ceil(max(ends) / step) - math.floor(min(ends) / step) <= 5)
-    ticks = [tick * step for tick in range(math.floor(min(ends) / step), math.ceil(max(ends) / step) + 1)]
-    fig = forest(rows, "Test partial r² gain from SVs (×10⁻⁴)", ticks, lambda tick: plain(tick, 0), log=False)
-    clear = [label for label, _, low, _ in rows if low > 0]
-    title = (f"Imputed SVs raised accuracy for {clear[0].lower()} only" if len(clear) == 1
-             else f"Imputed SVs raised accuracy for {len(clear)} of {len(rows)} traits")
-    return fig, [title]
-
-
 def main() -> None:
     numbers = json.loads(NUMBERS.read_text())
     with plt.rc_context({**POSTER_STYLE, "axes.labelsize": POSTER_LABEL}):
         drawn = []
-        if numbers.get("ablation"):
-            drawn.append(("aou_1_sv_part", ablation_figure(numbers["ablation"])))
         if numbers.get("paired"):
             drawn.append(("aou_1_gain", gain_figure(numbers["paired"])))
         if numbers.get("enrichment"):

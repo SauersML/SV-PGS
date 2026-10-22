@@ -176,14 +176,13 @@ def copy(numbers: dict) -> dict:
                  f"Where causal SVs impute well, the gain with imputed genotypes was **{kept_well:.0%}** as large"],
         "aou": [
             "50,000 short-read genomes; SVs imputed by GLIMPSE2 from 12,212 long-read assemblies",
-            "One 80/20 split by family, tested on 4,186–7,740 held-out people; gain: each model with vs without its SVs",
+            "SV-PGS fitted with SVs for LDL, hypothyroidism, AF and gout; one 80/20 split by family",
+            "Accuracy with SVs against SNV-only SV-PGS, both fitted by identical code, is running",
         ],
         "discussion": [
             "SV-PGS beats LDpred2-auto even with no causal SVs, so the gain comes from its model and denser variant set",
             f"With imputed SV genotypes the gain was **{share:.0%}** as large, so SVs add most when their genotypes are "
             "accurate",
-            "In All of Us, imputed SVs raised hypothyroidism accuracy (p = 0.025 before correcting for 4 traits); LDL, gout "
-            "and AF did not change",
         ],
     }
 
