@@ -94,8 +94,8 @@ REFERENCES = [
     "All of Us Research Program Investigators (2019) N Engl J Med 381:668.",
 ]
 PLACEHOLDERS = [
-    ("SV effects on hypertension", "Estimated SV effects by SV type and length"),
-    ("Test AUC by disease", "SV-PGS with or without SVs, LDpred2-auto"),
+    ("SV effect sizes by SV class and length", "From the fitted SV-PGS models"),
+    ("Test accuracy with vs without SVs", "SV-PGS with SVs vs SNV-only, fitted by identical code"),
 ]
 
 
