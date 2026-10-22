@@ -156,7 +156,6 @@ def copy(numbers: dict) -> dict:
             f"{accuracy['causal']} causal variants",
             f"{gain['shown']} genetic architectures vary the causal SVs or the trait; SVs imputed by Beagle",
         ],
-        "svs_title": "Rare SVs impute poorly",
         "accuracy": f"SV-PGS trained on {people(sooner)} people beat LDpred2-auto trained on {people(sizes[-1])} "
                     f"(AUC{NBSP}{auc(ours[sizes.index(sooner)][0])}{NBSP}vs{NBSP}{auc(theirs[-1][0])})" if sooner else "",
         "versus": f"SV-PGS was more accurate in {beaten} {wins['replicates']} traits",
@@ -630,7 +629,6 @@ def build() -> None:
             bar(97, "Introduction"), text(bullets(words["introduction"])),
             bar(91, "Methods"), figure(gallery["poster_model"]), text(bullets(words["methods"])),
             bar(93, "Simulation design"), text(bullets(words["design"])), figure(gallery["poster_variants"]),
-            headline(words["svs_title"]),
             figure(gallery["poster_imputation_accuracy"], flex=True, legend=GALLERY / "fig5_simulated_svs.txt"),
         ],
         [

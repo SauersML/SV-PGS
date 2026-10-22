@@ -930,16 +930,14 @@ def poster_sv_gain_figure(grids):
 
 
 def poster_imputation_figure(summary):
-    """The imputation figure in the poster's left column, wide and short: each frequency bin's mean r² of the imputed
-    dosage with the true genotype, SNVs and SVs, with frequencies below 1% shaded and the share of SVs there written
-    in the shading. The mean, not the median, so the curve agrees with the mean r² below 1% the poster's text quotes."""
+    """The imputation figure at the foot of the poster's left column: each frequency bin's mean r² of the imputed
+    dosage with the true genotype, SNVs and SVs, each named after its line's last mark. The margins are measured from
+    the drawn type, so larger type widens them. The y axis's title, longer than the axes are tall, is centred on the
+    figure's height, and the x axis's, wider than the axes, ends at the figure's right edge."""
     accuracy = summary["genotype_accuracy"]["r2_by_frequency"]
-    height = 5.2
-    fig = plt.figure(figsize=(POSTER_GENOTYPES, height))
-    # the y axis's title sits over its tick labels, left to right, which leaves the plot the figure's width
-    top, bottom, left, right = 0.75, 1.75, 1.25, 0.4
-    ax = frame(fig, left, bottom, POSTER_GENOTYPES - left - right, height - top - bottom)
-    ax.axvspan(0.04, 1, color="#EBEBEB", zorder=0, linewidth=0)
+    width, height, pad = POSTER_GENOTYPES, 5.2, 0.08
+    fig = plt.figure(figsize=(width, height))
+    ax = frame(fig, 0, 0, width, height)
     ends = {}
     for key, color in (("SNV", INK), ("SV", IMPUTED)):
         bins = [b for b in accuracy[key]["bins"] if b["count"]]
@@ -948,14 +946,11 @@ def poster_imputation_figure(summary):
         ax.plot(centers, mean, color=color, marker="o", markersize=POSTER_MARK * 0.9, markeredgewidth=0, zorder=3,
                 clip_on=False)
         ends[key] = (centers[-1], mean[-1])
-    # SNVs named over their line's end, SVs under theirs, so neither name sits between the lines
-    ax.text(ends["SNV"][0], ends["SNV"][1] + 0.07, "SNVs", color=INK, fontsize=POSTER_NAME, fontweight="bold",
-            ha="right", va="bottom")
-    ax.text(ends["SV"][0], ends["SV"][1] - 0.16, "SVs", color=IMPUTED, fontsize=POSTER_NAME, fontweight="bold",
-            ha="right", va="top")
-    # the share of SVs in the shaded band, written in the band between the two curves
-    ax.text(0.05, 0.64, f"{accuracy['SV']['below_1pct']:.0%} of SVs", ha="left", va="center", color=INK,
-            fontweight="bold")
+    # the two last marks are close, so SNVs is set a little above its mark and SVs below
+    after = POSTER_MARK * 0.9 / 2 / 72 + 0.15
+    for key, name, color, up in (("SNV", "SNVs", INK, 0.1), ("SV", "SVs", IMPUTED, -0.35)):
+        ax.text(*ends[key], name, transform=ax.transData + ScaledTranslation(after, up, fig.dpi_scale_trans),
+                color=color, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="center")
     ax.set_xscale("log")
     ax.set_xlim(0.04, 50)
     ax.set_ylim(0, 1)
@@ -963,8 +958,20 @@ def poster_imputation_figure(summary):
     ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
     ax.set_yticks([0, 0.5, 1], ["0", "0.5", "1"])
     ax.set_xlabel("Minor allele frequency (%)")
-    ax.text(0, 1, "Imputation r²", transform=shifted(ax, -(left - 0.12), 0.25, False), ha="left", va="bottom",
-            fontsize=POSTER_LABEL)
+    ax.set_ylabel("Imputation r²")
+    # each margin is what the type reaches past the axes, plus a pad, measured again until it settles
+    renderer = fig.canvas.get_renderer()
+    inches = fig.dpi_scale_trans.inverted()
+    for _ in range(6):
+        outer = ax.get_tightbbox(renderer).transformed(inches)
+        inner = ax.get_window_extent(renderer).transformed(inches)
+        left, bottom = inner.x0 - outer.x0 + pad, inner.y0 - outer.y0 + pad
+        right, above = outer.x1 - inner.x1 + pad, outer.y1 - inner.y1 + pad
+        across, up = width - left - right, height - bottom - above
+        ax.set_position((left / width, bottom / height, across / width, up / height))
+        ax.yaxis.label.set_y((height / 2 - bottom) / up)
+        title = ax.xaxis.label.get_window_extent(renderer).transformed(inches).width
+        ax.xaxis.label.set_x((width - pad - title / 2 - left) / across)
     return fig
 
 
