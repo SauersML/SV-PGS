@@ -800,11 +800,11 @@ def genotype_figure(summary):
 
 POSTER_TYPE, POSTER_LABEL, POSTER_NAME = 56, 60, 64
 """Points at print size in the poster's figures: ticks and notes; axis titles; the bold names of methods and genotype
-sources written beside their marks. A poster figure carries no legend and no title, since the poster's headline over
-it states its message."""
+sources written beside their marks. A poster figure carries no legend and no title: a headline over it, or the
+figure's own labels, state its message."""
 POSTER_LINE, POSTER_MARK, POSTER_BAR = 8.0, 26.0, 6.0
 """Points: a data line's width, a mean's marker and an interval's line in the poster's figures."""
-POSTER_HEIGHT = 7.6
+POSTER_HEIGHT = 9.65
 """Inches: the height of the two figures side by side at the top of the poster's middle column."""
 POSTER_HALF = 11.06
 """Inches: the width each of those two figures is placed at (half of build_pptx.py's 22.92 in middle column less its
@@ -854,10 +854,6 @@ def poster_accuracy_figure(grids, summary):
     return fig
 
 
-POSTER_WINS_HEIGHT = 7.6
-"""Inches: the height of the figure of every simulation's two test AUCs, beside Figure 1a."""
-
-
 def poster_wins_figure(grids):
     """SV-PGS's test AUC against LDpred2-auto's in every simulation at the largest training size, over the line of equal
     AUC: one dot per simulation (black with no causal SVs), with the 95% interval of the paired AUC difference drawn
@@ -875,10 +871,10 @@ def poster_wins_figure(grids):
     NUMBERS["poster_wins"] = {"train_count": size, "replicates": len(rows), "wins": int((gain > 0).sum()),
                               "clear": int((gain - half > 0).sum()), "null_replicates": int(null.sum()),
                               "architectures": len({row["point"] for row in rows})}
-    fig = plt.figure(figsize=(POSTER_HALF, POSTER_WINS_HEIGHT))
+    fig = plt.figure(figsize=(POSTER_HALF, POSTER_HEIGHT))
     ticks = widest(fig, ["0.00"], fontsize=POSTER_TYPE)
     top, bottom, left, right = 0.25, 2.05, ticks + 1.6, 0.3
-    ax = frame(fig, left, bottom, POSTER_HALF - left - right, POSTER_WINS_HEIGHT - top - bottom)
+    ax = frame(fig, left, bottom, POSTER_HALF - left - right, POSTER_HEIGHT - top - bottom)
     limits = (0.465, 0.68)
     ax.axline((limits[0], limits[0]), slope=1, color=INK, linewidth=4.0, zorder=1)
     for chosen, color in ((~null, SV_PGS), (null, INK)):
@@ -890,9 +886,9 @@ def poster_wins_figure(grids):
     ax.set_ylim(*limits)
     ax.set_xticks([0.5, 0.55, 0.6], ["0.50", "0.55", "0.60"])
     ax.set_yticks([0.5, 0.55, 0.6, 0.65], ["0.50", "0.55", "0.60", "0.65"])
-    # both titles run longer than their axis, so each ends at the axis's far end
+    # the x axis's title runs longer than its axis, so it ends at the axis's far end
     ax.set_xlabel("LDpred2-auto test AUC", loc="right")
-    ax.set_ylabel("SV-PGS test AUC", loc="top")
+    ax.set_ylabel("SV-PGS test AUC")
     ax.text(limits[0] + 0.005, limits[1] - 0.005, "SV-PGS\nbetter", color=SV_PGS, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top",
             linespacing=1.0)
     ax.text(0.632, limits[0] + 0.004, "Black: no\ncausal SVs", color=INK, fontweight="bold", ha="right", va="bottom",

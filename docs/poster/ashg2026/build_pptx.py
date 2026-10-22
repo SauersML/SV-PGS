@@ -121,12 +121,7 @@ def people(count: int) -> str:
 
 def copy(numbers: dict) -> dict:
     """The poster's sentences, each number from the gallery figure that shows it."""
-    accuracy, wins, gain, svs = numbers["fig1"], numbers["poster_wins"], numbers["poster_sv_gain"], numbers["fig5"]
-    sizes = accuracy["train_counts"]
-    ours, theirs = accuracy["SV-PGS"], accuracy["LDpred2-auto"]  # [mean, lower, upper, n] per size
-    # the smallest training set on which SV-PGS clears LDpred2-auto trained on the largest
-    sooner = next((size for size, cell in zip(sizes, ours) if cell[1] > theirs[-1][2]), None)
-    beaten = "all" if wins["wins"] == wins["replicates"] else f"{wins['wins']} of"
+    accuracy, gain, svs = numbers["fig1"], numbers["poster_sv_gain"], numbers["fig5"]
     every = gain["rows"]["all"]  # true and imputed: [mean, lower, upper, truths]; share: [ratio, lower, upper]
     share, share_lower, share_upper = every["share"]
     return {
@@ -138,8 +133,6 @@ def copy(numbers: dict) -> dict:
             f"Binary trait: h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}",
             f"{gain['shown']} genetic architectures; SVs imputed by Beagle",
         ],
-        "accuracy": f"SV-PGS at {people(sooner)} beat LDpred2-auto at {people(sizes[-1])}" if sooner else "",
-        "versus": f"SV-PGS had higher AUC in {beaten} {wins['replicates']} simulations",
         "gain_note": f"Mean and 95% CI over {every['true'][3]} simulations in 3 Mb of chr22",
         "gain": [f"Across all {every['architectures']} architectures, imputed SVs gave **{share:.0%}** of the gain of "
                  f"true SVs (95% CI {share_lower:.0%}–{share_upper:.0%})"],
@@ -611,10 +604,8 @@ def build() -> None:
         ],
         [
             bar(118, "Simulation results"),
-            row([*([headline(words["accuracy"])] if words["accuracy"] else []),
-                 figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
-                [headline(words["versus"]),
-                 figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
+            row([figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
+                [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
             Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)], gap="section"),
             figure(gallery["poster_sv_gain"]),
             text(bullets(words["gain"])),
