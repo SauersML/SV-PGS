@@ -114,3 +114,20 @@ def test_the_stage0_benchmark_passes_its_checks_on_the_host(tmp_path: Path) -> N
 
     report = main(["--tiny", "--device", "cpu", "--out", str(tmp_path)])
     assert report["checks"] and all(report["checks"].values()), report["checks"]
+
+
+def test_the_cuda_buffer_hands_a_host_array_back_from_to_host() -> None:
+    # Stage 0's lag profile is summed on the host (lag_profiles.lag_profile), and _project_block sends every array it
+    # returns through the buffer's to_host. CuPy's ascontiguousarray refuses a NumPy array, which failed both arms of
+    # round m1 at Stage 0 ("Argument 'a' has incorrect type"); the fake cupy here refuses one the same way.
+    from sv_pgs.genotype_buffers import CudaGenotypeBuffer
+
+    def refuse(array):
+        raise TypeError("Argument 'a' has incorrect type (expected cupy._core.core._ndarray_base, got numpy.ndarray)")
+
+    buffer = object.__new__(CudaGenotypeBuffer)
+    buffer._cupy = SimpleNamespace(ascontiguousarray=refuse)
+    host = np.arange(12.0).reshape(3, 4)[:, ::2]
+    returned = buffer.to_host(host)
+    assert isinstance(returned, np.ndarray) and returned.flags.c_contiguous
+    np.testing.assert_array_equal(returned, host)

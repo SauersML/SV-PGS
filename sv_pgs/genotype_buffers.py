@@ -586,7 +586,12 @@ class CudaGenotypeBuffer:
         Never pinned: CuPy's pinned pool keeps every freed block in its exact-size bin until ``free_all_blocks``, and
         Stage 0's per-block Grams and couplings come back at a new size for nearly every block (4 w^2 bytes, up to ~10
         GB at an 80 GB device's cap), so pinned copies held host memory without bound, outside the ledger, until the
-        VM's memory was gone partway through a genome. The fixed-size upload tiles stay pinned (``host_tile``)."""
+        VM's memory was gone partway through a genome. The fixed-size upload tiles stay pinned (``host_tile``).
+
+        A host array comes back as it is (contiguous): Stage 0's lag profile is summed on the host
+        (``lag_profiles.lag_profile``), and CuPy's ``ascontiguousarray`` refuses a NumPy array."""
+        if isinstance(array, np.ndarray):
+            return np.ascontiguousarray(array)
         with self.context():
             host = self._cupy.ascontiguousarray(array).get(stream=self._compute)
             self._compute.synchronize()
