@@ -858,26 +858,65 @@ def test_a_step_made_again_under_its_own_key_keeps_its_mirrored_copy(tmp_path: P
     assert not (mirror / "store").exists()
 
 
-def test_a_gcs_restart_file_is_sent_in_parallel_parts_within_the_part_limit(tmp_path: Path, monkeypatch) -> None:
+def test_a_gcs_restart_file_is_sent_in_parallel_parts_composed_into_one_object(tmp_path: Path, monkeypatch) -> None:
     transfer_manager = pytest.importorskip("google.cloud.storage.transfer_manager")
-    calls, whole = [], []
-    monkeypatch.setattr(transfer_manager, "upload_chunks_concurrently", lambda *args, **kwargs: calls.append((args, kwargs)))
+    objects: dict[str, bytes] = {}
+    deleted: list[str] = []
+
+    class Blob:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def upload_from_file(self, handle, size: int, retry=None) -> None:
+            objects[self.name] = handle.read(size)
+
+        def compose(self, sources) -> None:
+            objects[self.name] = b"".join(objects[source.name] for source in sources)
+
+    class Bucket:
+        def blob(self, name: str) -> Blob:
+            return Blob(name)
+
+        def delete_blobs(self, blobs) -> None:
+            for blob in blobs:
+                deleted.append(blob.name)
+                del objects[blob.name]
+
+    class Pool:
+        """The upload processes, run in this one."""
+
+        def __init__(self, **options) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *raised) -> bool:
+            return False
+
+        def map(self, function, *iterables):
+            return map(function, *iterables)
+
     monkeypatch.setattr(transfer_manager, "TM_DEFAULT_CHUNK_SIZE", 2)
-    blob = object()
     remote = GcsRemote.__new__(GcsRemote)
-    remote._bucket, remote._root = type("Bucket", (), {"blob": lambda self, name: blob})(), "svpgs/run/"
+    remote._bucket, remote._root, remote._url = Bucket(), "svpgs/run/", "gs://bucket/svpgs/run"
+    monkeypatch.setitem(run_mirror._PROCESS_REMOTES, remote._url, remote)
+    monkeypatch.setattr(run_mirror, "ProcessPoolExecutor", Pool)
+    whole: list[str] = []
     monkeypatch.setattr(remote, "upload", lambda path, name: whole.append(name))
     tiny = _write(tmp_path / "tiny", bytes(2))
-    small = _write(tmp_path / "small", bytes(16))
-    large = _write(tmp_path / "large", bytes(2 * run_mirror.MULTIPART_PARTS + 1))
+    small = _write(tmp_path / "small", bytes(range(7)))
+    large = _write(tmp_path / "large", bytes(range(256)) * 3)
     for path in (tiny, small, large):
         remote.upload_parts(path, f"restart/snv_indel/stage0/key/{path.name}")
-    # A file within one part is sent whole.
+    # A file within one part is sent whole; a larger one is its bytes, composed from its parts, which are deleted.
     assert whole == ["restart/snv_indel/stage0/key/tiny"]
-    (small_args, small_options), (large_args, large_options) = calls
-    assert small_args == (str(small), blob) and small_options["worker_type"] == transfer_manager.PROCESS and small_options["chunk_size"] == 2
-    # Past the default chunk's 10,000 parts, each part grows so the object stays within Cloud Storage's limit.
-    assert large_options["chunk_size"] == 3 and -(-large.stat().st_size // large_options["chunk_size"]) <= run_mirror.MULTIPART_PARTS
+    prefix = "svpgs/run/restart/snv_indel/stage0/key/"
+    assert objects == {prefix + "small": small.read_bytes(), prefix + "large": large.read_bytes()}
+    assert all(name.startswith(f"svpgs/run/{run_mirror.COMPOSING}/restart/") for name in deleted)
+    # Parts of at least the default chunk, and no more than compose takes: 4 of 7 bytes, 32 of 768.
+    assert sum(name.split("/")[-1].startswith("small.part") for name in deleted) == 4
+    assert sum(name.split("/")[-1].startswith("large.part") for name in deleted) == run_mirror.COMPOSE_SOURCES
 
 
 def test_a_gcs_restart_file_is_restored_in_parallel_ranges_with_its_checksum(tmp_path: Path, monkeypatch) -> None:

@@ -96,8 +96,11 @@ RECEIPT = ".pushed.json"
 restored, by object name; a file whose stamp differs is sent again. And by unit (its prefix), the build id of the
 mirrored copy the disk restored or saw whole there while it held the unit: once the disk no longer holds the unit, a
 push removes the mirrored copy only where it is still that build, and forgets the unit."""
-MULTIPART_PARTS = 10_000
-"""Cloud Storage's XML multipart upload: at most 10,000 parts an object."""
+COMPOSE_SOURCES = 32
+"""Cloud Storage's compose: at most 32 source objects into one (cloud.google.com/storage/docs/composite-objects)."""
+COMPOSING = ".composing"
+"""Where a parallel composite upload's parts wait for their compose, under the mirror's root and outside every step's
+and the restart store's names, so a part a killed push leaves behind is never read as a file of either."""
 DIRECTORIES = ".directories.json"
 """Beside a mirrored step, its directories, which GCS keeps only as the prefixes of objects: an empty one is
 restored from this list."""
@@ -204,21 +207,39 @@ class GcsRemote:
         self._bucket.blob(self._root + name).upload_from_filename(str(path))
 
     def upload_parts(self, path: Path, name: str) -> None:
-        """``upload`` in parts sent at once (Cloud Storage's XML multipart upload): one stream sent a restart unit's
-        150 GB LD store at one connection's rate. The parts go from the library's default count of processes, each with
-        its own client, not threads, whose per-chunk Python work shares one interpreter lock (``download_many``); a
-        push runs beside the fit, so not one per CPU. The object appears only when every part is in, whole or absent
-        like any other."""
+        """``upload`` in parts sent at once, then composed into one object (a parallel composite upload): one stream
+        sent a restart unit's 150 GB LD store at one connection's rate. The file's bytes are split into up to
+        COMPOSE_SOURCES ranges of at least the library's default chunk, each sent to its own object under COMPOSING
+        from its own process with its own client, not a thread, whose per-chunk Python work shares one interpreter lock
+        (``download_many``); compose writes the object from them, whole or absent like any other, and the parts are
+        deleted. Cloud Storage's XML multipart upload, which this replaced, needs storage.multipartUploads.create,
+        which the All of Us workspace's pet service account does not have: every restart push of rounds m1 and m2 was
+        refused with 403 (AccessDenied), so no restart unit reached the mirror. Compose needs only the object
+        permissions every other push uses. A composed object carries a CRC32C and no MD5, and ``download_parts``
+        checks the CRC32C."""
         from google.cloud.storage import transfer_manager
 
         size = path.stat().st_size
         if size <= transfer_manager.TM_DEFAULT_CHUNK_SIZE:
             self.upload(path, name)
             return
-        transfer_manager.upload_chunks_concurrently(
-            str(path), self._bucket.blob(self._root + name), worker_type=transfer_manager.PROCESS,
-            chunk_size=max(transfer_manager.TM_DEFAULT_CHUNK_SIZE, -(-size // MULTIPART_PARTS)),
-        )
+        count = min(COMPOSE_SOURCES, -(-size // transfer_manager.TM_DEFAULT_CHUNK_SIZE))
+        edges = [size * index // count for index in range(count + 1)]
+        parts = [f"{COMPOSING}/{name}.part{index}" for index in range(count)]
+        # spawn, not fork: a forked child would share the parent client's connections
+        with ProcessPoolExecutor(max_workers=min(count, len(os.sched_getaffinity(0))), mp_context=multiprocessing.get_context("spawn")) as pool:
+            list(pool.map(_upload_range_in_process, repeat(self._url), repeat(path), edges[:-1], edges[1:], parts))
+        sources = [self._bucket.blob(self._root + part) for part in parts]
+        self._bucket.blob(self._root + name).compose(sources)
+        self._bucket.delete_blobs(sources)
+
+    def upload_range(self, path: Path, start: int, stop: int, name: str) -> None:
+        """Bytes ``start`` to ``stop`` of the file at ``path`` as the object ``name``."""
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        with path.open("rb") as handle:
+            handle.seek(start)
+            self._bucket.blob(self._root + name).upload_from_file(handle, size=stop - start, retry=DEFAULT_RETRY)
 
     def write(self, name: str, content: bytes) -> None:
         self._bucket.blob(self._root + name).upload_from_string(content)
@@ -368,6 +389,12 @@ def _download_in_process(url: str, name: str, path: Path) -> str | None:
     if url not in _PROCESS_REMOTES:
         _PROCESS_REMOTES[url] = GcsRemote(url)
     return _PROCESS_REMOTES[url].download(name, path)
+
+
+def _upload_range_in_process(url: str, path: Path, start: int, stop: int, name: str) -> None:
+    if url not in _PROCESS_REMOTES:
+        _PROCESS_REMOTES[url] = GcsRemote(url)
+    _PROCESS_REMOTES[url].upload_range(path, start, stop, name)
 
 
 class _HashingFile:
