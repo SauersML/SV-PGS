@@ -814,21 +814,15 @@ def poster_accuracy_figure(grids, summary):
     ceiling = summary["points"]["null"]["true_value_auc"]
     ax.axhline(ceiling, color=INK, linestyle=(0, (1, 1.2)), linewidth=4.0, zorder=1)
     ax.text(SIZES[0] / 1.25, ceiling - 0.005, "Best possible", color=INK, va="top", ha="left")
-    means, lows, highs = {}, {}, {}
+    means = {}
     for key, method, color in (("with_sv_auc", "SV-PGS", SV_PGS), ("ldpred2_auc", "LDpred2-auto", LDPRED2)):
         pooled = [interval([row[key] for point, *_ in SV_SHARES for row in grouped.get((point, size), [])])
                   for size in SIZES]
         mean, low, high = (np.array([cell[i] for cell in pooled]) for i in range(3))
-        means[method], lows[method], highs[method] = mean, low, high
+        means[method] = mean
         ax.fill_between(SIZES, low, high, color=color, alpha=0.2, linewidth=0, zorder=2)
         ax.plot(SIZES, mean, color=color, zorder=3, marker="o", markeredgewidth=0)
         ax.text(SIZES[-1] * 1.15, mean[-1], f"{mean[-1]:.3f}", color=color, fontweight="bold", ha="left", va="center")
-    # the SV-PGS AUC at the smallest training size whose interval clears LDpred2-auto's at the largest (the size the
-    # poster's text names), carried right to the largest size as a dashed level, over LDpred2-auto's end
-    sooner = next((index for index in range(len(SIZES) - 1) if lows["SV-PGS"][index] > highs["LDpred2-auto"][-1]), None)
-    if sooner is not None:
-        ax.plot([SIZES[sooner], SIZES[-1]], [means["SV-PGS"][sooner]] * 2, color=SV_PGS, linewidth=4.0,
-                linestyle=(0, (2, 1.5)), zorder=2.5)
     # each method's name on the empty side of its own line: SV-PGS above its left half, LDpred2-auto below its right
     ax.text(SIZES[0] / 1.2, means["SV-PGS"][1] + 0.022, "SV-PGS", color=SV_PGS, fontsize=POSTER_NAME,
             fontweight="bold", ha="left", va="bottom")

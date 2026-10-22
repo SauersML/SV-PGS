@@ -62,8 +62,8 @@ INSET = 0.3
 """Text sits this far inside its column, under the section bars' labels."""
 BAR, BAR_SIZE = 1.0, 54
 BODY, HEADLINE, GLOSS, REFERENCE = 40, 40, 40, 32
-NUMBER, CLAIM = 120, 56
-"""Points: a key number over its figure, and the words set between two key numbers."""
+NUMBER = 120
+"""Points: a key number over its figure."""
 LINE_PITCH = 1.066
 """Line pitch per point of type at 90% line spacing, measured on the LibreOffice render."""
 SHIFTED_PITCH = 0.25
@@ -137,15 +137,12 @@ def copy(numbers: dict) -> dict:
     accuracy, wins, gain, svs = numbers["fig1"], numbers["poster_wins"], numbers["poster_sv_gain"], numbers["fig5"]
     sizes = accuracy["train_counts"]
     ours, theirs = accuracy["SV-PGS"], accuracy["LDpred2-auto"]  # [mean, lower, upper, n] per size
-    # SV-PGS is ahead at a size when its interval clears LDpred2-auto's
-    ahead = all(ours[index][1] > theirs[index][2] for index in range(len(sizes)))
     # the smallest training set on which SV-PGS clears LDpred2-auto trained on the largest
     sooner = next((size for size, cell in zip(sizes, ours) if cell[1] > theirs[-1][2]), None)
     every = wins["wins"] == wins["replicates"]
     share = gain["imputed_sum"] / gain["true_sum"]
     imputed_well = gain["rows"]["tagged_sv_fold3"]
     kept_well = imputed_well["imputed"][0] / imputed_well["true"][0]
-    thousand = lambda count: f"{count // 1000}k"
     return {
         "introduction": [
             "Polygenic scores (PGSs) rarely include structural variants (SVs)",
@@ -162,15 +159,11 @@ def copy(numbers: dict) -> dict:
             f"{gain['shown']} genetic architectures vary the causal SVs or the trait; SVs imputed by Beagle",
         ],
         "svs_title": "Rare SVs impute poorly",
-        # the three key numbers, each over the figure that shows it
-        "accuracy_number": [(thousand(sooner), "b blue"), ("  beats  ", f"b pt{CLAIM}"), (thousand(sizes[-1]), "b vermillion")]
-                           if sooner and sooner < sizes[-1] and ahead else None,
-        "accuracy": f"SV-PGS trained on {people(sooner)} people beats LDpred2-auto trained on {people(sizes[-1])} "
+        "accuracy": f"SV-PGS trained on {people(sooner)} people beat LDpred2-auto trained on {people(sizes[-1])} "
                     f"(AUC{NBSP}{auc(ours[sizes.index(sooner)][0])}{NBSP}vs{NBSP}{auc(theirs[-1][0])})" if sooner else "",
         "versus_number": [(f"{wins['wins']} of {wins['replicates']}", "b blue")],
         "versus": f"simulated data sets where SV-PGS beats LDpred2-auto, both trained on {people(sizes[-1])}{NBSP}people",
-        "gain_number": [(f"{share:.0%}", "b sky")],
-        "gain_claim": ["AUC gain with {{imputed SV genotypes|sky}},", "as a share of the gain with {{true SV genotypes|blue}}"],
+        "gain_title": f"Imputed SV genotypes gave {share:.0%} of the AUC gain of true SV genotypes",
         "gain": [f"The {gain['clear']} of {gain['shown']} architectures where true SV genotypes raised AUC (95% CI above "
                  "0), in one 3 Mb window of chr22",
                  f"Where causal SVs impute well, the gain with imputed genotypes was **{kept_well:.0%}** as large"],
@@ -443,19 +436,6 @@ def callout(number: list[tuple[str, str]] | None, statement: str) -> Block:
     return text(paragraphs + [Para(marked(statement), BODY, bullet=False, after=0)])
 
 
-def run_width(runs: list[tuple[str, str]], size: float) -> float:
-    """Inches ``runs`` take on one line."""
-    return sum(face("b" in flags.split(), "i" in flags.split()).getlength(words) * run_size(flags, size) / 100 / 72
-               for words, flags in runs)
-
-
-def aside(number: list[tuple[str, str]], claim: list[str]) -> Block:
-    """A key number in giant type with its claim, one bold line per entry, set beside it as a headline."""
-    return Block("aside", ([Para(number, NUMBER, bullet=False, after=0)],
-                           [Para([(words, flags + " b") for words, flags in marked(line)], HEADLINE, bullet=False,
-                                 after=0) for line in claim]))
-
-
 QR = 2.6
 """Inches: the side of the QR code to the repository."""
 
@@ -532,9 +512,6 @@ class Poster:
             return QR
         if block.kind == "row":
             return max(self.stack_height(child, part) for child, part in zip(block.children, parts(block, width)))
-        if block.kind == "aside":
-            number, claim = block.content
-            return max(sum(para.height(width) for para in number), sum(para.height(width) for para in claim))
         raise ValueError(block.kind)
 
     def most(self, block: Block, width: float) -> float:
@@ -577,15 +554,6 @@ class Poster:
             paragraphs = "".join(para.xml() for para in block.content)
             self.shapes.append(textbox(self.fresh(), "Repository", x + QR + INSET, y + (QR - words) / 2,
                                        width - QR - INSET, words, paragraphs))
-        elif block.kind == "aside":
-            number, claim = block.content
-            across = run_width(number[0].runs, number[0].size) + 2 * INSET + 0.4
-            tall = sum(para.height(width) for para in number)
-            words = sum(para.height(width - across) for para in claim)
-            self.shapes.append(textbox(self.fresh(), "Key number", x, y + (height - tall) / 2, across, tall,
-                                       "".join(para.xml() for para in number)))
-            self.shapes.append(textbox(self.fresh(), "Claim", x + across - INSET, y + (height - words) / 2,
-                                       width - across + INSET, words, "".join(para.xml() for para in claim)))
         elif block.kind == "row":
             for child, part in zip(block.children, parts(block, width)):
                 self.stack(child, x, y, part, None)
@@ -676,11 +644,11 @@ def build() -> None:
         ],
         [
             bar(118, "Simulation results"),
-            row([callout(words["accuracy_number"], words["accuracy"]),
+            row([*([headline(words["accuracy"])] if words["accuracy"] else []),
                  figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
                 [callout(words["versus_number"], words["versus"]),
                  figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
-            Block("aside", aside(words["gain_number"], words["gain_claim"]).content, gap="section"),
+            headline(words["gain_title"], gap="section"),
             figure(gallery["poster_sv_gain"], legend=GALLERY / "fig3_sv_gain_true_vs_imputed.txt"),
             text(bullets(words["gain"])),
         ],
