@@ -41,8 +41,12 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 @pytest.fixture(autouse=True)
 def clear_accelerator_caches():
-    """Return every test's device memory to the driver, so GPU tests don't inherit each other's pools."""
+    """Return every test's device memory to the driver, so GPU tests don't inherit each other's pools, and forget the
+    batched sweep's checks (``device_sweep._VERDICTS``, kept per process), so each test's first sweep is checked."""
     yield
+    sweeps = sys.modules.get("sv_pgs.device_sweep")
+    if sweeps is not None:
+        sweeps._VERDICTS.clear()
     gc.collect()
     cupy_module = sys.modules.get("cupy")
     if cupy_module is not None:

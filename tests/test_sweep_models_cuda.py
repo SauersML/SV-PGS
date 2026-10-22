@@ -79,6 +79,32 @@ def test_a_model_s_cuda_sweep_is_the_same_whichever_models_share_it() -> None:
                     np.testing.assert_array_equal(state[name][:, model], alone_state[name][:, 0])
 
 
+def test_a_cuda_sweep_with_several_warps_a_block_is_its_numpy_reference_and_passes_its_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At 20,000 samples each ``panel_step`` block holds several warps (a share of the samples per multiprocessor), as
+    on a whole genome's 44,000; the small problems above run one warp a block. The batched sweep's first-sweep check
+    (``device_sweep._SweepCheck``) runs on the device and passes."""
+    from sv_pgs import device_sweep
+
+    messages: list[str] = []
+    monkeypatch.setattr(device_sweep, "log", messages.append)
+    samples = 20_000
+    with cupy.cuda.Device(0):
+        problem = sweep_problem(cupy, 11, devices=(0, 0, 0), samples=samples)
+        kernels = CudaPanelKernels(cupy, _NODES)
+        assert kernels.threads(samples) > PANEL
+        device = _sweeps(cupy, kernels, problem, (0, 1, 2), 2)
+        reference = _sweeps(np, HostPanelKernels(kernels.threads(samples)), sweep_problem(np, 11, devices=(0, 0, 0), samples=samples), (0, 1, 2), 2)
+    # one check each, the CUDA kernels' first
+    assert len(messages) == 2 and all(message.startswith("batched sweep check passed") for message in messages), messages
+    for (residuals, totals, squares, state), (reference_residuals, reference_totals, reference_squares, reference_state) in zip(device, reference):
+        for name in MOMENTS:
+            scale = 1.0 + np.max(np.abs(reference_state[name]))
+            np.testing.assert_allclose(state[name], reference_state[name], rtol=1e-10, atol=1e-12 * scale, err_msg=name)
+        np.testing.assert_allclose(residuals, reference_residuals, rtol=1e-10, atol=1e-12 * np.max(np.abs(reference_residuals)))
+        np.testing.assert_allclose(squares, reference_squares, rtol=1e-10)
+        np.testing.assert_allclose(totals, reference_totals, rtol=1e-10, atol=1e-10 * np.max(np.abs(reference_totals)))
+
+
 @pytest.mark.skipif(DEVICE_COUNT < 2, reason="needs two CUDA devices")
 def test_a_sweep_over_two_devices_is_the_one_device_sweep() -> None:
     """Blocks on devices 0, 1 and 0: each block's launches on its own device, the residuals handed over between them.
