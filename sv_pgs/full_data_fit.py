@@ -327,11 +327,16 @@ class FitCertificate:
     # decrement and prediction move are withheld (NaN) and its criterion is unmet; ``budget_unresolved``: solves and
     # mixture searches that ended at their derived work budgets (a nonzero count also leaves the criterion unmet);
     # ``mixture_components``: the components of the returned mixture, whose largest mean move and noise gain the
-    # fixed-point terms report; ``state_digest``: models x 32 uint8, the SHA-256 of the returned state
-    # (``state_digest``). None where a route does not record them, which an artifact refuses.
+    # fixed-point terms report; ``mixture_settled``: whether the model's mode search settled under the whole-budget
+    # rule (``_mode_mixture``: its K orders tried, the last admitted one moving nothing, or a continuation of such a
+    # search that stood), what a later fit seeded from this one may keep (``warm_seeds.seeds_from_model``: a model
+    # saved without this term settled under the earlier first-quiet-order rule, which is no settled search now);
+    # ``state_digest``: models x 32 uint8, the SHA-256 of the returned state (``state_digest``). None where a route
+    # does not record them, which an artifact refuses.
     restored_best: BoolArray | None = None
     budget_unresolved: I64Array | None = None
     mixture_components: I64Array | None = None
+    mixture_settled: BoolArray | None = None
     state_digest: np.ndarray | None = None
     # Per model, the far field the fit left out of its likelihood: 0 on every route, since each reads the samples' own
     # fields (the band route corrects the far field from them; its size is logged, ``_GramMeanField.far_field``).
@@ -373,8 +378,9 @@ class FullDataFit:
     # moments in its own metric), None for a quantitative model.
     binary_components: tuple = ()
     # Each component's members' means (members x models, padded as ``member_components``) and, per model, whether its
-    # mode search settled with no solve or search ended at its budget (``_mode_mixture``): what a continuation of this
-    # fit starts its own search from (``mixture_start``).
+    # mode search settled with no solve or search ended at its budget (``_mode_mixture``: its K orders tried, the last
+    # admitted one moving its average by at most the draws' resolution, or a continuation's of such a search whose main
+    # fixed point came back): what a continuation of this fit starts its own search from (``mixture_start``).
     component_means: tuple[F64Array, ...] = ()
     component_noises: tuple[F64Array, ...] = ()
     mixture_settled: BoolArray | None = None
@@ -398,8 +404,9 @@ class MixtureStart:
     """An earlier fit's mode mixture as the start of a continuation's (``_mode_mixture``): each component's members'
     means (``means``, members x models per component, a model's first ``counts`` of them its own) and noise variances
     (``noises``, one per model per component: each fixed point's solve moves its own noise, so a component's mean is a
-    fixed point only at its own), and, per model, whether the earlier search settled (``settled``: one more order from
-    zero moved its average by at most the draws' resolution, and no solve or search there ended at its budget)."""
+    fixed point only at its own), and, per model, whether the earlier search settled (``settled``: its K orders from zero
+    tried, the last admitted one moved its average by at most the draws' resolution, and no solve or search there ended
+    at its budget)."""
 
     means: tuple[F64Array, ...]
     noises: tuple[F64Array, ...]
@@ -3275,13 +3282,13 @@ def fit_full_data(
         try:
             with device_scope(device):
                 return oracle, _timed_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
-        except FloatingPointError as error:
+        except (FloatingPointError, np.linalg.LinAlgError) as error:
             spent = bool(oracle.allowance_spent.any())
-            stuck = isinstance(error, NoCertifiedProgress) and not continued
+            stuck = isinstance(error, (NoCertifiedProgress, np.linalg.LinAlgError)) and not continued
             if (spent or stuck) and all(state is not None for state in oracle.best_state):
                 # Ended by its allowance where the loop then had no certified step, or a fit from the prior with no
-                # certified progress (a continuation's caller has the prior's fit to fall back on): the best-ELBO
-                # states, uncertified.
+                # certified progress or a failed quadratic (a continuation's caller has the prior's fit to fall
+                # back on): the best-ELBO states, uncertified.
                 log(
                     f"mean-field oracle: the outer loop raised{' after an allowance ended it' if spent else ''} ({error}): every model returns its "
                     "best-ELBO state, uncertified"
@@ -3470,6 +3477,7 @@ def fit_full_data(
             restored_best=restored,
             budget_unresolved=budget_unresolved,
             mixture_components=component_count,
+            mixture_settled=np.zeros(model_count, dtype=bool) if mean_field is None else np.asarray(mixture.settled, dtype=bool),
             state_digest=digests,
             far_field=far_field,
             far_field_scale=far_field_scale,
@@ -3538,43 +3546,62 @@ def _mode_mixture(
     columns the posterior is multimodal and the product family holds one mode, the column visited first taking the
     effect, while the posterior mean averages them. Fixed points are solved at the fitted hyperparameters from zero in
     random within-block member orders, each weighted per model by its evidence, exp(ELBO) (``small_n._mixture_weights``:
-    a poor fixed point carries no weight; a repeat of a held mode is merged into it), until one more moves every model's
-    fitted genetic values by at most the draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K; the main fixed point is the
+    a poor fixed point carries no weight; a repeat of a held mode is merged into it). Every searching model tries all K
+    orders, with order seeds 1..K in sequence, before reading its settling test: its last admitted order moved its
+    weighted fitted genetic values by at most the draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K. A refused order leaves
+    the last admitted move standing; with no admitted order the search is unresolved. The main fixed point is the
     first component and the fixed point from the Gaussian member's posterior mean (``_ridge_mean``, when ``moments`` are
     given) the second, and the main fixed point's dual-solver state is put back at the end.
+
+    On whole-genome All of Us LDL cholesterol, the SNV-only and SNV+SV main fixed points agreed on their shared SNVs
+    (correlation 1.000), but the SNV-only first order was 9.3 nats below its main point, carried no weight and ended the
+    search. The SNV+SV orders reached a mode 47 nats above its main point, with five times the sum of beta squared and
+    correlation 0.25 with it, and scored that mode: held-out partial r2 0.056 against 0.037 [real]. Stopping at the
+    first order that moved nothing made which mode a fit scores a draw of its first orders, not of the data, so every
+    search tries all K.
 
     A binary model's components each start from the main fixed point's sites and move their own (their Bernoulli
     bounds are the evidence that weighs them); a move of the fitted genetic values is measured in the main fixed point's
     metric at its known unit noise.
 
-    Work budget: at most K random orders are tried. The mixture reaches the scorer through its K draws, each from one
-    component (``draw_laws.ProductMixtureDraws``), so no more than K components are ever represented; a search that has
-    tried K orders (a refused order counts: it consumed the attempt) without settling ends there, unresolved, and says
-    so rather than run on.
+    Work budget: K random orders are tried before the settling test is read. The mixture reaches the scorer through
+    its K draws, each from one component (``draw_laws.ProductMixtureDraws``), so no more than K components are ever
+    represented; a refused order consumes its attempt. After K orders a search whose last admitted move exceeds the
+    resolution ends unresolved and says so rather than run on. One order costs one mean-field solve from zero
+    (40-140 s at whole genome [real]).
 
     Each model's mixture is its own, as when it is fitted alone: its components, their weights, the repeat test, the
-    settling test and the budget are its own, and once it has settled the later orders solve only the models that have
-    not, the settled ones left unsolved there. A model with fewer components than its group's most has the rest at
-    weight zero.
+    settling test and the budget are its own. Only models settled by the continuation's start skip the orders. A model
+    with fewer components than its group's most has the rest at weight zero.
 
     A continuation (``start``: the band fit's on the samples, a lattice check's refit, a fit from an earlier one's saved
-    model, ``warm_seeds``) searched its modes again from
-    zero at hyperparameters that moved little (the whole genome's first solve from zero took 7-16 sweeps, a solve from a
-    nearby state 2-3 [real]): on the repository's CPU fixtures a lattice check's refit repeated its fit's mixture solve
-    for solve and pass for pass, from the ridge start to the last order. So the earlier fit's components are solved
-    first, each from its own means and noise at these hyperparameters (each solve moves its own noise, so a component is
-    a fixed point only at its own), and admitted like any mode (the earlier main fixed point is not solved again where
-    this fit's main fixed point is within the draws' resolution of it). A model whose earlier search settled
-    (``MixtureStart.settled``: one more order from zero moved its average by at most the draws' resolution), whose every
-    earlier component is again a fixed point within the draws' resolution of where it started, ||Xp d||^2 / sigma^2 <=
-    1/K, and whose main fixed point is one of them has the same modes the earlier search settled on, at weights from
-    their evidence here: its search stands, and neither the ridge start nor any order runs for it. A component need not
-    come back: a solve stops when its extrapolated ELBO gain is within the tolerance, which on a slow plateau can be far
-    from where coordinate ascent ends (on a CPU fixture the earlier ridge component, solved again at the same
-    hyperparameters and noise, moved 139 resolutions into the main mode, another order's 60). A model where one does not
-    solves no more of the earlier components and searches as without a start (the ridge start, then the orders until it
-    settles), those it solved already held, so a start that fails costs the solves up to the first component that did
-    not come back.
+    model, ``warm_seeds``) searched its modes again from zero at hyperparameters that moved little (the whole genome's
+    first solve from zero took 7-16 sweeps, a solve from a nearby state 2-3 [real]): on the repository's CPU fixtures a
+    lattice check's refit repeated its fit's mixture solve for solve and pass for pass, from the ridge start to the last
+    order, and a refit from its own saved model that searched again repeated each of its 64 orders' ELBOs exactly [sim].
+    So the earlier fit's components are solved first, each from its own means and noise at these hyperparameters (each
+    solve moves its own noise, so a component is a fixed point only at its own), and admitted like any mode (the earlier
+    main fixed point is not solved again where this fit's main fixed point is within the draws' resolution of it). A
+    model whose earlier search settled (``MixtureStart.settled``: its K orders tried, the last admitted one moving its
+    average by at most the draws' resolution), none of whose components' solves is refused, and whose main fixed point
+    came back (the earlier main fixed point, or an earlier component solved again to within ||Xp d||^2 / sigma^2 <= 1/K
+    of where it started, is within the resolution of this fit's main fixed point: the hyperparameters left the main mode
+    where the earlier search found it) keeps that search, on the modes its components reached here at weights from their
+    evidence here: neither the ridge start nor any order runs for it. A model where a solve is refused solves no more of
+    its components and, like one whose main fixed point did not come back, searches as without a start (the ridge start,
+    then the K orders), those it solved already held.
+
+    The other components need not come back. A component's solve from its earlier state ends at that mode's fixed point
+    here, admitted where it ends (into a held mode it reaches within the resolution, as any repeat), and the earlier
+    state need not be that point: a solve stops when its extrapolated ELBO gain is within the tolerance, so it can stop
+    a few sweeps short of where coordinate ascent ends, or on a slow plateau far from it (on a CPU fixture the earlier
+    ridge component, solved again at the same hyperparameters and noise, moved 139 resolutions into the main mode,
+    another order's 60). The refit from its own saved model (its 19 components, at the saved hyperparameters and each at
+    its own noise) shows both: 4 of its 18 solves ended 1.1-3.9 resolutions from where they started, as new modes, in 3
+    sweeps each and within 0.02 nats of their earlier ELBOs, and 4 more moved 4.9-216 resolutions in 5-11 sweeps, into
+    held modes [sim]. Requiring them to come back read that as a changed posterior and ran the search again: its orders
+    repeated the earlier ones and admitted their earlier states again beside the modes they had reached, among them the
+    four that had moved into held modes [sim].
 
     The ridge start and the orders are solved and never factored by the dual solver (``_FullDataMeanField._solved``):
     nothing here reads a factor, neither a component's state nor the repeat and settling tests (sample-space images),
@@ -3632,9 +3659,8 @@ def _mode_mixture(
     if start is not None:
         if np.asarray(start.means[0]).shape != main.mean.shape:
             raise ValueError("a mixture start's components must be this fit's members x models")
-        # Per model: its earlier search settled and every earlier component solved so far is again a fixed point where it
-        # started; a model where one is not solves no more of them (it searches as without a start), and whether the main
-        # fixed point is among them.
+        # Per model: its earlier search settled and no solve of its components has been refused (a model where one is
+        # solves no more of them and searches as without a start), and whether its main fixed point came back.
         found = np.asarray(start.settled, dtype=bool).copy()
         main_found = np.zeros(count, dtype=bool)
         solved_count = np.zeros(count, dtype=np.int64)
@@ -3663,8 +3689,8 @@ def _mode_mixture(
             for model in solving:
                 resolution = float(main.noise[model]) / draw_count
                 solved_count[model] += 1
-                found[model] = main._fitted_square(oracle.mean[:, model] - start_means[:, model], model) <= resolution
-                if found[model] and not main_found[model]:
+                # Only until the main fixed point has come back: where the other components end is not read.
+                if not main_found[model] and main._fitted_square(oracle.mean[:, model] - start_means[:, model], model) <= resolution:
                     main_found[model] = main._fitted_square(oracle.mean[:, model] - main.mean[:, model], model) <= resolution
             admit(oracle, solving)
             del oracle, solved
@@ -3673,7 +3699,7 @@ def _mode_mixture(
             log(
                 f"mode mixture: model {model}: {int(solved_count[model])} of the earlier fit's {int(start.counts[model])} components solved "
                 "again here: " + (
-                    "each a fixed point where it started and the main fixed point among them, so its settled search stands" if settled[model]
+                    f"its main fixed point came back, so its settled search stands on their {len(means[model])} modes" if settled[model]
                     else "searching from the ridge start and the orders as without them"
                 )
             )
@@ -3696,8 +3722,8 @@ def _mode_mixture(
             admit(ridge, searching)
             average = [weighted(model)[0] for model in range(count)]
         del ridge
+    last_move = np.full(count, np.inf)
     for component in range(1, draw_count + 1):
-        searching = [model for model in range(count) if not settled[model]]
         if not searching:
             break
         oracle = type(main)(
@@ -3712,8 +3738,9 @@ def _mode_mixture(
         del oracle, solved
         for model in searching:
             updated = weighted(model)[0]
-            settled[model] = main._fitted_square(updated - average[model], model) / float(main.noise[model]) <= 1.0 / draw_count
+            last_move[model] = main._fitted_square(updated - average[model], model) / float(main.noise[model])
             average[model] = updated
+    settled[searching] = last_move[searching] <= 1.0 / draw_count
     for model in np.flatnonzero(~settled):
         unresolved[model] += 1
         refusals.append(

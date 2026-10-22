@@ -361,6 +361,7 @@ def _null_genetic_model(covariate_fit: _CovariateFit, draw_count: int, reason: s
         restored_best=np.zeros(1, dtype=bool),
         budget_unresolved=np.zeros(1, dtype=np.int64),
         mixture_components=np.zeros(1, dtype=np.int64),
+        mixture_settled=np.zeros(1, dtype=bool),
         state_digest=state_digest([covariate_fit.alpha, np.array([covariate_fit.noise])])[None, :],
         far_field=np.zeros(1),
         far_field_scale=np.zeros(1),
@@ -987,7 +988,7 @@ def _fit_group(
         try:
             try:
                 fit = solve(fit_prior, **continuation)
-            except FloatingPointError as error:
+            except (FloatingPointError, np.linalg.LinAlgError) as error:
                 if not continuation:
                     raise
                 # The seeds' start has no certified fixed point: the fit from the prior, as without seeds.
@@ -1026,7 +1027,7 @@ def _fit_group(
                         moved, starts=moved_hyperparameters, start_noise=np.asarray(fit.noise_variance, dtype=np.float64), start_mean=fit.member_mean,
                         mixture_start=fit.mixture_start(),
                     )
-                except FloatingPointError as error:
+                except (FloatingPointError, np.linalg.LinAlgError) as error:
                     # No fit on the checked lattice: these models keep the fit they have, and each certificate says the
                     # quadrature check that fit failed was never resolved, so the artifact never reads as a passed check.
                     finish(fit, fit_prior, moving, {
@@ -1034,15 +1035,13 @@ def _fit_group(
                         for model in moving
                     })
                     break
-                # A model whose refit ended without its outer criterion (an uncertified walk) where the fit it continued
-                # had met it keeps the certified fit, and its certificate records the quadrature check left open.
-                kept = [
-                    model for model in moving
-                    if fit.certificate.outer_criterion_met[model] and not refit.certificate.outer_criterion_met[model]
-                ]
+                # An uncertified refit keeps the fit it continued, whether or not that fit certified. Rechecking
+                # both uncertified walks doubled the lattice repeatedly [real, aou-wh6: 138 -> 275 -> 549 nodes].
+                kept = [model for model in moving if not refit.certificate.outer_criterion_met[model]]
                 if kept:
                     finish(fit, fit_prior, kept, {
                         model: f"lattice check unresolved ({checks[model].record()}): the refit on {moved.grid_size} nodes did not meet its outer criterion; the fit on {fit_prior.grid_size} nodes stands"
+                        + ("" if fit.certificate.outer_criterion_met[model] else ", uncertified as well, and the lattice is not moved again")
                         for model in kept
                     })
                 pending = [model for model in moving if model not in kept]

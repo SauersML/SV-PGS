@@ -31,6 +31,7 @@ from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
+from sv_pgs import gpu_guard
 from sv_pgs.compute_budget import ComputeBudget, _cupy_device_context
 from sv_pgs.progress import log
 
@@ -125,6 +126,7 @@ class ShardTileSource(Protocol):
     def fill(self) -> bool: ...
 
 
+@gpu_guard.traced
 def moved(cupy: Any, values: Any, device_id: int) -> Any:
     """``values`` (a cupy array on any device, or a numpy array) as a contiguous array on ``device_id``,
     with the copy ordered after the work that wrote ``values`` on its own device."""
@@ -190,6 +192,7 @@ class _PeerTile:
     def sample_operand(self, left: Any, relative_error: float) -> _PeerOperand:
         return _PeerOperand(left, relative_error)
 
+    @gpu_guard.traced
     def rmatmat(self, left: Any) -> Any:
         if not isinstance(left, _PeerOperand):
             return self._run(self._tile.rmatmat, self._there(left))
@@ -198,18 +201,22 @@ class _PeerTile:
                 left.prepared[self._device_id] = self._tile.sample_operand(self._there(left.left), left.relative_error)
         return self._run(self._tile.rmatmat, left.prepared[self._device_id])
 
+    @gpu_guard.traced
     def matmat(self, right: Any) -> Any:
         return self._run(self._tile.matmat, self._there(right))
 
+    @gpu_guard.traced
     def accumulate_matmat(self, right: Any, image: Any, relative_error: float) -> None:
         with _cupy_device_context(self._cupy, self._device_id):
             partial = self._cupy.zeros(tuple(image.shape), dtype=image.dtype)
             self._tile.accumulate_matmat(self._there(right), partial, relative_error)
         image += self._home(partial)
 
+    @gpu_guard.traced
     def weighted_column_squares(self, weights: Any) -> Any:
         return self._run(self._tile.weighted_column_squares, self._there(weights))
 
+    @gpu_guard.traced
     def columns(self, local: Any) -> Any:
         return self._run(self._tile.columns, self._there(local))
 
@@ -362,6 +369,7 @@ class ShardedDualSource:
                 if next(iterator, None) is not None:
                     raise ValueError("a shard yielded more blocks than the plan gives it")
 
+    @gpu_guard.traced
     def map_reduce(self, work: BlockWork, shared: Mapping[str, Any], rows: Mapping[str, Any], image_shape: tuple[int, ...]) -> Any:
         """Run ``work`` on every block, all devices at once, and return the sum of the devices'
         images on the home device, summed in device order."""

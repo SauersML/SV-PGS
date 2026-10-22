@@ -349,12 +349,26 @@ def test_a_saved_model_is_a_seed_of_its_mean_field_model(arms: SimpleNamespace) 
     np.testing.assert_array_equal(seed.components[0], seed.means)
     assert seed.component_noises is not None and seed.component_noises.shape == (count,) and np.all(seed.component_noises > 0.0)
     assert seed.component_noises[0] == pytest.approx(seed.noise, rel=1e-12)
-    assert seed.settled == (int(saved.certificate["budget_unresolved"][0]) == 0)
+    assert seed.settled == (int(saved.certificate["budget_unresolved"][0]) == 0 and bool(saved.certificate["mixture_settled"][0]))
     # A directory that is no whole saved model is no seed (its reason logged), never an error.
     broken = arms.root / "broken"
     shutil.copytree(arms.root / "models" / "with_sv" / "trait", broken)
     (broken / "arrays.npz").unlink()
     assert read_seeds(broken, _WORKING_BYTES) == {}
+
+
+def test_a_model_saved_before_the_whole_budget_search_seeds_no_settled_search(arms: SimpleNamespace, tmp_path: Path) -> None:
+    """A model saved before the mode mixture searched its whole budget (its certificate has no ``mixture_settled``) settled
+    at the first order that moved nothing, so a fit seeded from it searches again: its seed is not settled, though its
+    components still start the continuation's search. The same model with the term keeps its settled search."""
+    saved = load_model(arms.root / "models" / "with_sv" / "trait")
+    (seed,) = read_seeds(arms.root / "models" / "with_sv" / "trait", _WORKING_BYTES).values()
+    assert bool(saved.certificate["mixture_settled"][0]) and seed.settled
+    earlier = dataclasses.replace(saved, certificate={term: values for term, values in saved.certificate.items() if term != "mixture_settled"})
+    save_model(tmp_path / "earlier", earlier)
+    (old,) = read_seeds(tmp_path / "earlier", _WORKING_BYTES).values()
+    assert not old.settled and old.components is not None
+    np.testing.assert_array_equal(old.components, seed.components)
 
 
 @_hook
@@ -404,11 +418,15 @@ def test_a_refit_from_its_own_saved_model_starts_at_its_fixed_point(arms: Simple
     assert warm.certificate["remaining_gain"][0] <= _TOLERANCE
     assert bool(warm.certificate["outer_criterion_met"][0]) == bool(cold.certificate["outer_criterion_met"][0])
     np.testing.assert_array_equal(warm.scoring[0].store_rows, cold.scoring[0].store_rows)
-    assert np.corrcoef(warm.scoring[0].coefficients, cold.scoring[0].coefficients)[0, 1] > 0.999
+    # The same main fixed point; the mixture's mean, the scorer's coefficients, holds the saved modes each solved again
+    # to its fixed point here (``test_warm_start_eb``), so only its held-out scores are compared.
+    mains = [warm_seeds.main_means(fit.scoring[0].posterior_draws, _WORKING_BYTES) for fit in (warm, cold)]
+    assert np.corrcoef(*mains)[0, 1] > 0.999
     assert np.corrcoef(_held_out_scores(arms, warm), _held_out_scores(arms, cold))[0, 1] > 0.999
     np.testing.assert_allclose(warm.noise_variance, cold.noise_variance, rtol=0.01)
-    # The outer loop's first check finds the saved state stationary: what is left is the first solve from it and the mode
-    # mixture's search, which every fit runs (93 passes cold and 36 seeded when this was written).
+    # The outer loop's first check finds the saved state stationary: what is left is the first solve from it and one solve
+    # of each of the saved mixture's other components, its settled search standing (1086 passes cold and 78 seeded
+    # when this was written).
     assert passes < arms.passes["with_sv"] / 2
 
 

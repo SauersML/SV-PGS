@@ -104,7 +104,7 @@ ARMS = ("snv_indel", "with_sv")
 """workspace_pipeline.ARMS."""
 ARM_DIGITS = {"snv_indel": "1", "with_sv": "2"}
 """A run's arm in its RUN_ID (aou-wl1, aou-wl2)."""
-STEPS = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv", "fit", "score", "effects", "report", "export")
+STEPS = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv", "fit", "score", "report", "effects", "export")
 """workspace_pipeline.STEP_NAMES (tests/test_round.py checks they agree)."""
 UPSTREAM = {
     "samples": (), "store": (), "phenotypes": (), "cohort": ("samples", "phenotypes"), "measurement": ("samples", "cohort", "store"),

@@ -647,6 +647,29 @@ def _replaced_stores(names: dict[str, int]) -> set[str]:
     stores = [step for step in STEP_NAMES if step in complete and step in holding]
     return set(stores[:-1])
 
+def _restore_downloads(objects: list[tuple[Remote, Path, str]]) -> list[str | None] | None:
+    """The planned restore's objects in one pool, with each file's digest in the same order. A carried step may read
+    another mirror; GCS objects still use spawned processes with each process's own clients (``_download_in_process``)."""
+    if not objects:
+        return []
+    unwrapped = []
+    for source, path, name in objects:
+        while isinstance(source, _Within):
+            name = source._prefix + name
+            source = source._remote
+        unwrapped.append((source, path, name))
+    first = unwrapped[0][0]
+    if all(source is first for source, _path, _name in unwrapped):
+        return first.download_many([(path, name) for _source, path, name in unwrapped])
+    if all(isinstance(source, GcsRemote) for source, _path, _name in unwrapped):
+        with ProcessPoolExecutor(max_workers=len(os.sched_getaffinity(0)), mp_context=multiprocessing.get_context("spawn")) as pool:
+            return list(pool.map(
+                _download_in_process, [source._url for source, _path, _name in unwrapped],
+                [name for _source, _path, name in unwrapped], [path for _source, path, _name in unwrapped],
+            ))
+    with ThreadPoolExecutor(max_workers=len(os.sched_getaffinity(0))) as pool:
+        return list(pool.map(lambda item: item[0].download(item[2], item[1]), unwrapped))
+
 
 def restore(
     run_directory: Path, remote: Remote, mount: Path | None = None, bases: Sequence[Base] = (), arms: Sequence[str] | None = None,
@@ -663,7 +686,11 @@ def restore(
 
     With ``finishing``, for a run that only finishes (``workspace_pipeline.run_pipeline``'s ``finish``), a completed
     step before the fit is restored as its COMPLETE_FILE alone, but those it reads (FINISH_INPUTS), and no restart unit:
-    no store and no fit state, only the models, the scores and the effects."""
+    no store and no fit state, only the models, the scores and the effects.
+
+    Every step's objects share one pool, largest first, before any step is renamed into place. The AoU whole-genome
+    restore waited another 2m15s after the store, measurement's 21.3 GB on one or two streams [real, aou-wg6]; those
+    files can download beside the store's. Each completed step's marker is checked again before its rename."""
     names = remote.sizes("")
     run_directory.mkdir(parents=True, exist_ok=True)
     # The mirror's objects, a carried step's those of the base that carries it.
@@ -679,6 +706,7 @@ def restore(
                 objects = {entry: size for entry, size in objects.items() if not entry.startswith(f"{step}/")}
                 objects.update((entry, size) for entry, size in held.items() if entry.startswith(f"{step}/"))
     linked = _replaced_stores(objects)
+    planned, downloads = [], []
     for step in STEP_NAMES:
         final, partial = run_directory / step, run_directory / f"{step}{PARTIAL}"
         if final.exists() or partial.exists():
@@ -711,18 +739,19 @@ def restore(
             LOGGER.info("run mirror: %s/%s, which a later step's store replaces, is read from %s", step, STORE, payload)
         for directory in listed:
             (aside / directory).mkdir(parents=True, exist_ok=True)
-        # Largest first: a store's codes are one file per half and chromosome (``dosage_store.write_half_codes``), 44
-        # files and 547 GB at the AoU whole-genome workload, each downloaded as one stream; in name order a large one
-        # could start last and download alone while the other workers idle.
-        chosen.sort(key=lambda entry: -objects[entry])
         pairs = [(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen]
-        digests = source.download_many(pairs)
-        if target == final and source.read(f"{step}/{COMPLETE_FILE}") != marker:
+        planned.append((step, name, aside, target, source, origin, marker, pairs))
+        downloads.extend((source, path, entry) for path, entry in pairs)
+    downloads.sort(key=lambda item: (-objects[item[2]], item[2]))
+    digests = _restore_downloads(downloads)
+    restored = {path: digest for (_source, path, _entry), digest in zip(downloads, digests or ())}
+    for step, name, aside, target, source, origin, marker, pairs in planned:
+        if marker is not None and source.read(f"{step}/{COMPLETE_FILE}") != marker:
             raise RuntimeError(f"{step} changed on {origin} while it was restored; restore again.")
         # Each file's digest as its bytes were written, so a digest of this step's store reads none of them again.
-        record_restored((path, digest) for (path, _entry), digest in zip(pairs, digests or ()) if digest is not None)
+        record_restored((path, restored[path]) for path, _entry in pairs if restored.get(path) is not None)
         os.rename(aside, target)
-        LOGGER.info("run mirror: restored %s from %s, %d files, %.1f GB", name, origin, len(chosen), sum(objects[entry] for entry in chosen) / 1e9)
+        LOGGER.info("run mirror: restored %s from %s, %d files, %.1f GB", name, origin, len(pairs), sum(objects[entry] for _path, entry in pairs) / 1e9)
     if not finishing:
         _restore_restart(run_directory, remote, {name: size for name, size in names.items() if name.startswith(f"{RESTART}/")}, arms)
     # Each region's own steps; the driver links the run's steps before the fit into its directory again.

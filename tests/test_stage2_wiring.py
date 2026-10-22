@@ -661,3 +661,100 @@ def test_a_group_resumes_only_when_every_model_is_checkpointed(tmp_path: Path, m
     assert fitted_groups == [[0, 1], [2], [0, 1]]
     np.testing.assert_array_equal(again.noise_variance, first.noise_variance)
     assert again.certificate.refusals == ("model 0: stand-in", "model 1: stand-in", "model 2: stand-in")
+
+
+@pytest.mark.parametrize("first_certified, refit", [(False, "uncertified"), (True, "uncertified"), (False, "quadratic"), (False, "certified")])
+def test_an_uncertified_lattice_refit_keeps_the_coarser_fit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_certified: bool, refit: str) -> None:
+    """An uncertified fit and refit cost one lattice move and keep the coarser scoring model with an open check.
+    A failed quadratic does the same; certified refits still advance until their lattice check passes."""
+    from sv_pgs import full_data_fit, scale_mixture_ep, stage2_wiring
+
+    store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
+    training = (np.arange(store.n_samples) < store.n_samples * 4 // 5)[:, None]
+    monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp: (0.0, np.inf))
+
+    def ended(prior, starts, oracle, working_bytes, tolerance):
+        assert all(point is not None for point in oracle(list(starts)))
+        return full_data_fit._ended_fits(oracle, tolerance)
+
+    monkeypatch.setattr(full_data_fit, "_timed_hyperparameters", ended)
+    engine = stage2_wiring.fit_full_data
+    fits, nodes = [], []
+
+    def fitting(**arguments):
+        nodes.append(arguments["prior"].grid_size)
+        assert len(nodes) <= (3 if refit == "certified" else 2), "an uncertified refit moved the lattice again"
+        if len(nodes) > 1 and refit == "quadratic":
+            raise np.linalg.LinAlgError("the lattice refit's quadratic failed")
+        fit = engine(**arguments)
+        certified = first_certified if len(nodes) == 1 else refit == "certified"
+        fit = dataclasses.replace(fit, certificate=dataclasses.replace(
+            fit.certificate, outer_criterion_met=np.full_like(fit.certificate.outer_criterion_met, certified),
+        ))
+        fits.append(fit)
+        return fit
+
+    def check(*arguments):
+        # Two successful refits are allowed; an uncertified one must never reach the next check.
+        refine = refit != "certified" or len(nodes) < 3
+        return scale_mixture_ep.LatticeCheck(float(refine), 0.0, 0.0, 0.0, 0.5)
+
+    monkeypatch.setattr(stage2_wiring, "fit_full_data", fitting)
+    monkeypatch.setattr(stage2_wiring, "lattice_check", check)
+    fitted = _fitted_group(store, covariate, targets[:, None], training, tmp_path / "work", 5)
+    assert len(nodes) == (3 if refit == "certified" else 2)
+    # Refinement bisects midpoint cells without shrinking their integration interval.
+    assert nodes[1] == 2 * nodes[0]
+    kept = fits[-1] if refit == "certified" else fits[0]
+    np.testing.assert_array_equal(fitted.hyperparameters[0].coefficients, kept.hyperparameters[0].coefficients)
+    np.testing.assert_array_equal(fitted.noise_variance, kept.noise_variance)
+    assert np.all(np.isfinite(fitted.scoring[0].coefficients)) and fitted.scoring[0].store_rows.size > 0
+    refusals = fitted.certificate.refusals
+    if refit == "certified":
+        assert nodes[2] == 2 * nodes[1]
+        assert not any("lattice check unresolved" in reason for reason in refusals)
+    else:
+        assert not fitted.certificate.outer_criterion_met[0]
+        assert any("lattice check unresolved" in reason for reason in refusals)
+        if refit == "quadratic":
+            assert any("the lattice refit's quadratic failed" in reason for reason in refusals)
+        elif not first_certified:
+            assert any("uncertified as well, and the lattice is not moved again" in reason for reason in refusals)
+
+
+def test_a_seeded_quadratic_failure_fits_from_the_prior(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A seeded fit whose quadratic fails keeps the seed's reason and fits from the prior on the same lattice."""
+    from sv_pgs import full_data_fit, scale_mixture_ep, stage2_wiring
+
+    store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
+    training = (np.arange(store.n_samples) < store.n_samples * 4 // 5)[:, None]
+    monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp: (0.0, np.inf))
+    monkeypatch.setattr(stage2_wiring.warm_seeds, "seed_lattice", lambda seeds, nodes: nodes)
+    monkeypatch.setattr(stage2_wiring.warm_seeds, "warm_start", lambda seed, prior, *arguments: SimpleNamespace(
+        hyperparameters=scale_mixture_ep.initial_hyperparameters(prior), noise=1.0, mean=np.zeros(prior.variant_count),
+        components=None, component_noises=None, note="the test's seed",
+    ))
+
+    def ended(prior, starts, oracle, working_bytes, tolerance):
+        assert all(point is not None for point in oracle(list(starts)))
+        return full_data_fit._ended_fits(oracle, tolerance)
+
+    monkeypatch.setattr(full_data_fit, "_timed_hyperparameters", ended)
+    engine = stage2_wiring.fit_full_data
+    calls = []
+
+    def fitting(**arguments):
+        calls.append(arguments)
+        assert len(calls) <= 2
+        if len(calls) == 1:
+            assert "starts" in arguments
+            raise np.linalg.LinAlgError("the seeded quadratic failed")
+        assert "starts" not in arguments and arguments["warm_start"] is None
+        return engine(**arguments)
+
+    monkeypatch.setattr(stage2_wiring, "fit_full_data", fitting)
+    monkeypatch.setattr(stage2_wiring, "lattice_check", lambda *arguments: scale_mixture_ep.LatticeCheck(0.0, 0.0, 0.0, 0.0, 0.5))
+    fitted = _fitted_group(store, covariate, targets[:, None], training, tmp_path / "work", 5, seeds=[object()])
+    assert len(calls) == 2
+    assert np.all(np.isfinite(fitted.scoring[0].coefficients)) and fitted.scoring[0].store_rows.size > 0
+    assert any("fitted from the prior: the seeded quadratic failed" in reason for reason in fitted.certificate.refusals)

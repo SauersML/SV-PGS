@@ -203,7 +203,7 @@ def test_an_interrupted_restore_leaves_no_step_directory(tmp_path: Path) -> None
     restored = tmp_path / "restored"
     with pytest.raises(ConnectionError):
         restore(restored, _FailingRemote(mirror, "chunk/0"))
-    assert not (restored / "store").exists()
+    assert not (restored / "samples").exists() and not (restored / "store").exists()
     restore(restored, DirectoryRemote(mirror))
     assert (restored / "store" / COMPLETE_FILE).is_file() and not list(restored.glob("*.restoring"))
 
@@ -267,6 +267,147 @@ def test_a_restore_downloads_a_step_s_largest_objects_first(tmp_path: Path) -> N
 
     restore(tmp_path / "restored", Recording(tmp_path / "mirror"))
     assert [name.split("/")[4] for name in requested[:3]] == ["chr2", "chr1", "chr10"] and _tree(tmp_path / "restored") == _tree(run)
+
+
+@pytest.mark.parametrize("mounted", [False, True])
+def test_a_restore_downloads_every_step_in_one_pool_before_publishing_any(tmp_path: Path, monkeypatch, mounted) -> None:
+    """The selected objects share one queue, largest first across steps, and each digest stays with its file when the
+    steps are renamed in order. Replaced payloads link to the mount; downloaded directories retain empty ones."""
+    steps = ("store", "measurement", "direct_sv")
+    run = _stores(tmp_path / "run", steps)
+    for step in steps:
+        _write(run / step / "summary.json", json.dumps({"step": step, "payload": step * len(step)}))
+        (run / step / "calibration").mkdir()
+    mirror, restored = tmp_path / "mirror", tmp_path / "restored"
+    push(run, DirectoryRemote(mirror))
+    calls, published, receipts = [], [], {}
+    rename = os.rename
+
+    class Recording(DirectoryRemote):
+        def download_many(self, pairs):
+            if not pairs:
+                return super().download_many(pairs)
+            calls.append(list(pairs))
+            assert not any((restored / step).exists() for step in steps)
+            digests = super().download_many(pairs)
+            assert not any((restored / step).exists() for step in steps)
+            return digests
+
+    def record(pairs):
+        for path, digest in pairs:
+            assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+            receipts[path] = digest
+
+    def publish(aside, target):
+        if not published:
+            assert all(path.is_file() for path, _name in calls[0])
+        assert (aside / COMPLETE_FILE).is_file()
+        published.append(target.name)
+        rename(aside, target)
+
+    monkeypatch.setattr(run_mirror, "record_restored", record)
+    monkeypatch.setattr(run_mirror.os, "rename", publish)
+    remote = Recording(mirror)
+    restore(restored, remote, mirror if mounted else None)
+    assert len(calls) == 1 and published == list(steps)
+    pairs = calls[0]
+    sizes = remote.sizes("")
+    names = [name for _path, name in pairs]
+    assert names == sorted(names, key=lambda name: (-sizes[name], name))
+    assert {name.split("/")[0] for name in names} == set(steps)
+    assert set(receipts) == {path for path, _name in pairs}
+    assert _followed(restored / "store") == _followed(run / "store")
+    assert _followed(restored / "measurement") == _followed(run / "measurement")
+    assert _tree(restored / "direct_sv") == _tree(run / "direct_sv")
+    for step in steps:
+        assert (restored / step / "calibration").is_dir()
+        payload = restored / step / "store"
+        linked = mounted and step != "direct_sv"
+        assert payload.is_symlink() == linked
+        if linked:
+            assert payload.resolve() == (mirror / step / "store").resolve()
+            assert not any(name.startswith(f"{step}/store/") for name in names)
+            # Empty directories are recorded beside the step, not created on the mirror or through its link.
+            assert not (mirror / step / "store" / "loci").exists()
+            assert not (payload / "loci").exists()
+        else:
+            assert (payload / "loci").is_dir()
+    assert not list(restored.glob("*.restoring"))
+
+
+@pytest.mark.parametrize("removed", [False, True])
+def test_a_restore_rechecks_an_earlier_step_after_downloading_later_steps(tmp_path: Path, removed) -> None:
+    """A later step's download can overlap a replacement or removal of an earlier step's marker; that step is never
+    published from a mixture of the two versions."""
+    run = _stores(tmp_path / "run", ("store", "measurement"))
+    mirror = tmp_path / "mirror"
+    push(run, DirectoryRemote(mirror))
+
+    class Changing(DirectoryRemote):
+        def download_many(self, pairs):
+            digests = super().download_many(pairs)
+            if any(name.startswith("measurement/") for _path, name in pairs):
+                if removed:
+                    self.delete([f"store/{COMPLETE_FILE}"])
+                else:
+                    self.write(f"store/{COMPLETE_FILE}", b'{"key": "replaced"}')
+            return digests
+
+    restored = tmp_path / "restored"
+    with pytest.raises(RuntimeError, match="store changed on this run's mirror"):
+        restore(restored, Changing(mirror))
+    assert not (restored / "store").exists() and not (restored / "measurement").exists()
+
+
+@pytest.mark.parametrize("regional", [False, True])
+def test_a_restore_pools_gcs_objects_from_the_run_and_its_bases(tmp_path: Path, monkeypatch, regional) -> None:
+    """Carried steps and this run's steps share one spawned pool, including mirrors under a region prefix; each worker
+    reads the object's own mirror and the digests remain in submission order."""
+    base_run = _stores(tmp_path / "base-run", ("store", "measurement"))
+    own_run = tmp_path / "own-run"
+    _write(own_run / "cohort" / "cohort.npz", b"cohort")
+    _write(own_run / "cohort" / COMPLETE_FILE, '{"key": "cohort"}')
+    prefix = "regions/window/" if regional else ""
+    local = DirectoryRemote(tmp_path / "own-mirror")
+    carried = DirectoryRemote(tmp_path / "base-mirror")
+    push(own_run, run_mirror._Within(local, prefix))
+    push(base_run, run_mirror._Within(carried, prefix))
+    pools, queues = [], []
+
+    class Remote(GcsRemote):
+        def __init__(self, url, directory):
+            self._url, self.directory = url, directory
+
+        def sizes(self, prefix):
+            return self.directory.sizes(prefix)
+
+        def read(self, name):
+            return self.directory.read(name)
+
+    class Pool(ThreadPoolExecutor):
+        def __init__(self, max_workers, mp_context):
+            pools.append((max_workers, mp_context.get_start_method()))
+            super().__init__(max_workers)
+
+        def map(self, function, urls, names, paths):
+            queues.append(list(zip(urls, names, paths)))
+            return super().map(function, urls, names, paths)
+
+    own_url, base_url = "gs://ops/run", "gs://ops/base"
+    monkeypatch.setitem(run_mirror._PROCESS_REMOTES, own_url, local)
+    monkeypatch.setitem(run_mirror._PROCESS_REMOTES, base_url, carried)
+    monkeypatch.setattr(run_mirror, "ProcessPoolExecutor", Pool)
+    own, base = Remote(own_url, local), Remote(base_url, carried)
+    restored = tmp_path / "restored"
+    restore(restored, run_mirror._Within(own, prefix), bases=[Base(run_mirror._Within(base, prefix), base_url)])
+    assert pools == [(len(os.sched_getaffinity(0)), "spawn")]
+    assert len(queues) == 1
+    sizes = {**local.sizes(""), **carried.sizes("")}
+    names = [name for _url, name, _path in queues[0]]
+    assert names == sorted(names, key=lambda name: (-sizes[name], name))
+    assert {url for url, _name, _path in queues[0]} == {own_url, base_url}
+    assert all(name.startswith(prefix) for name in names)
+    assert _tree(restored) == {**_tree(base_run), **_tree(own_run)}
 
 
 def test_the_mirror_is_found_on_the_bucket_mount_that_shows_it(monkeypatch) -> None:

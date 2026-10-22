@@ -233,6 +233,10 @@ class StoreGenotypeBlockSource:
     def _drop_resident(self) -> None:
         """The ledger evicts the resident set: its blocks are freed as their last tile releases them, and the next read
         asks for it again."""
+        # A paused read and _keep can own this list too; eviction releases every block except a tile's own.
+        # The live curvature OOMs prompted this ownership check [real, hyperlipidemia and aou-wh5].
+        if self._resident is not None:
+            self._resident.clear()
         self._resident = None
         self._resident_complete = False
         self._evictions += 1
@@ -340,7 +344,10 @@ class StoreGenotypeBlockSource:
                     # Evicted mid-read (``_drop_resident``): the blocks not yet reached are streamed.
                     yield from self._iter_streamed(block_index)
                     return
-                yield block_index, self._resident_tile(block_index, resident[block_index])
+                tile = self._resident_tile(block_index, resident[block_index])
+                del resident
+                yield block_index, tile
+                del tile
             return
         if self._cupy is not None and self._resident is None and not self._resident_complete and self._admit_resident():
             self._resident = [None] * len(self._block_rows)

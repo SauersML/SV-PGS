@@ -2135,6 +2135,7 @@ def fit_small_n(
         restored_best=np.array([restored], dtype=bool),
         budget_unresolved=np.array([unresolved_budgets], dtype=np.int64),
         mixture_components=np.array([len(components)], dtype=np.int64),
+        mixture_settled=np.array([not mixture_unresolved], dtype=bool),
         state_digest=state_digest(
             [scoring.coefficients, np.asarray(scoring.posterior_draws), scoring.alpha, np.array([noise]), weights, solves[0].hyperparameters.coefficients]
         )[None, :],
@@ -2239,12 +2240,13 @@ def _mode_mixture(
     statistics: DenseStatistics, prior: ScaleMixturePrior, solves: list, starts: Sequence[F64Array], start_noise: float, draw_count: int,
     working_bytes: int, seed: int,
 ) -> tuple[list, bool]:
-    """The fixed points of coordinate ascent at each start's fitted hyperparameters, in successive random member orders,
-    until the mixture's mean has settled; returns the components and whether the search ended unsettled at its budget.
+    """The fixed points of coordinate ascent at each start's fitted hyperparameters, in K successive random member
+    orders; returns the components and whether the search ended unsettled at its budget.
 
-    Work budget: at most K orders (``full_data_fit._mode_mixture``'s: the mixture reaches the scorer through K draws,
-    each from one component, so no more than K components are ever represented; a refused order consumes its attempt),
-    after which the search ends unresolved and says so.
+    Work budget: all K orders before reading the settling test (``full_data_fit._mode_mixture``'s: the mixture reaches
+    the scorer through K draws, each from one component, so no more than K components are ever represented; a refused
+    order consumes its attempt), after which a search whose last admitted move exceeds the resolution ends unresolved
+    and says so.
 
     Between near-duplicate columns the posterior is multimodal (the effect on one column or on the other, weighted by
     each one's evidence), and the product family holds one mode: coordinate ascent gives the effect to whichever column
@@ -2253,10 +2255,10 @@ def _mode_mixture(
     a mode already held is merged into it (``_admit``), so each distinct mode carries its own mass once. Components alternate between the start the
     hyperparameters were fitted from and zero: a data start holds one mode's choice, which most orders carried from it
     keep, and zero leaves the choice to the order (in 60 simulations on real genotypes neither alone hedged: from the
-    lasso most components repeated the first fixed point, from zero many were poor modes). It stops when one more
-    component moves the mixture's fitted genetic values Xp mean-bar by at most the draws' resolution,
-    ||Xp d||^2 / sigma^2 <= 1/K: a run that repeats a held mode moves it by nothing, so the search ends at the first
-    run that finds no new mode of weight."""
+    lasso most components repeated the first fixed point, from zero many were poor modes). After all K orders it is
+    settled when the last admitted order moved the mixture's fitted genetic values Xp mean-bar by at most the draws'
+    resolution, ||Xp d||^2 / sigma^2 <= 1/K. A refused order leaves the last admitted move standing; with no admitted
+    order the search is unresolved. A repeat moves the mean by nothing but does not skip the remaining orders."""
     from sv_pgs.mean_field import MeanFieldFixedPoints
 
     components: list = []
@@ -2270,6 +2272,7 @@ def _mode_mixture(
         return np.einsum("m,mj->j", weights, np.array([component.oracle.mean for component in components]))
 
     average = mixture_mean()
+    last_move = np.inf
     for index in range(draw_count):
         solve, start_mean = solves[index % len(solves)], starts[index % len(starts)]
         from_start = (index // len(solves)) % 2 == 0
@@ -2284,10 +2287,9 @@ def _mode_mixture(
         updated = mixture_mean()
         noise = float(np.dot(_mixture_weights(components), [float(component.oracle.noise) for component in components]))
         move = _metric(statistics, oracle).image(updated - average)
+        last_move = float(move @ move) / noise
         average = updated
-        if float(move @ move) / noise <= 1.0 / draw_count:
-            return components, False
-    return components, True
+    return components, not (last_move <= 1.0 / draw_count)
 
 
 def _component_log_evidence(component: "_SmallNSolve | GaussianMember") -> float:

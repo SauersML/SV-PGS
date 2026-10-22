@@ -38,6 +38,9 @@ SCENARIO_MODULES = frozenset({"synthetic_store.py"})
 
 # (module path relative to sv_pgs/, symbol) -> (class, allowed values, citation)
 REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
+    ('gpu_guard.py', 'TRAIL'): ('external-config', frozenset({128}), 'live_resume/gpu_guard.py TRAIL: the requested live fault report length'),
+    ('device_sweep.py', 'SWEEP_RTOL'): ('external-config', frozenset({1e-9}), 'live_resume/fast_sweep.py RTOL: the existing sweep verification tolerance'),
+    ('device_sweep.py', 'SWEEP_ATOL'): ('external-config', frozenset({1e-300}), 'live_resume/fast_sweep.py ATOL_TINY: the existing sweep verification floor'),
     ('all_of_us.py', 'DISEASE_DEFINITIONS.lab_criteria'): ('spec', frozenset({160.0, 6.5, 60.0, 90, 30.0}), 'JNC 7 stage 2 hypertension (systolic >= 160 mmHg; Chobanian et al. 2003, JAMA 289:2560); NCEP ATP III high LDL cholesterol (>= 160 mg/dL; Circulation 2002, 106:3143); ADA Standards of Care (HbA1c >= 6.5%); KDIGO 2012 CKD (GFR < 60 or ACR >= 30 mg/g for > 90 days)'),
     ('all_of_us.py', 'DISEASE_DEFINITIONS.minimum_case_age_years'): ('spec', frozenset({40.0}), 'GOLD report: COPD diagnosis from age 40'),
     ('all_of_us.py', 'PREGNANCY_WINDOW_DAYS_BEFORE'): ('spec', frozenset({294}), '42 weeks, where post-term begins; ACOG Committee Opinion 736 (2018): postpartum through 12 weeks'),

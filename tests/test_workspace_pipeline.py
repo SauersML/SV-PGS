@@ -1988,7 +1988,7 @@ def test_postfit_resumes_after_a_mirrored_batch_and_keeps_every_output(workspace
     recorder = _Recorder()
     bindings = _bindings(recorder, client)
     monkeypatch.setattr(workspace_pipeline, "score_batches", _single_model_batches)
-    run_pipeline(config, bindings, BUDGET, through="report")
+    run_pipeline(config, bindings, BUDGET, through="effects")
     run = config.run_directory
     expected = _postfit_outputs(run / step)
     report = _postfit_outputs(run / "report")
@@ -2037,7 +2037,7 @@ def test_postfit_resumes_after_a_mirrored_batch_and_keeps_every_output(workspace
     else:
         monkeypatch.setattr(workspace_pipeline, "variant_effects", resumed)
     fit_calls = len(recorder.fit_calls)
-    run_pipeline(config, bindings, BUDGET, through="report")
+    run_pipeline(config, bindings, BUDGET, through="effects")
     assert len(recorder.fit_calls) == fit_calls
     assert len(calls) == total - 1
     _assert_postfit_outputs(run / step, expected)
@@ -2261,6 +2261,58 @@ def _assert_finished_outputs(run: Path, expected) -> None:
             _assert_postfit_outputs(run / step, outputs)
 
 
+def test_the_report_precedes_effects_with_the_same_keys_and_outputs(workspace, monkeypatch) -> None:
+    """The held-out report uses no effects file. Moving it before effects keeps every step's key and public output,
+    and a run through report leaves effects and export for the next invocation."""
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    bindings = _bindings(_Recorder(), client)
+    steps = {step.name: step for step in workspace_pipeline._STEPS}
+    assert steps["report"].upstream == ("cohort", "score")
+    assert steps["export"].upstream == ("report", "effects")
+    before = [step for step in workspace_pipeline._STEPS if step.name not in ("effects", "report", "export")]
+    with monkeypatch.context() as patched:
+        patched.setattr(workspace_pipeline, "_STEPS", (*before, steps["effects"], steps["report"], steps["export"]))
+        run_pipeline(config, bindings, BUDGET)
+    run = config.run_directory
+    expected = _finished_outputs(run)
+    keys = {step: json.loads((run / step / COMPLETE_FILE).read_text())["key"] for step in STEP_NAMES}
+    for step in ("report", "effects", "export"):
+        shutil.rmtree(run / step)
+    summaries = run_pipeline(config, bindings, BUDGET, through="report")
+    assert tuple(summaries)[-1] == "report"
+    assert not (run / "effects").exists() and not (run / "export").exists()
+    _assert_postfit_outputs(run / "report", expected["report"])
+    summaries = run_pipeline(config, bindings, BUDGET)
+    assert tuple(summaries) == STEP_NAMES
+    assert list(summaries).index("report") < list(summaries).index("effects") < list(summaries).index("export")
+    assert {step: json.loads((run / step / COMPLETE_FILE).read_text())["key"] for step in STEP_NAMES} == keys
+    _assert_finished_outputs(run, expected)
+
+
+@pytest.mark.parametrize("partial,through,expected", [
+    ("fit", "report", ("fit", "score", "effects")),
+    ("fit", "export", ("fit", "score", "effects")),
+    ("fit", "score", ("fit", "score")),
+    ("fit", "fit", ("fit",)),
+    ("store", "report", ("store",)),
+])
+def test_a_partial_fit_skips_the_report_and_keeps_its_arm_parts(monkeypatch, partial, through, expected) -> None:
+    """A partial fit reaches its effects and handoff past the report; a partial store shard still stops at the store."""
+    called, closed = [], []
+    run = SimpleNamespace(parts=set(), store=SimpleNamespace(close=lambda: closed.append(True)))
+
+    def part(run, step):
+        called.append(step.name)
+        run.parts.add(step.name)
+        raise workspace_pipeline.StepPart(step.name)
+
+    monkeypatch.setattr(workspace_pipeline, "_run_step", part)
+    steps = workspace_pipeline._STEPS[STEP_NAMES.index(partial):]
+    assert workspace_pipeline._steps(run, steps, through, "") == {}
+    assert tuple(called) == expected and closed == [True] and run.store is None
+
+
 def _fail(*args, **kwargs):
     pytest.fail("a finishing run fits, predicts or reads the store or the measurement model")
 
@@ -2284,10 +2336,12 @@ def test_arm_runs_score_their_own_arm_and_either_finishes_the_run_with_one_run_s
 
     first, second = runs("arm-a"), runs("arm-b")
     recorder = _Recorder()
-    summaries = run_pipeline(first, _artifact_bindings(recorder, client), BUDGET, fit_arms=(ARMS[0],))
+    summaries = run_pipeline(first, _artifact_bindings(recorder, client), BUDGET, through="report", fit_arms=(ARMS[0],))
     assert len(recorder.fit_calls) == 1 and {"fit", "score", "effects", "report"}.isdisjoint(summaries)
     for step in ("fit", "score", "effects"):
         assert (first.run_directory / f"{step}.partial").is_dir() and not (first.run_directory / step).exists()
+    assert list((first.run_directory / "effects.partial" / "batches").glob("*/handoff.json"))
+    assert not (first.run_directory / "report").exists()
     mirror_a, mirror_b = DirectoryRemote(root / "mirror-a"), DirectoryRemote(root / "mirror-b")
     push(first.run_directory, mirror_a)
     # The other arm's job starts from the same steps before the fit and makes its own arm's parts.
@@ -2310,7 +2364,7 @@ def test_arm_runs_score_their_own_arm_and_either_finishes_the_run_with_one_run_s
     # The first arm's parts survive a new disk: restored from its mirror, its run makes none of them again.
     shutil.rmtree(first.run_directory)
     restore(first.run_directory, mirror_a)
-    run_pipeline(first, dataclasses.replace(_artifact_bindings(recorder, client), fit=_fail, predict=_fail), BUDGET, fit_arms=(ARMS[0],))
+    run_pipeline(first, dataclasses.replace(_artifact_bindings(recorder, client), fit=_fail, predict=_fail), BUDGET, through="report", fit_arms=(ARMS[0],))
     assert not (first.run_directory / "effects").exists()
 
     # A finishing job elsewhere restores no store and no fit checkpoint, and waits while the partner has no parts.
@@ -2327,6 +2381,10 @@ def test_arm_runs_score_their_own_arm_and_either_finishes_the_run_with_one_run_s
     unpredicting = dataclasses.replace(_artifact_bindings(recorder, client), fit=_fail, predict=_fail, load_measurement_model=_fail)
     with monkeypatch.context() as patched:
         patched.setattr(DosageStore, "open", _fail)
+        summaries = run_pipeline(finishing, unpredicting, BUDGET, through="report", finish=True)
+        assert "report" in summaries and "effects" not in summaries and "export" not in summaries
+        assert not (finishing.run_directory / "effects").exists()
+        _assert_postfit_outputs(finishing.run_directory / "report", expected["report"])
         summaries = run_pipeline(finishing, unpredicting, BUDGET, finish=True)
         assert set(summaries) == set(STEP_NAMES)
         _assert_finished_outputs(finishing.run_directory, expected)

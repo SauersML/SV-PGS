@@ -184,7 +184,7 @@ from sv_pgs.warm_seeds import Seed, read_seeds
 
 LOGGER = logging.getLogger(__name__)
 
-STEP_NAMES = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv", "fit", "score", "effects", "report", "export")
+STEP_NAMES = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv", "fit", "score", "report", "effects", "export")
 ARMS = ("snv_indel", "with_sv")
 """The study's two arms, fitted on the same people, folds and seeds so that their held-out predictions are paired.
 ``snv_indel`` fits every record shorter than a structural variant (``COMMUNITY_SV_MINIMUM_LENGTH``: SNVs, short indels
@@ -5978,20 +5978,8 @@ _STEPS = (
         _checked_trait_model, _prediction_budget, _array_bytes, _final_store, score_batches, structural_records, model_part, GatheredRows,
         gathered_models, importlib.import_module("sv_pgs.postfit_checkpoint"),
     ), _score_step),
-    _Step(
-        "effects", ("cohort", "fit", "score"), lambda config: {
-            "jackknife_blocks": JACKKNIFE_BLOCKS, "confidence": CONFIDENCE_LEVEL,
-            "locus_panel": None if config.locus_panel is None else _file_digest(Path(config.locus_panel)),
-        },
-        (
-            _effects_step, _StoreRecords, arm_handoff, arm_scores, _score_batch, _scored_traits, _fit_verdicts, _opened_store, _fitted_model_directory,
-            _read_scores, _split_cohort, _checked_trait_model, _final_store, variant_effects, length_bins, genetic_variance_decomposition,
-            _shown, PriorMoments, prior_moments, jackknife_ratio, effect_summaries, suppressed_levels, _hidden_counts, _hidden_records, _number,
-            read_locus_panel, locus_classes, locus_variance, _checked_exportable, check_exportable, ExportRule, export_rules,
-            importlib.import_module("sv_pgs.postfit_checkpoint"),
-        ),
-        _effects_step,
-    ),
+    # The live round held its held-out comparison behind the per-record effects tables [real]. The report reads
+    # cohort and score alone; export still follows both report and effects.
     _Step(
         "report",
         ("cohort", "score"),
@@ -6005,6 +5993,20 @@ _STEPS = (
             held_out_comparison, probability_calibration,
         ),
         _report_step,
+    ),
+    _Step(
+        "effects", ("cohort", "fit", "score"), lambda config: {
+            "jackknife_blocks": JACKKNIFE_BLOCKS, "confidence": CONFIDENCE_LEVEL,
+            "locus_panel": None if config.locus_panel is None else _file_digest(Path(config.locus_panel)),
+        },
+        (
+            _effects_step, _StoreRecords, arm_handoff, arm_scores, _score_batch, _scored_traits, _fit_verdicts, _opened_store, _fitted_model_directory,
+            _read_scores, _split_cohort, _checked_trait_model, _final_store, variant_effects, length_bins, genetic_variance_decomposition,
+            _shown, PriorMoments, prior_moments, jackknife_ratio, effect_summaries, suppressed_levels, _hidden_counts, _hidden_records, _number,
+            read_locus_panel, locus_classes, locus_variance, _checked_exportable, check_exportable, ExportRule, export_rules,
+            importlib.import_module("sv_pgs.postfit_checkpoint"),
+        ),
+        _effects_step,
     ),
     _Step("export", ("report", "effects"), lambda config: config.export, (_export_step, check_exportable, ExportRule, export_rules), _export_step),
 )
@@ -6022,13 +6024,16 @@ their keys (``run_mirror.restore``'s ``finishing``)."""
 
 def _steps(run: _Run, steps: Sequence[_Step], through: str | None, label: str) -> dict[str, dict[str, Any]]:
     """Run ``steps`` in order for ``run``, through ``through`` when given. A step stopped after its part (StepPart) ends the
-    run there, except that the steps of ARM_PARTS do their own parts after it; the run's opened store is closed at the
-    end, however it ends."""
+    run there, except that after a partial fit the steps of ARM_PARTS do their own parts, skipping the report even
+    when it is ``through`` so each arm leaves its effects and handoff. The run's opened store is closed at the end,
+    however it ends."""
     summaries = {}
     try:
         for step in steps:
             if run.parts and step.name not in ARM_PARTS:
-                break
+                if "fit" not in run.parts:
+                    break
+                continue
             try:
                 summaries[step.name] = _run_step(run, step)
             except StepPart as part:

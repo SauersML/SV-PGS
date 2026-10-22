@@ -31,6 +31,7 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "launcher/workspace"
 def test_the_gate_knows_every_step_and_every_phase_the_package_logs() -> None:
     """A new timing line elsewhere fails here until the gate has a rule for it, so no phase's time is counted nowhere."""
     assert round_timeline.STEP_NAMES == STEP_NAMES
+    assert round_timeline.ARM_PARTS == workspace_pipeline.ARM_PARTS
     named = set()
     for path in PACKAGE.glob("*.py"):
         text = path.read_text(encoding="utf-8")

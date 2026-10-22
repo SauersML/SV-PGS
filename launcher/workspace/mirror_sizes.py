@@ -28,7 +28,7 @@ import json
 from pathlib import Path
 import subprocess
 
-STEP_NAMES = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv", "fit", "score", "effects", "report", "export")
+STEP_NAMES = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv", "fit", "score", "report", "effects", "export")
 """sv_pgs.workspace_pipeline.STEP_NAMES, in its order; the app's python3 that runs this script has no sv_pgs."""
 COMPLETE_FILE = "_COMPLETE.json"
 PARTIAL = ".partial"

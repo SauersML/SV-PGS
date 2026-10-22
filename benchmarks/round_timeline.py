@@ -55,9 +55,12 @@ try:
 except ImportError:  # run as a script, from its own directory
     import profile_log
 
-STEP_NAMES = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv", "fit", "score", "effects", "report", "export")
+STEP_NAMES = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv", "fit", "score", "report", "effects", "export")
 """``workspace_pipeline.STEP_NAMES``, in order (tests/test_round_timeline.py checks they agree); the log's analysis does
 not import sv_pgs."""
+ARM_PARTS = ("score", "effects")
+"""``workspace_pipeline.ARM_PARTS``: after an arm's partial fit, the only steps its run passes, each doing its arm's part
+(the report is the finishing run's)."""
 STEP = "step_"
 """A step line's phase prefix: ``step_<name>``."""
 STATES = ("reused", "computed", "part", "failed")
@@ -177,9 +180,14 @@ def problems(timeline: Timeline) -> list:
         if any(name not in STEP_NAMES for name in names):
             found.append(f"unknown steps logged: {' '.join(name for name in names if name not in STEP_NAMES)}")
             continue
-        first = STEP_NAMES.index(names[0])
-        # A driver passes every step from the first (a region's run, from its fit), each with its line.
-        if names[0] not in ("samples", "fit") or names != list(STEP_NAMES[first:first + len(names)]):
+        order = list(STEP_NAMES)
+        if any(step.name == "fit" and step.state == "part" for step in run):
+            fit = STEP_NAMES.index("fit")
+            order = [*STEP_NAMES[:fit + 1], *(name for name in STEP_NAMES[fit + 1:] if name in ARM_PARTS)]
+        first = order.index(names[0]) if names[0] in order else 0
+        # A driver passes every step from the first (a region's run, from its fit), each with its line; an arm's run
+        # passes only ARM_PARTS after its fit's part.
+        if names[0] not in ("samples", "fit") or names != order[first:first + len(names)]:
             found.append(f"a driver run logged {' '.join(names)}: a step between these has no line")
     for phase in timeline.phases:
         if phase.name not in KNOWN_PHASES:

@@ -96,6 +96,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
+from sv_pgs import gpu_guard
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 
 HOST = "host"
@@ -437,6 +438,7 @@ class _DeviceMeter:
         with self._on():
             return int(self.pool.total_bytes()) + self.outside
 
+    @gpu_guard.traced
     def settle(self) -> None:
         with self._on():
             self.pool.free_all_blocks()

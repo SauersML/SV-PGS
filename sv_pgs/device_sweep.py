@@ -45,8 +45,14 @@ from sv_pgs.compute_budget import _cupy_device_context
 from sv_pgs.config import ModelConfig
 from sv_pgs.device_plan import moved
 from sv_pgs.genotype_buffers import SIGNED_CODE_OFFSET
+from sv_pgs.gpu_guard import is_cuda_error, traced
 from sv_pgs.memory_broker import device_pool
 from sv_pgs.phase_timer import launch_timer
+from sv_pgs.progress import log
+
+SWEEP_RTOL = 1e-9
+SWEEP_ATOL = 1e-300
+"""The live native-code sweep's verification tolerance, relative to each reference array's largest value."""
 
 PANEL = 32
 """Columns per panel: the CUDA warp width (one lane per member of the panel)."""
@@ -966,6 +972,8 @@ class SweepLayout:
                     device_id, members, array_module.asarray(np.concatenate(code_rows[position])),
                     array_module.asarray(np.asarray(sign, dtype=np.float64)[members]), array_module.asarray(np.asarray(class_index, dtype=np.int64)[members]),
                 ))
+        self.checked = False
+        self.disabled = False
         self.widest_piece = max((last - first for block in self.blocks for first, last in block.pieces), default=0)
 
     @property
@@ -1085,7 +1093,143 @@ def _piece_grams(
     return grams, couplings
 
 
-def sweep_models(
+def sweep_models(xp: Any, kernels: Any, layout: SweepLayout, tiles: Iterator, **inputs) -> tuple:
+    """One batched sweep, checked against the host reference on the first sweep of the fit's layout.
+    The live single-model kernel agreed to about 1e-15 [real, wh6]; its multi-model successor had no device run.
+    Every moment, residual and ELBO term must meet the live sweep's tolerance. A mismatch or CUDA error disables
+    this layout and raises ``NoCodes``, which selects the caller's decoded reference route without committing any
+    moments. A poisoned CUDA context can still prevent that route from running."""
+    if layout.disabled:
+        raise NoCodes("the batched sweep was disabled for this fit")
+    state = inputs["state"]
+    # Device downloads can fail after one device has finished; no caller array moves before all have succeeded.
+    staged = {name: values.copy() for name, values in state.items()}
+    check = not layout.checked
+    reference = None
+
+    def checked_tiles():
+        for block, item in zip(layout.blocks, tiles, strict=True):
+            if reference is not None:
+                with _cupy_device_context(xp, int(item[3])):
+                    reference.block(block, item)
+            yield item
+
+    stream = checked_tiles()
+    try:
+        try:
+            reference = _SweepReference(layout, inputs) if check else None
+            result = _sweep_models(xp, kernels, layout, stream, **{**inputs, "state": staged})
+        finally:
+            stream.close()
+            close = getattr(tiles, "close", None)
+            if close is not None:
+                close()
+    except Exception as error:
+        if is_cuda_error(error):
+            layout.disabled = True
+            log(f"batched sweep disabled ({type(error).__name__}: {error}); using reference sweeps")
+            raise NoCodes("a CUDA error disabled the batched sweep") from error
+        raise
+    if reference is not None:
+        layout.checked = True
+        pairs = [(staged[name][:, model], reference.state[name][:, model])
+                 for name in MOMENTS for model in range(len(inputs["keys"]))]
+        residuals, totals, squares = reference.result()
+        pairs.extend(zip(result[0], residuals, strict=True))
+        pairs.extend(zip(np.asarray(result[1]).flat, totals.flat, strict=True))
+        pairs.extend(zip(result[2], squares, strict=True))
+        if not all(_sweep_agrees(actual, expected) for actual, expected in pairs):
+            layout.disabled = True
+            log("batched sweep disabled (verification mismatch); using reference sweeps")
+            raise NoCodes("the batched sweep disagreed with the reference")
+        log("batched sweep verification passed")
+    for name in MOMENTS:
+        state[name][...] = staged[name]
+    return result
+
+
+def _sweep_agrees(actual: Any, expected: Any) -> bool:
+    """Whether each model's array meets the live sweep's infinity-norm tolerance."""
+    actual, expected = np.asarray(actual), np.asarray(expected)
+    if actual.shape != expected.shape or not np.all(np.isfinite(actual)) or not np.all(np.isfinite(expected)):
+        return False
+    scale = np.max(np.abs(expected), initial=0.0)
+    return bool(np.max(np.abs(actual - expected), initial=0.0) <= SWEEP_RTOL * scale + SWEEP_ATOL)
+
+
+class _SweepReference:
+    """The host coordinate sweep alongside one streamed read, decoding at most one panel per model at a time.
+    Tiles are consumed before their iterator advances, so verification holds no resident-code references."""
+
+    def __init__(self, layout: SweepLayout, inputs: dict) -> None:
+        self.layout, self.inputs = layout, inputs
+        self.state = {name: values.copy() for name, values in inputs["state"].items()}
+        self.residuals = np.array(inputs["residuals"], dtype=np.float64)
+        self.totals = np.zeros((len(inputs["keys"]), PIECE_COLUMNS))
+        self.covariates = _to_host(inputs["covariates"])
+        self.pinvs = [_to_host(values) for values in inputs["covariate_pinvs"]]
+
+    def block(self, block: _BlockLayout, item: tuple) -> None:
+        """Advance each model's reference residual over this block's members in their own order."""
+        from sv_pgs.mean_field import _sweep
+
+        start, _stop, tile, device_id = item
+        device = self.layout.devices[block.device]
+        if start != block.start or device_id != device.device_id:
+            raise ValueError("a block's tile is not where the sweep's layout places it")
+        if not CodePanels.supports(tile):
+            raise NoCodes("a block's tile holds no codes for the panel sweep")
+        inputs = self.inputs
+        rows = _to_host(device.rows)
+        signs = _to_host(device.signs)
+        classes = _to_host(device.classes)
+        grid = np.asarray(inputs["grid"])
+        for model in range(len(inputs["keys"])):
+            mask = inputs["masks"][model]
+            covariates = self.covariates * mask[:, None]
+            node_count = grid.shape[-1] if inputs.get("node_counts") is None else int(inputs["node_counts"][model])
+            nodes = (grid if grid.ndim == 1 else grid[model])[:node_count]
+            density = np.ascontiguousarray(inputs["log_density"][model, :, :node_count])
+            for first, last in block.pieces:
+                for begin in range(first, last, PANEL):
+                    end = min(begin + PANEL, last)
+                    positions = np.arange(block.offset + begin, block.offset + end)
+                    members = block.members[begin:end]
+                    if inputs.get("live") is not None:
+                        live = np.asarray(inputs["live"][members, model], dtype=bool)
+                        positions, members = positions[live], members[live]
+                    if not members.size:
+                        continue
+                    local = rows[positions]
+                    standards = inputs.get("standardization")
+                    if standards is None:
+                        dense = _to_host(tile.columns(local))
+                    else:
+                        means, scales = standards
+                        codes = _to_host(tile.aligned_codes[local, :mask.shape[0]]).astype(np.float64)
+                        dense = ((codes - means[members, model, None]) / scales[members, model, None]).T
+                    masked = dense * signs[positions][None, :] * mask[:, None]
+                    projected = np.asfortranarray(masked - covariates @ (self.pinvs[model] @ (covariates.T @ masked)))
+                    log_nodes = inputs["log_scale"][members, model, None] + nodes[None, :]
+                    moments = {name: np.ascontiguousarray(values[members, model]) for name, values in self.state.items()}
+                    order = np.arange(members.size, dtype=np.int64)
+                    part = _sweep(
+                        projected, np.ascontiguousarray(inputs["squares"][members, model]), order,
+                        np.ascontiguousarray(classes[positions]), density, np.exp(log_nodes), log_nodes,
+                        float(inputs["noise"][model]), moments["mean"], self.residuals[model], moments["variance"],
+                        moments["shift"], moments["third"], moments["fourth"], order,
+                    )
+                    for name, values in moments.items():
+                        self.state[name][members, model] = values
+                    self.totals[model] += (part[0], part[1], part[3])
+
+    def result(self) -> tuple:
+        """The reference residuals, ELBO pieces and residual squares."""
+        return self.residuals, self.totals, np.array([float(values @ values) for values in self.residuals])
+
+
+@traced
+def _sweep_models(
     xp: Any, kernels: Any, layout: SweepLayout, tiles: Iterator[tuple[int, int, Any, int]], *, grams: PanelGrams, keys: Sequence[tuple],
     masks: np.ndarray, residuals: np.ndarray, noise: np.ndarray, log_density: np.ndarray, grid: np.ndarray, log_scale: np.ndarray,
     squares: np.ndarray, state: dict[str, np.ndarray], covariates: Any, covariate_pinvs: Sequence[Any], gram_columns: Callable[[int], int],

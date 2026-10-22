@@ -238,9 +238,9 @@ def test_a_fit_continued_from_its_own_fixed_point_and_mixture_is_the_same_fit_in
     a converged fit's hyperparameters, noise, main fixed point (``component_means[0]``) and mode mixture
     (``mixture_start``), the fit reaches the same fixed point and mixture, to the draws' resolution, in a handful of
     sweeps, where the cold fit took dozens: its empirical Bayes in at most 10. Its mode mixture solves the earlier
-    components from their own means and noise; here the first (the ridge component) was stopped on a plateau and moves
-    on into the main mode (``_mode_mixture``), so the search runs again, as in the cold fit, at the cost of that one
-    solve more (``test_warm_start_eb``: a saved fit whose components come back keeps its search, with no order)."""
+    components from their own means and noise; the earlier ridge component moves off its plateau into the main mode
+    (``_mode_mixture``), where it is merged, and the main fixed point comes back, so the settled search stands: neither
+    the ridge start nor an order runs again."""
     from sv_pgs import full_data_fit
     from sv_pgs.full_data_fit import _FullDataMeanField
 
@@ -284,8 +284,10 @@ def test_a_fit_continued_from_its_own_fixed_point_and_mixture_is_the_same_fit_in
         f"components' mixture {sweeps} sweeps ({searches[0]} searches), {int(warm.certificate.mixture_components[0])} modes"
     )
     assert sweeps["eb"] <= 10 < sum(cold_sweeps.values())
-    # One earlier component solved, then the search: the cold mixture's sweeps and that solve's.
-    assert 0 < searches[0] and sweeps["mixture"] < 2 * cold_sweeps["mixture"] and sum(sweeps.values()) < sum(cold_sweeps.values())
+    # The cold fit searches its whole budget, the ridge start and K orders; the continuation's main fixed point comes
+    # back, so that search stands and its mixture costs only its components' solves.
+    assert cold_searches == _DRAWS + 1 and searches[0] == 0
+    assert sweeps["mixture"] < cold_sweeps["mixture"] and sum(sweeps.values()) < sum(cold_sweeps.values())
     assert warm.certificate.outer_criterion_met[0] == cold.certificate.outer_criterion_met[0]
     for hyperparameters, earlier in zip(warm.hyperparameters, cold.hyperparameters):
         np.testing.assert_allclose(hyperparameters.coefficients, earlier.coefficients, rtol=1e-10, atol=1e-12)
@@ -700,9 +702,188 @@ def test_a_cold_solve_known_to_need_more_than_its_budget_is_not_run(tmp_path: Pa
     assert skipping.elbo[0] == running.elbo[0] and skipping.noise[0] == running.noise[0]
 
 
+def test_the_mode_mixture_searches_its_whole_budget_of_orders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The two-trait mixture tries order seeds 1..K once each in sequence, even after an order moves nothing, and
+    each model's weights remain a probability vector over its own modes."""
+    from sv_pgs.full_data_fit import _FullDataMeanField, _mode_mixture
+
+    oracle_of, starts, statistics, prior = _two_trait_oracle(tmp_path)
+    initialize, solved = _FullDataMeanField.__init__, _FullDataMeanField._solved
+    orders: list[int] = []
+    solving: list[list[int]] = []
+
+    def recording(self, *arguments, **keywords):
+        if keywords.get("order_seed") is not None:
+            orders.append(int(keywords["order_seed"]))
+        initialize(self, *arguments, **keywords)
+
+    def counted(self, hyperparameters, models):
+        solving.append(list(models))
+        return solved(self, hyperparameters, models)
+
+    main = oracle_of([0, 1])
+    assert all(point is not None for point in main(list(starts)))
+    monkeypatch.setattr(_FullDataMeanField, "__init__", recording)
+    monkeypatch.setattr(_FullDataMeanField, "_solved", counted)
+    mixture = _mode_mixture(main, main.gaussian, statistics, prior, _DRAWS, 1 << 22, 13, tuple(starts))
+    assert orders == list(range(1, _DRAWS + 1)) and solving == [[0, 1]] * _DRAWS
+    for model in range(2):
+        count = int(mixture.counts[model])
+        np.testing.assert_allclose(mixture.weights[:count, model].sum(), 1.0, rtol=1e-12)
+        assert np.all(mixture.weights[count:, model] == 0.0)
+        assert np.all(np.isfinite(mixture.mean[:, model]))
+
+
+@pytest.mark.parametrize(("orders", "settled"), [
+    ([(2.0, 0.0)], [True, True]),
+    ([(4.0, 0.0)], [False, True]),
+    ([(0.0, 0.0), (8.0, 0.0), None], [False, True]),
+    ([(0.0, 0.0), None, (8.0, 0.0)], [False, True]),
+    ([(8.0, 0.0), (8.0, 0.0), None], [True, True]),
+    ([(8.0, 0.0), None, (8.0, 0.0)], [True, True]),
+    ([None, None, None], [False, False]),
+])
+@pytest.mark.parametrize("charged", [False, True])
+def test_the_mode_mixture_settles_from_each_model_s_last_admitted_order(orders, settled, charged):
+    """A repeat does not hide a later mode, and a refused last order keeps each model's last admitted move. No
+    admitted order leaves the search unresolved; an unresolved solve still prevents a settled continuation."""
+    from sv_pgs.full_data_fit import _mode_mixture
+
+    calls = []
+
+    class Oracle:
+        model_count = 2
+        _siblings = {}
+
+        def __init__(self, *arguments, order_seed=None, **keywords):
+            self.order_seed = order_seed
+            self.mean = np.zeros((1, self.model_count))
+            self.shift = self.mean.copy()
+            self.member_squares = np.ones_like(self.mean)
+            self.noise = np.ones(self.model_count)
+            self.elbo = np.zeros(self.model_count)
+            self.mean_move = np.zeros(self.model_count)
+            self.noise_gain = np.zeros(self.model_count)
+            self.unresolved = np.zeros(self.model_count, dtype=np.int64)
+            self.sites = [None] * self.model_count
+            self.site_precision, self.site_shift = self.member_squares, self.shift
+            self._panel_grams = {}
+
+        def _solved(self, hyperparameters, solving):
+            calls.append((self.order_seed, list(solving)))
+            means = orders[self.order_seed - 1]
+            if means is None:
+                self.unresolved[solving] = int(charged)
+                return None
+            self.mean[0] = means
+            self.shift = self.mean.copy()
+            return self
+
+        def _fitted_square(self, move, model):
+            return float(move @ move)
+
+        def _iterate(self, *arguments):
+            pass
+
+    mixture = _mode_mixture(Oracle(), None, None, None, len(orders), 1 << 22, 13, (None, None))
+    assert calls == [(order, [0, 1]) for order in range(1, len(orders) + 1)]
+    expected = np.asarray(settled)
+    np.testing.assert_array_equal(mixture.settled, expected & (not charged or None not in orders))
+    np.testing.assert_array_equal(mixture.unresolved, (~expected).astype(np.int64) + charged * orders.count(None))
+    assert len(mixture.refusals) == int((~expected).sum())
+    assert all("without settling" in refusal and "unresolved" in refusal for refusal in mixture.refusals)
+    np.testing.assert_allclose(mixture.weights.sum(axis=0), 1.0, rtol=1e-12)
+
+
+@pytest.mark.parametrize(("components", "searches"), [
+    ([(0.0, 0.0, 0.0), (2.0, 2.0, 0.0)], False),
+    ([(0.0, 0.0, 0.0), (2.0, 4.0, -1.0)], False),
+    ([(0.0, 0.0, 0.0), (2.0, 4.0, 1.0)], False),
+    ([(0.0, 0.0, 0.0), (2.0, 0.0, 1.0)], False),
+    ([(0.0, 0.0, 0.0), (2.0, 2.0, 1.0), (4.0, 2.0, 2.0)], False),
+    ([(0.0, 0.0, 0.0), (2.0, 8.0, 1.0), (4.0, 8.0, 1.0)], False),
+    ([(2.0, 2.0, 0.0), (0.5, 0.0, 0.0)], False),
+    ([(2.0, 2.0, 0.0)], True),
+    ([(1.0, 0.0, 0.0)], True),
+    ([(0.0, 0.0, 0.0), (2.0, None, -1.0)], True),
+])
+def test_a_continuation_keeps_its_search_where_its_main_fixed_point_comes_back(components, searches):
+    """A settled search stands, with neither the ridge start nor an order, wherever the other components' solves end:
+    where they started, at a new mode of any weight, in the main or another held mode, or two at one new mode, each
+    distinct mode held once at its highest evidence. It searches all K orders where the main fixed point does not come
+    back (the earlier one is another mode, or reaches this fit's from more than the resolution away; another component
+    that comes back to it will do) or a solve is refused. The other model has only its main component and keeps its
+    search throughout."""
+    from sv_pgs.full_data_fit import MixtureStart, _mode_mixture
+
+    calls = []
+    states = {entry: (mean, elbo) for entry, mean, elbo in components}
+    draws = 2
+
+    class Oracle:
+        model_count = 2
+        _siblings = {}
+
+        def __init__(self, *arguments, order_seed=None, start_mean=None, **keywords):
+            self.order_seed = order_seed
+            self.mean = np.zeros((1, self.model_count)) if start_mean is None else start_mean.copy()
+            self.shift = self.mean.copy()
+            self.member_squares = np.ones_like(self.mean)
+            self.noise = np.ones(self.model_count)
+            self.elbo = np.zeros(self.model_count)
+            self.mean_move = np.zeros(self.model_count)
+            self.noise_gain = np.zeros(self.model_count)
+            self.unresolved = np.zeros(self.model_count, dtype=np.int64)
+            self.sites = [None] * self.model_count
+            self.site_precision, self.site_shift = self.member_squares, self.shift
+            self._panel_grams = {}
+
+        def _solved(self, hyperparameters, solving):
+            calls.append((self.order_seed, list(solving)))
+            if self.order_seed is None:
+                mean, elbo = states[float(self.mean[0, 0])]
+                if mean is None:
+                    self.unresolved[solving] += 1
+                    return None
+                self.mean[0, 0], self.elbo[0] = mean, elbo
+            self.shift = self.mean.copy()
+            return self
+
+        def _fitted_square(self, move, model):
+            return float(move @ move)
+
+        def _iterate(self, *arguments):
+            pass
+
+    start = MixtureStart(
+        means=tuple(np.array([[entry, 0.0]]) for entry, _mean, _elbo in components),
+        noises=tuple(np.ones(2) for _component in components), counts=np.array([len(components), 1]), settled=np.ones(2, dtype=bool),
+    )
+    mixture = _mode_mixture(Oracle(), None, None, None, draws, 1 << 22, 13, (None, None), start=start)
+    solves = len(components) - int(components[0][0] == 0.0)
+    assert calls == [(None, [0])] * solves + ([(order, [0]) for order in range(1, draws + 1)] if searches else [])
+    # Only distinct re-solved modes, each at its highest evidence once; orders repeat the main mode.
+    expected = {0.0: 0.0}
+    for _entry, mean, elbo in components:
+        if mean is not None:
+            expected[mean] = max(expected.get(mean, -np.inf), elbo)
+    means = np.array(list(expected))
+    weights = np.exp(np.array(list(expected.values())) - max(expected.values()))
+    weights /= weights.sum()
+    assert mixture.counts.tolist() == [len(expected), 1]
+    np.testing.assert_array_equal([mean[0, 0] for mean in mixture.component_means], means)
+    np.testing.assert_allclose(mixture.weights[:, 0], weights, rtol=1e-12)
+    np.testing.assert_allclose(mixture.mean[0, 0], means @ weights, rtol=1e-12)
+    np.testing.assert_allclose(mixture.weights.sum(axis=0), 1.0, rtol=1e-12)
+    refused = any(mean is None for _entry, mean, _elbo in components)
+    np.testing.assert_array_equal(mixture.settled, [not refused, True])
+    np.testing.assert_array_equal(mixture.unresolved, [int(refused), 0])
+    assert not mixture.refusals
+
+
 def test_a_group_s_mode_mixture_is_each_model_s_own(tmp_path: Path) -> None:
     """The mode mixture of a group's oracle gives each model the mixture it gets alone: its own components, weights,
-    repeat and settling tests, the later orders solving only the models still searching."""
+    repeat and settling tests after all K orders."""
     from sv_pgs.full_data_fit import _mode_mixture
 
     oracle_of, starts, statistics, prior = _two_trait_oracle(tmp_path)
@@ -769,11 +950,11 @@ def test_the_mode_mixture_reads_no_dual_solver_factor_of_its_orders(tmp_path: Pa
 
 def test_a_continuation_s_mode_mixture_starts_from_the_earlier_fit_s_components(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A continuation's mode mixture (``MixtureStart``) solves the earlier fit's components again from their means and
-    noise (the earlier main fixed point only where this fit's main one is not it): a model whose earlier search settled,
-    whose every component is again a fixed point where it started and whose main fixed point is one of them keeps that
-    settled search, with neither the ridge start nor an order solved for it, and its mixture is the earlier one to the
-    draws' resolution; a model whose earlier search did not settle solves none of them and searches as without a start,
-    alone."""
+    noise (the earlier main fixed point only where this fit's main one is not it): a model whose earlier search settled
+    and whose main fixed point comes back keeps that settled search, with neither the ridge start nor an order solved
+    for it, on the modes its components reach, two that reach one mode merged (so no more modes than the earlier
+    search held); here its mixture is the earlier one to the draws' resolution. A model whose earlier search did not
+    settle solves none of them and searches as without a start, alone."""
     from sv_pgs.full_data_fit import MixtureStart, _FullDataMeanField, _mode_mixture
 
     oracle_of, starts, statistics, prior = _two_trait_oracle(tmp_path)
@@ -798,11 +979,12 @@ def test_a_continuation_s_mode_mixture_starts_from_the_earlier_fit_s_components(
     monkeypatch.setattr(_FullDataMeanField, "_solved", counted)
     _main, plain = mixture(None)
     assert np.all(plain.settled) and len(plain.component_means) == int(plain.counts.max())
-    # The ridge start and at least one order per model, from zero.
-    assert any(from_zero for _models, from_zero in solves)
+    # The ridge start, then all K orders for both models, from zero.
+    assert solves == [([0, 1], False)] + [([0, 1], True)] * _DRAWS
     earlier = MixtureStart(means=plain.component_means, noises=plain.component_noises, counts=plain.counts, settled=plain.settled)
     main, continued = mixture(earlier)
-    assert np.all(continued.settled) and np.array_equal(continued.counts, plain.counts)
+    assert np.all(continued.settled) and np.all(continued.counts <= plain.counts)
+    np.testing.assert_allclose(continued.weights.sum(axis=0), 1.0, rtol=1e-12)
     # Only the earlier components were solved, each from its own means, but the main fixed point, which this main one is.
     restarted = len(plain.component_means) - 1
     assert len(solves) == restarted and not any(from_zero for _models, from_zero in solves)
@@ -813,9 +995,9 @@ def test_a_continuation_s_mode_mixture_starts_from_the_earlier_fit_s_components(
     _main, searched = mixture(MixtureStart(means=plain.component_means, noises=plain.component_noises, counts=plain.counts, settled=np.array([True, False])))
     # Model 0's earlier components (but its main fixed point), then model 1's search alone.
     own = int(plain.counts[0]) - 1
-    assert searched.settled[0] and len(solves) > own
+    assert searched.settled[0] and len(solves) == own + 1 + _DRAWS
     assert all(models == [0] for models, _from_zero in solves[:own]) and all(models == [1] for models, _from_zero in solves[own:])
-    assert any(from_zero for _models, from_zero in solves[own:])
+    assert solves[own:] == [([1], False)] + [([1], True)] * _DRAWS
     np.testing.assert_allclose(searched.mean[:, 0], continued.mean[:, 0], rtol=1e-10, atol=1e-12)
 
 
@@ -991,3 +1173,25 @@ def test_mean_field_posterior_does_not_hold_an_unused_refreshs_device_cross_prod
     assert posterior.local_response is None
     with pytest.raises(RuntimeError, match="holds no variance map"):
         posterior.variance_jvp(np.ones((8, 1)))
+
+
+def test_a_quadratic_failure_returns_a_scored_uncertified_fit_from_the_prior(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A linear algebra failure after the first fixed point keeps the best state and records the failure.
+    A continuation leaves its caller the earlier fit, as for no certified progress."""
+    from sv_pgs import full_data_fit
+
+    fit = _mean_field_fit(tmp_path)
+
+    def failing(prior, starts, oracle, working_bytes, tolerance):
+        assert all(point is not None for point in oracle(list(starts)))
+        raise np.linalg.LinAlgError("the test's quadratic failed")
+
+    monkeypatch.setattr(full_data_fit, "fit_hyperparameters", failing)
+    ended = fit()
+    assert not ended.certificate.outer_criterion_met[0]
+    assert any("the test's quadratic failed" in reason for reason in ended.certificate.refusals)
+    assert not any("allowance" in reason for reason in ended.certificate.refusals)
+    assert np.all(np.isfinite(ended.member_mean)) and np.any(ended.member_mean[:, 0] != 0.0)
+    assert np.isfinite(ended.noise_variance[0])
+    with pytest.raises(FloatingPointError, match="the test's quadratic failed"):
+        fit(starts=ended.hyperparameters, start_noise=np.asarray(ended.noise_variance), start_mean=ended.member_mean)

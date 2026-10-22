@@ -2179,3 +2179,254 @@ def test_checked_hyper_steps_compose_and_release_their_correction_without_cyclic
     finally:
         if enabled:
             gc.enable()
+
+
+@pytest.mark.parametrize("fault", ["zero radius", "nan radius", "quadratic", "weights quadratic", "gradient", "spectrum", "proposal", "trial gradient", "boundary", "resolution"])
+def test_an_inner_fault_ends_at_the_held_point_with_a_refusal(monkeypatch, fault):
+    """A numeric fault returns an uncertified model with its reason. The oracle's last point is returned, including the
+    density boundary where every derivative vanishes."""
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    start = initial_hyperparameters(prior)
+    size = start.coefficients.size
+    solved = []
+    restored = []
+
+    def fixed_points(hyperparameters):
+        solved.append(hyperparameters[0].coefficients.copy())
+        assert len(solved) <= engine.EB_STALL_TRIALS + 2
+        return [FixedPoint(
+            cavity=cavity, posterior=diagonal_posterior(np.ones(prior.variant_count)), mean=np.zeros(prior.variant_count),
+            precision_norm=lambda direction: np.inf, effective_effects=0.0, restore=lambda: restored.append(True),
+        )]
+
+    def no_hyper_step(*arguments, **keywords):
+        if fault == "weights quadratic":
+            raise np.linalg.LinAlgError("the test's weights quadratic failed")
+        raise FloatingPointError("no certified maximum in the test")
+
+    def newton(view, weights, coefficients, *arguments):
+        if fault == "quadratic":
+            raise np.linalg.LinAlgError("the test's quadratic failed")
+        return engine._NewtonB(
+            view=view, allowed=np.eye(size), log_smoothing=weights, origin=coefficients,
+            gradient=np.full(size, np.nan if fault == "gradient" else 1.0), total=np.eye(size),
+            eigenvectors=np.eye(size), eigenvalues=np.full(size, np.nan if fault == "spectrum" else 1.0),
+            definite=True, decrement=1.0,
+        )
+
+    monkeypatch.setattr(engine, "curvature_correction", lambda *arguments: INDEPENDENT_EFFECTS)
+    monkeypatch.setattr(engine, "_outer_state", lambda *arguments: None)
+    monkeypatch.setattr(engine, "hyper_step", no_hyper_step)
+    monkeypatch.setattr(engine, "_newton_b", newton)
+    monkeypatch.setattr(engine, "_penalized_gradient", lambda *arguments: np.full(size, np.nan if fault == "trial gradient" else 0.0 if fault == "boundary" else 1.0))
+    if fault in ("zero radius", "nan radius"):
+        monkeypatch.setattr(engine, "_cauchy_radius", lambda newton: 0.0 if fault == "zero radius" else np.nan)
+    if fault in ("proposal", "resolution"):
+        monkeypatch.setattr(engine, "_proposal", lambda *arguments: np.full(size, np.nan if fault == "proposal" else 0.0))
+    (fit,) = fit_hyperparameters(prior, [start], fixed_points, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert not fit.certified and fit.remaining_gain == np.inf and fit.prediction_move == np.inf
+    assert fit.iterations == (1 if fault == "boundary" else 0)
+    reason = {
+        "weights quadratic": "the test's weights quadratic failed",
+        "zero radius": "trust radius 0", "nan radius": "trust radius nan", "quadratic": "the test's quadratic failed",
+        "gradient": "quadratic model of the evidence at x is not finite", "spectrum": "quadratic model of the evidence at x is not finite",
+        "proposal": "inner step at radius", "trial gradient": "inner trial's gradient is not finite",
+        "boundary": "density collapsed to the family's boundary", "resolution": "no certified progress at the EP fixed point",
+    }[fault]
+    assert reason in fit.refusal
+    evaluated = fault in ("trial gradient", "boundary", "resolution")
+    assert len(solved) == (2 if fault == "boundary" else 3 if evaluated else 1)
+    assert bool(restored) == evaluated
+    if fault != "boundary":
+        np.testing.assert_array_equal(fit.hyperparameters.coefficients, start.coefficients)
+    np.testing.assert_array_equal(solved[-1], fit.hyperparameters.coefficients)
+
+
+@pytest.mark.parametrize("start_kind", ["unplanned", "planned", "trial value", "trial error"])
+def test_a_walk_that_never_held_a_certified_state_ascends_until_its_budget(monkeypatch, start_kind):
+    """Until a model has held a certified state, its walk outside every basin is the search for a first one, bounded by
+    the no-progress budget alone: it ascends whether or not its entering trials were planned with values, and a state
+    whose value is not finite or whose error is infinite is no basin. Its fixed point moves at every step (else the walk
+    ends as unmoved), so it ends at its budget, at the oracle's last point."""
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    start = initial_hyperparameters(prior)
+    size = start.coefficients.size
+    solved, plans, state_calls = [], [], []
+
+    def fixed_points(hyperparameters):
+        solved.append(hyperparameters[0].coefficients.copy())
+        assert len(solved) <= engine.EB_STALL_TRIALS + 2
+        return [FixedPoint(
+            cavity=cavity, posterior=diagonal_posterior(np.ones(prior.variant_count)), mean=np.zeros(prior.variant_count),
+            precision_norm=lambda direction: np.inf, effective_effects=0.0,
+        )]
+
+    def outer_state(*arguments):
+        state_calls.append(True)
+        if len(state_calls) > 1 and start_kind in ("trial value", "trial error"):
+            return engine._State(
+                value=np.nan if start_kind == "trial value" else 0.0, rest=0.0, gradient=np.ones(size),
+                fixed_curvature=np.eye(size), correction=INDEPENDENT_EFFECTS,
+                error=np.inf if start_kind == "trial error" else 0.0, decrement=1.0,
+            )
+        return None
+
+    def step(view, hyperparameters, *arguments, **keywords):
+        plans.append(True)
+        if start_kind == "unplanned" or len(plans) == 1:
+            raise FloatingPointError("no evaluated hyper step yet")
+        return engine.HyperStep(
+            hyperparameters=hyperparameters, evidence=0.0, smoothing_gradient=0.0,
+            stationarity_steps=np.zeros(0), stationarity_errors=np.zeros(0), stationarity_gain=0.0,
+        )
+
+    def newton(view, weights, coefficients, *arguments):
+        return engine._NewtonB(
+            view=view, allowed=np.eye(size), log_smoothing=weights, origin=coefficients, gradient=np.ones(size),
+            total=np.eye(size), eigenvectors=np.eye(size), eigenvalues=np.ones(size), definite=True, decrement=1.0,
+        )
+
+    monkeypatch.setattr(engine, "EB_STALL_TRIALS", 3)
+    monkeypatch.setattr(engine, "curvature_correction", lambda *arguments: INDEPENDENT_EFFECTS)
+    monkeypatch.setattr(engine, "_outer_state", outer_state)
+    monkeypatch.setattr(engine, "hyper_step", step)
+    monkeypatch.setattr(engine, "_newton_b", newton)
+    monkeypatch.setattr(engine, "_penalized_gradient", lambda *arguments: np.ones(size))
+    (fit,) = fit_hyperparameters(prior, [start], fixed_points, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert not fit.certified and fit.remaining_gain == np.inf and fit.prediction_move == np.inf
+    assert "no certified rise of V in 3 trials" in fit.refusal
+    assert "outside every basin" not in fit.refusal
+    # Every inner trial was an ascent and was taken: the walk left the start.
+    assert fit.iterations >= 1
+    assert not np.array_equal(fit.hyperparameters.coefficients, start.coefficients)
+    np.testing.assert_array_equal(solved[-1], fit.hyperparameters.coefficients)
+
+
+@pytest.mark.parametrize("step", [np.nan, np.inf])
+def test_a_nonfinite_correction_step_has_unmeasured_slopes_without_line_integrals(monkeypatch, step):
+    from types import SimpleNamespace
+
+    evidence = SimpleNamespace(
+        replaced_directions=np.ones((1, 1)), effective_degrees=np.ones(1), penalty_sizes=np.ones(1), magnitude=1.0,
+        coefficients=np.zeros(1), responses=np.zeros((1, 1)),
+    )
+
+    def no_integral(*arguments):
+        pytest.fail("a non-finite difference step must not integrate a line")
+
+    monkeypatch.setattr(engine, "_correction_value", no_integral)
+    slopes, errors, second = engine._correction_slopes(
+        None, np.zeros(1), evidence, np.ones(1, dtype=bool), None, _WORKING_BYTES, np.array([step]),
+    )
+    np.testing.assert_array_equal(slopes, np.zeros(1))
+    np.testing.assert_array_equal(errors, np.full(1, np.inf))
+    np.testing.assert_array_equal(second, np.zeros(1))
+
+
+@pytest.mark.parametrize("step", [np.nan, np.inf])
+def test_a_nonfinite_stationarity_step_ends_before_a_side_is_evaluated(monkeypatch, step):
+    from types import SimpleNamespace
+
+    evidence = SimpleNamespace(
+        effective_degrees=np.ones(1), penalty_sizes=np.ones(1), magnitude=1.0, inner_decrement=step,
+        coefficients=np.zeros(1), responses=np.zeros((1, 1)), gradient=np.zeros(1), value=0.0, error=0.0,
+    )
+    calls = []
+
+    def at_base(view, weights, *arguments):
+        calls.append(weights.copy())
+        assert len(calls) == 1, "a non-finite stationarity step must not evaluate either side"
+        return evidence
+
+    monkeypatch.setattr(engine, "_evidence", at_base)
+    monkeypatch.setattr(engine, "_corrected", lambda view, weights, value, *arguments: value)
+    monkeypatch.setattr(engine, "_full_gradient", lambda *arguments: (np.zeros(1), np.zeros(1), np.zeros(1)))
+    with pytest.raises(FloatingPointError, match="stationarity step is not finite"):
+        engine._stationarity(None, np.zeros(1), evidence, np.ones(1, dtype=bool), None, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("search", ["coefficients", "weights"])
+def test_a_nan_trust_radius_ends_the_local_ascent(monkeypatch, search):
+    from types import SimpleNamespace
+
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    start = initial_hyperparameters(prior)
+
+    def no_step(*arguments, **keywords):
+        pytest.fail("a NaN radius must end the local ascent before a trust step")
+
+    monkeypatch.setattr(engine, "_trust_region_step", no_step)
+    if search == "coefficients":
+        objective = SimpleNamespace(rounding=0.0)
+        size = start.coefficients.size
+        monkeypatch.setattr(engine, "_objective_ceiling", lambda *arguments: np.inf)
+        monkeypatch.setattr(engine, "_data_objective", lambda *arguments: objective)
+        monkeypatch.setattr(engine, "_penalized", lambda *arguments: (0.0, np.ones(size), -np.eye(size)))
+        monkeypatch.setattr(np.linalg, "norm", lambda *arguments, **keywords: np.nan)
+        coefficients, returned = engine._maximize_coefficients(prior, start.log_smoothing, start.coefficients, cavity, _WORKING_BYTES, 0.0)
+        np.testing.assert_array_equal(coefficients, start.coefficients)
+        assert returned is objective
+    else:
+        evidence = SimpleNamespace(gradient=np.full(1, np.nan), magnitude=1.0)
+        weights, returned = engine._ascend_evidence(
+            prior, np.zeros(1), evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES,
+            np.full(1, -np.inf), np.full(1, np.inf), _EVIDENCE_TOLERANCE, start.coefficients,
+        )
+        np.testing.assert_array_equal(weights, np.zeros(1))
+        assert returned is evidence
+
+
+@pytest.mark.parametrize("ending", ["unmoved", "quadratic", "budget"])
+def test_a_polish_that_cannot_reenter_a_basin_returns_the_state_it_left(monkeypatch, ending):
+    """A polish may leave a basin where its decrement is a sliver of the error, but a walk that ends uncertified out
+    there returns the state it left: an unmoved fixed point outside every basin, a numeric fault or the no-progress
+    budget each restore the oracle there before returning."""
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    start = initial_hyperparameters(prior)
+    size = start.coefficients.size
+    solved = []
+    state_calls, newton_calls = [], []
+    state = engine._State(
+        value=0.0, rest=0.0, gradient=np.ones(size), fixed_curvature=np.eye(size), correction=INDEPENDENT_EFFECTS,
+        error=4.0, decrement=1.0,
+    )
+    step = engine.HyperStep(
+        hyperparameters=start, evidence=0.0, evidence_error=0.0, smoothing_gradient=0.0,
+        stationarity_steps=np.zeros(0), stationarity_errors=np.zeros(0), stationarity_gain=0.0,
+    )
+
+    def fixed_points(hyperparameters):
+        solved.append(hyperparameters[0].coefficients.copy())
+        assert len(solved) <= engine.EB_STALL_TRIALS + 2
+        return [FixedPoint(
+            cavity=cavity, posterior=diagonal_posterior(np.ones(prior.variant_count)), mean=np.zeros(prior.variant_count),
+            precision_norm=(lambda direction: 0.0) if ending == "unmoved" else (lambda direction: np.inf), effective_effects=0.0,
+        )]
+
+    def outer_state(*arguments):
+        state_calls.append(True)
+        return state if len(state_calls) == 1 else None
+
+    def newton(view, weights, coefficients, *arguments):
+        newton_calls.append(True)
+        if ending == "quadratic" and len(newton_calls) > 1:
+            raise np.linalg.LinAlgError("the departed quadratic failed")
+        return engine._NewtonB(
+            view=view, allowed=np.eye(size), log_smoothing=weights, origin=coefficients, gradient=np.ones(size),
+            total=np.eye(size), eigenvectors=np.eye(size), eigenvalues=np.ones(size), definite=True, decrement=1.0,
+        )
+
+    monkeypatch.setattr(engine, "curvature_correction", lambda *arguments: INDEPENDENT_EFFECTS)
+    monkeypatch.setattr(engine, "_outer_state", outer_state)
+    monkeypatch.setattr(engine, "hyper_step", lambda *arguments, **keywords: step)
+    monkeypatch.setattr(engine, "_newton_b", newton)
+    monkeypatch.setattr(engine, "_penalized_gradient", lambda *arguments: np.ones(size))
+    if ending == "budget":
+        monkeypatch.setattr(engine, "EB_STALL_TRIALS", 1)
+    (fit,) = fit_hyperparameters(prior, [start], fixed_points, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert not fit.certified and fit.iterations == 1 and fit.remaining_gain == np.inf
+    assert len(solved) == (4 if ending == "unmoved" else 3)
+    assert {"unmoved": "fixed point unmoved outside every basin", "quadratic": "the departed quadratic failed", "budget": "no certified rise"}[ending] in fit.refusal
+    np.testing.assert_array_equal(fit.hyperparameters.coefficients, start.coefficients)
+    np.testing.assert_array_equal(solved[-1], start.coefficients)

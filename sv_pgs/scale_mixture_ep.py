@@ -1117,6 +1117,47 @@ def _device_budget(working_bytes: int) -> int:
     return max(1, min(int(working_bytes), int(broker.reclaimable(pool))))
 
 
+def _device_room(working_bytes: int) -> int:
+    """The bytes a pass may allocate without evicting a cache, measured after returning the pool's free blocks.
+    Line logs asked for 6.97 GB with 35.6 GB held, and kernel rows for 1.04 GB with 41.29 GB held on a 41.79 GB
+    device [real, hyperlipidemia and aou-wh5 hypertension]. Each pass reads the room again; a refused piece halves.
+    On the host or without a device ledger the caller's budget applies."""
+    xp = _DEVICE.get()
+    broker = current_broker()
+    if xp is np or broker is None:
+        return int(working_bytes)
+    pool = device_pool(int(xp.cuda.Device().id))
+    if pool not in broker.capacities:
+        return int(working_bytes)
+    return max(1, min(int(working_bytes), int(broker.remaining(pool))))
+
+
+def _kernel_pieces() -> Callable:
+    """One pass's kernel chunks, halved after a refusal down to one row, with that limit on every later chunk.
+    A failed formation's arrays leave with its frame before another piece is formed."""
+    limit = None
+
+    def pieces(class_position, rows, form):
+        nonlocal limit
+        start = 0
+        while start < rows.shape[0]:
+            size = rows.shape[0] - start if limit is None else min(limit, rows.shape[0] - start)
+            piece = rows[start:start + size]
+            try:
+                formed = form(piece)
+            except MemoryError:
+                if size == 1:
+                    raise
+                limit = (size + 1) // 2
+                log(f"a kernel chunk of {size} rows was refused; chunks of {limit} rows from here in this pass")
+                continue
+            yield class_position, piece, formed
+            del formed
+            start += size
+
+    return pieces
+
+
 @contextlib.contextmanager
 def device_scope(array_module: ModuleType | None) -> Iterator[None]:
     """Every objective and moment evaluation inside runs on ``array_module`` (None: numpy)."""
@@ -1192,7 +1233,7 @@ def _kernel_chunks(
     if cache is not None:
         cache.pop("rows", None)
     held = None
-    budget = _device_budget(working_bytes)
+    budget = _device_room(working_bytes)
     chunks = [list(_row_chunks(class_rows, prior.grid_size, budget)) for class_rows in prior.class_rows]
     xp = _DEVICE.get()
 
@@ -1208,15 +1249,22 @@ def _kernel_chunks(
     held_bytes = _HELD_ARRAYS_PER_ROW_SET * prior.grid_size * scales.dtype.itemsize * sum(rows.size for rows in prior.class_rows)
     key_bytes = scales.nbytes + cavity.precision.nbytes + cavity.shift.nbytes
     if cache is not None and all(len(pieces) <= 1 for pieces in chunks) and 2 * held_bytes + key_bytes <= budget:
-        formed = [(class_position, rows, form(rows)) for class_position, pieces in enumerate(chunks) for rows in pieces]
-        cache["rows"] = (
-            prior.class_rows, prior.log_variance_grid, working_bytes, scales.copy(), cavity.precision.copy(), cavity.shift.copy(), formed,
-        )
-        yield from formed
-        return
+        try:
+            formed = [(class_position, rows, form(rows)) for class_position, pieces in enumerate(chunks) for rows in pieces]
+        except MemoryError:
+            # Refused though the budget held them (the room fell since): formed piecewise below, and not held.
+            formed = None
+            log("the step's held kernel rows were refused; formed piecewise and not held")
+        if formed is not None:
+            cache["rows"] = (
+                prior.class_rows, prior.log_variance_grid, working_bytes, scales.copy(), cavity.precision.copy(), cavity.shift.copy(), formed,
+            )
+            yield from formed
+            return
+    pieces_of = _kernel_pieces()
     for class_position, pieces in enumerate(chunks):
         for rows in pieces:
-            yield class_position, rows, form(rows)
+            yield from pieces_of(class_position, rows, form)
 
 
 def _class_terms(
@@ -1710,6 +1758,8 @@ def _trust_region_step(
     step of a positive definite -H already fits; ||s(mu)|| falls monotonically in mu, so mu is bisected
     to double precision between its bounds.
     """
+    if not radius > 0.0:
+        raise FloatingPointError("the trust radius has no positive length")
     eigenvalues, eigenvectors = _spectrum(negative_hessian) if spectrum is None else spectrum
     components = eigenvectors.T @ gradient
     if eigenvalues[0] > 0.0:
@@ -1827,7 +1877,8 @@ def _maximize_coefficients(
             # flat at its rounding, -H indefinite there at rounding, and the trust region followed that curvature
             # for over an hour at gains of 1e-8.
             return coefficients, objective
-        if radius <= _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
+        # A NaN radius cannot contract to the limit either.
+        if not radius > _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
             return coefficients, objective
         step = _trust_region_step(-hessian, gradient, radius, spectrum)
         predicted = float(gradient @ step) + 0.5 * float(step @ hessian @ step)
@@ -3028,7 +3079,7 @@ def _lines(
     groups: dict[bytes, list[int]] = {}
     for column in range(count):
         groups.setdefault(np.packbits(scale_slopes[column] == 0.0).tobytes(), []).append(column)
-    budget = _device_budget(working_bytes)
+    budget = _device_room(working_bytes)
     xp = _DEVICE.get()
 
     def form(rows: I64Array):
@@ -3055,6 +3106,9 @@ def _lines(
             yield form(rows)
 
     def values(requests: dict[int, F64Array]) -> dict[int, F64Array]:
+        # Each pass sized to the device's room as it is now, not as it was when the lines were made.
+        nonlocal budget
+        budget = _device_room(working_bytes)
         steps_of = {column: np.asarray(steps, dtype=np.float64) for column, steps in requests.items()}
         log_density_of = {}
         totals = {}
@@ -3063,6 +3117,31 @@ def _lines(
             log_density_of[column] = log_weights - _log_sum_exp(log_weights, axis=2, keepdims=True)
             totals[column] = -(penalty + steps * penalty_slopes[column] + 0.5 * np.square(steps) * penalty_curvatures[column])
         xp = _DEVICE.get()
+
+        def piece_sums(exponentials, peak, row_kernel, scaled, device_density, density_peak, start: int, stop: int) -> list:
+            # One piece's addends to its class's sums, in the order the pass adds them: its peaks, then its logs.
+            products = exponentials[start:stop] @ scaled
+            addends = [float(_host(peak[start:stop].sum()))]
+            if xp is np:
+                # One log per running product, not per variant and step: the logs were 55% of a pass, 22
+                # ns each on the host [real, ENSG00000204859.13 on an EPYC 7702].
+                logs = np.zeros(products.shape[1])
+                if not _column_log_sums(products, _LOST_BELOW, logs):
+                    return [*addends, logs]
+            # Past tiny / eps a product's subnormal terms could matter at double precision: taken exactly there.
+            lost = products < _LOST_BELOW
+            with np.errstate(divide="ignore"):
+                # In place: the products are not read again, and a second rows x steps array is what the device refused.
+                logs = xp.log(products, out=products)
+            if np.any(lost):
+                row_index, step_index = np.nonzero(lost)
+                del lost
+                logs[row_index, step_index] = (
+                    _log_sum_exp(row_kernel[start + row_index] + device_density[step_index], axis=1)
+                    - peak[start + row_index] - xp.asarray(density_peak)[step_index]
+                )
+            return [*addends, _host(logs.sum(axis=0))]
+
         for key, members in groups.items():
             columns = [column for column in members if column in steps_of]
             if not columns:
@@ -3079,28 +3158,21 @@ def _lines(
                 for rows, peak, exponentials, row_kernel in fixed_chunks(key, fixed, class_position):
                     # The rows x steps products and their logs, in pieces of rows that fit the budget.
                     piece = max(1, budget // (3 * np.dtype(np.float64).itemsize * max(class_density.shape[0], 1)))
-                    for start in range(0, rows.shape[0], piece):
+                    start = 0
+                    while start < rows.shape[0]:
                         stop = min(start + piece, rows.shape[0])
-                        products = exponentials[start:stop] @ scaled
-                        summed += float(_host(peak[start:stop].sum()))
-                        if xp is np:
-                            # One log per running product, not per variant and step: the logs were 55% of a pass, 22
-                            # ns each on the host [real, ENSG00000204859.13 on an EPYC 7702].
-                            logs = np.zeros(products.shape[1])
-                            if not _column_log_sums(products, _LOST_BELOW, logs):
-                                summed += logs
-                                continue
-                        # Past tiny / eps a product's subnormal terms could matter at double precision: taken exactly there.
-                        lost = products < _LOST_BELOW
-                        with np.errstate(divide="ignore"):
-                            logs = np.log(products)
-                        if np.any(lost):
-                            row_index, step_index = np.nonzero(lost)
-                            logs[row_index, step_index] = (
-                                _log_sum_exp(row_kernel[start + row_index] + device_density[step_index], axis=1)
-                                - peak[start + row_index] - xp.asarray(density_peak)[step_index]
-                            )
-                        summed += _host(logs.sum(axis=0))
+                        try:
+                            addends = piece_sums(exponentials, peak, row_kernel, scaled, device_density, density_peak, start, stop)
+                        except MemoryError:
+                            # Refused though sized to the room (the room fell since): halved, down to one row.
+                            if stop - start == 1:
+                                raise
+                            piece = max(1, (stop - start) // 2)
+                            log(f"a line piece of {stop - start} rows was refused; pieces of {piece} rows from here")
+                            continue
+                        for addend in addends:
+                            summed += addend
+                        start = stop
                     summed += rows.shape[0] * density_peak
                 for position, column in enumerate(columns):
                     totals[column] += summed[bounds[position] : bounds[position + 1]]
@@ -3424,6 +3496,11 @@ def _correction_slopes(
         accuracy = max(float((2.0 * target[position] / 3.0 ** (2.0 / 3.0)) ** 1.5 / scale[position] ** 0.5), floor)
         share = accuracy / count
         step = max(float((3.0 * accuracy / scale[position]) ** (1.0 / 3.0)), limit)
+        if not np.isfinite(step):
+            # A non-finite step never halves to the limit; its slope is unmeasured, as outside a basin.
+            # The outer stall check cannot interrupt this loop [real, aou-wh6: seven-hour silence, cause unconfirmed].
+            slopes[position], errors[position] = 0.0, np.inf
+            continue
         centre = _correction_value(view, weights, evidence.coefficients, cavity, working_bytes, count, share)
         if centre is None:
             slopes[position], errors[position] = 0.0, np.inf
@@ -3452,7 +3529,7 @@ def _correction_slopes(
                 errors[position] = bounds[1] + abs(differences[0] - differences[1])
                 second[position] = curvature
                 break
-            if step <= limit:
+            if not step > limit:
                 slopes[position], errors[position] = 0.0, np.inf
                 break
             step = max(0.5 * step, limit)
@@ -3855,7 +3932,8 @@ def _ascend_evidence(
         free_hessian = hessian[np.ix_(free, free)]
         if 0.5 * float(gradient[free] @ np.linalg.solve(free_hessian, gradient[free])) <= max(tolerance, _EPSILON * current.magnitude):
             return weights, current
-        if radius <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
+        # A NaN radius cannot contract to the limit either.
+        if not radius > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
             return weights, current
         step = np.zeros_like(weights)
         step[free] = _trust_region_step(free_hessian, gradient[free], radius)
@@ -4210,6 +4288,8 @@ def _stationarity(
         unit[position] = 1.0
         climb = 1.0 if gradient[position] >= 0.0 else -1.0
         step = max(2.0 * float(np.sqrt(laplace_error[position] / scale[position])), limit)
+        if not np.isfinite(step):
+            raise FloatingPointError("the B-evidence stationarity step is not finite")
         column = None
         while column is None:
             for side in (climb, -climb):
@@ -4228,7 +4308,7 @@ def _stationarity(
                 column = -(trial.gradient - base.gradient) / (side * step)
                 break
             if column is None:
-                if step <= limit:
+                if not step > limit:
                     raise FloatingPointError("the B-evidence has no certified maximum in one basin on either side of a fitted penalty weight")
                 folds[position] = 0.0
                 step = max(0.5 * step, limit)
@@ -4958,7 +5038,10 @@ def fit_hyperparameters(
 
     def solve_state(trial: MixtureHyperparameters, point: FixedPoint) -> tuple[CurvatureCorrection, _State | None]:
         correction = curvature_correction(prior, trial.coefficients, point.cavity, point.posterior, working_bytes, tolerance)
-        return correction, _outer_state(prior, trial, point, correction, working_bytes, tolerance)
+        state = _outer_state(prior, trial, point, correction, working_bytes, tolerance)
+        if state is not None and not (np.isfinite(state.value) and np.isfinite(state.error)):
+            state = None
+        return correction, state
 
     solved = [solve_state(start, point) for start, point in zip(hyperparameters, points)]
     corrections = [correction for correction, _state in solved]
@@ -5022,9 +5105,13 @@ def fit_hyperparameters(
     # when that was: the no-progress budget (``EB_STALL_TRIALS``, ``EB_STALL_HOURS``).
     stalled = [0] * count
     rose = [time.monotonic()] * count
+    # The certified state a polish left where x's decrement was within half its error. A walk that finds no basin
+    # again ends there, as a stalled release ends at its anchor, rather than returning the uncertified departure.
+    departures: list[tuple | None] = [None] * count
 
     def progressed(model: int) -> None:
         stalled[model], rose[model] = 0, time.monotonic()
+        departures[model] = None
 
     def segment_reach(model: int, segment: F64Array, fraction: float, gain: float) -> float:
         """The largest gain any shorter fraction of a refused joint step can reach, under the quadratic model of the
@@ -5073,6 +5160,7 @@ def fit_hyperparameters(
         otherwise the model returns to that state and this release is not planned again."""
         anchor = anchors[model]
         assert anchor is not None
+        departures[model] = None
         anchor_hyperparameters, anchor_point, anchor_correction, anchor_state, predicted = anchor
         polished_state = states[model]
         if polished_state is None:
@@ -5097,8 +5185,34 @@ def fit_hyperparameters(
         displaced[model], radii[model] = True, None
         inner_gains[model] = anchor_gains[model]
 
+    def end_walk(model: int, step: HyperStep | None, newton_decrement: float, reason: str) -> None:
+        """The model ends uncertified with its refusal, at the state a provisional walk left where it has one.
+        The oracle is restored there on return, as at the no-progress budget's ending."""
+        departure = departures[model]
+        if departure is not None:
+            hyperparameters[model], points[model], corrections[model], states[model], inner_gains[model] = departure
+            departures[model], displaced[model] = None, True
+        anchor = anchors[model]
+        if anchor is not None:
+            hyperparameters[model], points[model], corrections[model], states[model] = anchor[:4]
+            anchors[model], displaced[model] = None, True
+        reported = step if step is not None else last_steps[model]
+        if reported is None:
+            reported = HyperStep(
+                hyperparameters=hyperparameters[model], evidence=np.nan, smoothing_gradient=np.inf, stationarity_steps=np.zeros(0),
+                stationarity_errors=np.zeros(0), stationarity_gain=np.inf,
+            )
+        uncertified(model, _OuterTrial(hyperparameters[model], reported, np.inf, False), reported, newton_decrement, reason)
+
     def inner(model: int, step: HyperStep | None, remaining: float, polishes: bool) -> _OuterTrial | None:
-        newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
+        try:
+            newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
+        except (FloatingPointError, np.linalg.LinAlgError) as error:
+            end_walk(model, step, np.inf, f"no quadratic model of the evidence at x: {error}")
+            return None
+        if not all(np.all(np.isfinite(value)) for value in (newton.gradient, newton.eigenvalues, newton.eigenvectors)):
+            end_walk(model, step, np.inf, "the quadratic model of the evidence at x is not finite")
+            return None
         tail = tail_of(model)
         if polishes and newton.definite and max(newton.decrement, tail) <= polish_tolerances[model] and states[model] is not None:
             # x is at its maximum at rho_k to the certificate's resolution: the model predicts less gain than the
@@ -5116,8 +5230,16 @@ def fit_hyperparameters(
         if radius is None:
             radius = _cauchy_radius(newton)
             radii[model] = radius
+        if not radius > 0.0:
+            # The Cauchy radius can vanish before the trust step divides by it [real, aou-wt6: ZeroDivisionError].
+            end_walk(model, step, newton.decrement, f"trust radius {radius:.3g}, no inner step to take")
+            return None
         proposal = _proposal(newton, radius)
-        return _OuterTrial(_trial(newton, proposal), step, remaining, False, newton=newton, proposal=proposal, radius=radius, polishes=polishes)
+        trial = _trial(newton, proposal)
+        if not (np.all(np.isfinite(proposal)) and np.all(np.isfinite(trial.coefficients))):
+            end_walk(model, step, newton.decrement, f"the inner step at radius {radius:.3g} is not finite")
+            return None
+        return _OuterTrial(trial, step, remaining, False, newton=newton, proposal=proposal, radius=radius, polishes=polishes)
 
     def decide(model: int, state: _State, step: HyperStep) -> tuple[_State, HyperStep, float, float]:
         """The certificate at the state and its step: (state, step, predicted, remaining), each resolvable piece
@@ -5190,6 +5312,9 @@ def fit_hyperparameters(
                 prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned, held_edges=held,
                 held_finite=frozenset(refused_edges[model]), release_provisional=True,
             )
+        except np.linalg.LinAlgError as error:
+            end_walk(model, None, np.inf, f"no quadratic model of the evidence at the weights: {error}")
+            return None
         except FloatingPointError:
             # V's model has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
             step = None
@@ -5297,6 +5422,9 @@ def fit_hyperparameters(
         return entry
 
     def uncertified(model: int, entry: _OuterTrial, step: HyperStep, newton_decrement: float, reason: str) -> None:
+        if fits[model] is not None:
+            pending[model] = None
+            return
         tail = ", ".join(f"{value:.4g}" for value in histories[model][-8:])
         log(
             f"eb outer: model {model} returns uncertified ({reason}) after {iterations[model]} accepted steps, {halvings[model]} halvings, "
@@ -5306,12 +5434,17 @@ def fit_hyperparameters(
             hyperparameters=hyperparameters[model], step=step, newton_decrement=newton_decrement, remaining_gain=entry.remaining,
             prediction_move=np.inf, prediction_tolerance=2.0 * tolerance, iterations=iterations[model], halvings=halvings[model],
             unresolved=unresolved[model], history=tuple(histories[model]), certified=False,
+            refusal=f"model {model}: its empirical Bayes ended ({reason}); it returns where it stood, uncertified",
         )
         pending[model] = None
 
     def stall(model: int, hours: float) -> None:
         """The model's empirical Bayes ends at its last certified state (where a release is in flight, the one it
         left), uncertified, with its remaining gain unmeasured: its no-progress budget is spent."""
+        departure = departures[model]
+        if departure is not None:
+            hyperparameters[model], points[model], corrections[model], states[model], inner_gains[model] = departure
+            departures[model], displaced[model] = None, True
         anchor = anchors[model]
         if anchor is not None:
             hyperparameters[model], points[model], corrections[model], states[model] = anchor[:4]
@@ -5354,6 +5487,8 @@ def fit_hyperparameters(
         for model in range(count):
             if fits[model] is None and pending[model] is None:
                 pending[model] = plan(model)
+            if fits[model] is not None:
+                pending[model] = None
         if all(fit is not None for fit in fits):
             if any(displaced):
                 warm_from_states()
@@ -5623,6 +5758,9 @@ def fit_hyperparameters(
                 gradient = _penalized_gradient(
                     newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.origin + proposal, trial_point.cavity, working_bytes,
                 )
+                if not np.all(np.isfinite(gradient)):
+                    end_walk(model, entry.step, newton.decrement, "the inner trial's gradient is not finite")
+                    continue
                 if not np.any(gradient):
                     # The data no longer see x at the trial: every derivative is at rounding, the density has collapsed
                     # onto a lattice node (the mixing density's width -> 0 boundary: on gene 1 [real] with the
@@ -5642,7 +5780,8 @@ def fit_hyperparameters(
                     iterations[model] += 1
                     last_step = last_steps[model]
                     if last_step is None:
-                        raise NoCertifiedProgress("the Newton-B step reaches the mixing density's boundary before any hyper step certified a value")
+                        end_walk(model, entry.step, newton.decrement, "density collapsed to the family's boundary before any hyper step certified a value")
+                        continue
                     uncertified(model, replace(entry, remaining=np.inf), last_step, newton.decrement, "density collapsed to the family's boundary")
                     continue
                 # The step is an ascent where the trapezoid rule of the two fixed points' gradients along it is
@@ -5651,26 +5790,38 @@ def fit_hyperparameters(
                 # eigenvalues 2e-5 and 1e-2 the decrement is the weak direction's g^2 / lambda, which no step shorter
                 # than Newton's thousand units lowers, so the loop halved to x's resolution and read a maximum where
                 # the state's own error was 9.6 nats.
-                accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
+                mode_gain = 0.5 * float((newton.gradient + gradient) @ proposal)
+                accepted = np.isfinite(mode_gain) and mode_gain > 0.0
             left = False
             if accepted:
                 trial_correction, trial_state = solve_state(trial, trial_point)
-                # A step from a certified state to one outside every basin (no certified V at the trial) is refused
-                # and shortened as a descent is, where x's own decrement is most of that state's error: the polish is
-                # then what lowers the error, the trapezoid sees an ascent of E, but V at the trial has no value to
-                # rise by, and the walk out there is blind. On the repository's grouped Gram fixture a polish from a
+                previous_state = states[model]
+                inner_gain = np.nan
+                if previous_state is not None and trial_state is not None:
+                    inner_gain, _resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
+                # A step from a certified state to one outside every basin (no certified V at the trial), or to one
+                # whose path gain has no value, is refused and shortened as a descent is: V at the trial has no value
+                # to rise by, and the walk out there is blind. On the repository's grouped Gram fixture a polish from a
                 # state of error 1.36 (all of it x's decrement) took two such steps (101 and 217 units) and came back
                 # to a certified state of error 15.1 five fixed points later, sixteen in all to its maximum; shortened,
                 # its third step reached 0.056 and its fourth 0.0007. On LDL's whole-genome fit [real, aou-wl1
                 # snv_indel] a polish's first step (5.87 units from a state of error 3.75, all of it the decrement)
-                # left every basin, about 7.5 minutes a fixed point. Where the decrement is a sliver of the error no
-                # step of x moves the certificate, and the refusals only halve: a release's polish on dbg_eb7 with six
-                # sparse records (decrement 0.002 of 7.94 nats) halved a 155-unit step eighteen times to a basin 6e-4
-                # wide, 47 fixed points in the stage where 9 do without the refusal.
-                left = trial_state is None and states[model] is not None and states[model].decrement > 0.5 * states[model].error
+                # left every basin, about 7.5 minutes a fixed point; whole-genome steps outside every basin were also
+                # accepted with gain nan and state error inf, then overflowed [real, aou-wh6 and aou-wh5]. A polish
+                # may still leave where its finite decrement is within half the state's finite error: where the
+                # decrement is a sliver of the error no step of x moves the certificate, and the refusals only halve
+                # (a release's polish on dbg_eb7 with six sparse records, decrement 0.002 of 7.94 nats, halved a
+                # 155-unit step eighteen times to a basin 6e-4 wide, 47 fixed points in the stage where 9 do without
+                # the refusal). A step that leaves a saddle may leave the same way. The state it left is kept (``departures``): a walk that ends uncertified from out
+                # there (its no-progress budget, an unmoved fixed point or a numeric fault) returns that state.
+                departs = bool(
+                    trial_state is None and previous_state is not None
+                    and np.isfinite(newton.decrement) and np.isfinite(previous_state.decrement) and np.isfinite(previous_state.error)
+                    and previous_state.decrement <= 0.5 * previous_state.error
+                )
+                left = not departs and previous_state is not None and (trial_state is None or not np.isfinite(inner_gain))
                 accepted = not left
             if accepted:
-                previous_state = states[model]
                 if previous_state is None and trial_state is None and last_steps[model] is not None:
                     current = points[model]
                     moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64))
@@ -5681,22 +5832,29 @@ def fit_hyperparameters(
                         # steps were accepted on the gradients' trapezoid at |x| 1.3e5 with the ELBO fixed at
                         # -611.7085 (a released block's weight at its range's lower end let the density collapse), until
                         # the run was killed. x stands as its maximum to the data's resolution and the fit returns
-                        # uncertified with its last evaluated step, as at the boundary below.
+                        # uncertified with its last evaluated step, as at the boundary below; a walk that left a
+                        # certified state ends at that state.
                         if anchors[model] is not None:
                             # As at the boundary: a release's polish is judged against the state it left.
                             settle_release(model)
                             pending[model] = None
+                            continue
+                        if departures[model] is not None:
+                            end_walk(model, entry.step, newton.decrement, "fixed point unmoved outside every basin")
                             continue
                         hyperparameters[model], points[model] = trial, trial_point
                         displaced[model] = False
                         iterations[model] += 1
                         uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement, "fixed point unmoved outside every basin")
                         continue
+            if accepted:
+                if departs:
+                    departures[model] = (
+                        hyperparameters[model], points[model], corrections[model], previous_state, list(inner_gains[model]),
+                    )
                 if previous_state is not None and trial_state is not None:
-                    inner_gain, _resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
                     inner_gains[model].append(float(inner_gain))
                 else:
-                    inner_gain = np.nan
                     inner_gains[model] = []
                 log(
                     f"eb outer: model {model} inner step accepted: length {length:.3g} (radius {entry.radius:.3g}), decrement {newton.decrement:.3g} "
@@ -5721,6 +5879,9 @@ def fit_hyperparameters(
                 f"{'unresolved trial' if trial_point is None else 'below resolution' if not resolved else 'no certified value' if left else 'no ascent'}"
             )
             if not resolved:
+                if departures[model] is not None:
+                    end_walk(model, entry.step, newton.decrement, "the inner step is below resolution outside every basin")
+                    continue
                 if entry.polishes and anchors[model] is not None:
                     settle_release(model)
                     pending[model] = None
@@ -5743,10 +5904,11 @@ def fit_hyperparameters(
                     uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement,
                                 "x at its maximum at a saddle of V's model, no certified hyper step")
                     continue
-                raise NoCertifiedProgress(
-                    "the Newton-B step makes no certified progress at the EP fixed point "
-                    + ("(B + S is indefinite there)" if not newton.definite else "(the weights have no evaluated step)")
+                end_walk(
+                    model, entry.step, newton.decrement, "the Newton-B step makes no certified progress at the EP fixed point "
+                    + ("(B + S is indefinite there)" if not newton.definite else "(the weights have no evaluated step)"),
                 )
+                continue
             radius = 0.5 * length
             radii[model] = radius
             shorter = _proposal(newton, radius)

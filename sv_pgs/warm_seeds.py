@@ -33,9 +33,10 @@ What a seed changes, and what it cannot. The fit from a seed is the same EB oute
 with the same acceptance criteria (the remaining gain within 1 / (2K) nats, the prediction move within p_eff / K) and
 a certificate computed at the state it returns: no seed value is ever reported as a fit. A seed only moves where the
 loop starts, and skips the nested search from the moment start. At a seed that is this problem's own fixed point the
-loop's first check finds it stationary (``tests/test_warm_seeds.py``: on its synthetic store the refit's first check
-read the cold fit's last remaining gain, and its passes over the data fell from 93 to 36, all but 2 of them the mode
-mixture's search, which every fit runs at its fitted hyperparameters). From any other seed it climbs to a fixed point
+loop's first check finds it stationary, and its mode mixture solves the saved components again, its settled search
+standing where its main fixed point comes back (``full_data_fit._mode_mixture``: no ridge start or order from zero;
+on the synthetic store of ``tests/test_warm_seeds.py`` the refit's passes over the data fell from 1086 to 78, 72 of
+them the solves of the saved mixture's 18 other components [sim]). From any other seed it climbs to a fixed point
 like any start; the EB objective has local maxima, so it can be another one than the cold start reaches, within the
 criteria, which is why the note says where each model started (``note``, among the certificate's refusals, where
 ``model_acceptance`` reads a note as information). For the same reason where a fit starts is in its keys: the fit
@@ -212,10 +213,13 @@ def seeds_from_model(model: FittedModel, source: str, working_bytes: int, digest
     natural parameters) with at least one member. A binary model (its start is its Polya-Gamma sites, which no artifact
     holds), an EP or tied fit (a dense law) and the null genetic model (no member) are none."""
     seeds: dict[str, Seed] = {}
-    # Each model's count of components (the law pads a group's shorter mixtures with its first at weight zero) and
-    # whether nothing of its fit ended at a work budget, its mode search included (``FitCertificate.budget_unresolved``).
+    # Each model's count of components (the law pads a group's shorter mixtures with its first at weight zero), whether
+    # nothing of its fit ended at a work budget, its mode search included (``FitCertificate.budget_unresolved``), and
+    # whether its search settled under the whole-budget rule (``FitCertificate.mixture_settled``; a model saved before
+    # that rule has no such term, and its search, stopped at the first order that moved nothing, is not kept).
     counts = np.asarray(model.certificate.get("mixture_components", np.zeros(len(model.model_names))), dtype=np.int64)
     budgeted = np.asarray(model.certificate.get("budget_unresolved", np.ones(len(model.model_names))), dtype=np.int64)
+    whole = np.asarray(model.certificate.get("mixture_settled", np.zeros(len(model.model_names))), dtype=bool)
     for index, (name, scoring, hyperparameters, noise) in enumerate(zip(model.model_names, model.scoring, model.hyperparameters, np.asarray(model.noise_variance))):
         law = scoring.posterior_draws
         if scoring.trait_type != TraitType.QUANTITATIVE or getattr(law, "kind", None) != "product_mixture" or scoring.store_rows.shape[0] == 0:
@@ -229,7 +233,7 @@ def seeds_from_model(model: FittedModel, source: str, working_bytes: int, digest
             log_density=np.asarray(law.log_density, dtype=np.float64), log_variance_grid=np.asarray(law.log_variance_grid, dtype=np.float64),
             hyperparameters=hyperparameters, noise=float(noise), sites_digest=model.provenance.sites_digest,
             problem_digest=model.provenance.problem_digest, offset_digest=model.provenance.offset_digest,
-            components=components, settled=components is not None and int(budgeted[index]) == 0, digest=digest,
+            components=components, settled=components is not None and int(budgeted[index]) == 0 and bool(whole[index]), digest=digest,
             component_noises=None if components is None else np.array([component_noise(law, component, float(noise)) for component in range(count)]),
         )
     return seeds
