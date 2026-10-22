@@ -955,7 +955,7 @@ def poster_sv_gain_figure(grids):
                  for key, row in sets.items()},
     }
     rows = list(sets.values())
-    pitch, top, bottom, right = 2.84, 0.25, 2.3, 0.5
+    pitch, top, bottom, right = 1.7375, 0.25, 2.3, 0.5
     height = top + bottom + pitch * len(rows)
     fig = plt.figure(figsize=(POSTER_GAIN, height))
     left = widest(fig, [row["label"] for row in rows], fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0) + 0.75
@@ -984,12 +984,12 @@ def poster_sv_gain_figure(grids):
     ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
     ax.set_xticks(ticks, [plain(tick, 3) for tick in ticks])
     ax.set_xlabel("Test AUC gain from adding SVs")
-    # the two genotype sources named in the empty space right of the control row, each at its own marks' height
-    # there and after a mark like its own, the longer name ending 0.2 in inside the plot's right edge
+    # the two genotype sources named in the empty space right of the control row, 0.55 rows apart so the first
+    # name's descenders clear the second's capitals, each after a mark like its own and the longer name ending 0.2 in
+    # inside the plot's right edge
     across = POSTER_GAIN - left - right - 0.2 - widest(fig, [label for label, _, _ in SOURCES], fontsize=POSTER_TYPE,
                                                        fontweight="bold")
-    for offset, (label, color, filled) in ((-0.2, SOURCES[0]), (0.2, SOURCES[1])):
-        y = len(rows) - 1 + offset
+    for y, (label, color, filled) in ((len(rows) - 1.35, SOURCES[0]), (len(rows) - 0.8, SOURCES[1])):
         ax.plot([0], [y], "o", transform=shifted(ax, across - 0.5), markersize=POSTER_MARK, color=color,
                 markerfacecolor=color if filled else "white", markeredgecolor=color,
                 markeredgewidth=0 if filled else 6.0, clip_on=False, zorder=4)
