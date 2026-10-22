@@ -158,9 +158,16 @@ mkdir -p "$TMPDIR"
 # its restore takes no store and no fit checkpoint (run-mirror restore --finishing).
 base=()
 [ -z "${BASE_RUN}" ] || base=(--base "gs://${OPS_BUCKET}/svpgs/${BASE_RUN}/run")
+# A push is given PUSH_SECONDS (the 150 GB LD store of a whole-genome Stage 0 took 10 minutes at the 257 MB/s the
+# workspace's composite upload measured): a push hung on a stalled stream would hold the lock every later push waits
+# on. timeout signals the push's whole process group, its upload processes with it; a push cut short leaves each unit
+# whole or absent on the mirror (sv_pgs/run_mirror.py), and the next sends the rest.
+PUSH_SECONDS=3600
 mirror() {
-  flock "$RUN/mirror.lock" "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" --mirror "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run" \
-    ${base[@]+"${base[@]}"} ${fit_arm[@]+"${fit_arm[@]}"} "${@:2}"
+  local limit=()
+  [ "$1" != push ] || limit=(timeout -k 60 "${PUSH_LIMIT:-$PUSH_SECONDS}")
+  flock "$RUN/mirror.lock" ${limit[@]+"${limit[@]}"} "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" \
+    --mirror "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run" ${base[@]+"${base[@]}"} ${fit_arm[@]+"${fit_arm[@]}"} "${@:2}"
 }
 finishing=()
 [ "${MERGE}" != 1 ] || finishing=(--finishing)
@@ -169,7 +176,39 @@ mark restored
 # A loop's sleep goes first: killed alone, the subshell left it running, and the task (and its log) ended only when the
 # sleep did. A push in progress is left to finish; the last push below waits on its lock.
 stop() { pkill -x -P "$1" sleep 2>/dev/null; kill "$1" 2>/dev/null; }
-( while sleep 60; do mirror push || mark "push-failed"; done ) &
+# The pusher pushes PUSH_EVERY seconds after each push that went through. After a failed one it waits twice as long
+# as before, up to PUSH_BACKOFF_CAP, and marks only the 1st, 2nd, 4th, 8th ... failure in a row ("push-failed-<n>"):
+# round m2's l1 marked "push-failed" once a minute for nine hours, 557 times. A run whose pushes keep failing
+# (PUSH_GIVE_UP_FAILURES in a row, the latest PUSH_GIVE_UP_SECONDS or more after the last push that went through or the
+# pusher's start) has its progress on this disk only, where a preemption loses it, at a GPU VM's price: the pusher
+# marks "push-stuck" and signals the task (USR1), which stops the driver and ends the job with status 3. Batch does not
+# retry it (job_fit.json.template's lifecyclePolicies), and round.py --follow resubmits a stuck run once at most.
+PUSH_EVERY=60
+PUSH_BACKOFF_CAP=900
+PUSH_GIVE_UP_FAILURES=4
+PUSH_GIVE_UP_SECONDS=2400
+push_loop() {
+  local failures=0 wait=$PUSH_EVERY since=$SECONDS
+  while sleep "$wait"; do
+    if mirror push; then
+      [ "$failures" = 0 ] || mark "push-recovered-$failures"
+      failures=0 wait=$PUSH_EVERY since=$SECONDS
+      continue
+    fi
+    failures=$((failures + 1))
+    (( failures & (failures - 1) )) || mark "push-failed-$failures"
+    wait=$(( wait * 2 < PUSH_BACKOFF_CAP ? wait * 2 : PUSH_BACKOFF_CAP ))
+    if (( failures >= PUSH_GIVE_UP_FAILURES && SECONDS - since >= PUSH_GIVE_UP_SECONDS )); then
+      mark "push-stuck"
+      kill -USR1 $$
+      return
+    fi
+  done
+}
+stuck=""
+driver=""
+trap 'stuck=1; [ -z "$driver" ] || kill -TERM "$driver" 2>/dev/null' USR1
+push_loop &
 pusher=$!
 # Batch writes the task log to the bucket only when the task ends, so a fit gave no sign of its progress for hours. The
 # driver's stderr also goes to a file whose last lines are copied beside the task log every 5 minutes: the same lines
@@ -181,11 +220,19 @@ progress="$(dirname "$0")/progress-task${BATCH_TASK_INDEX}.log"
 copy_progress() { tail -n 300 "$RUN/driver.log" > "$progress" 2>/dev/null; cp "$RUN/driver.log" "${progress%.log}.full.log" 2>/dev/null; }
 ( while sleep 300; do copy_progress; done ) &
 progressor=$!
-# The driver runs in the background and is waited for, so the TERM trap runs at once.
+# The driver runs in the background and is waited for, so the TERM and USR1 traps run at once. A wait a trap ended
+# (USR1: the driver told to stop) is waited out to the driver's own end. A driver started after the pusher gave up is
+# not started.
 drive() {
+  [ -z "$stuck" ] || return 3
   "$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} ${fit_arm[@]+"${fit_arm[@]}"} "$@" \
     2> >(tee -a "$RUN/driver.log" >&2) &
-  wait "$!"
+  driver=$!
+  local code
+  wait "$driver"; code=$?
+  while kill -0 "$driver" 2>/dev/null; do wait "$driver"; code=$?; done
+  driver=""
+  return "$code"
 }
 # An arm-only driver exits successfully with its arm's parts (StepPart): its models in fit.partial, its scores and
 # effects in score.partial and effects.partial, made while the store was on this disk. Its success is not a completed
@@ -233,8 +280,17 @@ elif [ "$status" -eq 0 ] && [ -n "${AFTER_SCRIPT}" ]; then
     && mark "after-done" || { mark "exit-after"; status=1; }
 fi
 stop "$pusher"
-# A run whose last push failed did not keep its results: the job fails even if the driver finished.
-mirror push || { mark "exit-push"; [ "$status" -ne 0 ] || status=1; }
+# A run whose last push failed did not keep its results: the job fails even if the driver finished. After the pusher
+# gave up, the last push has 10 minutes, and the job ends with status 3 unless the driver had finished and that push
+# went through.
+if [ -n "$stuck" ]; then
+  if ! PUSH_LIMIT=600 mirror push || [ "$status" -ne 0 ]; then
+    mark "exit-push-stuck"
+    status=3
+  fi
+else
+  mirror push || { mark "exit-push"; [ "$status" -ne 0 ] || status=1; }
+fi
 # A publication still writing is let finish: one cut short leaves no COMPLETE, so no job reads it, but its parts stay.
 [ -z "$publisher" ] || wait "$publisher"
 mark "exit-${status}"

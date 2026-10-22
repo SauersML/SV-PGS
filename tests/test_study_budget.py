@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -374,7 +375,9 @@ def test_a_task_is_retried_only_when_its_vm_went_away(tmp_path, job, slot):
     # task can cause itself or that end an attempt at its cap.
     own = {int(code) for code in re.findall(r"exit (\d+)", script)} - {int(terminated)}
     assert own == {1}
-    for exit_code in (*own, 2, 134, 137, 139, 143, 50000, 50002, 50004, 50005):
+    # A run whose pushes kept failing ends with status 3 (the pusher gave up): never retried on the VM.
+    assert 'mark "exit-push-stuck"\n    status=3' in script
+    for exit_code in (*own, 2, 3, 134, 137, 139, 143, 50000, 50002, 50004, 50005):
         assert not _retried(policies, exit_code), exit_code
 
 
@@ -527,6 +530,75 @@ def test_an_arm_job_given_its_partner_finishes_the_run_from_both_arms_parts_or_l
     calls, markers, status = _ran_task(tmp_path, merge_script, "waiting", "waiting")
     assert calls == [call.format(ops=tmp_path / "waiting" / "ops") for call in (expected[0], expected[1], expected[3])]
     assert status == 1 and {"merge-waiting", "exit-1"} <= markers
+
+
+_UV_PUSHING = """#!/bin/bash
+# uv sync, as far as run_step.sh sees it: an sv-pgs whose first PUSH_FAILS pushes fail and whose driver runs
+# DRIVE_SECONDS, each call logged.
+mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
+ln -sfn "PYTHON" "$UV_PROJECT_ENVIRONMENT/bin/python"
+cat > "$UV_PROJECT_ENVIRONMENT/bin/sv-pgs" <<'STUB'
+#!/bin/bash
+run="$(dirname "$0")/../.."
+echo "$1 $2" >> "$run/sv-pgs-calls"
+case "$1 $2" in
+  "run-mirror push") count=$(( $(cat "$run/pushes" 2>/dev/null || echo 0) + 1 )); echo "$count" > "$run/pushes"; [ "$count" -gt "$PUSH_FAILS" ] ;;
+  "workspace-run "*) exec sleep "$DRIVE_SECONDS" ;;
+esac
+STUB
+chmod +x "$UV_PROJECT_ENVIRONMENT/bin/sv-pgs"
+"""
+
+
+@pytest.mark.skipif(shutil.which("flock") is None or shutil.which("pkill") is None, reason="run_step.sh runs on Linux")
+@pytest.mark.parametrize("failures, drive, status", [(100, 60, 3), (2, 6, 0)])
+def test_failed_pushes_back_off_and_a_run_whose_pushes_keep_failing_stops(tmp_path, failures, drive, status):
+    """The rendered fit task with the pusher's minute at 1 s and its give-up at 4 failures over 2 s. Pushes that keep
+    failing are marked at the 1st, 2nd and 4th failure, not each one; then the pusher gives up, the driver is stopped long
+    before its end, and the job fails with status 3, which Batch does not retry. Two failures then a push that goes
+    through are marked as recovered, and the job ends as its driver does."""
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(UV_EXTRAS="", BUDGET_SLOT="train-1", THROUGH="report")
+    submitted = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/train-1/run_step.sh"]
+    for constant, value in (("PUSH_EVERY=60", "PUSH_EVERY=1"), ("PUSH_BACKOFF_CAP=900", "PUSH_BACKOFF_CAP=1"), ("PUSH_GIVE_UP_SECONDS=2400", "PUSH_GIVE_UP_SECONDS=2")):
+        assert script.count(constant) == 1
+        script = script.replace(constant, value)
+    ops, run = tmp_path / "ops", tmp_path / "run"
+    (ops / "source").mkdir(parents=True)
+    (ops / "source/uv.lock").write_text("version = 1\n")
+    (ops / "source/pyproject.toml").write_text("[project]\nname = 'sv-pgs'\n")
+    (ops / "run_config.json").write_text(json.dumps({"run_directory": str(tmp_path / "pipeline")}))
+    staged = tmp_path / "staged"
+    (staged / "bin").mkdir(parents=True)
+    (staged / "bin/uv").write_text(_UV_PUSHING.replace("PYTHON", sys.executable))
+    (staged / "python/cpython-3.12-linux/bin").mkdir(parents=True)
+    (staged / "python/cpython-3.12-linux/bin/python3.12").write_text("#!/bin/sh\n")
+    with tarfile.open(ops / "env.tar", "w") as archive:
+        for part in ("bin", "python"):
+            archive.add(staged / part, arcname=part)
+    run.mkdir()
+    task = tmp_path / "launcher/run_step.sh"
+    task.parent.mkdir(parents=True)
+    task.write_text(script.replace("OPS=/mnt/disks/ops/svpgs/study\n", f"OPS={ops}\n").replace("RUN=/mnt/disks/run\n", f"RUN={run}\n"))
+    started = time.monotonic()
+    ran = subprocess.run(
+        ["bash", str(task)], env=dict(os.environ, BATCH_TASK_INDEX="0", PUSH_FAILS=str(failures), DRIVE_SECONDS=str(drive)),
+        capture_output=True, text=True, timeout=120,
+    )
+    took = time.monotonic() - started
+    markers = {path.name.split("_task_", 1)[1] for path in (ops / "markers").iterdir()}
+    assert ran.returncode == status, ran.stderr
+    if status:
+        assert {"push-failed-1", "push-failed-2", "push-failed-4", "push-stuck", "exit-push-stuck", "exit-3"} <= markers
+        assert "push-failed-3" not in markers and not any(marker.startswith("push-recovered") for marker in markers)
+        # The driver was stopped well before its 60 s, and the last push was tried once more.
+        assert took < 40
+        assert (run / "sv-pgs-calls").read_text().splitlines()[-1] == "run-mirror push"
+    else:
+        assert {"push-failed-1", "push-failed-2", "push-recovered-2", "exit-0"} <= markers
+        assert not {"push-stuck", "exit-push-stuck", "exit-push"} & markers
 
 
 @pytest.mark.parametrize("job, slot, through", [("store", "prepare", "direct_sv"), ("fit", "pilot", "fit")])
