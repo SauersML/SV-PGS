@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from launcher.workspace import step_codes
@@ -59,3 +61,15 @@ def test_before_the_fit_two_trees_differ_only_where_a_step_runs_other_code(tmp_p
     # A tree without a step's body differs there.
     shutil.rmtree(earlier / "sv_pgs")
     assert set(step_codes.compare_before_fit(earlier, candidate)[1]) == set(STEP_ROOTS)
+
+
+def test_the_tool_run_from_a_tree_leaves_that_tree_as_it_was(tmp_path: Path) -> None:
+    # round.py runs a commit's own step_codes.py --before-fit on the commit's extracted tree and then stages that tree,
+    # so a bytecode file written beside the commit's sv_pgs/step_code.py would fail the staging check.
+    earlier, commit = _tree(tmp_path / "earlier"), _tree(tmp_path / "commit")
+    tool = commit / "launcher" / "workspace" / "step_codes.py"
+    tool.parent.mkdir(parents=True)
+    shutil.copy(step_codes.__file__, tool)
+    shown = subprocess.run([sys.executable, str(tool), "--before-fit", str(earlier), str(commit)], capture_output=True, text=True, check=False)
+    assert shown.returncode == 0, shown.stderr
+    assert not list(commit.rglob("__pycache__")) and not list(earlier.rglob("__pycache__"))

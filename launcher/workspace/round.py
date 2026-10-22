@@ -644,7 +644,7 @@ def same_code(commit: Path, base: Path, lists=None) -> dict:
         if lists is not None:
             (Path(temporary) / "run_config.json").write_text(json.dumps(lists), encoding="utf-8")
             named = ["--config", str(Path(temporary) / "run_config.json")]
-        shown = subprocess.run([sys.executable, str(tool), "--before-fit", *named, str(base), str(commit)], capture_output=True, text=True, check=False)
+        shown = subprocess.run([sys.executable, "-B", str(tool), "--before-fit", *named, str(base), str(commit)], capture_output=True, text=True, check=False)
     found = {}
     for line in shown.stdout.splitlines():
         matched = re.match(r"^(\w+)\s+(same|differs)\b", line)

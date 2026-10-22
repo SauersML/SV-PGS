@@ -79,11 +79,16 @@ def compare(staged: Path, candidate: Path) -> tuple[list[str], list[str]]:
 
 
 def _step_code():
-    """This tree's sv_pgs/step_code.py, loaded from its file alone (it imports only the standard library)."""
+    """This tree's sv_pgs/step_code.py, loaded from its file alone (it imports only the standard library). The load
+    writes no bytecode, so the tree is left as it was: round.py stages a commit's tree after reading it with this."""
     path = Path(__file__).resolve().parents[2] / "sv_pgs" / "step_code.py"
     spec = importlib.util.spec_from_file_location("_step_code", path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    writes, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = writes
     return module
 
 
