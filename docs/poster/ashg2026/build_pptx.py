@@ -60,8 +60,8 @@ COLUMNS = ((MARGIN, LEFT), (MARGIN + LEFT + GUTTER, MIDDLE), (48 - MARGIN - RIGH
 """Each column's left edge and width."""
 INSET = 0.3
 """Text sits this far inside its column, under the section bars' labels."""
-BAR, BAR_SIZE = 1.0, 54
-BODY, HEADLINE, GLOSS, REFERENCE = 40, 40, 40, 32
+BAR, BAR_SIZE = 1.25, 72
+BODY, HEADLINE, GLOSS, REFERENCE = 56, 60, 56, 44
 LINE_PITCH = 1.066
 """Line pitch per point of type at 90% line spacing, measured on the LibreOffice render."""
 SHIFTED_PITCH = 0.25
@@ -69,7 +69,7 @@ SHIFTED_PITCH = 0.25
 BULLET_INDENT = 0.42
 AFTER = 14
 """Points of space after a bullet."""
-GAPS = {"bar": 0.35, "block": 0.3, "section": 0.7}
+GAPS = {"bar": 0.35, "block": 0.3, "section": 0.5}
 """Space under a section bar, between blocks of a section, and above the next bar (before the column is justified)."""
 JUSTIFY_LIMIT = 2.0
 """The most extra space a section break takes when a column is spread to the bottom margin."""
@@ -84,16 +84,17 @@ COLOURS = {"blue": BLUE, "vermillion": VERMILLION, "grey": GREY, "sky": SKY}
 
 TITLE = ["Enabling Polygenic Prediction from Structural", "Variants in the NIH All of Us Multi-Ancestry Biobank"]
 REFERENCES = [
-    "Byrska-Bishop et al. (2022) Cell 185:3426.",
-    "Taylor et al. (2024) Nature 631:610.",
-    "Privé et al. (2020) Bioinformatics 36:5424.",
-    "Browning et al. (2018) Am J Hum Genet 103:338.",
-    "Wray et al. (2010) PLoS Genet 6:e1000864.",
-    "All of Us Research Program Investigators (2019) N Engl J Med 381:668.",
+    "Byrska-Bishop 2022 Cell",
+    "Taylor 2024 Nature",
+    "Privé 2020 Bioinformatics",
+    "Browning 2018 Am J Hum Genet",
+    "Wray 2010 PLoS Genet",
+    "All of Us 2019 N Engl J Med",
 ]
+"""First author, year and journal, set as one paragraph."""
 PLACEHOLDERS = [
-    ("SV effect sizes by SV class and length", "From the fitted SV-PGS models"),
-    ("Test accuracy with vs without SVs", "SV-PGS with SVs vs SNV-only, fitted by identical code"),
+    ("SV effect sizes", "By SV class and length"),
+    ("Test AUC with SVs", "vs SNV-only, same code"),
 ]
 
 
@@ -114,18 +115,6 @@ def marked(text: str) -> list[tuple[str, str]]:
     return runs
 
 
-NBSP = "\u00a0"
-"""A space no line breaks at, which keeps a number with its unit."""
-
-
-def auc(value: float) -> str:
-    return f"{value:.3f}"
-
-
-def gain(value: float) -> str:
-    return f"{value:+.3f}".replace("-", "−")
-
-
 def people(count: int) -> str:
     return f"{count:,}"
 
@@ -142,36 +131,27 @@ def copy(numbers: dict) -> dict:
     imputed_well = gain["rows"]["tagged_sv_fold3"]
     kept_well = imputed_well["imputed"][0] / imputed_well["true"][0]
     return {
-        "introduction": [
-            "Polygenic scores (PGSs) rarely include structural variants (SVs)",
-            "We test whether adding SVs makes PGSs more accurate",
-        ],
-        "methods": ["Prior variance depends on imputation r², allele frequency and SV length",
-                    "Priors fit by empirical Bayes on GPUs"],
+        "introduction": ["We test whether structural variants (SVs) improve polygenic scores"],
+        "methods": ["Empirical Bayes priors depend on imputation r², frequency and SV length"],
         "code": ["Code:", "github.com/", "SauersML/SV-PGS"],
         "design": [
-            f"{people(svs['people'])} people from 1000 Genomes chr22: train on {people(sizes[0])}–{people(sizes[-1])}, "
-            f"test on {people(accuracy['test_people'])}",
-            f"Binary trait: liability h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}, "
-            f"{accuracy['causal']} causal variants",
-            f"{gain['shown']} genetic architectures vary the causal SVs or the trait; SVs imputed by Beagle",
+            f"{people(svs['people'])} people from 1000 Genomes chr22",
+            f"Binary trait: h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}",
+            f"{gain['shown']} genetic architectures; SVs imputed by Beagle",
         ],
-        "accuracy": f"SV-PGS trained on {people(sooner)} people beat LDpred2-auto trained on {people(sizes[-1])} "
-                    f"(AUC{NBSP}{auc(ours[sizes.index(sooner)][0])}{NBSP}vs{NBSP}{auc(theirs[-1][0])})" if sooner else "",
+        "accuracy": f"SV-PGS at {people(sooner)} beat LDpred2-auto at {people(sizes[-1])}" if sooner else "",
         "versus": f"SV-PGS had higher AUC in {beaten} {wins['replicates']} simulations",
         "gain_title": f"Imputed SV genotypes gave {share:.0%} of the AUC gain of true SV genotypes",
         "gain": [f"The {gain['clear']} of {gain['shown']} architectures where true SV genotypes raised AUC (95% CI above "
                  "0), in one 3 Mb window of chr22",
                  f"Where causal SVs impute well, the gain with imputed genotypes was **{kept_well:.0%}** as large"],
         "aou": [
-            "50,000 short-read genomes; SVs imputed by GLIMPSE2 from 12,212 long-read assemblies",
-            "SV-PGS fitted with SVs for LDL, hypothyroidism, AF and gout; one 80/20 split by family",
-            "Accuracy with SVs against SNV-only SV-PGS, both fitted by identical code, is running",
+            "SVs imputed into 50,000 genomes from 12,212 long-read assemblies",
+            "SV-PGS fitted for LDL, hypothyroidism, AF and gout",
         ],
         "discussion": [
-            "SV-PGS beats LDpred2-auto even with no causal SVs, so the gain comes from its model and denser variant set",
-            f"With imputed SV genotypes the gain was **{share:.0%}** as large, so SVs add most when their genotypes are "
-            "accurate",
+            "SV-PGS outperformed LDpred2-auto even with no causal SVs",
+            "SVs add most when their genotypes are accurate",
         ],
     }
 
@@ -295,7 +275,7 @@ def placeholder(shape_id: int, x: float, y: float, width: float, height: float, 
     """A dashed panel where an All of Us figure will go."""
     text = "".join(
         Para([(words, flags)], size, bullet=False, colour=colour, after=after, align="ctr").xml()
-        for words, flags, size, colour, after in (("All of Us · result pending", "b", 26, TEAL, 18),
+        for words, flags, size, colour, after in (("All of Us · result pending", "b", REFERENCE, TEAL, 18),
                                                   (title, "b", HEADLINE, INK, 12), (detail, "", GLOSS, GREY, 0))
     )
     return (
@@ -371,7 +351,7 @@ def authors_and_affiliations() -> tuple[list[tuple[str, str]], list[str]]:
 
 def header(xml: str) -> str:
     """The abstract's title (two lines, as the template sets it), then its authors and affiliations."""
-    title = "".join(Para([(text, "b")], 76, bullet=False, colour="FFFFFF", after=0).xml() for text in TITLE)
+    title = "".join(Para([(text, "b")], 92, bullet=False, colour="FFFFFF", after=0).xml() for text in TITLE)
     xml = replace_text(xml, 89, title.replace('<a:spcPct val="90000"/>', '<a:spcPct val="100000"/>'))
     authors, affiliations = authors_and_affiliations()
     author_runs: list[tuple[str, str]] = []
@@ -385,10 +365,10 @@ def header(xml: str) -> str:
     # the template's three-name line (about 56 characters at 72 pt) clears the wordmark with room for some 64
     names_size = min(72, 72 * 64 // max(len(plain), 1))
     lines = [Para(author_runs, names_size, bullet=False, colour="FFFFFF", after=3)]
-    lines += [Para([(entry.split(" ", 1)[0], "sup"), (entry.split(" ", 1)[1], "")], 22, bullet=False, colour="FFFFFF",
+    lines += [Para([(entry.split(" ", 1)[0], "sup"), (entry.split(" ", 1)[1], "")], 34, bullet=False, colour="FFFFFF",
                    after=0) for entry in affiliations]
     xml = replace_text(xml, 90, "".join(line.xml() for line in lines))
-    return move(xml, 90, 1.37, 2.55, 32.5, 2.9)
+    return move(xml, 90, 1.37, 3.0, 32.5, 2.45)
 
 
 # ------------------------------------------------------------------ laying out the columns
@@ -644,7 +624,7 @@ def build() -> None:
         [
             bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks(),
             bar(95, "Discussion"), text(bullets(words["discussion"])),
-            bar(96, "References"), text([Para([(entry, "")], REFERENCE, bullet=False, after=6) for entry in REFERENCES]),
+            bar(96, "References"), text([Para([("; ".join(REFERENCES), "")], REFERENCE, bullet=False, after=0)]),
             code(words["code"]),
         ],
     ]

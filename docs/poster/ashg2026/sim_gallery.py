@@ -795,7 +795,7 @@ def genotype_figure(summary):
 # ------------------------------------------------------------------ the poster's own figures
 
 
-POSTER_TYPE, POSTER_LABEL, POSTER_NAME = 40, 44, 48
+POSTER_TYPE, POSTER_LABEL, POSTER_NAME = 56, 60, 64
 """Points at print size in the poster's figures: ticks and notes; axis titles; the bold names of methods and genotype
 sources written beside their marks. A poster figure carries no legend and no title, since the poster's headline over
 it states its message."""
@@ -820,30 +820,32 @@ def poster_accuracy_figure(grids, summary):
     the AUC of the true genetic value."""
     grouped = cells(grids["grid"])
     fig = plt.figure(figsize=(POSTER_HALF, POSTER_HEIGHT))
-    # the right margin holds each line's last AUC, in bold at tick size
+    # the right margin holds each line's last AUC, in bold at tick size; the left one the ticks and the axis title
     ends = widest(fig, ["0.000"], fontsize=POSTER_TYPE, fontweight="bold")
-    top, bottom, left, right = 0.25, 2.05, 2.25, 0.3 + ends
+    top, bottom, left, right = 0.25, 2.05, widest(fig, ["0.00"], fontsize=POSTER_TYPE) + 1.45, 0.3 + ends
     ax = frame(fig, left, bottom, POSTER_HALF - left - right, POSTER_HEIGHT - top - bottom)
     log_size_axis(ax)
-    ax.set_xlabel("Training people (thousands)")
+    ax.set_xlabel("Training size (thousands)")
     ceiling = summary["points"]["null"]["true_value_auc"]
     ax.axhline(ceiling, color=INK, linestyle=(0, (1, 1.2)), linewidth=4.0, zorder=1)
-    ax.text(SIZES[0] / 1.25, ceiling - 0.005, "Best possible", color=INK, va="top", ha="left")
-    means = {}
+    # named over its line, so the room under it is SV-PGS's
+    ax.text(SIZES[0] / 1.25, ceiling + 0.004, "Best possible", color=INK, va="bottom", ha="left")
+    upper = {}
     for key, method, color in (("with_sv_auc", "SV-PGS", SV_PGS), ("ldpred2_auc", "LDpred2-auto", LDPRED2)):
         pooled = [interval([row[key] for point, *_ in SV_SHARES for row in grouped.get((point, size), [])])
                   for size in SIZES]
         mean, low, high = (np.array([cell[i] for cell in pooled]) for i in range(3))
-        means[method] = mean
+        upper[method] = high
         ax.fill_between(SIZES, low, high, color=color, alpha=0.2, linewidth=0, zorder=2)
         ax.plot(SIZES, mean, color=color, zorder=3, marker="o", markeredgewidth=0)
         ax.text(SIZES[-1] * 1.15, mean[-1], f"{mean[-1]:.3f}", color=color, fontweight="bold", ha="left", va="center")
-    # each method's name on the empty side of its own line: SV-PGS above its left half, LDpred2-auto below its right
-    ax.text(SIZES[0] / 1.2, means["SV-PGS"][1] + 0.022, "SV-PGS", color=SV_PGS, fontsize=POSTER_NAME,
+    # each method's name on the empty side of its own line: SV-PGS over its left half, clear of its band at 20,000;
+    # LDpred2-auto, wider than the axes, under its right half and on into the right margin
+    ax.text(SIZES[0] / 1.2, upper["SV-PGS"][2] + 0.006, "SV-PGS", color=SV_PGS, fontsize=POSTER_NAME,
             fontweight="bold", ha="left", va="bottom")
-    ax.text(SIZES[-1] * 1.2, 0.506, "LDpred2-auto", color=LDPRED2, fontsize=POSTER_NAME, fontweight="bold",
-            ha="right", va="bottom")
-    ax.set_ylim(0.5, ceiling + 0.008)
+    ax.text(1, 0.496, "LDpred2-auto", transform=shifted(ax, right - 0.1), color=LDPRED2, fontsize=POSTER_NAME,
+            fontweight="bold", ha="right", va="bottom")
+    ax.set_ylim(0.49, ceiling + 0.03)
     ax.set_yticks(np.arange(0.5, 0.651, 0.05), ["0.50", "0.55", "0.60", "0.65"])
     ax.set_ylabel("Test AUC")
     return fig
@@ -1091,7 +1093,7 @@ def gallery_page(pdf: PdfPages, image: Path, caption: str) -> None:
 COLUMN, EDGE = 11.4, 0.3
 """Inches: the poster's left column (build_pptx.py's LEFT), where its schematics are placed at full width so their type
 prints at its own size, and the margin kept clear at either side."""
-VARIANTS = (("SNV", INK, 0.09), ("indel", GREEN, 0.3), ("SV", IMPUTED, 1.3))
+VARIANTS = (("SNV", INK, 0.09), ("indel", GREEN, 0.3), ("SV", IMPUTED, 1.1))
 """The variant classes as the left column draws them: name, colour, and the width in inches of the block that stands for
 one variant on a chromosome (one base for an SNV, a few for an indel, many for an SV)."""
 SCHEMATICS = {
@@ -1127,22 +1129,27 @@ def chromosome(ax, left: float, right: float, y: float, marks, tall: float = 0.5
 def poster_model_figure():
     """The SV-PGS model for the poster's Methods: an SNV, an indel and an SV on a chromosome, each class with its own
     effect-size prior (the SV's also at a low imputation r², which narrows it), all fitted together into one score."""
-    height = 4.4
+    height = 4.6
     fig, ax = canvas(height)
-    # the priors' centre line and half-width, and the score's box, in inches
-    centre, reach = 5.75, 1.45
-    box_left, box_middle, box_tall = 8.3, 2.05, 1.25
-    bases = (2.85, 1.65, 0.25)
+    # left to right, in inches: the class names, a stretch of chromosome after the widest, the priors, the arrows, and
+    # the score's box as wide as its name
+    name_style = {"fontsize": POSTER_NAME, "fontweight": "bold"}
+    stretch = EDGE + widest(fig, [name for name, *_ in VARIANTS], **name_style) + 0.2
+    stretch = (stretch, stretch + 1.45)
+    box_left = COLUMN - EDGE - widest(fig, ["SV-PGS"], **name_style) - 0.3
+    box_middle, box_tall = 1.9, 1.25
+    centre, reach = (stretch[1] + 0.2 + box_left - 1.1) / 2, (box_left - 1.1 - stretch[1] - 0.2) / 2
+    bases = (2.75, 1.8, 0.2)
     # each class's prior SD in inches, a schematic (empirical Bayes learns the real ones); every prior encloses the
-    # same area, so a narrower one stands taller, the SNV's 0.9 in
+    # same area, so a narrower one stands taller, the SNV's 0.75 in
     spreads = (0.2, 0.28, 0.5)
-    area = 0.9 * spreads[0] * math.sqrt(2 * math.pi)
+    area = 0.75 * spreads[0] * math.sqrt(2 * math.pi)
     effect = np.linspace(-reach, reach, 400)
     ax.text(centre, height - 0.04, "Effect-size prior", ha="center", va="top", color=INK)
     for (name, colour, block), base, spread in zip(VARIANTS, bases, spreads):
         middle = base + 0.4
-        ax.text(EDGE, middle, name, ha="left", va="center", color=colour, fontsize=POSTER_NAME, fontweight="bold")
-        chromosome(ax, 2.1, 4.0, middle, [(3.05, block, colour)])
+        ax.text(EDGE, middle, name, ha="left", va="center", color=colour, **name_style)
+        chromosome(ax, *stretch, middle, [(sum(stretch) / 2, block, colour)])
         ax.plot([centre - reach, centre + reach], [base, base], color=LIGHT, linewidth=3.2, zorder=1,
                 solid_capstyle="round")
         # each curve drawn where it stands clear of its baseline, so the tails leave the baseline bare
@@ -1157,17 +1164,16 @@ def poster_model_figure():
             shown = low > 0.03
             ax.plot(centre + effect[shown], base + low[shown], color=colour, linewidth=5.0, linestyle=(0, (1.4, 1.1)),
                     zorder=3)
-            ax.text(centre, base + low.max() + 0.05, "low r²", ha="center", va="bottom", color=INK)
+            ax.text(centre, base + low.max() + 0.04, "low r²", ha="center", va="bottom", color=INK)
         # every class into the one model
         ax.annotate("", xy=(box_left - 0.08, box_middle + (middle - box_middle) * 0.4),
-                    xytext=(centre + reach + 0.2, middle),
+                    xytext=(centre + reach + 0.15, middle),
                     arrowprops={"arrowstyle": "-|>,head_length=0.55,head_width=0.28", "color": INK, "linewidth": 4.0,
                                 "shrinkA": 0, "shrinkB": 0})
     ax.add_patch(matplotlib.patches.FancyBboxPatch((box_left, box_middle - box_tall / 2), COLUMN - EDGE - box_left,
                                                    box_tall, boxstyle="round,pad=0,rounding_size=0.2",
                                                    facecolor=SV_PGS, edgecolor="none"))
-    ax.text((box_left + COLUMN - EDGE) / 2, box_middle, "SV-PGS", ha="center", va="center", color="white",
-            fontsize=POSTER_NAME, fontweight="bold")
+    ax.text((box_left + COLUMN - EDGE) / 2, box_middle, "SV-PGS", ha="center", va="center", color="white", **name_style)
     return fig
 
 
