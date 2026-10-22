@@ -868,9 +868,13 @@ def poster_wins_figure(grids):
     # the paired test's standard error is the gain over its z
     half = stats.norm.ppf(0.975) * np.abs(gain / np.asarray([row["z_vs_ldpred2"] for row in rows]))
     null = np.asarray([row["point"] == "null" for row in rows])
+    # the same gain in the 3 Mb window, where SV-PGS and LDpred2-auto see far fewer variants
+    window = [row["delta_auc_vs_ldpred2"] for point in LABELS for row in cells(grids["window"]).get((point, size), [])
+              if row.get("delta_auc_vs_ldpred2") is not None]
     NUMBERS["poster_wins"] = {"train_count": size, "replicates": len(rows), "wins": int((gain > 0).sum()),
                               "clear": int((gain - half > 0).sum()), "null_replicates": int(null.sum()),
-                              "architectures": len({row["point"] for row in rows})}
+                              "architectures": len({row["point"] for row in rows}),
+                              "gain": interval(gain), "null_gain": interval(gain[null]), "window_gain": interval(window)}
     fig = plt.figure(figsize=(POSTER_HALF, POSTER_HEIGHT))
     ticks = widest(fig, ["0.00"], fontsize=POSTER_TYPE)
     top, bottom, left, right = 0.25, 2.05, ticks + 1.6, 0.3

@@ -19,7 +19,8 @@ Every simulation number in the text is read from figures/gallery/numbers.json, w
 values its figures draw. The All of Us section shows figures/aou_*.png in name order (else aou_results.py's
 fig_aou_effects.png and fig_aou_diseases.png), each under the first line of its .txt namesake, if any, as a one-line
 title and above that file's other lines as bullets; git ignores these files, so All of Us results stay local until
-they are released. Without them the section holds two dashed placeholders.
+they are released. Without them the section holds a dashed placeholder. The section's bullets state the matched tests
+in aou_numbers.json (its "matched" rows), which is also git-ignored.
 """
 
 from __future__ import annotations
@@ -94,7 +95,6 @@ REFERENCES = [
 """First author, year and journal, set as one paragraph."""
 PLACEHOLDERS = [
     ("SV effect sizes", "By SV class and length"),
-    ("Test AUC with SVs", "vs SNV-only, same code"),
 ]
 
 
@@ -121,30 +121,44 @@ def people(count: int) -> str:
 
 def copy(numbers: dict) -> dict:
     """The poster's sentences, each number from the gallery figure that shows it."""
-    accuracy, gain, svs = numbers["fig1"], numbers["poster_sv_gain"], numbers["fig5"]
-    every = gain["rows"]["all"]  # true and imputed: [mean, lower, upper, truths]; share: [ratio, lower, upper]
-    share, share_lower, share_upper = every["share"]
+    accuracy, wins, gain, svs = numbers["fig1"], numbers["poster_wins"], numbers["poster_sv_gain"], numbers["fig5"]
+    rows = gain["rows"]  # true and imputed: [mean, lower, upper, simulations]; share: [ratio, lower, upper]
+    simulations = rows["all"]["true"][3] + rows["null"]["true"][3]
     return {
         "introduction": ["We test whether structural variants (SVs) improve polygenic scores"],
         "methods": ["Empirical Bayes priors depend on imputation r², frequency and SV length"],
         "code": ["Code:", "github.com/", "SauersML/SV-PGS"],
         "design": [
-            f"{people(svs['people'])} people from 1000 Genomes chr22",
-            f"Binary trait: h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}",
-            f"{gain['shown']} genetic architectures; SVs imputed by Beagle",
+            f"{people(svs['people'])} genomes from 1000 Genomes chr22, one cohort",
+            f"Baseline: liability h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}, "
+            f"{accuracy['causal']} causal variants; {gain['shown']} architectures vary one setting",
         ],
-        "gain_note": f"Mean and 95% CI over {every['true'][3]} simulations in 3 Mb of chr22",
-        "gain": [f"Across all {every['architectures']} architectures, imputed SVs gave **{share:.0%}** of the gain of "
-                 f"true SVs (95% CI {share_lower:.0%}–{share_upper:.0%})"],
-        "aou": [
-            "SVs imputed into 50,000 genomes from 12,212 long-read assemblies",
-            "SV-PGS fitted for LDL, hypothyroidism, AF and gout",
-        ],
+        "whole_note": f"Simulations on whole chr22, tested on {people(accuracy['test_people'])} people",
+        "gain_note": f"Mean and 95% CI over {simulations} simulations in 3 Mb of chr22",
+        "aou": ["SVs imputed into 50,000 genomes from 12,212 long-read assemblies", *aou_matched()],
         "discussion": [
-            "SV-PGS outperformed LDpred2-auto even with no causal SVs",
-            "SVs add most when their genotypes are accurate",
+            f"SV-PGS gained {wins['gain'][0]:.3f} AUC over LDpred2-auto on whole chr22, "
+            f"{wins['window_gain'][0]:.3f} in 3 Mb",
+            "The gain was the same without SVs and grew with heritability and training size",
         ],
     }
+
+
+def minus(value: float, digits: int) -> str:
+    return f"{value:.{digits}f}".replace("-", "−")
+
+
+def aou_matched() -> list[str]:
+    """The All of Us tests of SV-PGS with SVs against the same model fitted without SVs by identical code, on the
+    same held-out people: aou_numbers.json's "matched" rows (aggregates, every count > 20), as sentences."""
+    path = HERE / "aou_numbers.json"
+    rows = json.loads(path.read_text()).get("matched", {}).get("rows", []) if path.is_file() else []
+    lines = []
+    for row in rows:
+        lines.append(f"{row['trait']}: SVs changed test {row['metric']} by {minus(row['relative'], 1)}% (95% CI "
+                     f"{minus(row['relative_lower'], 1)}% to {minus(row['relative_upper'], 1)}%; "
+                     f"{people(row['held_out'])} people)")
+    return lines + ["More traits are running"] if rows else lines
 
 
 # ------------------------------------------------------------------ DrawingML
@@ -604,11 +618,11 @@ def build() -> None:
         ],
         [
             bar(118, "Simulation results"),
+            Block("text", [Para([(words["whole_note"], "")], bullet=False, after=0)]),
             row([figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
             Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)], gap="section"),
             figure(gallery["poster_sv_gain"]),
-            text(bullets(words["gain"])),
         ],
         [
             bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks(),

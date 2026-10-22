@@ -320,14 +320,6 @@
    "Duplication": 92
   }
  },
- "poster_wins": {
-  "train_count": 40000,
-  "replicates": 59,
-  "wins": 59,
-  "clear": 46,
-  "null_replicates": 6,
-  "architectures": 13
- },
  "poster_sv_gain": {
   "shown": 17,
   "rows": {
@@ -364,5 +356,16 @@
     "share": [2.258055, null, null]
    }
   }
+ },
+ "poster_wins": {
+  "train_count": 40000,
+  "replicates": 59,
+  "wins": 59,
+  "clear": 46,
+  "null_replicates": 6,
+  "architectures": 13,
+  "gain": [0.033019, 0.028242, 0.037797, 59],
+  "null_gain": [0.04459, 0.033299, 0.055881, 6],
+  "window_gain": [0.006047, 0.002433, 0.00966, 24]
  }
 }
