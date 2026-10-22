@@ -25,8 +25,8 @@ import matplotlib
 import numpy as np
 
 from sim_gallery import (
-    BLUE, GREEN, INK, ORANGE, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_NAME, POSTER_STYLE, PURPLE, frame, plt,
-    shifted, widest,
+    BLUE, GREEN, INK, ORANGE, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_NAME, POSTER_STYLE, PURPLE, frame, plain,
+    plt, shifted, widest,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -56,10 +56,11 @@ def trait_name(trait: str) -> str:
     return TRAITS.get(trait, trait.replace("_", " ").capitalize())
 
 
-def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list[float], tick_text, log: bool):
+def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list[float], tick_text, log: bool,
+           reference: float | None = None):
     """A forest at the column's width: a row per (label, estimate, low, high), its label at the left, the estimate
-    filled where its interval excludes the reference (0, or 1 on a log axis), with the reference drawn."""
-    reference = 1.0 if log else 0.0
+    filled where its interval excludes the reference (0, or 1 on a log axis, unless given), with the reference drawn."""
+    reference = (1.0 if log else 0.0) if reference is None else reference
     top, bottom, right = 0.35, 1.85, 0.75
     height = top + bottom + PITCH * len(rows)
     fig = plt.figure(figsize=(COLUMN, height))
@@ -152,6 +153,25 @@ def classes_figure(enrichment: list[dict]) -> tuple:
     return fig, [title]
 
 
+def alpha_figure(alpha: list[dict]) -> tuple:
+    """Each class's frequency dependence alpha, effect variance per allele proportional to (2p(1 - p))^alpha, combined
+    over traits by inverse variance with its 95% interval, SNVs first; the SNVs' alpha drawn as the reference line."""
+    rows = []
+    for name, label in (("snv", "SNVs"), *CLASSES.items()):
+        found = [(row["posterior_alpha"], row["posterior_alpha_standard_error"]) for row in alpha
+                 if row["variant_class"] == name and row.get("posterior_alpha_standard_error")]
+        if not found:
+            continue
+        weights = np.array([1.0 / error ** 2 for _, error in found])
+        mean = float(np.dot(weights, [value for value, _ in found]) / weights.sum())
+        half = Z / math.sqrt(weights.sum())
+        rows.append((label, mean, mean - half, mean + half))
+    snv = next((row[1] for row in rows if row[0] == "SNVs"), 0.0)
+    ends = [end for _, _, low, high in rows for end in (low, high)] + [0.0]
+    fig = forest(rows, "Frequency dependence α", span(ends), lambda tick: plain(tick, 1), log=False, reference=snv)
+    return fig, ["Rare SVs have larger effects"]
+
+
 LENGTH_CLASSES = (("deletion", "Deletions", ORANGE), ("insertion", "Insertions", GREEN), ("duplication", "Duplications", PURPLE))
 """The classes drawn by length, each in its colour in the simulation figures (sim_gallery.py's SV_CLASSES)."""
 
@@ -213,6 +233,8 @@ def main() -> None:
             drawn.append(("aou_2_classes", classes_figure(numbers["enrichment"])))
         if numbers.get("by_length"):
             drawn.append(("aou_3_length", length_figure(numbers["by_length"])))
+        if numbers.get("alpha"):
+            drawn.append(("aou_4_alpha", alpha_figure(numbers["alpha"])))
         for name, (fig, lines) in drawn:
             fig.savefig(OUT / f"{name}.png", transparent=True)
             plt.close(fig)
