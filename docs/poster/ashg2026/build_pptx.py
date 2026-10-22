@@ -158,7 +158,7 @@ def copy(numbers: dict) -> dict:
         ],
         "accuracy": f"SV-PGS trained on {people(sooner)} people beat LDpred2-auto trained on {people(sizes[-1])} "
                     f"(AUC{NBSP}{auc(ours[sizes.index(sooner)][0])}{NBSP}vs{NBSP}{auc(theirs[-1][0])})" if sooner else "",
-        "versus": f"SV-PGS was more accurate in {beaten} {wins['replicates']} traits",
+        "versus": f"SV-PGS had higher AUC in {beaten} {wins['replicates']} simulations",
         "gain_title": f"Imputed SV genotypes gave {share:.0%} of the AUC gain of true SV genotypes",
         "gain": [f"The {gain['clear']} of {gain['shown']} architectures where true SV genotypes raised AUC (95% CI above "
                  "0), in one 3 Mb window of chr22",

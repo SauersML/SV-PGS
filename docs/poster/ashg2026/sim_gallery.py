@@ -850,13 +850,13 @@ def poster_accuracy_figure(grids, summary):
 
 
 POSTER_WINS_HEIGHT = 7.6
-"""Inches: the height of the figure of every simulated trait's two test AUCs, beside Figure 1a."""
+"""Inches: the height of the figure of every simulation's two test AUCs, beside Figure 1a."""
 
 
 def poster_wins_figure(grids):
-    """SV-PGS's test AUC against LDpred2-auto's for every simulated trait at the largest training size, over the line of
-    equal AUC: one dot per trait (black with no causal SVs), with the 95% interval of the paired AUC difference drawn
-    through it, so a dot above the line is a trait SV-PGS predicted better."""
+    """SV-PGS's test AUC against LDpred2-auto's in every simulation at the largest training size, over the line of equal
+    AUC: one dot per simulation (black with no causal SVs), with the 95% interval of the paired AUC difference drawn
+    through it, so a dot above the line is a simulation in which SV-PGS predicted better."""
     size = SIZES[-1]
     grouped = cells(grids["grid"])
     rows = [row for point in LABELS for row in grouped.get((point, size), [])
