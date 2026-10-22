@@ -167,7 +167,9 @@ def gwas_and_bands(train, part, cm: np.ndarray, short: np.ndarray, folders: Mapp
             for index in range(r0 // CHUNK, (r1 - 1) // CHUNK + 1):
                 if index not in cache:
                     rows = np.arange(index * CHUNK, min((index + 1) * CHUNK, total))
-                    means[rows], beta[rows], se[rows], _, cache[index] = adjuster.block(rows)
+                    means[rows], beta[rows], se[rows], squares, cache[index] = adjuster.block(rows)
+                    # a record with no variance among the training rows correlates with nothing (write_inputs zeroes its beta)
+                    cache[index][~(squares > 0.0)] = 0.0
                     _, beta_part[rows], se_part[rows], _, _ = part_adjuster.block(rows)
             columns = cache[c0 // CHUNK]
             # products[k, i - r0] = r(c0 + k, i) for i in [r0, r1)
@@ -177,8 +179,8 @@ def gwas_and_bands(train, part, cm: np.ndarray, short: np.ndarray, folders: Mapp
             position = np.arange(r0, r1)[None, :]
             inside = (position >= lo[c0:c1, None]) & (position < hi[c0:c1, None])
             wide.write(products[inside].astype("<f4").tobytes())
-            squares = np.where(inside, products.astype(np.float64) ** 2, 0.0)
-            scores[c0:c1] = squares.sum(axis=1)
+            r2 = np.where(inside, products.astype(np.float64) ** 2, 0.0)
+            scores[c0:c1] = r2.sum(axis=1)
             kept_columns, kept_rows = short[c0:c1], short[r0:r1]
             if kept_columns.any():
                 narrow_inside = inside[kept_columns][:, kept_rows]
@@ -187,8 +189,8 @@ def gwas_and_bands(train, part, cm: np.ndarray, short: np.ndarray, folders: Mapp
                 if not np.array_equal(found, short_hi[own] - short_lo[own]):
                     raise AssertionError("the snv_indel band is not the with_sv band's restriction to its records.")
                 narrow.write(products[kept_columns][:, kept_rows][narrow_inside].astype("<f4").tobytes())
-                short_scores[own] = squares[kept_columns][:, kept_rows].sum(axis=1)
-            del products, inside, squares
+                short_scores[own] = r2[kept_columns][:, kept_rows].sum(axis=1)
+            del products, inside, r2
     found = {"means": means, "beta": beta, "se": se, "beta_part": beta_part, "se_part": se_part}
     return {
         "with_sv": {**found, "lo": lo, "hi": hi, "ld_scores": scores},
@@ -285,6 +287,14 @@ class Units:
         os.replace(aside, path)
 
 
+def step_keys(run: _Run) -> dict[str, str]:
+    """The keys of the run's finished steps through direct_sv, whose store is read (``aou_ldpred2.run_identity``)."""
+    from sv_pgs.workspace_pipeline import COMPLETE_FILE, STEP_NAMES
+
+    steps = STEP_NAMES[: STEP_NAMES.index("direct_sv") + 1]
+    return {step: json.loads((run.output(step) / COMPLETE_FILE).read_text(encoding="utf-8"))["key"] for step in steps if (run.output(step) / COMPLETE_FILE).is_file()}
+
+
 def code_digest() -> str:
     code = hashlib.sha256()
     for source in (pathlib.Path(__file__), _SCRIPT, *(pathlib.Path(module.__file__) for module in (ldpred2_auto_allvar, ldpred2_auto, sbayesrc))):
@@ -349,15 +359,17 @@ def candidate_scores(codes: np.ndarray, columns: np.ndarray, means: np.ndarray, 
 
 def choose(labels: np.ndarray, tuning: np.ndarray, target: np.ndarray, covariates: np.ndarray) -> tuple[dict[tuple[str, str], int], np.ndarray]:
     """Per (arm, method), the candidate with the largest partial r^2 on the tuning rows (``tuning`` [rows, candidates]),
-    and every candidate's tuning partial r^2 (NaN for a constant or non-finite score)."""
+    and every candidate's tuning partial r^2 (NaN for a constant or non-finite score). LDpred2-auto has one candidate
+    and no choice: it is kept wherever its score is finite."""
     r2 = np.array([_partial_r2(target, tuning[:, index], covariates) for index in range(tuning.shape[1])])
+    finite = np.all(np.isfinite(tuning), axis=0)
     chosen = {}
     for arm in ARMS:
         for method in METHODS:
             members = np.flatnonzero([label.startswith(f"{arm}|{method}|") for label in labels.tolist()])
-            usable = members[np.isfinite(r2[members])]
+            usable = members[finite[members]] if method == "ldpred2_auto" else members[np.isfinite(r2[members])]
             if usable.size:
-                chosen[(arm, method)] = int(usable[np.argmax(r2[usable])])
+                chosen[(arm, method)] = int(usable[0]) if method == "ldpred2_auto" else int(usable[np.argmax(r2[usable])])
     return chosen, r2
 
 
@@ -397,8 +409,9 @@ def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np
     codes = read_codes(store, records, columns)
     _log(f"{name}: codes read")
     path = None if units is None else units.path(
-        trait=name, model=model, records=_digest(records), training=_digest(cohort.store_columns[training]), held=_digest(cohort.store_columns[held]),
-        tuning=_digest(tuning),
+        trait=name, model=model, records=_digest(records), cm=_digest(cm), short=_digest(short), training=_digest(cohort.store_columns[training]),
+        held=_digest(cohort.store_columns[held]), tuning=_digest(tuning), target=_digest(cohort.targets[training, trait]),
+        covariates=_digest(cohort.covariates[np.ix_(training, own)]),
     )
     fitted = None if path is None or units is None else units.read(path)
     if fitted is None:
@@ -432,7 +445,8 @@ def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np
             }
             if binary:
                 line["cases"] = _cases_text(held.shape[0], cases)
-                line["held_out_auc"] = None if index is None else auc_components(target, held_scores[:, index]).auc
+                both = cases is not None and 0 < cases < held.shape[0]
+                line["held_out_auc"] = auc_components(target, held_scores[:, index]).auc if index is not None and both else None
             lines.append(line)
     arrays = {
         "trait": np.array(name), "binary": np.array(binary), "methods": np.array(METHODS), "arms": np.array(ARMS),
@@ -464,9 +478,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--units", type=pathlib.Path, help="Where each trait's fitted effects are kept, and found again after a restart (Units).")
     args = parser.parse_args(argv)
     config = WorkspaceConfig.read(args.config)
+    if getattr(config, "direct_sv", None) is not None:
+        raise ValueError("the run adds direct SV calls to its store: with_sv would test them beside the imputed SVs.")
     run = _Run(config, workspace_bindings(), detect_compute_budget(), {})
     cohort = _cohort_of(run)
-    units = None if args.units is None else Units(args.units, {"format": "aou-fastpgs-v1", "code": code_digest(), "config": pathlib.Path(args.config).read_text()})
+    units = None if args.units is None else Units(args.units, {"format": "aou-fastpgs-v1", "code": code_digest(), "steps": step_keys(run), "config": pathlib.Path(args.config).read_text()})
     measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
     cores = os.cpu_count() or 1
     lines = []

@@ -154,3 +154,31 @@ def test_scores_and_the_tuning_choice() -> None:
     assert chosen == {("snv_indel", "ct"): 1, ("with_sv", "ct"): 3, ("with_sv", "ldpred2_auto"): 4}
     assert np.isnan(r2[2])
     assert r2[1] == pytest.approx(_partial_r2(target, tuning[:, 1], covariates))
+
+
+def test_a_record_with_no_training_variance_correlates_with_nothing(tmp_path: Path) -> None:
+    generator = np.random.default_rng(7)
+    view = _view(generator, 90, 80)
+    view.all_codes[40] = 0
+    folders = {arm: tmp_path / arm for arm in aou_fastpgs.ARMS}
+    for folder in folders.values():
+        folder.mkdir()
+    short = np.ones(90, dtype=bool)
+    short[40] = False
+    arms = aou_fastpgs.gwas_and_bands(view, view, view.variants["cm"], short, folders)
+    wide = arms["with_sv"]
+    band = _read_band(folders["with_sv"], wide["lo"], wide["hi"])
+    assert all(np.all(np.isfinite(column)) for column in band)
+    assert np.all(np.isfinite(wide["ld_scores"]))
+    np.testing.assert_array_equal(band[40], (np.arange(wide["lo"][40], wide["hi"][40]) == 40).astype(np.float32))
+    aou_fastpgs.write_inputs(folders["with_sv"], wide, 80, 80, 1)
+    assert np.all(np.isfinite(np.fromfile(folders["with_sv"] / "sumstats.bin", dtype="<f8")))
+
+
+def test_ldpred2_auto_is_kept_without_a_usable_tuning_target() -> None:
+    generator = np.random.default_rng(8)
+    tuning = generator.normal(size=(50, 3))
+    labels = np.array(["snv_indel|ldpred2_auto|auto", "snv_indel|ct|p<=1", "with_sv|ldpred2_auto|auto"])
+    tuning[:, 2] = np.nan
+    chosen, _ = aou_fastpgs.choose(labels, tuning, np.zeros(50), np.ones((50, 1)))
+    assert chosen == {("snv_indel", "ldpred2_auto"): 0}
