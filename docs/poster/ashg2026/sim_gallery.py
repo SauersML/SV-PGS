@@ -994,27 +994,34 @@ def poster_sv_gain_figure(grids):
 
 
 def poster_imputation_figure(summary):
-    """The imputation figure at the foot of the poster's left column: each frequency bin's mean r² of the imputed
-    dosage with the true genotype, SNVs and SVs, each named after its line's last mark. The margins are measured from
-    the drawn type, so larger type widens them. The y axis's title, longer than the axes are tall, is centred on the
-    figure's height, and the x axis's, wider than the axes, ends at the figure's right edge."""
+    """The genotype accuracy figure at the foot of the poster's left column: each frequency bin's mean r² of the
+    measured genotype with the true genotype, for SNVs called from simulated reads and SVs imputed by Beagle, with a
+    conservative 95% interval of the mean, ±1.96 √(mean (1 − mean) / n): an r² lies in [0, 1], so its variance is at
+    most mean (1 − mean), and the summary keeps each bin's mean and count, not its values. The names stand in a column
+    after the lines' last marks. The margins are measured from the drawn type, so larger type widens them. The y axis's
+    title is centred on the figure's height, and the x axis's, wider than the axes, ends at the figure's right edge."""
     accuracy = summary["genotype_accuracy"]["r2_by_frequency"]
     width, height, pad = POSTER_GENOTYPES, 5.2, 0.08
     fig = plt.figure(figsize=(width, height))
     ax = frame(fig, 0, 0, width, height)
-    ends = {}
+    mark = POSTER_MARK * 0.7
     for key, color in (("SNV", INK), ("SV", IMPUTED)):
         bins = [b for b in accuracy[key]["bins"] if b["count"]]
         centers = np.array([math.sqrt(b["low"] * b["high"]) * 100 for b in bins])
         mean = np.array([b["mean"] for b in bins])
-        ax.plot(centers, mean, color=color, marker="o", markersize=POSTER_MARK * 0.9, markeredgewidth=0, zorder=3,
-                clip_on=False)
-        ends[key] = (centers[-1], mean[-1])
-    # the two last marks are close, so SNVs is set a little above its mark and SVs below
-    after = POSTER_MARK * 0.9 / 2 / 72 + 0.15
-    for key, name, color, up in (("SNV", "SNVs", INK, 0.1), ("SV", "SVs", IMPUTED, -0.35)):
-        ax.text(*ends[key], name, transform=ax.transData + ScaledTranslation(after, up, fig.dpi_scale_trans),
-                color=color, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="center")
+        half = 1.96 * np.sqrt(mean * (1 - mean) / np.array([b["count"] for b in bins]))
+        ax.vlines(centers, np.clip(mean - half, 0, 1), np.clip(mean + half, 0, 1), color=color, linewidth=POSTER_BAR,
+                  zorder=2, clip_on=False)
+        ax.plot(centers, mean, color=color, marker="o", markersize=mark, markeredgewidth=0, zorder=3, clip_on=False)
+    # each name over how its genotypes were measured, in a column level with the SNVs' last mark, since the two last
+    # marks are too close for a two-line name beside each
+    after = mark / 2 / 72 + 0.15
+    for name, color, down, size, weight in (("SNVs", INK, -0.1, POSTER_NAME, "bold"),
+                                            ("called", INK, 0.68, POSTER_TYPE, "normal"),
+                                            ("SVs", IMPUTED, 1.5, POSTER_NAME, "bold"),
+                                            ("imputed", IMPUTED, 2.28, POSTER_TYPE, "normal")):
+        ax.text(1, 1, name, transform=shifted(ax, after, -down, False), color=color, fontsize=size, fontweight=weight,
+                ha="left", va="center")
     ax.set_xscale("log")
     ax.set_xlim(0.04, 50)
     ax.set_ylim(0, 1)
@@ -1022,7 +1029,7 @@ def poster_imputation_figure(summary):
     ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
     ax.set_yticks([0, 0.5, 1], ["0", "0.5", "1"])
     ax.set_xlabel("Minor allele frequency (%)")
-    ax.set_ylabel("Imputation r²")
+    ax.set_ylabel("Genotype r²")
     # each margin is what the type reaches past the axes, plus a pad, measured again until it settles
     renderer = fig.canvas.get_renderer()
     inches = fig.dpi_scale_trans.inverted()
