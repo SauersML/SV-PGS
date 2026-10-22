@@ -70,7 +70,7 @@ SHIFTED_PITCH = 0.25
 BULLET_INDENT = 0.42
 AFTER = 14
 """Points of space after a bullet."""
-GAPS = {"bar": 0.35, "block": 0.3, "section": 0.5}
+GAPS = {"bar": 0.25, "block": 0.2, "section": 0.4}
 """Space under a section bar, between blocks of a section, and above the next bar (before the column is justified)."""
 JUSTIFY_LIMIT = 2.0
 """The most extra space a section break takes when a column is spread to the bottom margin."""
