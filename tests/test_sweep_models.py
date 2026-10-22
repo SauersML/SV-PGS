@@ -27,9 +27,12 @@ _SAMPLES = 300
 _NODES = 37
 
 
-def sweep_problem(xp, seed: int, devices: tuple[int, ...] = (0, 1, 0), samples: int = _SAMPLES, blocks: tuple[int, ...] = _BLOCKS):
+def sweep_problem(
+    xp, seed: int, devices: tuple[int, ...] = (0, 1, 0), samples: int = _SAMPLES, blocks: tuple[int, ...] = _BLOCKS, collinear: bool = False,
+):
     """Codes, members and three models' metrics, priors and starting residuals; the tiles on ``xp``'s devices
-    (``devices`` per block) and each model's dense projected design (host) for the reference."""
+    (``devices`` per block) and each model's dense projected design (host) for the reference. ``collinear`` makes the
+    second covariate the first block's first column to within 1e-6 of its scale."""
     rng = np.random.default_rng(seed)
     tiles, bounds, member_blocks, groups, signs, dense_columns = [], [], [], [], [], []
     start = member = 0
@@ -60,6 +63,8 @@ def sweep_problem(xp, seed: int, devices: tuple[int, ...] = (0, 1, 0), samples: 
     members = group.shape[0]
     classes = rng.integers(0, 2, members).astype(np.int64)
     covariates = np.column_stack([np.ones(samples), rng.normal(size=(samples, 2))])
+    if collinear:
+        covariates[:, 1] = dense_columns[0][:, 0] + 1e-6 * rng.normal(size=samples)
     training = rng.random((samples, 2)) < 0.85
     # Two quantitative models' training masks and a binary model's root weights sqrt(omega) on its training rows.
     masks = np.stack([training[:, 0], training[:, 1], np.where(training[:, 0], rng.uniform(0.2, 0.5, samples), 0.0)]).astype(np.float64)

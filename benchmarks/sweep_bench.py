@@ -241,10 +241,16 @@ def _old(cp, problem, model, state, residual, grams):
 
 
 class _NoKernels:
-    """``sweep_models``' kernels with nothing launched: the host's share of a sweep on numpy."""
+    """``sweep_models``' kernels with nothing launched: the host's share of a sweep on numpy. They stand in for
+    ``kernels`` in the sweep's check (``kind``): a layout those checked is not checked again, so the timed sweep is the
+    unchecked one a solve repeats."""
 
     def __init__(self, kernels):
         self._kernels = kernels
+
+    @property
+    def kind(self):
+        return type(self._kernels).__name__
 
     def threads(self, sample_count):
         return self._kernels.threads(sample_count)

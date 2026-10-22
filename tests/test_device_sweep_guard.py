@@ -1,6 +1,7 @@
-"""The first batched sweep of a configuration is checked once per process (``device_sweep._SweepCheck``: each
-member's step against the sweep's own inputs to it), a failed check or CUDA error leaves the reference route's state
-untouched, and a fault inside the kernels' chain is caught."""
+"""The batched sweep's check (``device_sweep._SweepCheck``: each member's step against the sweep's own inputs to it):
+the whole sweep on a configuration's first layout in a process, the first block on each later layout; a failed check
+or CUDA error leaves the reference route's state untouched; a fault inside the kernels' chain is caught, also one that
+shows only on a later member order; and a failure line carries no value."""
 import numpy as np
 import pytest
 
@@ -22,17 +23,9 @@ def _run(problem, layout, state):
                          problem["residuals"].copy(), sweep.PanelGrams())
 
 
-def test_the_first_sweep_of_a_configuration_is_checked_once_per_process(monkeypatch):
-    original = sweep._SweepCheck.block
-    calls = []
+def test_a_configuration_s_first_layout_is_checked_whole_and_each_later_one_on_its_first_block(monkeypatch):
     messages = []
     monkeypatch.setattr(sweep, "log", messages.append)
-
-    def counted(self, block, *args):
-        calls.append(self.layout)
-        return original(self, block, *args)
-
-    monkeypatch.setattr(sweep._SweepCheck, "block", counted)
     layouts = []
     for _fit in range(2):
         problem, layout, state = _case()
@@ -40,16 +33,20 @@ def test_the_first_sweep_of_a_configuration_is_checked_once_per_process(monkeypa
             _run(problem, layout, state)
         assert layout.checked and not layout.disabled
         layouts.append(layout)
-    # The first layout's first sweep is checked; a later layout (another fit or member order) runs unchecked.
-    assert len(calls) == len(layouts[0].blocks) and all(value is layouts[0] for value in calls)
-    assert len(messages) == 1 and messages[0].startswith("batched sweep check passed: largest error")
+    # one check per layout, on its first sweep: the whole sweep, then the later layout's first block
+    assert [message.split(")")[0] for message in messages] == [
+        "batched sweep check passed (whole sweep", "batched sweep check passed (first block of a new member order",
+    ]
     worst = float(messages[0].split("largest error ")[1].split(" ")[0])
     assert 0.0 < worst < 1.0
-    # A new process (no verdict) checks again.
+    # Another configuration (one model, not three) is checked whole; so is the first one in a new process.
+    problem, layout, state = _case()
+    batched_sweep(np, sweep.HostPanelKernels(2 * sweep.PANEL), problem, layout, range(1), {name: values[:, :1].copy() for name, values in state.items()},
+                  problem["residuals"][:1].copy(), sweep.PanelGrams())
     sweep._VERDICTS.clear()
     problem, layout, state = _case()
     _run(problem, layout, state)
-    assert len(calls) == 2 * len(layout.blocks)
+    assert [message.split(")")[0].split("(")[1] for message in messages[2:]] == ["whole sweep", "whole sweep"]
 
 
 @pytest.mark.parametrize("field", [*sweep.MOMENTS, "residual", "divergence", "weighted_variance", "sizes", "squares"])
@@ -79,7 +76,6 @@ def test_sweep_mismatch_disables_the_fit_without_committing_state(monkeypatch, f
     with pytest.raises(sweep.NoCodes, match="disabled"):
         _run(problem, layout, state)
     assert len(messages) == 1 and messages[0].startswith("batched sweep disabled (check failed: ")
-    # A sample's residual is never written to the log: only the largest error and its tolerance.
     assert ("member" in messages[0]) == (field in sweep.MOMENTS)
     # Another layout of the same configuration takes the reference route without sweeping.
     monkeypatch.setattr(sweep, "_sweep_models", lambda *args, **kwargs: pytest.fail("swept after a failed check"))
@@ -92,14 +88,14 @@ def test_sweep_mismatch_disables_the_fit_without_committing_state(monkeypatch, f
 class _Faulty(sweep.HostPanelKernels):
     """The numpy kernels with one fault on the third launch that projects a panel."""
 
-    def __init__(self, fault):
+    def __init__(self, fault, launch=3):
         super().__init__(2 * sweep.PANEL)
-        self.fault, self.launches = fault, 0
+        self.fault, self.launch, self.launches = fault, launch, 0
 
     def panel_step(self, blocks, threads, models, arguments):
         projected_width = int(arguments[11])
         self.launches += projected_width > 0
-        third = projected_width > 0 and self.launches == 3
+        third = projected_width > 0 and self.launches == self.launch
         residuals, grams, mean, variance = arguments[15], arguments[30], arguments[33], arguments[34]
         projected, panel = int(arguments[10]), int(arguments[32])
         if third and self.fault == "residual":
@@ -113,15 +109,16 @@ class _Faulty(sweep.HostPanelKernels):
             variance[projected + 1, 0] *= 1.0 + 1e-5
         if third and self.fault == "mean":
             mean[projected + 2, 0] += 1e-5 * abs(mean[projected + 2, 0])
+        if third and self.fault == "leak":
+            # a wrong pointer: a sample's residual lands in a member's fourth moment
+            self.leaked = float(residuals[0, np.flatnonzero(residuals[0])[0]])
+            arguments[37][projected + 1, 0] = self.leaked
 
 
 @pytest.mark.parametrize("fault, quantities", [("residual", ("shift", "residual")), ("gram", ("shift",)), ("variance", ("variance",)), ("mean", ("shift", "mean"))])
 def test_a_fault_inside_the_kernels_chain_fails_the_check(monkeypatch, fault, quantities):
     # three blocks of several panels each, over two devices
-    problem = sweep_problem(np, 7)
-    layout = _layout(np, problem)
-    count = sum(block.members.size for block in layout.blocks)
-    state = {name: np.zeros((count, 3)) for name in sweep.MOMENTS}
+    problem, layout, state = _larger()
     messages = []
     monkeypatch.setattr(sweep, "log", messages.append)
     with pytest.raises(sweep.NoCodes, match="disagreed"):
@@ -130,15 +127,71 @@ def test_a_fault_inside_the_kernels_chain_fails_the_check(monkeypatch, fault, qu
     assert any(messages[0].startswith(f"batched sweep disabled (check failed: {quantity} of model 0") for quantity in quantities), messages[0]
 
 
-def test_the_check_passes_every_kernel_without_a_fault_on_the_larger_problem(monkeypatch):
-    problem = sweep_problem(np, 7)
+def _larger(seed=7, **options):
+    problem = sweep_problem(np, seed, **options)
     layout = _layout(np, problem)
     count = sum(block.members.size for block in layout.blocks)
-    state = {name: np.zeros((count, 3)) for name in sweep.MOMENTS}
+    return problem, layout, {name: np.zeros((count, 3)) for name in sweep.MOMENTS}
+
+
+def test_a_fault_on_a_later_member_order_fails_that_layout_s_check(monkeypatch):
+    """A kernel right on the configuration's first layout and wrong on a later one (an indexing fault that a member
+    order reaches): the later layout's first-block check catches it before its moments are committed."""
+    messages = []
+    monkeypatch.setattr(sweep, "log", messages.append)
+    problem, first, state = _larger()
+    batched_sweep(np, _Faulty(None), problem, first, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
+    problem, later, state = _larger()
+    later.blocks[0] = sweep._BlockLayout(later.blocks[0].device, later.blocks[0].offset, later.blocks[0].start, later.blocks[0].members[::-1].copy(),
+                                         later.blocks[0].pieces)
+    with pytest.raises(sweep.NoCodes, match="disagreed"):
+        batched_sweep(np, _Faulty("gram", launch=1), problem, later, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
+    assert all(not values.any() for values in state.values())
+    assert messages[1].startswith("batched sweep disabled (check failed: shift of model 0, member ")
+
+
+def test_a_failure_line_carries_no_value(monkeypatch):
+    messages = []
+    monkeypatch.setattr(sweep, "log", messages.append)
+    problem, layout, state = _larger()
+    kernels = _Faulty("leak")
+    with pytest.raises(sweep.NoCodes, match="disagreed"):
+        batched_sweep(np, kernels, problem, layout, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
+    assert messages[0].startswith("batched sweep disabled (check failed: fourth of model 0, member ")
+    assert "times its tolerance" in messages[0] and abs(kernels.leaked) > 1e-3
+    for digits in (2, 3, 6, 17):
+        assert f"{abs(kernels.leaked):.{digits}g}" not in messages[0]
+
+
+def test_a_strong_effect_s_moments_are_held_to_their_own_size():
+    """One unit-variance node, n = 44,000, h = 8,800: q is N(0.2, 1 / 44,001), its fourth central moment 3 c^2 =
+    1.5e-9. A fourth moment of 0 (or a variance of 0) is far outside its tolerance."""
+    (mean, variance, third, fourth, pieces), scales = sweep._tilted(
+        np.array([8800.0]), np.array([44000.0]), 1.0, np.zeros(1), np.zeros(1), np.zeros((1, 1)),
+    )
+    conditional = 1.0 / (1.0 + 44000.0)
+    assert mean[0] == pytest.approx(8800.0 * conditional) and variance[0] == pytest.approx(conditional)
+    assert fourth[0] == pytest.approx(3.0 * conditional ** 2)
+    for values, scale in ((variance, scales[1]), (fourth, scales[3])):
+        assert sweep.SWEEP_RTOL * scale[0] < 1e-3 * values[0]
+
+
+def test_a_column_nearly_spanned_by_a_covariate_passes_the_check(monkeypatch):
+    """The kernels form x_j' r from the unprojected codes; a column that a covariate nearly spans leaves a projected
+    product far smaller than the rounding of the unprojected one, which the shift's tolerance carries."""
+    messages = []
+    monkeypatch.setattr(sweep, "log", messages.append)
+    problem, layout, state = _larger(samples=20_000, collinear=True)
+    batched_sweep(np, _Faulty(None), problem, layout, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
+    assert messages[0].startswith("batched sweep check passed (whole sweep)")
+
+
+def test_the_check_passes_every_kernel_without_a_fault_on_the_larger_problem(monkeypatch):
+    problem, layout, state = _larger()
     messages = []
     monkeypatch.setattr(sweep, "log", messages.append)
     batched_sweep(np, _Faulty(None), problem, layout, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
-    assert layout.checked and messages[0].startswith("batched sweep check passed")
+    assert layout.checked and messages[0].startswith("batched sweep check passed (whole sweep)")
 
 
 @pytest.mark.parametrize("checked", [False, True])
