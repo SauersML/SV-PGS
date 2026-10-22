@@ -946,7 +946,7 @@ def poster_sv_gain_figure(grids):
                  for key, row in sets.items()},
     }
     rows = list(sets.values())
-    pitch, top, bottom, right = 1.9, 1.1, 2.3, 0.5
+    pitch, top, bottom, right = 2.65, 1.1, 2.3, 0.5
     height = top + bottom + pitch * len(rows)
     fig = plt.figure(figsize=(POSTER_GAIN, height))
     left = widest(fig, [row["label"] for row in rows], fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0) + 0.75

@@ -140,10 +140,8 @@ def copy(numbers: dict) -> dict:
         ],
         "accuracy": f"SV-PGS at {people(sooner)} beat LDpred2-auto at {people(sizes[-1])}" if sooner else "",
         "versus": f"SV-PGS had higher AUC in {beaten} {wins['replicates']} simulations",
-        "gain_title": "Imputed SVs matched true SVs when well imputed",
-        "gain": [f"Mean and 95% CI across {every['true'][3]} simulated truths, each a new draw of causal variants, "
-                 "in 3 Mb of chr22",
-                 f"Across all {every['architectures']} architectures, imputed SVs gave **{share:.0%}** of the gain of "
+        "gain_note": f"Mean and 95% CI over {every['true'][3]} simulations in 3 Mb of chr22",
+        "gain": [f"Across all {every['architectures']} architectures, imputed SVs gave **{share:.0%}** of the gain of "
                  f"true SVs (95% CI {share_lower:.0%}–{share_upper:.0%})"],
         "aou": [
             "SVs imputed into 50,000 genomes from 12,212 long-read assemblies",
@@ -617,7 +615,7 @@ def build() -> None:
                  figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
                 [headline(words["versus"]),
                  figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
-            headline(words["gain_title"], gap="section"),
+            Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)], gap="section"),
             figure(gallery["poster_sv_gain"]),
             text(bullets(words["gain"])),
         ],
