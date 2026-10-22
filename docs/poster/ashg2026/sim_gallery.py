@@ -812,8 +812,8 @@ def poster_accuracy_figure(grids, summary):
     log_size_axis(ax)
     ax.set_xlabel("Training people (thousands)")
     ceiling = summary["points"]["null"]["true_value_auc"]
-    ax.axhline(ceiling, color=GREY, linestyle=(0, (1, 1.2)), linewidth=4.0, zorder=1)
-    ax.text(SIZES[0] / 1.25, ceiling - 0.005, "Best possible", color=GREY, va="top", ha="left")
+    ax.axhline(ceiling, color=INK, linestyle=(0, (1, 1.2)), linewidth=4.0, zorder=1)
+    ax.text(SIZES[0] / 1.25, ceiling - 0.005, "Best possible", color=INK, va="top", ha="left")
     means, lows, highs = {}, {}, {}
     for key, method, color in (("with_sv_auc", "SV-PGS", SV_PGS), ("ldpred2_auc", "LDpred2-auto", LDPRED2)):
         pooled = [interval([row[key] for point, *_ in SV_SHARES for row in grouped.get((point, size), [])])
@@ -821,7 +821,7 @@ def poster_accuracy_figure(grids, summary):
         mean, low, high = (np.array([cell[i] for cell in pooled]) for i in range(3))
         means[method], lows[method], highs[method] = mean, low, high
         ax.fill_between(SIZES, low, high, color=color, alpha=0.2, linewidth=0, zorder=2)
-        ax.plot(SIZES, mean, color=color, zorder=3, marker="o", markeredgecolor="white", markeredgewidth=3.0)
+        ax.plot(SIZES, mean, color=color, zorder=3, marker="o", markeredgewidth=0)
         ax.text(SIZES[-1] * 1.15, mean[-1], f"{mean[-1]:.3f}", color=color, fontweight="bold", ha="left", va="center")
     # the SV-PGS AUC at the smallest training size whose interval clears LDpred2-auto's at the largest (the size the
     # poster's text names), carried right to the largest size as a dashed level, over LDpred2-auto's end
@@ -837,7 +837,6 @@ def poster_accuracy_figure(grids, summary):
     ax.set_ylim(0.5, ceiling + 0.008)
     ax.set_yticks(np.arange(0.5, 0.651, 0.05), ["0.50", "0.55", "0.60", "0.65"])
     ax.set_ylabel("Test AUC")
-    value_grid(ax, "y")
     return fig
 
 
@@ -865,8 +864,8 @@ def poster_wins_figure(grids):
     upper, words = height / 2 - 0.1, 1.4
     centre = (upper - words - height / 2) / 2 - (offsets.max() + offsets.min()) / 2
     area = (diameter * 72) ** 2 * 0.9
-    ax.scatter(values[~null], centre + offsets[~null], s=area, color=SV_PGS, edgecolors="white", linewidths=2.0, zorder=3)
-    ax.scatter(values[null], centre + offsets[null], s=area, color=INK, edgecolors="white", linewidths=2.0, zorder=3)
+    ax.scatter(values[~null], centre + offsets[~null], s=area, color=SV_PGS, linewidths=0, zorder=3)
+    ax.scatter(values[null], centre + offsets[null], s=area, color=INK, linewidths=0, zorder=3)
     ax.axvline(0, color=INK, linewidth=5.0, zorder=2)
     ax.set_xlim(*limits)
     ax.set_yticks([])
@@ -875,6 +874,7 @@ def poster_wins_figure(grids):
     ax.set_xticks(ticks, [plain(tick) for tick in ticks])
     ax.set_xlabel("AUC gain over LDpred2-auto")
     ax.text(0.003, upper, "SV-PGS better", color=SV_PGS, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top")
+    ax.text(0.081, upper, "Black: no\ncausal SVs", color=INK, fontweight="bold", ha="right", va="top", linespacing=1.05)
     ax.annotate("", xy=(0.052, upper - 1.05), xytext=(0.003, upper - 1.05), xycoords="data",
                 arrowprops={"arrowstyle": "-|>,head_length=0.9,head_width=0.45", "color": SV_PGS, "linewidth": 5.0,
                             "shrinkA": 0, "shrinkB": 0})
@@ -920,15 +920,13 @@ def poster_sv_gain_figure(grids):
     ax = frame(fig, left, bottom, POSTER_GAIN - left - right, height - top - bottom)
     limits = (-0.006, 0.036)
     for y, point in enumerate(clear):
-        if y % 2 == 0:
-            ax.axhspan(y - 0.5, y + 0.5, color="#F2F2F2", zorder=0, linewidth=0)
         for offset, values, (_, color, filled) in ((-0.2, true[point], SOURCES[0]), (0.2, imputed[point], SOURCES[1])):
             mean, low, high, _ = interval(values)
             ax.hlines(y + offset, max(low, limits[0]), min(high, limits[1]), color=color, linewidth=POSTER_BAR,
                       zorder=3, capstyle="round")
             ax.plot([mean], [y + offset], "o", markersize=POSTER_MARK, color=color,
-                    markerfacecolor=color if filled else "white", markeredgecolor="white" if filled else color,
-                    markeredgewidth=3.0 if filled else 6.0, zorder=4)
+                    markerfacecolor=color if filled else "white", markeredgecolor=color,
+                    markeredgewidth=0 if filled else 6.0, zorder=4)
         ax.text(0, y, POSTER_ROWS[point], transform=shifted(ax, -0.3), ha="right", va="center", linespacing=1.0)
     ax.axvline(0, color=INK, linewidth=4.0, zorder=2)
     ax.set_yticks([])
@@ -942,7 +940,7 @@ def poster_sv_gain_figure(grids):
     for across, (label, color, filled) in ((left, SOURCES[0]), (left + 8.2, SOURCES[1])):
         fig.add_artist(Line2D([(across + 0.25) / POSTER_GAIN], [1 - 0.55 / height], marker="o", markersize=POSTER_MARK,
                               color=color, markerfacecolor=color if filled else "white",
-                              markeredgecolor="white" if filled else color, markeredgewidth=3.0 if filled else 6.0))
+                              markeredgecolor=color, markeredgewidth=0 if filled else 6.0))
         fig.text((across + 0.75) / POSTER_GAIN, 1 - 0.55 / height, label, color=color, fontsize=POSTER_NAME,
                  fontweight="bold", va="center", ha="left")
     return fig
@@ -964,8 +962,8 @@ def poster_imputation_figure(summary):
         bins = [b for b in accuracy[key]["bins"] if b["count"]]
         centers = np.array([math.sqrt(b["low"] * b["high"]) * 100 for b in bins])
         mean = np.array([b["mean"] for b in bins])
-        ax.plot(centers, mean, color=color, marker="o", markersize=POSTER_MARK * 0.9, markeredgecolor="white",
-                markeredgewidth=3.0, zorder=3, clip_on=False)
+        ax.plot(centers, mean, color=color, marker="o", markersize=POSTER_MARK * 0.9, markeredgewidth=0, zorder=3,
+                clip_on=False)
         ends[key] = (centers[-1], mean[-1])
     # SNVs named over their line's end, SVs under theirs, so neither name sits between the lines
     ax.text(ends["SNV"][0], ends["SNV"][1] + 0.07, "SNVs", color=INK, fontsize=POSTER_NAME, fontweight="bold",

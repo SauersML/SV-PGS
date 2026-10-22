@@ -61,7 +61,7 @@ COLUMNS = ((MARGIN, LEFT), (MARGIN + LEFT + GUTTER, MIDDLE), (48 - MARGIN - RIGH
 INSET = 0.3
 """Text sits this far inside its column, under the section bars' labels."""
 BAR, BAR_SIZE = 1.0, 54
-BODY, HEADLINE, GLOSS, REFERENCE = 40, 52, 32, 28
+BODY, HEADLINE, GLOSS, REFERENCE = 40, 40, 40, 32
 NUMBER, CLAIM = 120, 56
 """Points: a key number over its figure, and the words set between two key numbers."""
 LINE_PITCH = 1.066
@@ -109,7 +109,7 @@ def marked(text: str) -> list[tuple[str, str]]:
             words, colour = piece[2:-2].split("|")
             runs.append((words, f"b {colour}"))
         elif piece in ("SV-PGS", "LDpred2-auto"):
-            runs.append((piece, "b blue" if piece == "SV-PGS" else "b vermillion"))
+            runs.append((piece, ""))
         elif piece:
             runs.append((piece, ""))
     return runs
@@ -170,13 +170,12 @@ def copy(numbers: dict) -> dict:
         "accuracy": f"SV-PGS trained on {people(sooner)} people beats LDpred2-auto trained on {people(sizes[-1])} "
                     f"(AUC{NBSP}{auc(ours[sizes.index(sooner)][0])}{NBSP}vs{NBSP}{auc(theirs[-1][0])})" if sooner else "",
         "versus_number": [(f"{wins['wins']} of {wins['replicates']}", "b blue")],
-        "versus": f"simulated data sets where SV-PGS beats LDpred2-auto, both trained on {people(sizes[-1])}{NBSP}people "
-                  "(black: no causal SVs)",
+        "versus": f"simulated data sets where SV-PGS beats LDpred2-auto, both trained on {people(sizes[-1])}{NBSP}people",
         "gain_number": [(f"{share:.0%}", "b sky")],
-        "gain_claim": ["of the AUC gain from {{true SV genotypes|blue}}", "remains when SVs are {{imputed|sky}}"],
+        "gain_claim": ["AUC gain with {{imputed SV genotypes|sky}},", "as a share of the gain with {{true SV genotypes|blue}}"],
         "gain": [f"The {gain['clear']} of {gain['shown']} architectures where true SV genotypes raised AUC (95% CI above "
                  "0), in one 3 Mb window of chr22",
-                 f"With well-imputed causal SVs, **{kept_well:.0%}** of the gain remains"],
+                 f"Where causal SVs impute well, the gain with imputed genotypes was **{kept_well:.0%}** as large"],
         "aou": [
             "SVs from long-read assemblies, imputed into short-read genomes",
             "SV-PGS with and without SVs, tested on held-out people",
@@ -184,7 +183,8 @@ def copy(numbers: dict) -> dict:
         "discussion": [
             "SV-PGS beats LDpred2-auto even with no causal SVs, so the gain comes from its model and denser variant set",
             f"True SV genotypes raised AUC in {gain['clear']} of {gain['shown']} architectures",
-            f"Imputed SVs gave **{share:.0%}** of that gain, so SVs add most when their genotypes are accurate",
+            f"With imputed SV genotypes the gain was **{share:.0%}** as large, so SVs add most when their genotypes are "
+            "accurate",
         ],
     }
 
@@ -681,7 +681,7 @@ def build() -> None:
     gallery = {name: GALLERY / f"{name}.png" for name in (
         "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy")}
     model = [para for formula, gloss in EQUATION for para in (
-        Para(formula, BODY, bullet=False, after=4), Para([(gloss, "")], GLOSS, bullet=False, colour=GREY, after=20))]
+        Para(formula, BODY, bullet=False, after=4), Para([(gloss, "")], GLOSS, bullet=False, after=20))]
     columns = [
         [
             bar(97, "Introduction"), text(bullets(words["introduction"])),
