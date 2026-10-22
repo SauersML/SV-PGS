@@ -8,6 +8,11 @@ the report's ``_partial_r2`` at unit weights). Only matched pairing runs are val
 fitted by different code compares the code as well as the SVs. Deleting the SV terms from one joint fit is no test
 either: the SNVs that tag those SVs would have carried their effect in a refit.
 
+Secondary and descriptive only, ``--contrast ablation``: one with_sv model's held-out score against the same score
+with its SV terms zeroed (``_Scores.held_out_structural`` subtracted), on the same people. This is no measure of SV
+gain, for the reason above. It says how much the joint fit's own SV terms carry, given the SNV weights fitted beside
+them. Its relative gain is against the model's own short-variant part, and its output is labelled ABLATION_LABEL.
+
 Uncertainty is a family bootstrap (``held_out_comparison.cluster_bootstrap_counts``) drawn once over the union of
 every trait's held-out people. People are matched across runs by research id, and two people share a cluster where
 any run puts them in one family (``union_clusters``). Every trait's gain is read from the same resamples, so the
@@ -75,6 +80,8 @@ disease, more than 20 cases)."""
 LEVEL = 0.05
 UPPER = float(stats.norm.ppf(0.95))
 """The one-sided 95% normal quantile behind every upper bound."""
+ABLATION_LABEL = ("SECONDARY / DESCRIPTIVE: SV terms zeroed in the joint fit, not a measure of SV gain "
+                  "('snv_indel' below = the with_sv model less its SV terms)")
 
 
 @dataclass(frozen=True)
@@ -323,10 +330,11 @@ def pooled_lines(label: str, absolute: dict[str, object], relative: dict[str, ob
             f"{label} relative gain (% of snv_indel r^2), GLS fixed: {normal(relative['fixed'], 100, '%')}; random: {normal(relative['random'], 100, '%')}"]
 
 
-def report(result: dict[str, object], traits: Sequence[PairedTrait]) -> list[str]:
-    """The printed lines: aggregates only, every count of 1 to 20 shown as <=20."""
+def report(result: dict[str, object], traits: Sequence[PairedTrait], contrast: str = "arms") -> list[str]:
+    """The printed lines: aggregates only, every count of 1 to 20 shown as <=20; the ablation's under ABLATION_LABEL."""
     names = result["traits"]
-    lines = ["per trait: trait n cases snv_indel_r2 gain(x1e-4) CI SE z p_two p_one at_most(x1e-4) relative_gain(%) relative_SE(%) at_most(%)"]
+    lines = [ABLATION_LABEL] if contrast == "ablation" else []
+    lines += ["per trait: trait n cases snv_indel_r2 gain(x1e-4) CI SE z p_two p_one at_most(x1e-4) relative_gain(%) relative_SE(%) at_most(%)"]
     for index, trait in enumerate(traits):
         cases = shown(int(np.sum(trait.target))) if trait.binary else ""
         lines.append("  " + "\t".join(str(value) for value in (
@@ -363,9 +371,10 @@ def report(result: dict[str, object], traits: Sequence[PairedTrait]) -> list[str
 OPS = "/home/jupyter/workspace/svpgs_ops/svpgs"
 
 
-def read_run(name: str) -> dict[str, object]:
-    """One pairing run's trait as the test reads it, from its cohort and score steps inside the workspace: per held-out
-    person the research id, family, ancestry, outcome, covariates and both arms' held-out scores."""
+def read_run(name: str, contrast: str = "arms") -> dict[str, object]:
+    """One run's trait as the test reads it, from its cohort and score steps inside the workspace: per held-out person
+    the research id, family, ancestry, outcome, covariates and the two scores compared (both arms, or for the ablation
+    the with_sv model's score and the same score less its SV terms)."""
     from sv_pgs.compute_budget import detect_compute_budget
     from sv_pgs.config import TraitType
     from sv_pgs.workspace_pipeline import ARMS, WorkspaceConfig, _held_out_rows, _read_cohort, _read_scores, _Run, workspace_bindings
@@ -384,17 +393,20 @@ def read_run(name: str) -> dict[str, object]:
             "ids": np.asarray(cohort.research_ids, dtype=object)[rows], "families": cohort.families[rows],
             "ancestry": np.asarray(cohort.ancestry, dtype=object)[rows], "target": cohort.targets[rows, trait],
             "covariates": cohort.covariates[np.ix_(rows, np.flatnonzero(cohort.covariate_columns[trait]))],
-            "baseline": scores.held_out_genetic[ARMS.index("snv_indel"), rows, trait],
+            "baseline": (scores.held_out_genetic[ARMS.index("with_sv"), rows, trait] - scores.held_out_structural[rows, trait]
+                         if contrast == "ablation" else scores.held_out_genetic[ARMS.index("snv_indel"), rows, trait]),
             "candidate": scores.held_out_genetic[ARMS.index("with_sv"), rows, trait], "seed": run.config.seed}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("runs", nargs="+", help="Matched pairing runs (both arms fitted by identical code), one trait each.")
+    parser.add_argument("--contrast", choices=("arms", "ablation"), default="arms",
+                        help="arms (primary): with_sv vs snv_indel; ablation (secondary, descriptive): SV terms zeroed in one fit.")
     parser.add_argument("--permutations", type=int, default=PERMUTATIONS)
     parser.add_argument("--resamples", type=int, default=RESAMPLES)
     args = parser.parse_args(argv)
-    runs = [read_run(name) for name in args.runs]
+    runs = [read_run(name, args.contrast) for name in args.runs]
     ids, index = np.unique(np.concatenate([run["ids"] for run in runs]).astype(str), return_inverse=True)
     offsets = np.cumsum([0] + [run["ids"].shape[0] for run in runs])
     people = [index[offsets[i]:offsets[i + 1]] for i in range(len(runs))]
@@ -408,11 +420,11 @@ def main(argv: list[str] | None = None) -> int:
         ancestry[people[i][~known]] = labels[~known]
     traits = [PairedTrait(run["name"], run["binary"], people[i], np.asarray(run["target"], dtype=np.float64), np.asarray(run["covariates"], dtype=np.float64),
                           np.asarray(run["baseline"], dtype=np.float64), np.asarray(run["candidate"], dtype=np.float64)) for i, run in enumerate(runs)]
-    print(f"runs {' '.join(args.runs)}; with_sv vs snv_indel; union of held-out people {shown(ids.shape[0])}, clusters {shown(int(clusters.max()) + 1)}, "
+    print(f"runs {' '.join(args.runs)}; contrast {args.contrast}; union of held-out people {shown(ids.shape[0])}, clusters {shown(int(clusters.max()) + 1)}, "
           f"ancestry labels differing between runs {shown(disagreements)}; resamples {args.resamples}, permutations {args.permutations}")
     labels = np.char.lower(ancestry.astype(str))
     result = analyse(traits, clusters, labels, int(runs[0]["seed"]), args.resamples, args.permutations)
-    print("\n".join(report(result, traits)))
+    print("\n".join(report(result, traits, args.contrast)))
     return 0
 
 

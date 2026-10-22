@@ -94,6 +94,7 @@ def test_no_gain_is_found_where_none_was_planted_and_a_planted_gain_is_found_and
     assert abs(calibration["Z_mean"]) < 1.0 and np.all(np.isfinite(calibration["z_sd"]))
     lines = sv_gain_meta.report(planted, traits)
     assert any(line.startswith("PRIMARY Stouffer") for line in lines) and any("at most" in line for line in lines)
+    assert sv_gain_meta.report(planted, traits, "ablation")[0] == sv_gain_meta.ABLATION_LABEL and lines[0] != sv_gain_meta.ABLATION_LABEL
 
 
 def test_one_family_coin_swaps_all_its_members_in_every_trait() -> None:
