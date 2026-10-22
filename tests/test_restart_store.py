@@ -23,7 +23,7 @@ from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.full_data_fit import _MODEL_STATE_ARRAYS, _ModelState, block_grams, fit_full_data, stage0_lattice
 from sv_pgs.genotype_statistics import DosageStoreTileSource, compute_genotype_statistics
 from sv_pgs.restart_store import (
-    REQUEST, RestartStore, WarmStart, definition_sources, facts, load_statistics, load_warm_start, module_sources, save_statistics,
+    MODE_INDEX, REQUEST, RestartStore, WarmStart, definition_sources, facts, load_statistics, load_warm_start, module_sources, save_statistics,
     save_warm_start, state_key, unit_key,
 )
 from sv_pgs.scale_mixture_ep import AnnotationGroup, initial_hyperparameters, scale_mixture_prior, without_annotations
@@ -536,6 +536,64 @@ def test_keeping_warm_starts_does_not_change_an_uninterrupted_fit(tmp_path: Path
     np.testing.assert_array_equal(plain.certificate.state_digest, kept.certificate.state_digest)
     np.testing.assert_array_equal(plain.certificate.outer_iterations, kept.certificate.outer_iterations)
     assert list((tmp_path / "restart" / "eb").glob("*/model0.npz"))
+    store.close()
+
+
+def _orders(monkeypatch: pytest.MonkeyPatch, stop_at: int | None = None) -> list[int]:
+    """The mode search's order seeds as their oracles are made, the ``stop_at``-th's making preempted."""
+    seeds: list[int] = []
+    original = full_data_fit._FullDataMeanField.__init__
+
+    def recording(self, *arguments, order_seed=None, **keywords):
+        if order_seed is not None:
+            seeds.append(order_seed)
+            if order_seed == stop_at:
+                raise RuntimeError("preempted mid-search")
+        original(self, *arguments, order_seed=order_seed, **keywords)
+
+    monkeypatch.setattr(full_data_fit._FullDataMeanField, "__init__", recording)
+    return seeds
+
+
+def test_a_mode_search_preempted_after_an_order_goes_on_from_the_next_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    arguments, store = _problem(tmp_path)
+    plain = fit_full_data(**arguments())
+    seeds = _orders(monkeypatch, stop_at=6)
+    with pytest.raises(RuntimeError, match="preempted mid-search"):
+        fit_full_data(**arguments(), warm_start=_warm(tmp_path))
+    assert seeds == [1, 2, 3, 4, 5, 6]
+    (index,) = (tmp_path / "restart" / "eb").glob(f"*/{MODE_INDEX}")
+    assert sorted(path.name for path in index.parent.glob("mode.*.npz")) == ["mode.0.main.npz"]
+    monkeypatch.undo()
+    capsys.readouterr()
+    seeds = _orders(monkeypatch)
+    resumed = fit_full_data(**arguments(), warm_start=_warm(tmp_path))
+    assert "mode mixture: restarted after 5 orders" in capsys.readouterr().err
+    assert seeds == list(range(6, 17))
+    np.testing.assert_allclose(resumed.member_mean, plain.member_mean, rtol=1e-6, atol=1e-6 * np.abs(plain.member_mean).max())
+    np.testing.assert_array_equal(resumed.certificate.mixture_components, plain.certificate.mixture_components)
+    np.testing.assert_array_equal(resumed.certificate.budget_unresolved, plain.certificate.budget_unresolved)
+    assert resumed.mixture_settled.tolist() == plain.mixture_settled.tolist()
+    store.close()
+
+
+@pytest.mark.parametrize("change", ["another search", "a corrupt source", "a corrupt index"])
+def test_a_saved_mode_search_of_another_search_or_damaged_starts_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str) -> None:
+    arguments, store = _problem(tmp_path)
+    _orders(monkeypatch, stop_at=6)
+    with pytest.raises(RuntimeError, match="preempted mid-search"):
+        fit_full_data(**arguments(), warm_start=_warm(tmp_path))
+    (index,) = (tmp_path / "restart" / "eb").glob(f"*/{MODE_INDEX}")
+    if change == "a corrupt source":
+        (index.parent / "mode.0.main.npz").write_bytes(b"cut short")
+    elif change == "a corrupt index":
+        index.write_bytes(index.read_bytes()[:-8])
+    monkeypatch.undo()
+    seeds = _orders(monkeypatch)
+    fit_full_data(**arguments(), warm_start=_warm(tmp_path), **({"mode_orders": 4} if change == "another search" else {}))
+    assert seeds == list(range(1, 5 if change == "another search" else 17))
     store.close()
 
 

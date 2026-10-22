@@ -76,7 +76,9 @@ from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.gram_space import GramBand
 from sv_pgs.phase_timer import TimedOracle, timed_sweep, timing
 from sv_pgs.progress import log
-from sv_pgs.restart_store import WarmStart, load_warm_start, save_warm_start, state_key
+from sv_pgs.restart_store import (
+    MODE_INDEX, MODE_SOURCE, WarmStart, load_mode_search, load_warm_start, save_mode_search, save_mode_source, save_warm_start, state_key,
+)
 from sv_pgs.krylov_recycle import local_response
 from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
 from sv_pgs.tie_map import _compact_identity_tie_map
@@ -3186,7 +3188,8 @@ def fit_full_data(
     place of the moment, nested or continued start, and solves it again (its first call has no cold competitor, and no
     saved ELBO stands as a best). The outer loop's search history is not kept, so a resumed fit can take another path
     to another local optimum, and its certificate is the returned state's own; a fit that is not interrupted does the
-    same operations as without it.
+    same operations as without it. The mode mixture's search is kept in the fitted prior's unit too (``_mode_mixture``'s
+    ``progress``), so a fit preempted in it goes on from its last order.
 
     ``mixture_start`` (a continuation's: the earlier fit's ``FullDataFit.mixture_start``, or saved fits' modes,
     ``stage2_wiring``) starts the mode mixture's search from those components (``_mode_mixture``) on the mean-field
@@ -3311,7 +3314,7 @@ def fit_full_data(
             allowance_spent[:] |= np.asarray(getattr(oracle, "allowance_spent", False), dtype=bool)
 
     # A model resumed on the fitted prior starts there (``solve``), as a continued fit does: the nested search is behind it.
-    _key, resumed = warm_starts(prior)
+    prior_key, resumed = warm_starts(prior)
     if starts is None and any(entry is not None for entry in resumed):
         starts = [
             entry[0] if entry is not None else initial_hyperparameters(prior, moments[model].mean_variance)
@@ -3399,7 +3402,7 @@ def fit_full_data(
             )
         mixture = _mode_mixture(
             mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters, moments, None if binary.any() else mixture_start,
-            orders=mode_orders,
+            orders=mode_orders, progress=None if prior_key is None else (kept[prior_key][0], prior_key),
         )
         member_mean, components, component_weights, binary_parts = mixture.mean, mixture.components, mixture.weights, mixture.binaries
         mean_move, noise_gains = mixture.mean_move, mixture.noise_gain
@@ -3543,7 +3546,7 @@ class _Mixture:
 def _mode_mixture(
     main: "_FullDataMeanField", gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int,
     working_bytes: int, seed: int, hyperparameters: tuple[MixtureHyperparameters, ...], moments: Sequence[MomentStart] = (),
-    start: MixtureStart | None = None, orders: int | None = None,
+    start: MixtureStart | None = None, orders: int | None = None, progress: tuple[Any, str] | None = None,
 ) -> _Mixture:
     """The mean-field fit's mixture over coordinate ascent's modes (``small_n._mode_mixture``): between near-duplicate
     columns the posterior is multimodal and the product family holds one mode, the column visited first taking the
@@ -3617,7 +3620,17 @@ def _mode_mixture(
 
     The ridge start and the orders are solved and never factored by the dual solver (``_FullDataMeanField._solved``):
     nothing here reads a factor, neither a component's state nor the repeat and settling tests (sample-space images),
-    nor a binary component (its reads of the store), and the main fixed point's own factor is put back at the end."""
+    nor a binary component (its reads of the store), and the main fixed point's own factor is put back at the end.
+
+    ``progress`` (the ``eb`` unit's directory and key of this fit's prior, ``fit_full_data``) keeps the search in the
+    restart store: each component's source (where its solve started: the main fixed point, a start component, the ridge
+    start or an order's zero, kept as its first solve's means and noise) and, after the start components and the ridge
+    start and after each order, the search's index (``restart_store.MODE_INDEX``). A search restarted on the same problem
+    and search (a preempted job's next attempt, whose empirical Bayes resumed from its own saved state) solves each saved
+    source again at these hyperparameters from its means and noise, as a continuation solves an earlier fit's components,
+    and admits them, then goes on with the next order. Its start components and ridge start are not solved again, and its
+    settled models and the last admitted order's move are the saved ones. Each order costs a solve from zero (7-16 sweeps
+    at whole genome [real]); a source solved again costs that of a solve from a nearby state (2-3 [real])."""
     count = main.model_count
     # Per model, per component: its mean, (shift, omega), ELBO, ``BinaryComponent`` (None for a quantitative model),
     # mean move, noise gain and noise variance.
@@ -3629,6 +3642,15 @@ def _mode_mixture(
     gains: list[list[float]] = [[] for _model in range(count)]
     noises: list[list[float]] = [[] for _model in range(count)]
     columns = (means, parts, elbos, binaries, moves, gains, noises)
+    # Per model, per component: its source's name in the restart store (``progress``).
+    sources: list[list[str]] = [[] for _model in range(count)]
+    search = None if progress is None else state_key(
+        unit=progress[1], draw_count=draw_count, seed=seed, orders=orders, start=start, moments=list(moments), members=main.mean.shape,
+    )
+    saved = None if progress is None else load_mode_search(progress[0], search, main.mean.shape[0], count)
+    if progress is not None and saved is None:
+        for stale in progress[0].glob(MODE_SOURCE.format(model="*", name="*")):
+            stale.unlink()
 
     def pieces(oracle: "_FullDataMeanField", model: int) -> tuple:
         return (
@@ -3637,12 +3659,18 @@ def _mode_mixture(
             float(oracle.mean_move[model]), float(oracle.noise_gain[model]), float(oracle.noise[model]),
         )
 
-    def held(oracle: "_FullDataMeanField", model: int) -> None:
+    def held(oracle: "_FullDataMeanField", model: int, name: str) -> None:
         for values, piece in zip(columns, pieces(oracle, model)):
             values[model].append(piece)
+        sources[model].append(name)
+        if progress is not None:
+            path = progress[0] / MODE_SOURCE.format(model=model, name=name)
+            # A source is its component's first solve's start, written once; a saved one solved again keeps its file.
+            if name == "main" or not path.exists():
+                save_mode_source(path, search, oracle.mean[:, model], float(oracle.noise[model]))
 
     for model in range(count):
-        held(main, model)
+        held(main, model, "main")
 
     def weighted(model: int) -> tuple[F64Array, F64Array]:
         values = np.array(elbos[model])
@@ -3650,10 +3678,11 @@ def _mode_mixture(
         weights /= weights.sum(axis=0)
         return np.einsum("cm,cjm->jm", weights, np.array(means[model])[:, :, None])[:, 0], weights[:, 0]
 
-    def admit(oracle: "_FullDataMeanField", models: Sequence[int]) -> None:
+    def admit(oracle: "_FullDataMeanField", models: Sequence[int], name: str | dict[int, str]) -> None:
         """For each of ``models``, a new mode, or a repeat of a held one merged into it (``small_n._admit``: the mixture
         is over distinct modes, each weighted by its own mass once); the repeat of the higher evidence is kept. The
-        component's panel Grams are released: its order's panels are no other component's."""
+        component's panel Grams are released: its order's panels are no other component's. ``name`` is the solve's
+        source (per model where a dict), which a new mode keeps."""
         oracle._panel_grams.clear()
         for model in models:
             for index, kept in enumerate(means[model]):
@@ -3663,13 +3692,50 @@ def _mode_mixture(
                             values[model][index] = piece
                     break
             else:
-                held(oracle, model)
+                held(oracle, model, name[model] if isinstance(name, dict) else name)
 
     settled = np.zeros(count, dtype=bool)
     unresolved = np.zeros(count, dtype=np.int64)
     refusals: list[str] = []
     seeded = orders is not None
-    if start is not None:
+    last_move = np.full(count, np.inf)
+    first_order = 1
+
+    def save(position: int) -> None:
+        """The search's index after ``position`` orders, then the sources no component keeps removed."""
+        if progress is None:
+            return
+        save_mode_search(progress[0] / MODE_INDEX, search, position, sources, last_move, unresolved, settled)
+        kept_sources = {progress[0] / MODE_SOURCE.format(model=model, name=name) for model in range(count) for name in sources[model]}
+        for stale in progress[0].glob(MODE_SOURCE.format(model="*", name="*")):
+            if stale not in kept_sources:
+                stale.unlink()
+
+    if saved is not None:
+        # A restarted search: each saved source but the main fixed point (this fit's own stands for it) solved again at
+        # these hyperparameters from its means and noise, the k-th of every model's together, and admitted.
+        settled, unresolved = saved["settled"].copy(), saved["unresolved"].copy()
+        last_move, first_order = saved["last_move"].copy(), saved["position"] + 1
+        restarted = [entries[1:] for entries in saved["sources"]]
+        for index in range(max(len(entries) for entries in restarted)):
+            solving = [model for model in range(count) if index < len(restarted[model])]
+            oracle = type(main)(
+                gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters),
+                np.array([restarted[model][index][2] if model in solving else float(main.noise[model]) for model in range(count)]), **main._siblings,
+                start_mean=np.column_stack([restarted[model][index][1] if model in solving else main.mean[:, model] for model in range(count)]),
+                sites=list(main.sites),
+            )
+            solved = oracle._solved(list(hyperparameters), solving)
+            unresolved += oracle.unresolved
+            if solved is not None:
+                admit(oracle, solving, {model: restarted[model][index][0] for model in solving})
+            del oracle, solved
+        log(
+            f"mode mixture: restarted after {saved['position']} orders: "
+            + "; ".join(f"model {model}: {len(restarted[model])} saved components solved again, {len(means[model])} modes held" for model in range(count))
+        )
+        save(saved["position"])
+    elif start is not None:
         if np.asarray(start.means[0]).shape != main.mean.shape:
             raise ValueError("a mixture start's components must be this fit's members x models")
         # Per model: its earlier search settled (a seeded search solves every model's components) and no solve of its
@@ -3713,7 +3779,7 @@ def _mode_mixture(
                 # Only until the main fixed point has come back: where the other components end is not read.
                 if not main_found[model] and main._fitted_square(oracle.mean[:, model] - start_means[:, model], model) <= resolution:
                     main_found[model] = main._fitted_square(oracle.mean[:, model] - main.mean[:, model], model) <= resolution
-            admit(oracle, solving)
+            admit(oracle, solving, f"start{index}")
             del oracle, solved
         settled = np.zeros(count, dtype=bool) if seeded else found & main_found
         for model in range(count):
@@ -3728,7 +3794,7 @@ def _mode_mixture(
             )
     average = [weighted(model)[0] for model in range(count)]
     searching = [model for model in range(count) if not settled[model]]
-    if moments and searching:
+    if moments and searching and saved is None:
         # The dense end (``_ridge_mean``): with many small effects the zero-started fixed point keeps a sparse basin and
         # over-shrinks (bench-sim scenario_001 [sim]: calibration slope 2.33, r2 below the infinitesimal ridge's), and
         # the evidence weights decide between the basins.
@@ -3742,11 +3808,12 @@ def _mode_mixture(
             sites=list(main.sites),
         )
         if ridge._solved(list(hyperparameters), searching) is not None:
-            admit(ridge, searching)
+            admit(ridge, searching, "ridge")
             average = [weighted(model)[0] for model in range(count)]
         del ridge
-    last_move = np.full(count, np.inf)
-    for component in range(1, (draw_count if orders is None else orders) + 1):
+    if saved is None:
+        save(0)
+    for component in range(first_order, (draw_count if orders is None else orders) + 1):
         if not searching:
             break
         oracle = type(main)(
@@ -3755,14 +3822,14 @@ def _mode_mixture(
         )
         solved = oracle._solved(list(hyperparameters), searching)
         unresolved += oracle.unresolved
-        if solved is None:
-            continue
-        admit(oracle, searching)
+        if solved is not None:
+            admit(oracle, searching, f"order{component}")
+            for model in searching:
+                updated = weighted(model)[0]
+                last_move[model] = main._fitted_square(updated - average[model], model) / float(main.noise[model])
+                average[model] = updated
         del oracle, solved
-        for model in searching:
-            updated = weighted(model)[0]
-            last_move[model] = main._fitted_square(updated - average[model], model) / float(main.noise[model])
-            average[model] = updated
+        save(component)
     if seeded:
         for model in range(count):
             note = (

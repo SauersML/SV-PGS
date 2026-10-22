@@ -507,3 +507,81 @@ def load_warm_start(path: Path, key: str, prior: Any, residual_length: int, site
     except (OSError, ValueError, TypeError, KeyError, AttributeError, EOFError, BadZipFile) as error:
         log(f"eb warm start: ignored {path.name} ({error})")
         return None
+
+
+# ---------------------------------------------------------------------------
+# The mode mixture's search
+# ---------------------------------------------------------------------------
+
+MODE_FORMAT = "svpgs-mode-search-v1"
+MODE_INDEX = "modes.npz"
+"""In an ``eb`` unit: the mode mixture's search so far (``full_data_fit._mode_mixture``): the orders it has tried, its
+components' sources, the last admitted order's move, its unresolved solves and settled models. The run mirror reads it
+before the unit's other files and sends it after them, so a mirrored index names only sources the mirror holds."""
+MODE_SOURCE = "mode.{model}.{name}.npz"
+"""In an ``eb`` unit: where one of a model's components started, its members' means and noise variance (each source is
+written once, the main fixed point's at each search's start)."""
+
+
+def _save_checked(path: Path, metadata: dict[str, Any], arrays: dict[str, np.ndarray]) -> None:
+    metadata["digest"] = named_digest({"metadata": json.dumps(metadata, sort_keys=True), **arrays})
+    save_archive(path, metadata, arrays)
+
+
+def _load_checked(path: Path, key: str) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    with np.load(path, allow_pickle=False) as archive:
+        metadata = json.loads(str(archive["metadata"]))
+        if metadata.get("format") != MODE_FORMAT or metadata.get("key") != key:
+            raise ValueError("another search or format")
+        arrays = {name: np.array(archive[name]) for name in archive.files if name != "metadata"}
+    digest = metadata.pop("digest")
+    if digest != named_digest({"metadata": json.dumps(metadata, sort_keys=True), **arrays}):
+        raise ValueError("its checksum differs")
+    return metadata, arrays
+
+
+def save_mode_source(path: Path, key: str, mean: np.ndarray, noise: float) -> None:
+    """A component's source (``MODE_SOURCE``), checksummed."""
+    _save_checked(path, {"format": MODE_FORMAT, "key": key, "noise": float(noise)}, {"mean": np.asarray(mean, dtype=np.float64)})
+
+
+def save_mode_search(path: Path, key: str, position: int, sources: list[list[str]], last_move: np.ndarray, unresolved: np.ndarray, settled: np.ndarray) -> None:
+    """The search's index (``MODE_INDEX``) after ``position`` orders (0: its start components and ridge start), each
+    model's sources in their components' order, checksummed and replacing the previous one atomically."""
+    _save_checked(
+        path, {"format": MODE_FORMAT, "key": key, "position": int(position), "sources": sources},
+        {"last_move": np.asarray(last_move, dtype=np.float64), "unresolved": np.asarray(unresolved, dtype=np.int64), "settled": np.asarray(settled, dtype=bool)},
+    )
+
+
+def load_mode_search(directory: Path, key: str, members: int, models: int) -> dict[str, Any] | None:
+    """The search ``key`` saved in ``directory`` with each source it names, whole (position, sources as (name, mean,
+    noise) per model, last_move, unresolved, settled), or None with the reason logged: the search then starts again."""
+    try:
+        metadata, arrays = _load_checked(directory / MODE_INDEX, key)
+        sources = metadata["sources"]
+        if (
+            len(sources) != models or any(not names or names[0] != "main" for names in sources)
+            or any(arrays[name].shape != (models,) for name in ("last_move", "unresolved", "settled"))
+        ):
+            raise ValueError("it does not fit this group's models")
+        loaded = []
+        for model, names in enumerate(sources):
+            entries = []
+            for name in names:
+                source, values = _load_checked(directory / MODE_SOURCE.format(model=model, name=name), key)
+                mean, noise = values["mean"], float(source["noise"])
+                if mean.shape != (members,) or not np.all(np.isfinite(mean)) or not np.isfinite(noise) or noise <= 0.0:
+                    raise ValueError(f"model {model}'s source {name} is not {members} finite means at a positive noise")
+                entries.append((name, mean, noise))
+            loaded.append(entries)
+        log(f"mode mixture: loaded its search after {metadata['position']} orders from {directory.name[:16]}")
+        return {"position": int(metadata["position"]), "sources": loaded, "last_move": arrays["last_move"],
+                "unresolved": arrays["unresolved"], "settled": arrays["settled"]}
+    except FileNotFoundError as error:
+        if Path(error.filename or "").name != MODE_INDEX:
+            log(f"mode mixture: ignored its saved search ({Path(error.filename or '').name} is missing)")
+        return None
+    except (OSError, ValueError, TypeError, KeyError, EOFError, BadZipFile) as error:
+        log(f"mode mixture: ignored its saved search ({error})")
+        return None

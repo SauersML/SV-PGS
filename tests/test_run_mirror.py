@@ -1000,3 +1000,67 @@ def test_a_restore_reads_a_sealed_unit_s_files_in_parts_largest_first_and_a_muta
     sizes = DirectoryRemote(mirror).sizes("restart/")
     assert parts and all("/stage0/" in name for name in parts) and [sizes[name] for name in parts] == sorted((sizes[name] for name in parts), reverse=True)
     assert many and all("/eb/" in name for name in many)
+
+
+def test_a_mode_search_index_is_read_before_its_sources_are_listed_and_sent_after_them(tmp_path: Path) -> None:
+    """The fit writes a source and then the index naming it while a push is sending the unit: the push sends the index
+    it read first, which names only the sources it then listed and sent, and the next push sends the newer pair."""
+    from sv_pgs.restart_store import MODE_INDEX
+
+    run, mirror = tmp_path / "run", tmp_path / "mirror"
+    unit = RestartStore(run / "restart" / "with_sv").mutable("eb", "start", group="model0", named=facts({"inputs": "eb"}))
+    _write(unit / "mode.0.main.npz", b"main")
+    _write(unit / MODE_INDEX, b"index naming main")
+    sent: list[str] = []
+
+    class Writing(DirectoryRemote):
+        def upload(self, path: Path, name: str) -> None:
+            super().upload(path, name)
+            sent.append(name.rsplit("/", 1)[1])
+            if name.endswith("mode.0.main.npz") and not (unit / "mode.0.order1.npz").exists():
+                _write(unit / "mode.0.order1.npz", b"order 1")
+                _write(unit / MODE_INDEX, b"index naming main and order1")
+
+        def write(self, name: str, content: bytes) -> None:
+            super().write(name, content)
+            sent.append(name.rsplit("/", 1)[1])
+
+    push(run, Writing(mirror))
+    prefix = mirror / "restart" / "with_sv" / "eb" / "start"
+    assert sent.index(MODE_INDEX) > sent.index("mode.0.main.npz")
+    assert (prefix / MODE_INDEX).read_bytes() == b"index naming main"
+    assert not (prefix / "mode.0.order1.npz").exists()
+    sent.clear()
+    push(run, Writing(mirror))
+    assert sent == ["mode.0.order1.npz", MODE_INDEX]
+    assert (prefix / MODE_INDEX).read_bytes() == b"index naming main and order1"
+    sent.clear()
+    push(run, Writing(mirror))
+    assert sent == []
+
+
+def test_a_released_unit_stays_on_the_mirror_while_another_unit_is_not_pushed(tmp_path: Path) -> None:
+    """A group's EB start is released once its model's checkpoint is saved; while the checkpoint's upload is refused,
+    the mirror keeps the EB start, and the push after the refusals end sends the checkpoint and removes the start."""
+    from sv_pgs.restart_store import REQUEST
+
+    run, mirror = tmp_path / "run", tmp_path / "mirror"
+    store = RestartStore(run / "restart" / "with_sv")
+    _write(store.mutable("eb", "start", group="model0", named=facts({"inputs": "eb"})) / "model0.npz", b"warm start")
+    push(run, DirectoryRemote(mirror))
+    _write(store.mutable("checkpoints", "k", group=REQUEST, named=facts({"inputs": "checkpoint"})) / "model0.npz", b"checkpoint")
+    store.release("model0")
+
+    class Refusing(DirectoryRemote):
+        def upload(self, path: Path, name: str) -> None:
+            if "/checkpoints/" in name:
+                raise PermissionError("403 Forbidden")
+            super().upload(path, name)
+
+    with pytest.raises(run_mirror.PushIncomplete, match="checkpoints"):
+        push(run, Refusing(mirror))
+    start = mirror / "restart" / "with_sv" / "eb" / "start"
+    assert (start / "model0.npz").read_bytes() == b"warm start" and (start / MANIFEST).is_file()
+    push(run, DirectoryRemote(mirror))
+    assert not (start / "model0.npz").exists() and not (start / MANIFEST).exists()
+    assert (mirror / "restart" / "with_sv" / "checkpoints" / "k" / "model0.npz").read_bytes() == b"checkpoint"

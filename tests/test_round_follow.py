@@ -78,7 +78,15 @@ def test_why_a_job_failed_is_batch_s_exit_first_then_the_task_s_and_the_driver_s
     # A store fan-out's task markers carry its chromosome index.
     assert planner.classify(record, [[0], [1]], [f"{MARK}_task_7-exit-restore"])[0] == "restore"
     assert planner.classify(record, [[1]], [f"{MARK}_task_exit-install"])[0] == "install"
-    assert planner.classify(record, [[137]], [])[0] == "unknown"
+    assert planner.classify(record, [[2]], [])[0] == "unknown"
+    # A driver the kernel killed is not resubmitted, though its last push failed after it.
+    assert planner.classify(record, [[137]], [])[0] == "killed"
+    assert planner.classify(record, [[1]], [f"{MARK}_task_exit-137", f"{MARK}_task_exit-push", f"{MARK}_task_exit-1"])[0] == "killed"
+    # A fan-out task's own failure decides, though another task's VM was preempted.
+    assert planner.classify(record, [[1], [50001]], [f"{MARK}_store_failed-ValueError"])[0] == "driver"
+    assert planner.classify(record, [[50001], [50001, 50005]], [])[0] == "time-cap"
+    # A driver interrupted from outside names no error of its own.
+    assert planner.classify(record, [[3]], [f"{MARK}_fit_failed-KeyboardInterrupt", f"{MARK}_task_exit-push-stuck"])[0] == "push-stuck"
 
 
 def test_a_preempted_fit_is_resubmitted_on_a_free_slot_and_a_driver_error_never(tmp_path, cloud) -> None:  # noqa: F811
@@ -210,6 +218,124 @@ def test_the_follower_ends_with_the_round_stops_on_stop_and_is_the_round_s_only_
     assert json.loads((state / "r7.log").read_text().splitlines()[-1])["action"] == "follow stopped"
 
 
+def test_a_failed_read_decides_nothing_and_a_failed_pass_is_tried_again(tmp_path, cloud, monkeypatch) -> None:  # noqa: F811
+    plan, fake = _round(tmp_path, spend_cap_usd=1000)
+    gcloud = planner.Gcloud(BUCKET, True)
+    _set(fake, "svpgs-aou-r7-l1-train-1", "FAILED", [50001], hours=1)
+    _set(fake, "svpgs-aou-r7-l2-train-1", "RUNNING", hours=1)
+    # The cloud does not answer: neither chain is ended or resubmitted.
+    monkeypatch.setenv("FAKE_GCLOUD_DOWN", "1")
+    follower = planner.Follower(plan, gcloud, cloud, "p", "r")
+    with pytest.raises(planner.Unavailable, match="auth tokens"):
+        follower.resubmit()
+    assert not follower.ended and not _submitted(fake)
+    monkeypatch.delenv("FAKE_GCLOUD_DOWN")
+    follower.forget()
+    follower.resubmit()
+    assert [entry["BUDGET_SLOT"] for entry in _submitted(fake)] == ["train-3"]
+    # A pass that fails is logged and the next one runs: here the round then ends.
+    state = tmp_path / "state"
+    _set(fake, "svpgs-aou-r7-l1-train-3", "SUCCEEDED")
+    _set(fake, "svpgs-aou-r7-l2-train-1", "SUCCEEDED")
+    report = fake / "gcs" / BUCKET / "svpgs/aou-r7-l2/run/report"
+    report.mkdir(parents=True)
+    (report / "_COMPLETE.json").write_text("{}")
+    resubmit = planner.Follower.resubmit
+    calls = []
+
+    def flaky(self):
+        calls.append(1)
+        if len(calls) == 1:
+            raise planner.Unavailable("gcloud storage ls failed: connection reset")
+        return resubmit(self)
+
+    monkeypatch.setattr(planner.Follower, "resubmit", flaky)
+    assert planner.watch(plan, gcloud, cloud, "p", "r", 0.001, state) == 0
+    logged = [json.loads(line) for line in (state / "r7.log").read_text().splitlines()]
+    assert [line["action"] for line in logged] == ["follow started", "pass failed", "follow ended"] and len(calls) == 2
+
+
+def test_the_lease_is_taken_and_kept_only_over_its_own_generation(tmp_path, cloud, monkeypatch) -> None:  # noqa: F811
+    plan, fake = _round(tmp_path)
+    gcloud = planner.Gcloud(BUCKET, True)
+    path = f"{plan.staging}/follow/lease.json"
+    with planner.Lease(gcloud, plan, tmp_path / "a", 1800) as first:
+        holder = json.loads(gcloud.read(path))
+        assert holder["token"] == first.me["token"]
+        # Another follower that read no lease before this one wrote it cannot write its own.
+        second = planner.Lease(planner.Gcloud(BUCKET, True), plan, tmp_path / "b", 1800)
+        with monkeypatch.context() as patched:
+            patched.setattr(second.cloud, "generation", lambda _path: None)
+            with pytest.raises(planner.Contended):
+                second.__enter__()
+        first.renew()
+        # Another follower takes the lease (this one's had gone stale): this one submits nothing more.
+        gcloud.write(path, json.dumps({"host": "elsewhere", "pid": 1, "time": time.time(), "token": "other"}))
+        follower = planner.Follower(plan, gcloud, cloud, "p", "r")
+        follower.lease = first
+        _set(fake, "svpgs-aou-r7-l1-train-1", "FAILED", [50001])
+        _set(fake, "svpgs-aou-r7-l2-train-1", "RUNNING")
+        follower.forget()
+        with pytest.raises(planner.Contended, match="another follower"):
+            follower.resubmit()
+        assert not _submitted(fake) and not (fake / "gcs" / BUCKET / "svpgs/_rounds/r7/follow/chains/svpgs-aou-r7-l1-train-1.json").exists()
+    # Leaving, it does not remove the other follower's lease.
+    assert json.loads(gcloud.read(path))["token"] == "other"
+
+
+def test_a_refused_submission_leaves_the_chain_as_it_was_and_spend_counts_each_task(tmp_path, cloud, monkeypatch) -> None:  # noqa: F811
+    plan, fake = _round(tmp_path, spend_cap_usd=1000)
+    gcloud = planner.Gcloud(BUCKET, True)
+    follower = planner.Follower(plan, gcloud, cloud, "p", "r")
+    _set(fake, "svpgs-aou-r7-l1-train-1", "FAILED", [50001])
+    _set(fake, "svpgs-aou-r7-l2-train-1", "RUNNING")
+
+    def refused(entry, launcher):
+        raise planner.RoundError(f"{entry['name']} was not submitted: quota")
+
+    chain = fake / "gcs" / BUCKET / "svpgs/_rounds/r7/follow/chains/svpgs-aou-r7-l1-train-1.json"
+    with monkeypatch.context() as patched:
+        patched.setattr(planner, "submit", refused)
+        follower.forget()
+        with pytest.raises(planner.RoundError, match="quota"):
+            follower.resubmit()
+    assert [job["reason"] for job in json.loads(chain.read_text())["jobs"]] == ["planned"] and "svpgs-aou-r7-l1-train-1" not in follower.ended
+    follower.forget()
+    follower.resubmit()
+    assert [job["reason"] for job in json.loads(chain.read_text())["jobs"]] == ["planned", "preempted"]
+    # A fan-out of 22 tasks ran 2 hours: 44 VM-hours.
+    record, _tasks = _job("SUCCEEDED", hours=2, machine="n2-standard-8")
+    record["taskGroups"] = [{"taskCount": 22}]
+    (fake / "jobs" / "svpgs-aou-r7-l1-train-1").write_text(json.dumps(record))
+    _set(fake, "svpgs-aou-r7-l2-train-1", "SUCCEEDED")
+    follower.records.clear()
+    many = follower.spent()
+    (fake / "jobs" / "svpgs-aou-r7-l1-train-1").write_text(json.dumps(dict(record, taskGroups=[{"taskCount": 1}])))
+    follower.records.clear()
+    one = follower.spent()
+    assert one > 0 and many == pytest.approx(22 * one)
+
+
+def test_a_root_job_execute_did_not_submit_is_submitted_once_the_round_is_recorded(tmp_path, cloud) -> None:  # noqa: F811
+    plan, fake = _round(tmp_path)
+    gcloud = planner.Gcloud(BUCKET, True)
+    follower = planner.Follower(plan, gcloud, cloud, "p", "r")
+    # No round.json: --execute has not run, so nothing is submitted.
+    planner.follow(plan, gcloud, cloud, "p", "r", follower)
+    assert not _submitted(fake)
+    (fake / "gcs" / BUCKET / "svpgs" / plan.staging / "round.json").parent.mkdir(parents=True, exist_ok=True)
+    (fake / "gcs" / BUCKET / "svpgs" / plan.staging / "round.json").write_text("{}")
+    # l1's job is in Batch; l2's slot was reserved by a submission that made no job 20 minutes ago.
+    _set(fake, "svpgs-aou-r7-l1-train-1", "RUNNING")
+    slots = fake / "gcs" / BUCKET / "svpgs/aou-r7-l2/budget/slots"
+    slots.mkdir(parents=True)
+    (slots / "train-1.json").write_text("{}")
+    os.utime(slots / "train-1.json", (time.time() - 1200, time.time() - 1200))
+    follower.forget()
+    planner.follow(plan, gcloud, cloud, "p", "r", follower)
+    assert [(entry["RUN_ID"], entry["BUDGET_SLOT"]) for entry in _submitted(fake)] == [("aou-r7-l2", "train-3")]
+
+
 def test_a_gpu_job_s_attempt_is_capped_and_the_cap_is_within_the_slot(tmp_path) -> None:
     repository, commit = _repository(tmp_path / "repo", partner=True)
     plan = planner.build(planner.read_spec(_spec(commit, count=1)), *planner.read_timeline("budget"), None, repository)
@@ -248,33 +374,50 @@ def test_follow_sh_starts_one_detached_follower_stops_it_and_starts_recorded_rou
     spec = tmp_path / "r7.json"
     spec.write_text(json.dumps({"round": "r7"}))
     state = tmp_path / "state"
-    environment = dict(os.environ, SVPGS_FOLLOW_STATE=str(state), OPS_BUCKET="ops-bucket", HOME=str(tmp_path / "home"), PATH=os.environ["PATH"])
+    environment = dict(os.environ, SVPGS_FOLLOW_STATE=str(state), SVPGS_FOLLOW_RESTART_SECONDS="1", OPS_BUCKET="ops-bucket", HOME=str(tmp_path / "home"),
+                       PATH=os.environ["PATH"])
 
     def follow(*arguments: str) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", str(launcher / "follow.sh"), *arguments], env=environment, capture_output=True, text=True, timeout=120)
 
+    def started_pid() -> int:
+        for _ in range(100):
+            if (state / "r7.pid").is_file() and Path(f"/proc/{(state / 'r7.pid').read_text().strip()}").exists():
+                return int((state / "r7.pid").read_text())
+            time.sleep(0.1)
+        raise AssertionError("no follower started")
+
     started = follow("start", str(spec), "5")
     assert started.returncode == 0 and "follower started" in started.stdout, started.stderr
-    pid = int((state / "r7.pid").read_text())
+    pid, supervisor = started_pid(), int((state / "r7.supervisor").read_text())
     try:
         # Its own session, so the terminal that started it can close; the round is recorded with its settings.
-        assert os.getsid(pid) == pid != os.getsid(0)
+        assert os.getsid(pid) == supervisor != os.getsid(0)
         assert (state / "rounds/r7").read_text().splitlines() == [str(spec), "5"]
         assert "export OPS_BUCKET=ops-bucket" in (state / "r7.env").read_text()
         assert "already runs" in follow("start", str(spec)).stdout
         assert "running (pid" in follow("status").stdout
         stopped = follow("stop", "r7")
         assert stopped.returncode == 0 and "stopped" in stopped.stdout
-        assert not Path(f"/proc/{pid}").exists() and not (state / "rounds/r7").exists()
+        assert not Path(f"/proc/{pid}").exists() and not Path(f"/proc/{supervisor}").exists() and not (state / "rounds/r7").exists()
         assert (state / "r7.log").read_text() == "stopped\n"
-        # A follower killed with its machine is started again by ensure, as the app's restart runs it; a stopped one not.
+        # A follower that dies while its round is recorded is started again by its supervisor.
         assert follow("start", str(spec), "5").returncode == 0
-        os.kill(int((state / "r7.pid").read_text()), signal.SIGKILL)
+        pid = started_pid()
+        os.kill(pid, signal.SIGKILL)
+        for _ in range(100):
+            if (state / "r7.pid").read_text().strip() != str(pid) and Path(f"/proc/{(state / 'r7.pid').read_text().strip()}").exists():
+                break
+            time.sleep(0.1)
+        assert int((state / "r7.pid").read_text()) != pid and "started again" in (state / "r7.out").read_text()
+        # Killed with its machine (the supervisor too), it is started again by ensure, as the app's restart runs it; a
+        # stopped one not.
+        os.kill(int((state / "r7.supervisor").read_text()), signal.SIGKILL)
+        os.kill(started_pid(), signal.SIGKILL)
         time.sleep(0.5)
         assert "not running" in follow("status").stdout
         assert follow("ensure").returncode == 0
-        pid = int((state / "r7.pid").read_text())
-        assert Path(f"/proc/{pid}").exists()
+        assert Path(f"/proc/{started_pid()}").exists()
         follow("stop", "r7")
         assert follow("ensure").returncode == 0 and not Path(f"/proc/{int((state / 'r7.pid').read_text())}").exists()
     finally:

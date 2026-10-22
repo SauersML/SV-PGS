@@ -157,6 +157,8 @@ WORKSPACE_ENVIRONMENT = (
     "WORKSPACE_CDR", "IMPUTED_BUCKET", "PANEL_BUCKET",
 )
 """submit.sh's settings that are the workspace's, the same for every job of every round: read from the environment."""
+REGIONS = "regions"
+"""A run's regional fits under run/ (workspace_pipeline.REGIONS_DIRECTORY), each with its own restart units and partials."""
 ROUNDS = "_rounds"
 """The ops bucket's directory under svpgs/ of each round's one staging (STAGED_SOURCE) and its record (round.json)."""
 OPS_MOUNT = "/mnt/disks/ops/svpgs"
@@ -259,6 +261,15 @@ LAYOUTS = {
 
 class RoundError(ValueError):
     """A spec, a check or a cloud state that stops the round before anything is submitted."""
+
+
+class Unavailable(RoundError):
+    """A read of the cloud that failed, not one that found nothing: nothing is decided on it, and a follower's next pass
+    reads again."""
+
+
+class Contended(RoundError):
+    """Another follower holds the round, or took it from this one (Lease)."""
 
 
 # ---------------------------------------------------------------------------
@@ -493,22 +504,40 @@ class Gcloud:
     def _run(self, arguments: list, change: bool = False) -> subprocess.CompletedProcess:
         if change and not self.execute:
             raise RuntimeError("a change to the cloud outside --execute")
-        done = subprocess.run(["gcloud", *arguments], capture_output=True, text=True, check=False)
+        try:
+            done = subprocess.run(["gcloud", *arguments], capture_output=True, text=True, check=False, timeout=COMMAND_SECONDS)
+        except subprocess.TimeoutExpired:
+            raise (RoundError if change else Unavailable)(f"gcloud {' '.join(arguments[:3])} did not finish in {COMMAND_SECONDS} s") from None
         if change and done.returncode != 0:
+            if PRECONDITION.search(done.stderr):
+                raise Contended(f"gcloud {' '.join(arguments[:2])}: the object changed since it was read")
             raise RoundError(f"gcloud {' '.join(arguments[:2])} failed: {done.stderr.strip()[-500:]}")
         return done
 
+    def _read(self, arguments: list):
+        """A read's output, or None where what it reads is absent; Unavailable where it failed otherwise."""
+        done = self._run(arguments)
+        if done.returncode == 0:
+            return done.stdout
+        if ABSENT.search(done.stderr):
+            return None
+        raise Unavailable(f"gcloud {' '.join(arguments[:3])} failed: {done.stderr.strip()[-300:]}")
+
     def read(self, path: str):
         """An object's text, or None where there is none."""
-        shown = self._run(["storage", "cat", self.url(path)])
-        return shown.stdout if shown.returncode == 0 else None
+        return self._read(["storage", "cat", self.url(path)])
+
+    def generation(self, path: str):
+        """An object's generation, or None where there is none."""
+        shown = self._read(["storage", "objects", "describe", self.url(path), "--format=json"])
+        return None if shown is None else int(json.loads(shown)["generation"])
 
     def listing(self, path: str) -> dict:
         """Every object under the directory ``path``: its name relative to it, and its size."""
         root = self.url(path.rstrip("/") + "/")
-        shown = self._run(["storage", "ls", "-l", "-r", root])
+        shown = self._read(["storage", "ls", "-l", "-r", root])
         found = {}
-        for line in shown.stdout.splitlines() if shown.returncode == 0 else ():
+        for line in (shown or "").splitlines():
             matched = re.match(r"^\s*(\d+)\s+\S+\s+(gs://\S+)$", line)
             if matched and matched.group(2).startswith(root) and not matched.group(2).endswith("/"):
                 found[matched.group(2)[len(root):]] = int(matched.group(1))
@@ -516,29 +545,26 @@ class Gcloud:
 
     def size(self, path: str):
         """One object's size, or None where there is none."""
-        shown = self._run(["storage", "ls", "-l", self.url(path)])
-        matched = re.match(r"^\s*(\d+)\s", shown.stdout) if shown.returncode == 0 else None
+        matched = re.match(r"^\s*(\d+)\s", self._read(["storage", "ls", "-l", self.url(path)]) or "")
         return int(matched.group(1)) if matched else None
 
     def children(self, path: str) -> set:
         """The names directly under the directory ``path`` (one listing, not recursive)."""
         root = self.url(path.rstrip("/") + "/") if path else self.url("")
-        shown = self._run(["storage", "ls", root])
-        lines = shown.stdout.splitlines() if shown.returncode == 0 else []
+        lines = (self._read(["storage", "ls", root]) or "").splitlines()
         return {line[len(root):].strip("/") for line in lines if line.startswith(root) and line[len(root):].strip("/")}
 
     def completed(self, run: str) -> set:
         """The steps a run's mirror holds completed: one listing of its run/*/_COMPLETE.json."""
-        shown = self._run(["storage", "ls", self.url(f"{run}/run/*/{COMPLETE}")])
-        lines = shown.stdout.splitlines() if shown.returncode == 0 else []
+        lines = (self._read(["storage", "ls", self.url(f"{run}/run/*/{COMPLETE}")]) or "").splitlines()
         return {matched.group(1) for line in lines for matched in [re.search(r"/run/([^/]+)/" + re.escape(COMPLETE) + "$", line.strip())] if matched}
 
     def models(self, run: str) -> dict:
         """The saved models a run's mirror holds where warm_start_models looks (WARM_PATTERN): each model's directory
         under svpgs/ by (arm, trait), from one listing of their model.json."""
-        shown = self._run(["storage", "ls", self.url(WARM_PATTERN.format(run=run).format(arm="*", trait="*") + "/model.json")])
+        shown = self._read(["storage", "ls", self.url(WARM_PATTERN.format(run=run).format(arm="*", trait="*") + "/model.json")])
         found: dict = {}
-        for line in shown.stdout.splitlines() if shown.returncode == 0 else ():
+        for line in (shown or "").splitlines():
             matched = re.search(r"/svpgs/(" + re.escape(run) + r"/run/fit[^/]*/models/([^/]+)/([^/]+))/model\.json$", line.strip())
             if matched:
                 found.setdefault((matched.group(2), matched.group(3)), []).append(matched.group(1))
@@ -574,31 +600,38 @@ class Gcloud:
         """A local directory into the directory ``parent``, under its own name."""
         self._run(["storage", "cp", "-r", str(local), self.url(parent) + "/"], change=True)
 
-    def write(self, target: str, text: str) -> None:
+    def write(self, target: str, text: str, generation=None) -> None:
+        """An object's text; where ``generation`` is given, only over that generation of it (0: where there is none),
+        else Contended."""
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "object"
             path.write_text(text, encoding="utf-8")
-            self._run(["storage", "cp", str(path), self.url(target)], change=True)
+            match = [] if generation is None else [f"--if-generation-match={int(generation)}"]
+            self._run(["storage", "cp", str(path), self.url(target), *match], change=True)
 
     def job_state(self, name: str, project: str, region: str):
-        shown = self._run(["batch", "jobs", "describe", name, f"--project={project}", f"--location={region}", "--format=value(status.state)"])
-        return (shown.stdout.strip() or None) if shown.returncode == 0 else None
+        shown = self._read(["batch", "jobs", "describe", name, f"--project={project}", f"--location={region}", "--format=value(status.state)"])
+        return (shown or "").strip() or None
 
     def job(self, name: str, project: str, region: str):
         """A job's record (gcloud batch jobs describe), or None where there is no such job."""
-        shown = self._run(["batch", "jobs", "describe", name, f"--project={project}", f"--location={region}", "--format=json"])
-        try:
-            return json.loads(shown.stdout) if shown.returncode == 0 else None
-        except ValueError:
+        shown = self._read(["batch", "jobs", "describe", name, f"--project={project}", f"--location={region}", "--format=json"])
+        if shown is None:
             return None
+        try:
+            return json.loads(shown)
+        except ValueError:
+            raise Unavailable(f"gcloud batch jobs describe {name}: not JSON") from None
 
     def exits(self, name: str, project: str, region: str) -> list:
-        """Each task's exit codes, attempt by attempt (its status events'), or [] where they cannot be read."""
-        shown = self._run(["batch", "tasks", "list", f"--job={name}", f"--project={project}", f"--location={region}", "--format=json"])
-        try:
-            tasks = json.loads(shown.stdout) if shown.returncode == 0 else []
-        except ValueError:
+        """Each task's exit codes, attempt by attempt (its status events'), or [] where the job has no tasks."""
+        shown = self._read(["batch", "tasks", "list", f"--job={name}", f"--project={project}", f"--location={region}", "--format=json"])
+        if shown is None:
             return []
+        try:
+            tasks = json.loads(shown)
+        except ValueError:
+            raise Unavailable(f"gcloud batch tasks list {name}: not JSON") from None
         return [[event["taskExecution"]["exitCode"] for event in task.get("status", {}).get("statusEvents", [])
                  if isinstance(event.get("taskExecution", {}).get("exitCode"), int)] for task in tasks]
 
@@ -606,9 +639,9 @@ class Gcloud:
         """Every object under the directory ``path``: its name relative to it, and when it was written (seconds since
         the epoch; a listing's time, which is UTC, is never shown)."""
         root = self.url(path.rstrip("/") + "/")
-        shown = self._run(["storage", "ls", "-l", "-r", root])
+        shown = self._read(["storage", "ls", "-l", "-r", root])
         found = {}
-        for line in shown.stdout.splitlines() if shown.returncode == 0 else ():
+        for line in (shown or "").splitlines():
             matched = re.match(r"^\s*\d+\s+(\S+)\s+(gs://\S+)$", line)
             if matched and matched.group(2).startswith(root) and not matched.group(2).endswith("/"):
                 try:
@@ -617,8 +650,9 @@ class Gcloud:
                     continue
         return found
 
-    def remove(self, path: str) -> None:
-        self._run(["storage", "rm", self.url(path)], change=True)
+    def remove(self, path: str, generation=None) -> None:
+        match = [] if generation is None else [f"--if-generation-match={int(generation)}"]
+        self._run(["storage", "rm", self.url(path), *match], change=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1313,12 +1347,26 @@ def copy_step(cloud: Gcloud, holder: str, run_id: str, step: str) -> None:
     cloud.copy(f"{source}/{COMPLETE}", f"{target}/{COMPLETE}")
 
 
+JOB_ENVIRONMENT = (
+    "RUN_ID", "BUDGET_SLOT", "THROUGH", "STAGED_SOURCE", "BASE_RUN", "FIT_ARMS", "PARALLEL_ARMS", "PARTNER_RUN", "MACHINE_TYPE", "GPU_TYPE",
+    "GPU_COUNT", "PROVISIONING_MODEL", "MAX_RETRIES", "MAX_RUN_HOURS", "MAX_RUN_SECONDS", "RUN_DISK_TYPE", "RUN_DISK_GB", "SHARED_RUNTIME",
+    "UV_EXTRAS", "HOURLY_USD", "TASK_COUNT", "STORE_SHARDS", "AFTER_SCRIPT",
+)
+"""submit.sh's settings that are each job's: a job gets the plan's, or submit.sh's default, never the shell's."""
+SUBMIT_SECONDS = 1800
+
+
 def submit(entry: dict, launcher: Path) -> None:
     """submit.sh with the job's command (fit, store or merge) and environment over the workspace's."""
     missing = [name for name in WORKSPACE_ENVIRONMENT if not os.environ.get(name)]
     if missing:
         raise RoundError(f"the environment lacks the workspace's {missing}")
-    done = subprocess.run(["bash", str(launcher / "submit.sh"), entry["command"]], env=dict(os.environ, **entry["environment"]), capture_output=True, text=True, check=False)
+    environment = {name: value for name, value in os.environ.items() if name not in JOB_ENVIRONMENT}
+    try:
+        done = subprocess.run(["bash", str(launcher / "submit.sh"), entry["command"]], env=dict(environment, **entry["environment"]), capture_output=True,
+                              text=True, check=False, timeout=SUBMIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RoundError(f"{entry['name']}: submit.sh did not finish in {SUBMIT_SECONDS} s") from None
     if done.returncode != 0:
         raise RoundError(f"{entry['name']} was not submitted: {done.stderr.strip()[-500:]}")
     print(f"submitted {entry['name']}", flush=True)
@@ -1355,11 +1403,15 @@ FOLLOW = "follow"
 """Under the round's staging, --follow's own objects: chains/<job>.json (each job it submitted for a planned job, with
 why), lease.json (the follower that holds the round), follow.log (every action), and STOP, which a person writes to
 stop every follower of the round."""
+KILLED = ("exit-137", "exit-139")
+"""run_step.sh's markers of a driver the kernel killed (out of host memory) or that crashed: the same code fails the same
+way on the same data, like an error the driver names."""
 ON_VM_EXITS = {50001: "preempted", 50003: "preempted", 50006: "preempted", 75: "preempted", 50005: "time-cap", 50002: "vm-lost", 50004: "vm-lost"}
 """A task's last exit that Batch, not the task, chose: its VM went away and Batch's retries ran out (the job templates'
 RETRY_TASK codes), its attempt reached maxRunDuration, or its VM stopped answering."""
 TASK_EXITS = {"exit-push-stuck": "push-stuck", "exit-no-gpu": "no-gpu", "exit-restore": "restore", "exit-push": "push", "exit-install": "install",
-              "exit-source": "source", "exit-adopt": "adopt", "exit-after": "after", "merge-waiting": "merge-waiting"}
+              "exit-source": "source", "exit-adopt": "adopt", "exit-after": "after", "exit-check": "check",
+              "merge-waiting": "merge-waiting"}
 """run_step.sh's markers of a task that stopped before or after its driver, and why."""
 RESUBMITTED = {"preempted": None, "time-cap": None, "vm-lost": 1, "push-stuck": 1, "no-gpu": 1, "restore": 1, "push": 1}
 """The reasons a failed job is resubmitted for, and how often one chain may fail for each (None: as often as the chain's
@@ -1373,6 +1425,14 @@ ACTIVE = ("QUEUED", "SCHEDULED", "SCHEDULED_PENDING_QUEUED", "RUNNING", "SUBMITT
 SUBMITTING_SECONDS = 600
 """A recorded job Batch does not show is taken as still being submitted for this long, then as deleted."""
 MARKER_TIME = re.compile(r"^(\d{8}T\d{6}Z)_(.+)$")
+ABSENT = re.compile(r"matched no objects|NOT_FOUND|not found|No such object|\b404\b", re.IGNORECASE)
+"""A gcloud read's error that says what it reads is not there (an object, a listing's prefix, a job), not that it failed."""
+PRECONDITION = re.compile(r"\b412\b|precondition", re.IGNORECASE)
+"""A gcloud write's error that says the object is not at the generation the write named."""
+CONTENDED = 4
+"""round.py's exit where another follower holds the round: follow.sh does not start this one again."""
+COMMAND_SECONDS = 600
+"""The longest one gcloud command may take; a read cut there is Unavailable, and the pass is tried again."""
 
 
 def _local_time(seconds: float) -> str:
@@ -1398,17 +1458,21 @@ def classify(record: dict, exits: list, markers: list) -> tuple:
     a job whose last attempt was preempted failed for that, whatever an earlier attempt marked."""
     last = [codes[-1] for codes in exits if codes]
     failed = [code for code in last if code != 0]
-    for code in failed:
-        if code in ON_VM_EXITS:
-            return ON_VM_EXITS[code], f"exit {code}"
+    # A fan-out's task that failed on its own decides, though another task's VM went away.
+    if failed and all(code in ON_VM_EXITS for code in failed):
+        return ON_VM_EXITS[failed[-1]], f"exit {failed[-1]}"
     events = [matched.group(2) for matched in map(MARKER_TIME.match, markers) if matched]
     # A store fan-out's task markers carry its chromosome index: task_<index>-<event>.
     task = [re.sub(r"^\d+-", "", event[len("task_"):]) for event in events if event.startswith("task_")]
-    if 3 in failed or "exit-push-stuck" in task:
-        return "push-stuck", "its pushes kept failing"
-    driver = [event for event in events if not event.startswith("task_") and "_failed-" in event]
+    # A driver interrupted from outside (run_step.sh's INT) names no error of its own.
+    driver = [event for event in events if not event.startswith("task_") and "_failed-" in event and not event.endswith("failed-KeyboardInterrupt")]
     if driver:
         return "driver", driver[-1]
+    killed = [marker for marker in task if marker in KILLED]
+    if killed or any(code in (137, 139) for code in failed):
+        return "killed", killed[-1] if killed else f"exits {failed}"
+    if 3 in failed or "exit-push-stuck" in task:
+        return "push-stuck", "its pushes kept failing"
     for marker, reason in TASK_EXITS.items():
         if marker in task:
             return reason, marker
@@ -1430,6 +1494,7 @@ class Follower:
         self.records: dict = {}
         self.chains: dict = {}
         self.ended: dict = {}
+        self.lease = None
         self.cap = plan.spec["spend_cap_usd"] or spend_cap(plan)
         budget = Path(os.environ.get("STUDY_BUDGET") or HERE / "study_budget.template.json")
         self.slots = json.loads(budget.read_text(encoding="utf-8"))["slots"]
@@ -1513,7 +1578,9 @@ class Follower:
                     # A record without Batch's times (createTime, its events): its hours cannot be read.
                     hours = 0.0
                 rate, _unpriced = spend.usd_per_hour(*spend.shape_of(record))
-                total += hours * (rate if rate is not None else entry["rate"])
+                # Each task of a fan-out is its own VM for as long as the job, at most (spend.report).
+                tasks = int(record.get("taskGroups", [{}])[0].get("taskCount", 1))
+                total += hours * tasks * (rate if rate is not None else entry["rate"])
         return total
 
     def free_slot(self, run: str, slot: str):
@@ -1532,7 +1599,7 @@ class Follower:
         events = record.get("status", {}).get("statusEvents", [])
         began = [spend.moment(event["eventTime"]).timestamp() for event in events if "to RUNNING" in event.get("description", "")]
         since = max(began) if began else spend.moment(record["createTime"]).timestamp()
-        written = [stamp for path in ("run/restart", "run/fit.partial", "run/score.partial", "run/effects.partial")
+        written = [stamp for path in ("run/restart", "run/fit.partial", "run/score.partial", "run/effects.partial", f"run/{REGIONS}")
                    for stamp in self.cloud.stamped(f"{run}/{path}").values()]
         return any(stamp > since for stamp in written)
 
@@ -1543,12 +1610,47 @@ class Follower:
             self.say("refused", job=job["name"], why=f"the round has spent ${spent:.0f} of its ${self.cap:.0f} cap (spend_cap_usd)")
             self.ended[entry["name"]] = ("FAILED", "spend cap")
             return False
-        jobs = self.chain(entry) + [dict(job, time=self.clock())]
-        self.cloud.write(f"{self.root}/chains/{entry['name']}.json", json.dumps({"jobs": jobs}, indent=2) + "\n")
+        if self.lease is not None:
+            # The round is still this follower's (Lease.renew raises Contended where another took it).
+            self.lease.renew()
+        before = self.chain(entry)
+        jobs = before + [dict(job, time=self.clock())]
+        path = f"{self.root}/chains/{entry['name']}.json"
+        self.cloud.write(path, json.dumps({"jobs": jobs}, indent=2) + "\n")
         self.chains[entry["name"]] = jobs
-        submit(dict(entry, name=job["name"], run_id=job["run_id"], environment=job["environment"]), self.launcher)
+        try:
+            submit(dict(entry, name=job["name"], run_id=job["run_id"], environment=job["environment"]), self.launcher)
+        except RoundError as error:
+            # Not submitted: the chain is as it was, and the next pass tries again (a planned job on a free slot where
+            # submit.sh reserved its own, ``follow``).
+            self.say("not submitted", job=job["name"], reason=job["reason"], why=str(error)[-300:])
+            if before:
+                self.cloud.write(path, json.dumps({"jobs": before}, indent=2) + "\n")
+            else:
+                self.cloud.remove(path)
+            self.chains[entry["name"]] = before
+            raise
         self.say("submitted", job=job["name"], reason=job["reason"], spent_usd=round(spent, 2), cap_usd=self.cap)
         return True
+
+    def send_planned(self, planned: dict, entry: dict, waiting: list) -> None:
+        """The planned job ``entry`` (``planned``'s, or its CPU merge in the run that got further) submitted on its own
+        slot. Where a submission reserved that slot and made no job (it failed, or its follower died during it), on
+        another slot like it once the reservation is SUBMITTING_SECONDS old (a submission still running has its job by
+        then); before that it waits."""
+        run, slot = entry["run_id"], entry["environment"]["BUDGET_SLOT"]
+        reserved = self.cloud.stamped(f"{run}/budget/slots").get(f"{slot}.json")
+        if reserved is not None:
+            if self.clock() - reserved < SUBMITTING_SECONDS:
+                waiting.append((planned["name"], {slot: "reserved just now, its job not yet in Batch"}))
+                return
+            slot = self.free_slot(run, slot)
+            if slot is None:
+                self.ended[planned["name"]] = ("FAILED", f"{run} has no free budget slot like {entry['environment']['BUDGET_SLOT']}")
+                self.say("ended", job=planned["name"], why=self.ended[planned["name"]][1])
+                return
+        self.send(planned, {"name": f"svpgs-{run}-{slot}", "run_id": run, "slot": slot, "environment": dict(entry["environment"], BUDGET_SLOT=slot),
+                            "reason": "planned"})
 
     def resubmit(self) -> None:
         """Each chain whose latest job FAILED: resubmitted on a free slot of its run where its reason allows (RESUBMITTED)
@@ -1659,7 +1761,13 @@ def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str,
             runs = [entry["destination"]] + [run for run, _arms in entry["sources"]]
             keys = {run: cloud.read(f"{run}/run/fit.partial/_KEY") for run in runs}
             if None in keys.values() or len(set(keys.values())) != 1:
-                waiting.append((entry["name"], {run: "fit key " + ("missing" if key is None else key[:12]) for run, key in keys.items()}))
+                found = {run: "fit key " + ("missing" if key is None else key[:12]) for run, key in keys.items()}
+                if not cloud.execute:
+                    waiting.append((entry["name"], found))
+                    continue
+                # Every job it waits for SUCCEEDED, so nothing will make the keys agree.
+                follower.ended[entry["name"]] = ("FAILED", "its runs' fits ended without one fit key: " + ", ".join(f"{run} {text}" for run, text in found.items()))
+                follower.say("ended", job=entry["name"], why=follower.ended[entry["name"]][1])
                 continue
         if not cloud.execute:
             waiting.append((entry["name"], {name: f"{value}: ready, --execute submits it" for name, value in before.items()}))
@@ -1671,8 +1779,12 @@ def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str,
                 cloud.copy_tree(source, target, skip=records)
                 for name in records:
                     cloud.copy(f"{source}/{name}", f"{target}/{name}")
-        follower.send(planned, {"name": entry["name"], "run_id": entry["run_id"], "slot": entry["environment"]["BUDGET_SLOT"],
-                                "environment": entry["environment"], "reason": "planned"})
+        follower.send_planned(planned, entry, waiting)
+    if cloud.execute and cloud.read(f"{plan.staging}/round.json") is not None:
+        # The jobs --execute submits, where it stopped before submitting them all (a refused submission): this pass's.
+        for entry in ([plan.store] if plan.store else []) + [entry for entry in plan.jobs if not entry["after"]]:
+            if not follower.chain(entry) and entry["name"] not in follower.ended:
+                follower.send_planned(entry, entry, waiting)
     return waiting
 
 
@@ -1688,14 +1800,20 @@ def _alive(pid) -> bool:
 
 class Lease:
     """The one follower of a round: a lock file on this machine (and the follower's pid beside it) and, in the bucket,
-    FOLLOW/lease.json naming the holder, written again each pass. A follower elsewhere whose lease is fresher than
-    ``stale`` seconds holds the round: this one refuses to start. Released on every exit."""
+    FOLLOW/lease.json naming the holder, taken and written again each pass and before each submission only over the
+    generation this follower last wrote (a generation precondition), so of two followers that read it at once one takes
+    it, and one whose lease another took (it had gone stale) stops before it submits anything (Contended). A follower
+    elsewhere whose lease is fresher than ``stale`` seconds holds the round: this one refuses to start. Released on every
+    exit, only where it is still this follower's."""
 
     def __init__(self, cloud: Gcloud, plan: Plan, directory: Path, stale: float) -> None:
+        import uuid
+
         self.cloud, self.path, self.stale = cloud, f"{plan.staging}/{FOLLOW}/lease.json", stale
         self.directory, self.round = directory, plan.spec["round"]
-        self.me = {"host": os.uname().nodename, "pid": os.getpid()}
+        self.me = {"host": os.uname().nodename, "pid": os.getpid(), "token": uuid.uuid4().hex}
         self.handle = None
+        self.held = None
 
     def __enter__(self):
         import fcntl
@@ -1706,20 +1824,25 @@ class Lease:
             fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self.handle.close()
-            raise RoundError(f"a follower of round {self.round} already runs on this machine (pid {self._pid()}): follow.sh stop it first")
-        held = self.cloud.read(self.path)
-        if held is not None:
-            try:
-                holder = json.loads(held)
-            except ValueError:
-                holder = {}
-            age = time.time() - float(holder.get("time", 0))
-            dead = holder.get("host") == self.me["host"] and not _alive(holder.get("pid"))
-            if (holder.get("host"), holder.get("pid")) != (self.me["host"], self.me["pid"]) and age < self.stale and not dead:
-                self.handle.close()
-                raise RoundError(f"round {self.round} is followed by pid {holder.get('pid')} on {holder.get('host')}, seen {age / 60:.0f} minutes ago: stop it first")
+            raise Contended(f"a follower of round {self.round} already runs on this machine (pid {self._pid()}): follow.sh stop it first")
+        try:
+            generation = self.cloud.generation(self.path)
+            text = None if generation is None else self.cloud.read(self.path)
+            if text is not None:
+                try:
+                    holder = json.loads(text)
+                except ValueError:
+                    holder = {}
+                age = time.time() - float(holder.get("time", 0))
+                dead = holder.get("host") == self.me["host"] and not _alive(holder.get("pid"))
+                if age < self.stale and not dead:
+                    raise Contended(f"round {self.round} is followed by pid {holder.get('pid')} on {holder.get('host')}, seen {age / 60:.0f} minutes ago: stop it first")
+            self.held = 0 if text is None else generation
+            self.renew()
+        except BaseException:
+            self.handle.close()
+            raise
         (self.directory / f"{self.round}.pid").write_text(f"{os.getpid()}\n")
-        self.renew()
         return self
 
     def _pid(self) -> str:
@@ -1729,13 +1852,24 @@ class Lease:
             return "?"
 
     def renew(self) -> None:
-        self.cloud.write(self.path, json.dumps(dict(self.me, time=time.time())) + "\n")
+        """The lease written again over the generation this follower holds; Contended where another follower took it."""
+        try:
+            self.cloud.write(self.path, json.dumps(dict(self.me, time=time.time())) + "\n", generation=self.held)
+        except Contended:
+            self.held = None
+            raise Contended(f"round {self.round}: another follower took the lease, so this one submits nothing more") from None
+        generation = self.cloud.generation(self.path)
+        if generation is None or json.loads(self.cloud.read(self.path) or "{}").get("token") != self.me["token"]:
+            self.held = None
+            raise Contended(f"round {self.round}: another follower wrote the lease, so this one submits nothing more")
+        self.held = generation
 
     def __exit__(self, *raised) -> bool:
-        try:
-            self.cloud.remove(self.path)
-        except RoundError:
-            pass
+        if self.held:
+            try:
+                self.cloud.remove(self.path, generation=self.held)
+            except RoundError:
+                pass
         (self.directory / f"{self.round}.pid").unlink(missing_ok=True)
         self.handle.close()
         return False
@@ -1746,9 +1880,10 @@ def watch(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str, 
     has ended: every chain SUCCEEDED or ended failed, nothing waiting. A STOP object under FOLLOW, or TERM or INT (follow.sh
     stop), ends it between passes. With --execute it holds the round's Lease, so one follower runs, and logs every action
     to ``directory``/<round>.log and FOLLOW/follow.log; a round that ended or was STOPped leaves ``directory``/rounds, so
-    follow.sh ensure does not start it again. Returns 0 where every planned job SUCCEEDED or the follower was stopped, 1
-    where the round ended with a job failed. HUP is not caught: the follower runs in its own session (follow.sh), and a
-    terminal closing is no reason to stop."""
+    follow.sh ensure does not start it again. A pass that fails (a read that failed, a submission refused) is logged and
+    the next one tries again; one whose lease another follower took ends the follower (Contended). Returns 0 where every
+    planned job SUCCEEDED or the follower was stopped, 1 where the round ended with a job failed. HUP is not caught: the
+    follower runs in its own session (follow.sh), and a terminal closing is no reason to stop."""
     import signal
 
     stopping: list = []
@@ -1766,32 +1901,45 @@ def watch(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str, 
     stale = max(3 * minutes * 60, 1800)
     lease = Lease(cloud, plan, directory, stale) if cloud.execute else None
     with lease if lease is not None else contextlib.nullcontext():
+        follower.lease = lease
         follower.say("follow started", round=plan.spec["round"], pid=os.getpid(), every_minutes=minutes, cap_usd=follower.cap)
+        failures = 0
         while True:
-            if cloud.read(f"{plan.staging}/{FOLLOW}/STOP") is not None:
-                follower.say("follow stopped", why=f"svpgs/{plan.staging}/{FOLLOW}/STOP exists")
-                if cloud.execute:
-                    recorded.unlink(missing_ok=True)
-                return 0
-            follower.forget()
-            follower.resubmit()
-            waiting = follow(plan, cloud, launcher, project, region, follower)
-            for name, states in waiting:
-                print(f"{name}: " + ", ".join(f"{run} {state}" for run, state in states.items()), flush=True)
-            states = {entry["name"]: follower.state(entry) for entry in follower.entries()}
-            active = sorted(name for name, state in states.items() if state in ACTIVE)
-            if not waiting and not active:
-                failed = {name: follower.ended.get(name, ("FAILED", state or "never submitted (round.py --execute submits it)"))[1]
-                          for name, state in states.items() if state != "SUCCEEDED"}
-                follower.say("follow ended", succeeded=sum(state == "SUCCEEDED" for state in states.values()), failed=failed)
-                if cloud.execute:
-                    recorded.unlink(missing_ok=True)
-                return 1 if failed else 0
+            try:
+                if cloud.read(f"{plan.staging}/{FOLLOW}/STOP") is not None:
+                    follower.say("follow stopped", why=f"svpgs/{plan.staging}/{FOLLOW}/STOP exists")
+                    if cloud.execute:
+                        recorded.unlink(missing_ok=True)
+                    return 0
+                follower.forget()
+                follower.resubmit()
+                waiting = follow(plan, cloud, launcher, project, region, follower)
+                for name, states in waiting:
+                    print(f"{name}: " + ", ".join(f"{run} {state}" for run, state in states.items()), flush=True)
+                states = {entry["name"]: follower.state(entry) for entry in follower.entries()}
+                active = sorted(name for name, state in states.items() if state in ACTIVE)
+                if not waiting and not active:
+                    failed = {name: follower.ended.get(name, ("FAILED", state or "never submitted (round.py --execute submits it)"))[1]
+                              for name, state in states.items() if state != "SUCCEEDED"}
+                    follower.say("follow ended", succeeded=sum(state == "SUCCEEDED" for state in states.values()), failed=failed)
+                    if cloud.execute:
+                        recorded.unlink(missing_ok=True)
+                    return 1 if failed else 0
+                if lease is not None:
+                    lease.renew()
+                failures = 0
+            except Contended as error:
+                follower.say("follow ended", why=str(error))
+                raise
+            except Exception as error:  # noqa: BLE001 - a failed pass is tried again; only a lost lease ends the follower
+                if minutes <= 0:
+                    raise
+                failures += 1
+                follower.say("pass failed", why=f"{type(error).__name__}: {str(error)[-300:]}", failures_in_a_row=failures)
             if minutes <= 0:
                 return 0
-            if lease is not None:
-                lease.renew()
-            deadline = time.time() + minutes * 60
+            # Passes that keep failing (the cloud unreachable) are spaced out to at most an hour.
+            deadline = time.time() + min(minutes * 60 * 2 ** min(failures, 6), max(minutes * 60, 3600))
             while time.time() < deadline and not stopping:
                 time.sleep(min(5.0, max(deadline - time.time(), 0)))
             if stopping:
@@ -1827,6 +1975,9 @@ def main(argv=None) -> int:
         print(render(plan), flush=True)
         if args.execute:
             execute(plan, cloud, HERE)
+    except Contended as error:
+        print(f"round: {error}", file=sys.stderr)
+        return CONTENDED
     except RoundError as error:
         print(f"round: {error}", file=sys.stderr)
         return 2

@@ -161,12 +161,17 @@ base=()
 # A push is given PUSH_SECONDS (the 150 GB LD store of a whole-genome Stage 0 took 10 minutes at the 257 MB/s the
 # workspace's composite upload measured): a push hung on a stalled stream would hold the lock every later push waits
 # on. timeout signals the push's whole process group, its upload processes with it; a push cut short leaves each unit
-# whole or absent on the mirror (sv_pgs/run_mirror.py), and the next sends the rest.
+# whole or absent on the mirror (sv_pgs/run_mirror.py), and the next sends the rest. A push waits for the lock as long
+# as it may run, so the last push's limit bounds its wait for one still running too. A restore is given RESTORE_SECONDS
+# (the whole-genome store and Stage 0, 700 GB, came back in under an hour) and an adoption ADOPT_SECONDS: a download
+# that retries without end would hold the VM until the job's cap.
 PUSH_SECONDS=3600
+RESTORE_SECONDS=10800
+ADOPT_SECONDS=3600
 mirror() {
-  local limit=()
-  [ "$1" != push ] || limit=(timeout -k 60 "${PUSH_LIMIT:-$PUSH_SECONDS}")
-  flock "$RUN/mirror.lock" ${limit[@]+"${limit[@]}"} "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" \
+  local seconds
+  case "$1" in push) seconds="${PUSH_LIMIT:-$PUSH_SECONDS}" ;; restore) seconds=$RESTORE_SECONDS ;; *) seconds=$ADOPT_SECONDS ;; esac
+  flock -w "$seconds" "$RUN/mirror.lock" timeout -k 60 "$seconds" "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" \
     --mirror "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run" ${base[@]+"${base[@]}"} ${fit_arm[@]+"${fit_arm[@]}"} "${@:2}"
 }
 finishing=()
@@ -207,7 +212,13 @@ push_loop() {
 }
 stuck=""
 driver=""
-trap 'stuck=1; [ -z "$driver" ] || kill -TERM "$driver" 2>/dev/null' USR1
+# A driver told to stop (TERM) that has not ended in DRIVER_GRACE seconds is killed; the watch ends with the driver.
+DRIVER_GRACE=300
+halt() {
+  kill -TERM "$1" 2>/dev/null || return 0
+  ( for _ in $(seq 1 "$DRIVER_GRACE"); do kill -0 "$1" 2>/dev/null || break; sleep 1; done; ! kill -0 "$1" 2>/dev/null || kill -KILL "$1" ) > /dev/null 2>&1 &
+}
+trap 'stuck=1; [ -z "$driver" ] || halt "$driver"' USR1
 push_loop &
 pusher=$!
 # Batch writes the task log to the bucket only when the task ends, so a fit gave no sign of its progress for hours. The
@@ -228,6 +239,8 @@ drive() {
   "$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} ${fit_arm[@]+"${fit_arm[@]}"} "$@" \
     2> >(tee -a "$RUN/driver.log" >&2) &
   driver=$!
+  # The pusher gave up between the check above and here: the trap saw no driver to stop.
+  [ -z "$stuck" ] || halt "$driver"
   local code
   wait "$driver"; code=$?
   while kill -0 "$driver" 2>/dev/null; do wait "$driver"; code=$?; done
@@ -237,9 +250,18 @@ drive() {
 # An arm-only driver exits successfully with its arm's parts (StepPart): its models in fit.partial, its scores and
 # effects in score.partial and effects.partial, made while the store was on this disk. Its success is not a completed
 # run, which holds both arms and reaches the requested final step, in every region's directory when the run fits regions
-# (workspace_pipeline.completed_through).
+# (workspace_pipeline.completed_through). Its status: 0 completed, 3 not yet, any other the check failed. A staged tree
+# from before completed_through drives each step it runs to its end, so there the driver's success is the completed run:
+# the check's ImportError made evaluate jobs of runs aou-wl5 and aou-we6 end SUCCEEDED having done nothing (fastpgs).
+# Only a workspace_pipeline without completed_through counts so; a module that does not import is a failed check.
 completed() {
-  "$RUN/venv/bin/python" -c 'import sys; from sv_pgs.workspace_pipeline import WorkspaceConfig, completed_through; sys.exit(0 if completed_through(WorkspaceConfig.read(sys.argv[1]), sys.argv[2]) else 1)' "$OPS/run_config.json" "${THROUGH}"
+  "$RUN/venv/bin/python" -c '
+import sys
+from sv_pgs import workspace_pipeline
+if not hasattr(workspace_pipeline, "completed_through"):
+    sys.exit(0)
+config = workspace_pipeline.WorkspaceConfig.read(sys.argv[1])
+sys.exit(0 if workspace_pipeline.completed_through(config, sys.argv[2]) else 3)' "$OPS/run_config.json" "${THROUGH}"
 }
 # PARTNER_RUN ("${PARTNER_RUN}"): the run of this ops bucket that fits the other arm. Once this job's parts are pushed,
 # the partner's are adopted from its mirror if they are all there (run-mirror adopt), and the driver finishes the run
@@ -261,9 +283,13 @@ if [ "${MERGE}" = 1 ]; then
 else
   drive
   status=$?
-  if [ "$status" -eq 0 ] && [ -n "${PARTNER_RUN}" ] && ! completed; then
+  check=0
+  if [ "$status" -eq 0 ] && [ -n "${PARTNER_RUN}" ]; then completed || check=$?; fi
+  if [ "$check" -eq 3 ]; then
     mirror push || mark "push-failed"
     finish deferred
+  elif [ "$check" -ne 0 ]; then
+    mark "exit-check"; status=1
   fi
 fi
 kill "$sampler" 2>/dev/null
@@ -272,8 +298,12 @@ copy_progress
 # AFTER_SCRIPT ("${AFTER_SCRIPT}"), a script of the source tree, runs once the driver has finished, with RUN and OPS set,
 # its output beside the progress log: benchmarks/bench_real/aou_ldpred2.sh reads the steps the driver left. It runs only
 # in the job that holds the completed run.
-if [ "$status" -eq 0 ] && [ -n "${AFTER_SCRIPT}" ] && ! completed; then
+check=0
+if [ "$status" -eq 0 ] && [ -n "${AFTER_SCRIPT}" ]; then completed || check=$?; fi
+if [ "$check" -eq 3 ]; then
   mark "after-deferred"
+elif [ "$check" -ne 0 ]; then
+  mark "exit-check"; status=1
 elif [ "$status" -eq 0 ] && [ -n "${AFTER_SCRIPT}" ]; then
   mark "after-started"
   RUN="$RUN" OPS="$OPS" bash "$RUN/source/${AFTER_SCRIPT}" > "$(dirname "$0")/after-task${BATCH_TASK_INDEX}.log" 2>&1 \
@@ -291,7 +321,13 @@ if [ -n "$stuck" ]; then
 else
   mirror push || { mark "exit-push"; [ "$status" -ne 0 ] || status=1; }
 fi
-# A publication still writing is let finish: one cut short leaves no COMPLETE, so no job reads it, but its parts stay.
-[ -z "$publisher" ] || wait "$publisher"
+# A publication still writing is let finish, for PUBLISH_GRACE seconds at most: one cut short leaves no COMPLETE, so no
+# job reads it, but its parts stay; it is not the task's result.
+PUBLISH_GRACE=900
+if [ -n "$publisher" ]; then
+  for _ in $(seq 1 $((PUBLISH_GRACE / 5))); do kill -0 "$publisher" 2>/dev/null || break; sleep 5; done
+  kill "$publisher" 2>/dev/null || true
+  wait "$publisher" 2>/dev/null || true
+fi
 mark "exit-${status}"
 exit "$status"

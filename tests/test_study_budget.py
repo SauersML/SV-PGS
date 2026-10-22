@@ -466,7 +466,9 @@ _UV_ADOPTING = """#!/bin/bash
 # uv sync, as far as run_step.sh sees it: the venv with its interpreter and an sv-pgs that logs its calls and answers
 # run-mirror adopt with ADOPTED ("adopted" or "waiting").
 mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
-ln -sfn "PYTHON" "$UV_PROJECT_ENVIRONMENT/bin/python"
+# A wrapper, not a link: the interpreter finds its own environment (its packages) from its own path.
+printf '#!/bin/sh\\nexec PYTHON "$@"\\n' > "$UV_PROJECT_ENVIRONMENT/bin/python"
+chmod +x "$UV_PROJECT_ENVIRONMENT/bin/python"
 cat > "$UV_PROJECT_ENVIRONMENT/bin/sv-pgs" <<'STUB'
 #!/bin/bash
 echo "$*" >> "$(dirname "$0")/../../sv-pgs-calls"
@@ -483,7 +485,11 @@ def _ran_task(tmp_path: Path, script: str, name: str, adopted: str) -> tuple[lis
     (ops / "source").mkdir(parents=True)
     (ops / "source/uv.lock").write_text("version = 1\n")
     (ops / "source/pyproject.toml").write_text("[project]\nname = 'sv-pgs'\n")
-    (ops / "run_config.json").write_text(json.dumps({"run_directory": str(tmp_path / name / "pipeline")}))
+    # A whole run config, so the task's check of the completed run reads it (its run is not completed).
+    from tests.test_workspace_pipeline import _filled
+
+    config = json.loads(_filled((Path(__file__).parents[1] / "launcher/workspace/run_config.template.json").read_text()))
+    (ops / "run_config.json").write_text(json.dumps(dict(config, run_directory=str(tmp_path / name / "pipeline"))))
     staged = tmp_path / name / "staged"
     (staged / "bin").mkdir(parents=True)
     (staged / "bin/uv").write_text(_UV_ADOPTING.replace("PYTHON", sys.executable))

@@ -16,8 +16,9 @@ The durable state is what the driver resumes from:
   sets the fit step aside keeps them: a sealed unit (Stage 0 with its LD store, the far-field scale, the band, a
   block's codes) is pushed payload first and its manifest last, chunked in parallel, and a whole remote copy is never
   replaced, so a push cut short leaves the last whole copy or none; a mutable unit's self-checking files (an EB start,
-  a completed model's checkpoint) are each replaced whole, sent again when their size or modification time changes
-  (RECEIPT). A unit the fit released is removed from the mirror, but only by a disk that restored that build of it or
+  a completed model's checkpoint, a mode search's sources) are each replaced whole, sent again when their size or
+  modification time changes (RECEIPT), a mode search's index (``restart_store.MODE_INDEX``) read first and sent last.
+  A unit the fit released is removed from the mirror, but only by a disk that restored that build of it or
   saw it whole there while it held it (RECEIPT), so a job never removes a unit it never held: another job's, another
   build of the same key, one a failed restore left behind, or a region's it never restored.
 - **The partial steps' chromosome units:** each converted chromosome's files (STORE_CHROMOSOME_FILES) with its record
@@ -81,7 +82,7 @@ from typing import Protocol
 
 from sv_pgs.content_identity import GCS_MOUNTS, record_restored
 from sv_pgs.postfit_checkpoint import RECORD
-from sv_pgs.restart_store import FORMAT, KINDS, MANIFEST, RestartStore
+from sv_pgs.restart_store import FORMAT, KINDS, MANIFEST, MODE_INDEX, RestartStore
 from sv_pgs.workspace_pipeline import (
     ARM_PARTS, ARMS, COMPLETE_FILE, FINISH_INPUTS, HANDOFF, KEY_FILE, REGIONS_DIRECTORY, RESTART_DIRECTORY, STEP_NAMES, arm_handoff,
 )
@@ -605,7 +606,11 @@ def push(run_directory: Path, remote: Remote, bases: Sequence[Base] = (), arms: 
     (a partial renamed to its step, a step set aside, a released unit) ends that directory's push for this time; the
     next push sees where it went. A restart unit or step whose push fails does not stop the others': the push sends
     the rest and then raises ``PushIncomplete`` naming what it did not send."""
-    failed = _push_restart(run_directory, remote, arms)
+    try:
+        failed = _push_restart(run_directory, remote, arms)
+    except Exception as error:  # noqa: BLE001 - the restart units unlisted or their receipt unwritten: the steps go on
+        LOGGER.warning("run mirror: the restart units were not pushed (%s: %s); the push goes on", type(error).__name__, error)
+        failed = [(RESTART, error)]
     references: set[str] = set()
     for step in STEP_NAMES:
         final, partial = run_directory / step, run_directory / f"{step}{PARTIAL}"
@@ -624,10 +629,14 @@ def push(run_directory: Path, remote: Remote, bases: Sequence[Base] = (), arms: 
         except Exception as error:  # noqa: BLE001 - one step's failed upload must not stop the others'
             LOGGER.warning("run mirror: %s was not pushed (%s: %s); the push goes on", step, type(error).__name__, error)
             failed.append((step, error))
-    if references:
-        named = remote.sizes(f"{BASES}/")
-        for reference in sorted(references - named.keys()):
-            remote.write(reference, b"")
+    try:
+        if references:
+            named = remote.sizes(f"{BASES}/")
+            for reference in sorted(references - named.keys()):
+                remote.write(reference, b"")
+    except Exception as error:  # noqa: BLE001 - the regions' pushes go on
+        LOGGER.warning("run mirror: the run's bases were not named (%s: %s); the push goes on", type(error).__name__, error)
+        failed.append((BASES, error))
     regions = run_directory / REGIONS_DIRECTORY
     for region in sorted(regions.iterdir()) if regions.is_dir() else ():
         try:
@@ -914,7 +923,19 @@ def _push_restart(run_directory: Path, remote: Remote, arms: Sequence[str] | Non
                     pushed += 1
                 receipt[prefix] = record["id"] if found is None else found[0]["id"]
                 continue
-            files = sorted((file for file in path.iterdir() if file.is_file() and not file.name.startswith(".")), key=lambda file: file.name == MANIFEST)
+            # The mode search's index is read before the files are listed and sent after them: the fit writes a source
+            # before the index that names it, so every source a sent index names is sent before it.
+            index = None
+            try:
+                with (path / MODE_INDEX).open("rb") as handle:
+                    stat = os.fstat(handle.fileno())
+                    index = (handle.read(), [stat.st_size, stat.st_mtime_ns])
+            except FileNotFoundError:
+                pass
+            files = sorted(
+                (file for file in path.iterdir() if file.is_file() and not file.name.startswith(".") and file.name != MODE_INDEX),
+                key=lambda file: file.name == MANIFEST,
+            )
             for file in files:
                 stat = file.stat()
                 stamp = [stat.st_size, stat.st_mtime_ns]
@@ -922,6 +943,10 @@ def _push_restart(run_directory: Path, remote: Remote, arms: Sequence[str] | Non
                     continue
                 remote.upload(file, prefix + file.name)
                 receipt[prefix + file.name] = stamp
+                pushed += 1
+            if index is not None and not (mirrored.get(MODE_INDEX) == index[1][0] and receipt.get(prefix + MODE_INDEX) == index[1]):
+                remote.write(prefix + MODE_INDEX, index[0])
+                receipt[prefix + MODE_INDEX] = index[1]
                 pushed += 1
             receipt[prefix] = record["id"]
         except FileNotFoundError:
@@ -935,15 +960,34 @@ def _push_restart(run_directory: Path, remote: Remote, arms: Sequence[str] | Non
     for prefix, objects in held.items():
         if prefix in local or prefix not in receipt or (arms is not None and prefix.split("/")[1] not in arms):
             continue
+        if failed:
+            # A unit is released once what replaces it is saved (a completed model's checkpoint for its group's EB
+            # starts and Stage 0): while a unit of this push was not sent, the released ones stay on the mirror.
+            LOGGER.info("run mirror: restart unit %s is kept on the mirror while %d units are not pushed", prefix, len(failed))
+            local.add(prefix)
+            continue
+        if (root / prefix[len(RESTART) + 1:]).exists():
+            # On this disk but not whole there (``RestartStore.units`` lists whole units only): not released.
+            local.add(prefix)
+            continue
         try:
             build = json.loads(remote.read(prefix + MANIFEST) or b"")["id"] if MANIFEST in objects else None
         except (ValueError, KeyError, TypeError):
             build = None
+        except Exception as error:  # noqa: BLE001 - its manifest unread: kept, and read again at the next push
+            LOGGER.warning("run mirror: released restart unit %s was not read (%s: %s)", prefix, type(error).__name__, error)
+            local.add(prefix)
+            continue
         if build != receipt[prefix]:
             LOGGER.info("run mirror: restart unit %s on the mirror is not the build this disk held; it is kept", prefix)
             continue
-        remote.delete([prefix + MANIFEST])
-        remote.delete([prefix + name for name in objects if name != MANIFEST])
+        try:
+            remote.delete([prefix + MANIFEST])
+            remote.delete([prefix + name for name in objects if name != MANIFEST])
+        except Exception as error:  # noqa: BLE001 - a removal that fails is tried again at the next push; the rest go on
+            LOGGER.warning("run mirror: released restart unit %s was not removed (%s: %s)", prefix, type(error).__name__, error)
+            local.add(prefix)
+            continue
         LOGGER.info("run mirror: removed restart unit %s, which the fit released", prefix)
     # A unit the disk no longer holds is done with here, its mirrored copy removed above or not this disk's to remove.
     for name in list(receipt):

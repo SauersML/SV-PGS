@@ -41,18 +41,39 @@ def files(path):
     return sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else []
 def show(path):
     return "gs://" + path.relative_to(root / "gcs").as_posix()
+def absent(what="The following URLs matched no objects or files"):
+    sys.exit(f"ERROR: (gcloud.{'.'.join(args[:2])}) {what}")
+# Each object's generation, as Cloud Storage keeps it: one written outside this gcloud is at generation 1.
+generations = root / "generations.json"
+def generation(path):
+    return json.loads(generations.read_text()).get(str(path), 1) if generations.is_file() and path.is_file() else (1 if path.is_file() else 0)
+def written(path):
+    known = json.loads(generations.read_text()) if generations.is_file() else {}
+    known[str(path)] = max(known.values(), default=1) + 1
+    generations.write_text(json.dumps(known))
+def matches(path):
+    wanted = [value.split("=", 1)[1] for value in args if value.startswith("--if-generation-match=")]
+    if wanted and int(wanted[0]) != generation(path):
+        sys.exit("ERROR: (gcloud.storage) HTTPError 412: At least one of the pre-conditions you specified did not hold.")
+if os.environ.get("FAKE_GCLOUD_DOWN"):
+    sys.exit("ERROR: (gcloud) There was a problem refreshing your current auth tokens: connection reset")
 if args[:2] == ["storage", "cat"]:
     path = local(args[2])
     if not path.is_file():
-        sys.exit(1)
+        absent()
     sys.stdout.write(path.read_text())
+elif args[:3] == ["storage", "objects", "describe"]:
+    path = local(args[3])
+    if not path.is_file():
+        absent("NOT_FOUND: No such object")
+    print(json.dumps({"name": args[3], "generation": str(generation(path))}))
 elif args[:2] == ["storage", "ls"]:
     url = args[-1]
     path = local(url)
     if "-l" in args:
         listed = files(path) if url.endswith("/") and "-r" in args else [path] if path.is_file() else []
         if not listed:
-            sys.exit(1)
+            absent("One or more URLs matched no objects.")
         for item in listed:
             written = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(item.stat().st_mtime))
             print(f"{item.stat().st_size:>10}  {written}  {show(item)}")
@@ -60,12 +81,12 @@ elif args[:2] == ["storage", "ls"]:
     elif "*" in url:
         matched = sorted(item for item in (root / "gcs").glob(url[len("gs://"):]) if item.is_file())
         if not matched:
-            sys.exit(1)
+            absent("One or more URLs matched no objects.")
         for item in matched:
             print(show(item))
     else:
         if not path.is_dir() or not any(path.iterdir()):
-            sys.exit(1)
+            absent("One or more URLs matched no objects.")
         for item in sorted(path.iterdir()):
             print(show(item) + ("/" if item.is_dir() else ""))
 elif args[:2] == ["storage", "cp"] and "-r" in args:
@@ -79,16 +100,18 @@ elif args[:2] == ["storage", "cp"] and "-r" in args:
         (into / item.relative_to(local(source))).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(item, into / item.relative_to(local(source)))
 elif args[:2] == ["storage", "cp"]:
-    source, target = local(args[2]), local(args[3])
+    source, target = [local(value) for value in args[2:] if not value.startswith("-")]
     if not source.is_file():
-        sys.exit(1)
+        absent()
+    matches(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, target)
+    written(target)
 elif args[:3] == ["batch", "jobs", "describe"]:
     # A job's file holds its state, or its whole record as JSON.
     state = root / "jobs" / args[3]
     if not state.is_file():
-        sys.exit(1)
+        absent(f"NOT_FOUND: Resource 'jobs/{args[3]}' was not found")
     text = state.read_text().strip()
     record = json.loads(text) if text.startswith("{") else {"status": {"state": text}}
     print(json.dumps(record) if "--format=json" in args else record["status"]["state"])
@@ -98,7 +121,8 @@ elif args[:3] == ["batch", "tasks", "list"]:
 elif args[:2] == ["storage", "rm"]:
     path = local(args[2])
     if not path.is_file():
-        sys.exit(1)
+        absent()
+    matches(path)
     path.unlink()
 else:
     sys.exit(f"unexpected gcloud {args}")
