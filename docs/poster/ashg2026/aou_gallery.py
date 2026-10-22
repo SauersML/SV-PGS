@@ -10,10 +10,12 @@ NUMBERS holds:
   the class's mean posterior E[beta^2 | data] per record over the SNVs' (posterior_enrichment, with its jackknife
   interval), the learned prior's (prior_enrichment), and the class's share of the model's genetic variance and of the
   fitted variants;
-- "by_length" and "alpha": prior_by_length.tsv's and frequency_alpha.tsv's rows of arm with_sv, not drawn here.
+- "by_length" and "alpha": prior_by_length.tsv's and frequency_alpha.tsv's rows of arm with_sv.
+None of the last three is drawn: their posterior moments E[beta^2 | data] are mostly the learned prior's mass where the
+data say little about each record (gout's SVs: 98% posterior variance), so they are no measure of what the data put on
+SVs.
 
-Outputs, in figures/: aou_1_gain.png from "paired" and aou_2_svs.png from "enrichment", each drawn when NUMBERS holds
-its rows (transparent, at the width of the poster's right column), each with its .txt, whose first
+Outputs, in figures/: aou_1_gain.png from "paired", drawn when NUMBERS holds its rows (transparent, at the width of the poster's right column), each with its .txt, whose first
 line build_pptx.py sets as the figure's headline.
 
     uv run --with matplotlib --with scipy python docs/poster/ashg2026/aou_gallery.py
@@ -27,8 +29,7 @@ from pathlib import Path
 import matplotlib
 import numpy as np
 
-from matplotlib.transforms import ScaledTranslation, blended_transform_factory
-from sim_gallery import BLUE, INK, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_STYLE, SKY, frame, plt, shifted, widest
+from sim_gallery import BLUE, INK, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_STYLE, frame, plt, shifted, widest
 
 HERE = Path(__file__).resolve().parent
 NUMBERS = HERE / "aou_numbers.json"
@@ -113,66 +114,12 @@ def gain_figure(paired: list[dict]) -> tuple:
     return fig, [title]
 
 
-SV_COLOUR = SKY
-"""Every SV together: the poster's SV colour (sim_gallery.py's VARIANTS)."""
-
-
-def rows_figure(rows: list[tuple[str, float, float, float]], xlabel: str, limits: tuple[float, float],
-                ticks: list[float], tick_text, reference: float, reference_name: str):
-    """A forest at the column's width on a log axis: a row per (label, estimate, low, high), an interval past an axis
-    end running off it in an arrowhead, and the reference drawn and named over the plot."""
-    top, bottom, right = 1.05, 2.1, 0.5
-    height = top + bottom + PITCH * 1.3 * len(rows)
-    fig = plt.figure(figsize=(COLUMN, height))
-    left = widest(fig, [label for label, *_ in rows], fontsize=POSTER_STYLE["font.size"]) + 0.45
-    ax = frame(fig, left, bottom, COLUMN - left - right, height - top - bottom)
-    ax.set_xscale("log")
-    for y, (label, value, low, high) in enumerate(rows):
-        ax.hlines(y, max(low, limits[0]) if low > 0 else limits[0], min(high, limits[1]), color=SV_COLOUR,
-                  linewidth=POSTER_BAR, zorder=3, capstyle="round")
-        for end, edge, marker in ((low, limits[0], "<"), (high, limits[1], ">")):
-            if (end < edge) if marker == "<" else (end > edge):
-                ax.plot([edge], [y], marker=marker, markersize=POSTER_MARK * 0.7, color=SV_COLOUR, markeredgewidth=0,
-                        zorder=3, clip_on=False)
-        ax.plot([value], [y], "o", markersize=POSTER_MARK, color=SV_COLOUR, markeredgewidth=0, zorder=4)
-        ax.text(0, y, label, transform=shifted(ax, -0.3), ha="right", va="center")
-    ax.axvline(reference, color=INK, linewidth=4.0, zorder=2)
-    ax.text(reference, 1, reference_name, transform=blended_transform_factory(ax.transData, ax.transAxes)
-            + ScaledTranslation(0, 0.15, fig.dpi_scale_trans), ha="center", va="bottom")
-    ax.set_yticks([])
-    ax.spines["left"].set_visible(False)
-    ax.set_ylim(len(rows) - 0.5, -0.5)
-    ax.set_xlim(*limits)
-    ax.set_xticks(ticks, [tick_text(tick) for tick in ticks])
-    ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-    # the axis title centred on the figure, not the plot, so it has the labels' width as well
-    ax.set_xlabel(xlabel)
-    ax.xaxis.label.set_x((COLUMN / 2 - left) / (COLUMN - left - right))
-    return fig
-
-
-def svs_figure(enrichment: list[dict]) -> tuple:
-    """Per trait, every SV's posterior effect variance per variant (E[beta^2 | data] on the standardized genotype)
-    over the SNVs', with its block-jackknife 95% interval, on a log axis, the largest first; the SNVs' (1) drawn and
-    named. The ticks are plain ratios: at the poster's type a "×" after each would run them together."""
-    rows = sorted(((trait_name(row["trait"]), row["posterior_enrichment"], row["posterior_enrichment_ci_low"],
-                    row["posterior_enrichment_ci_high"]) for row in enrichment if row["variant_class"] == "all_structural"),
-                  key=lambda row: -row[1])
-    fig = rows_figure(rows, "Effect variance vs SNVs", (0.03, 30.0), [0.1, 1.0, 10.0], lambda tick: f"{tick:g}",
-                      reference=1.0, reference_name="SNVs")
-    above = [label for label, _, low, _ in rows if low > 1.0]
-    which = f"only in {above[0].lower()}" if len(above) == 1 else f"in {len(above)} of {len(rows)} traits"
-    return fig, [f"Per variant, SVs beat SNVs {which}"]
-
-
 def main() -> None:
     numbers = json.loads(NUMBERS.read_text())
     with plt.rc_context({**POSTER_STYLE, "axes.labelsize": POSTER_LABEL}):
         drawn = []
         if numbers.get("paired"):
             drawn.append(("aou_1_gain", gain_figure(numbers["paired"])))
-        if numbers.get("enrichment"):
-            drawn.append(("aou_2_svs", svs_figure(numbers["enrichment"])))
         for name, (fig, lines) in drawn:
             fig.savefig(OUT / f"{name}.png", transparent=True)
             plt.close(fig)
