@@ -603,8 +603,9 @@ def push(run_directory: Path, remote: Remote, bases: Sequence[Base] = (), arms: 
     carries (``Base``), which the mirror names instead (BASES); the restart units first (an EB start is the newest
     progress), of ``arms`` only where given (a job that fits those arms). A file the driver moves away during the push
     (a partial renamed to its step, a step set aside, a released unit) ends that directory's push for this time; the
-    next push sees where it went."""
-    _push_restart(run_directory, remote, arms)
+    next push sees where it went. A restart unit or step whose push fails does not stop the others': the push sends
+    the rest and then raises ``PushIncomplete`` naming what it did not send."""
+    failed = _push_restart(run_directory, remote, arms)
     references: set[str] = set()
     for step in STEP_NAMES:
         final, partial = run_directory / step, run_directory / f"{step}{PARTIAL}"
@@ -620,13 +621,33 @@ def push(run_directory: Path, remote: Remote, bases: Sequence[Base] = (), arms: 
                 _push_partial(remote, partial, step)
         except FileNotFoundError as moved:
             LOGGER.info("run mirror: %s moved during the push (%s); it is pushed next time", step, moved)
+        except Exception as error:  # noqa: BLE001 - one step's failed upload must not stop the others'
+            LOGGER.warning("run mirror: %s was not pushed (%s: %s); the push goes on", step, type(error).__name__, error)
+            failed.append((step, error))
     if references:
         named = remote.sizes(f"{BASES}/")
         for reference in sorted(references - named.keys()):
             remote.write(reference, b"")
     regions = run_directory / REGIONS_DIRECTORY
     for region in sorted(regions.iterdir()) if regions.is_dir() else ():
-        push(region, _Within(remote, f"{REGIONS_DIRECTORY}/{region.name}/"), arms=arms)
+        try:
+            push(region, _Within(remote, f"{REGIONS_DIRECTORY}/{region.name}/"), arms=arms)
+        except PushIncomplete as incomplete:
+            failed.extend((f"{REGIONS_DIRECTORY}/{region.name}/{name}", error) for name, error in incomplete.failures)
+    if failed:
+        raise PushIncomplete(failed) from failed[0][1]
+
+
+class PushIncomplete(RuntimeError):
+    """A push that sent all it could but ``failures``' (each restart unit's prefix or step, with its error), whose
+    uploads failed: the job's pusher (launcher/workspace/run_step.sh.template) counts it a failed push, and the next
+    push sends them again."""
+
+    def __init__(self, failures: list[tuple[str, BaseException]]) -> None:
+        shown = "; ".join(f"{name} ({type(error).__name__}: {error})" for name, error in failures[:3])
+        super().__init__(f"{len(failures)} not pushed: {shown}{' ...' if len(failures) > 3 else ''}")
+        self.failures = failures
+        self.names = [name for name, _error in failures]
 
 
 def _restorable_partial(names: dict[str, int], name: str) -> list[str]:
@@ -853,54 +874,64 @@ def _read_json(path: Path, default):
         return default
 
 
-def _push_restart(run_directory: Path, remote: Remote, arms: Sequence[str] | None) -> None:
+def _push_restart(run_directory: Path, remote: Remote, arms: Sequence[str] | None) -> list[tuple[str, BaseException]]:
     """The restart units of ``arms`` (every arm's where None) to the mirror (the module docstring): a sealed unit the
     mirror holds whole is kept as it is; one it does not is sent payload first, in parts, and its manifest last; a
     mutable unit's changed files are each replaced whole, its manifest after them; and a mirrored unit this disk
     restored or saw whole there (its build id in RECEIPT) but no longer holds (released, superseded) is removed,
-    manifest first, where the mirror's copy is still that build."""
+    manifest first, where the mirror's copy is still that build. Returns the units whose push failed, each with its
+    error; the others are pushed all the same."""
     root = run_directory / RESTART
     if not root.is_dir():
-        return
+        return []
     held = _remote_units(remote.sizes(f"{RESTART}/"))
     receipt = _read_json(root / RECEIPT, {})
     local: set[str] = set()
     pushed = 0
-    for directory in sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")):
-        if arms is not None and directory.name not in arms:
-            continue
-        store = RestartStore(directory)
-        for kind in KINDS:
-            for path, record in store.units(kind):
-                prefix = f"{RESTART}/{directory.name}/{kind}/{path.name}/"
-                local.add(prefix)
-                mirrored = held.get(prefix, {})
-                try:
-                    if record["files"] is not None:
-                        found = _remote_record(remote, prefix, mirrored)
-                        if found is None:
-                            content = (path / MANIFEST).read_bytes()
-                            if MANIFEST in mirrored:
-                                remote.delete([prefix + MANIFEST])
-                            for name in record["files"]:
-                                remote.upload_parts(path / name, prefix + name)
-                            remote.write(prefix + MANIFEST, content)
-                            pushed += 1
-                        receipt[prefix] = record["id"] if found is None else found[0]["id"]
-                        continue
-                    files = sorted((file for file in path.iterdir() if file.is_file() and not file.name.startswith(".")), key=lambda file: file.name == MANIFEST)
-                    for file in files:
-                        stat = file.stat()
-                        stamp = [stat.st_size, stat.st_mtime_ns]
-                        if mirrored.get(file.name) == stat.st_size and receipt.get(prefix + file.name) == stamp:
-                            continue
-                        remote.upload(file, prefix + file.name)
-                        receipt[prefix + file.name] = stamp
-                        pushed += 1
-                    receipt[prefix] = record["id"]
-                except FileNotFoundError:
-                    # Released while it was sent: its removal follows below or at the next push.
-                    local.discard(prefix)
+    failed: list[tuple[str, BaseException]] = []
+    units = [
+        (f"{RESTART}/{directory.name}/{kind}/{path.name}/", path, record)
+        for directory in sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("."))
+        if arms is None or directory.name in arms
+        for kind in KINDS for path, record in RestartStore(directory).units(kind)
+    ]
+    # The mutable units first: an EB start or a mode search's progress is a few MB and the fit's newest state, and a
+    # sealed unit's push (Stage 0's LD store, minutes) must not hold it back.
+    units.sort(key=lambda unit: unit[2]["files"] is not None)
+    for prefix, path, record in units:
+        local.add(prefix)
+        mirrored = held.get(prefix, {})
+        try:
+            if record["files"] is not None:
+                found = _remote_record(remote, prefix, mirrored)
+                if found is None:
+                    content = (path / MANIFEST).read_bytes()
+                    if MANIFEST in mirrored:
+                        remote.delete([prefix + MANIFEST])
+                    for name in record["files"]:
+                        remote.upload_parts(path / name, prefix + name)
+                    remote.write(prefix + MANIFEST, content)
+                    pushed += 1
+                receipt[prefix] = record["id"] if found is None else found[0]["id"]
+                continue
+            files = sorted((file for file in path.iterdir() if file.is_file() and not file.name.startswith(".")), key=lambda file: file.name == MANIFEST)
+            for file in files:
+                stat = file.stat()
+                stamp = [stat.st_size, stat.st_mtime_ns]
+                if mirrored.get(file.name) == stat.st_size and receipt.get(prefix + file.name) == stamp:
+                    continue
+                remote.upload(file, prefix + file.name)
+                receipt[prefix + file.name] = stamp
+                pushed += 1
+            receipt[prefix] = record["id"]
+        except FileNotFoundError:
+            # Released while it was sent: its removal follows below or at the next push.
+            local.discard(prefix)
+        except Exception as error:  # noqa: BLE001 - one unit's refused or broken upload must not stop the others'
+            # The 403 on every sealed unit of rounds m1 and m2 also kept every EB start behind it off the mirror. The
+            # unit stays this disk's (in ``local``), so nothing of it is removed, and the next push sends it again.
+            LOGGER.warning("run mirror: restart unit %s was not pushed (%s: %s); the push goes on", prefix, type(error).__name__, error)
+            failed.append((prefix, error))
     for prefix, objects in held.items():
         if prefix in local or prefix not in receipt or (arms is not None and prefix.split("/")[1] not in arms):
             continue
@@ -924,6 +955,7 @@ def _push_restart(run_directory: Path, remote: Remote, arms: Sequence[str] | Non
     os.replace(temporary, root / RECEIPT)
     if pushed:
         LOGGER.info("run mirror: pushed %d restart files", pushed)
+    return failed
 
 
 def _restore_restart(run_directory: Path, remote: Remote, names: dict[str, int], arms: Sequence[str] | None) -> None:

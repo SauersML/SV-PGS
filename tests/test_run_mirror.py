@@ -521,7 +521,7 @@ def test_a_replacement_model_loses_its_old_marker_until_its_upload_finishes(tmp_
                 raise ConnectionError("interrupted replacement")
             super().upload(path, name)
 
-    with pytest.raises(ConnectionError, match="interrupted replacement"):
+    with pytest.raises(run_mirror.PushIncomplete, match="interrupted replacement"):
         push(run, InterruptedUpload(mirror))
     restored = tmp_path / "restored"
     restore(restored, remote)
@@ -534,8 +534,9 @@ def test_an_arm_record_from_another_fit_key_is_not_pushed(tmp_path: Path) -> Non
     run = _run(tmp_path / "run")
     record = run / "fit.partial" / "models" / "snv_indel" / "asthma.json"
     record.write_text(json.dumps({"fit_key": "another fit"}))
-    with pytest.raises(ValueError, match="different fit key"):
+    with pytest.raises(run_mirror.PushIncomplete, match="different fit key") as refused:
         push(run, DirectoryRemote(tmp_path / "mirror"))
+    assert isinstance(refused.value.__cause__, ValueError)
 
 
 def test_a_completed_step_marker_does_not_hide_a_missing_payload(tmp_path: Path) -> None:
@@ -680,7 +681,7 @@ def test_an_interrupted_or_damaged_mirrored_unit_is_never_restored_and_the_next_
                 raise ConnectionError("preempted")
             super().upload_parts(path, name)
 
-    with pytest.raises(ConnectionError, match="preempted"):
+    with pytest.raises(run_mirror.PushIncomplete, match=f"restart/snv_indel/stage0/{unit.name}/"):
         push(run, Interrupted(mirror))
     assert (mirror / "restart" / "snv_indel" / "stage0" / unit.name / "ld" / "gram.f32").is_file()
     restore(tmp_path / "first", DirectoryRemote(mirror))
@@ -694,6 +695,37 @@ def test_an_interrupted_or_damaged_mirrored_unit_is_never_restored_and_the_next_
     push(run, DirectoryRemote(mirror))
     restore(tmp_path / "third", DirectoryRemote(mirror))
     assert RestartStore(tmp_path / "third" / "restart" / "snv_indel").unit("stage0", unit.name) is not None
+
+
+def test_a_unit_whose_upload_is_refused_holds_back_neither_the_warm_starts_nor_the_steps(tmp_path: Path) -> None:
+    # Rounds m1 and m2: every sealed unit's upload was refused (403), and each push stopped there, so no EB start and no
+    # saved model reached the mirror either.
+    run, mirror = _run(tmp_path / "run"), tmp_path / "mirror"
+    sent: list[str] = []
+
+    class Refusing(DirectoryRemote):
+        def upload(self, path: Path, name: str) -> None:
+            sent.append(name)
+            super().upload(path, name)
+
+        def upload_parts(self, path: Path, name: str) -> None:
+            sent.append(name)
+            raise PermissionError("403 AccessDenied")
+
+    with pytest.raises(run_mirror.PushIncomplete, match="restart/with_sv/stage0/") as refused:
+        push(run, Refusing(mirror))
+    assert refused.value.names == [f"restart/with_sv/stage0/{unit_key(facts({'inputs': 'stage0'}))}/"]
+    # The mutable unit went first, before the sealed one was tried, and the steps and the fit's saved model after it.
+    assert sent.index("restart/with_sv/eb/start/model0.npz") < next(index for index, name in enumerate(sent) if "/stage0/" in name)
+    assert (mirror / "restart" / "with_sv" / "eb" / "start" / "model0.npz").read_bytes() == b"warm start"
+    assert (mirror / "store" / COMPLETE_FILE).is_file()
+    assert (mirror / "fit.partial" / "models" / "snv_indel" / "asthma.json").is_file()
+    assert not list(mirror.glob(f"restart/with_sv/stage0/*/{MANIFEST}"))
+    # Once uploads are let through, the next push sends the refused unit, and a restore has all of it.
+    push(run, DirectoryRemote(mirror))
+    restore(tmp_path / "restored", DirectoryRemote(mirror))
+    assert RestartStore(tmp_path / "restored" / "restart" / "with_sv").unit("stage0", unit_key(facts({"inputs": "stage0"}))) is not None
+    assert (tmp_path / "restored" / "restart" / "with_sv" / "eb" / "start" / "model0.npz").read_bytes() == b"warm start"
 
 
 def test_a_released_unit_leaves_the_mirror_only_from_a_disk_that_held_it_whole_there(tmp_path: Path) -> None:
