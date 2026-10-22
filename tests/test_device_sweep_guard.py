@@ -1,7 +1,10 @@
 """The batched sweep's check (``device_sweep._SweepCheck``: each member's step against the sweep's own inputs to it):
-the whole sweep on a configuration's first layout in a process, the first block on each later layout; a failed check
-or CUDA error leaves the reference route's state untouched; a fault inside the kernels' chain is caught, also one that
-shows only on a later member order; and a failure line carries no value."""
+the whole sweep on a configuration's first layout in a process, each device's first block and one other in turn on
+each later layout; a failed check or CUDA error leaves the reference route's state untouched; a fault inside the
+kernels' chain is caught, also one that shows only on a later member order, in a block after one the check skipped;
+and a failure line carries no value."""
+import re
+
 import numpy as np
 import pytest
 
@@ -33,12 +36,12 @@ def test_a_configuration_s_first_layout_is_checked_whole_and_each_later_one_on_i
             _run(problem, layout, state)
         assert layout.checked and not layout.disabled
         layouts.append(layout)
-    # one check per layout, on its first sweep: the whole sweep, then the later layout's first block
+    # one check per layout, on its first sweep: the whole sweep, then the later layout's two devices' first blocks
     assert [message.split(")")[0] for message in messages] == [
-        "batched sweep check passed (whole sweep", "batched sweep check passed (first block of a new member order",
+        "batched sweep check passed (whole sweep", "batched sweep check passed (2 of 2 blocks of a new member order",
     ]
-    worst = float(messages[0].split("largest error ")[1].split(" ")[0])
-    assert 0.0 < worst < 1.0
+    worst = float(messages[0].split("largest error below ")[1].split(" ")[0])
+    assert 0.0 < worst <= 1.0
     # Another configuration (one model, not three) is checked whole; so is the first one in a new process.
     problem, layout, state = _case()
     batched_sweep(np, sweep.HostPanelKernels(2 * sweep.PANEL), problem, layout, range(1), {name: values[:, :1].copy() for name, values in state.items()},
@@ -86,21 +89,23 @@ def test_sweep_mismatch_disables_the_fit_without_committing_state(monkeypatch, f
 
 
 class _Faulty(sweep.HostPanelKernels):
-    """The numpy kernels with one fault on the third launch that projects a panel."""
+    """The numpy kernels with one fault on the third launch that projects a panel (the ``launch``-th, counting those
+    that project a panel at a device position of ``after`` or later)."""
 
-    def __init__(self, fault, launch=3):
+    def __init__(self, fault, launch=3, after=0):
         super().__init__(2 * sweep.PANEL)
-        self.fault, self.launch, self.launches = fault, launch, 0
+        self.fault, self.launch, self.after, self.launches = fault, launch, after, 0
 
     def panel_step(self, blocks, threads, models, arguments):
         projected_width = int(arguments[11])
-        self.launches += projected_width > 0
-        third = projected_width > 0 and self.launches == self.launch
         residuals, grams, mean, variance = arguments[15], arguments[30], arguments[33], arguments[34]
         projected, panel = int(arguments[10]), int(arguments[32])
+        counted = projected_width > 0 and projected >= self.after
+        self.launches += counted
+        third = counted and self.launches == self.launch
         if third and self.fault == "residual":
-            # a residual move off by a millionth of the residual's size at one sample
-            residuals[0, 0] += 1e-4 * np.max(np.abs(residuals[0]))
+            # a residual move off by a millionth of the residual's size at one of model 0's training samples
+            residuals[0, np.flatnonzero(arguments[14][0])[0]] += 1e-4 * np.max(np.abs(residuals[0]))
         if third and self.fault == "gram":
             grams[panel, 0, 1, 0] *= 1.0 + 1e-4
             grams[panel, 0, 0, 1] *= 1.0 + 1e-4
@@ -127,8 +132,12 @@ def test_a_fault_inside_the_kernels_chain_fails_the_check(monkeypatch, fault, qu
     assert any(messages[0].startswith(f"batched sweep disabled (check failed: {quantity} of model 0") for quantity in quantities), messages[0]
 
 
-def _larger(seed=7, **options):
+def _larger(seed=7, reversed_order=False, **options):
+    """The problem, its layout and a zero state; ``reversed_order`` lays each block's members out in reverse, as a
+    mode search's later order lays them out anew."""
     problem = sweep_problem(np, seed, **options)
+    if reversed_order:
+        problem["member_blocks"] = [members[::-1].copy() for members in problem["member_blocks"]]
     layout = _layout(np, problem)
     count = sum(block.members.size for block in layout.blocks)
     return problem, layout, {name: np.zeros((count, 3)) for name in sweep.MOMENTS}
@@ -141,13 +150,37 @@ def test_a_fault_on_a_later_member_order_fails_that_layout_s_check(monkeypatch):
     monkeypatch.setattr(sweep, "log", messages.append)
     problem, first, state = _larger()
     batched_sweep(np, _Faulty(None), problem, first, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
-    problem, later, state = _larger()
-    later.blocks[0] = sweep._BlockLayout(later.blocks[0].device, later.blocks[0].offset, later.blocks[0].start, later.blocks[0].members[::-1].copy(),
-                                         later.blocks[0].pieces)
+    problem, later, state = _larger(reversed_order=True)
     with pytest.raises(sweep.NoCodes, match="disagreed"):
         batched_sweep(np, _Faulty("gram", launch=1), problem, later, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
     assert all(not values.any() for values in state.values())
     assert messages[1].startswith("batched sweep disabled (check failed: shift of model 0, member ")
+
+
+@pytest.mark.parametrize("injected", ["residual", "gram"])
+def test_a_later_layout_s_check_reaches_a_block_after_one_it_skipped(monkeypatch, injected):
+    """Four blocks, the first two each a device's first: later layouts check them and, in turn, block 2 or block 3.
+    Block 3 follows block 2, which that check skips, so its members' residuals are taken back from the sweep's own
+    after it. Without a fault it passes; a residual move off at one sample, or a wrong Gram, in block 3 fails."""
+    messages = []
+    monkeypatch.setattr(sweep, "log", messages.append)
+    options = dict(devices=(0, 1, 0, 0), blocks=(70, 45, 90, 60))
+    for fault in (None, None, None, None, injected):
+        problem, layout, state = _larger(reversed_order=bool(messages), **options)
+        # block 3's members sit after blocks 0 and 2 on device 0
+        after = sum(layout.blocks[index].members.size for index in (0, 2)) + sweep.PANEL
+        if fault is None:
+            batched_sweep(np, _Faulty(None), problem, layout, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
+            continue
+        with pytest.raises(sweep.NoCodes, match="disagreed"):
+            batched_sweep(np, _Faulty(fault, launch=1, after=after), problem, layout, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
+        assert all(not values.any() for values in state.values())
+    assert [message.split(")")[0].split("(")[1] for message in messages[:4]] == [
+        "whole sweep", *(f"3 of 4 blocks of a new member order",) * 3,
+    ]
+    assert messages[4].startswith("batched sweep disabled (check failed: shift of model 0, member ")
+    member = int(messages[4].split("member ")[1].split(":")[0])
+    assert member in set(problem["member_blocks"][3])
 
 
 def test_a_failure_line_carries_no_value(monkeypatch):
@@ -157,18 +190,30 @@ def test_a_failure_line_carries_no_value(monkeypatch):
     kernels = _Faulty("leak")
     with pytest.raises(sweep.NoCodes, match="disagreed"):
         batched_sweep(np, kernels, problem, layout, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
-    assert messages[0].startswith("batched sweep disabled (check failed: fourth of model 0, member ")
-    assert "times its tolerance" in messages[0] and abs(kernels.leaked) > 1e-3
-    for digits in (2, 3, 6, 17):
-        assert f"{abs(kernels.leaked):.{digits}g}" not in messages[0]
+    assert abs(kernels.leaked) > 1e-3
+    # no number but the model's and the member's: neither the value nor its ratio to a tolerance
+    assert re.fullmatch(r"batched sweep disabled \(check failed: fourth of model 0, member \d+: error outside its tolerance\); "
+                        r"using reference sweeps", messages[0]), messages[0]
 
 
-def test_a_strong_effect_s_moments_are_held_to_their_own_size():
+def test_a_configuration_names_its_covariates_and_classes():
+    problem, layout, _state = _case()
+    inputs = dict(masks=problem["masks"], keys=[(0, b""), (1, b""), (2, b"")], grid=problem["grid"], covariates=problem["covariates"],
+                  log_density=problem["log_density"])
+    key = sweep._configuration(sweep.HostPanelKernels(2 * sweep.PANEL), layout, inputs)
+    for name, values in (("covariates", problem["covariates"][:, :2]), ("log_density", problem["log_density"][:, :1])):
+        assert sweep._configuration(sweep.HostPanelKernels(2 * sweep.PANEL), layout, {**inputs, name: values}) != key
+
+
+@pytest.mark.parametrize("nodes", [1, 146])
+def test_a_strong_effect_s_moments_are_held_to_their_own_size(nodes):
     """One unit-variance node, n = 44,000, h = 8,800: q is N(0.2, 1 / 44,001), its fourth central moment 3 c^2 =
-    1.5e-9. A fourth moment of 0 (or a variance of 0) is far outside its tolerance."""
-    (mean, variance, third, fourth, pieces), scales = sweep._tilted(
-        np.array([8800.0]), np.array([44000.0]), 1.0, np.zeros(1), np.zeros(1), np.zeros((1, 1)),
-    )
+    1.5e-9. A fourth moment of 0 (or a variance of 0) is far outside its tolerance, also beside 145 nodes whose log
+    density of -1e10 leaves them no weight (and no part in a moment's rounding)."""
+    lattice = np.linspace(-10.0, 2.0, nodes) if nodes > 1 else np.zeros(1)
+    lattice[nodes // 2] = 0.0
+    density = np.where(np.arange(nodes) == nodes // 2, 0.0, -1e10)[None, :]
+    (mean, variance, third, fourth, pieces), scales = sweep._tilted(np.array([8800.0]), np.array([44000.0]), 1.0, np.zeros(1), lattice, density)
     conditional = 1.0 / (1.0 + 44000.0)
     assert mean[0] == pytest.approx(8800.0 * conditional) and variance[0] == pytest.approx(conditional)
     assert fourth[0] == pytest.approx(3.0 * conditional ** 2)
@@ -181,9 +226,23 @@ def test_a_column_nearly_spanned_by_a_covariate_passes_the_check(monkeypatch):
     product far smaller than the rounding of the unprojected one, which the shift's tolerance carries."""
     messages = []
     monkeypatch.setattr(sweep, "log", messages.append)
-    problem, layout, state = _larger(samples=20_000, collinear=True)
+    problem, layout, state = _larger(samples=20_000, collinear=1e-6)
     batched_sweep(np, _Faulty(None), problem, layout, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
     assert messages[0].startswith("batched sweep check passed (whole sweep)")
+
+
+def test_a_warm_start_moving_a_column_a_covariate_spans_passes_the_check(monkeypatch):
+    """A near-zero residual and a column a covariate spans to 1e-14 of its scale, whose start mean 0.3 the sweep moves
+    toward 0: the kernels move the residual by the unprojected column less the covariates' share, two order-one
+    terms whose difference is near 1e-14, so the residual rounds on the scale of the column, not of its move."""
+    messages = []
+    monkeypatch.setattr(sweep, "log", messages.append)
+    problem, layout, state = _larger(samples=20_000, collinear=1e-14)
+    spanned = np.flatnonzero(problem["group"] == 0)
+    state["mean"][spanned] = 0.3
+    batched_sweep(np, _Faulty(None), problem, layout, range(3), state, 1e-12 * problem["residuals"], sweep.PanelGrams())
+    assert messages[0].startswith("batched sweep check passed (whole sweep)"), messages[0]
+    assert np.all(np.abs(state["mean"][spanned] - 0.3) > 0.1)
 
 
 def test_the_check_passes_every_kernel_without_a_fault_on_the_larger_problem(monkeypatch):

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import math
 import time
 from typing import Any, Callable, Iterator, Sequence
 
@@ -1096,40 +1097,59 @@ def _piece_grams(
     return grams, couplings
 
 
-_VERDICTS: dict[tuple, bool] = {}
-"""Each batched-sweep configuration's whole-sweep check in this process (``sweep_models``, keyed by
-``_configuration``): True once a sweep passed it, False once a check of the configuration failed."""
+_VERDICTS: dict[tuple, int] = {}
+"""Each batched-sweep configuration's checks in this process (``sweep_models``, keyed by ``_configuration``): how many
+of its layouts passed theirs, or 0 once a check of the configuration failed."""
 
 
 def _configuration(kernels: Any, layout: SweepLayout, inputs: dict) -> tuple:
     """Everything a batched sweep's launches read besides the member order: the kernels (their ``kind``, else their
-    class), the samples, the models, the blocks' devices and member counts, the pieces' bounds, the lattice's shape and
-    each model's node count, whether the models carry their own standardization, which members each model has, and
-    whether the masks are 0/1 training masks or a binary model's root weights."""
+    class), the samples, the models, the covariates' count, the blocks' devices and member counts, the pieces' bounds,
+    the lattice's shape and each model's node count, the classes' log densities' shape, whether the models carry their
+    own standardization, which members each model has, and whether the masks are 0/1 training masks or a binary
+    model's root weights."""
     masks = np.asarray(inputs["masks"])
     live = inputs.get("live")
     node_counts = inputs.get("node_counts")
     return (
-        getattr(kernels, "kind", type(kernels).__name__), int(masks.shape[1]), len(inputs["keys"]),
+        getattr(kernels, "kind", type(kernels).__name__), int(masks.shape[1]), len(inputs["keys"]), int(inputs["covariates"].shape[1]),
         tuple((layout.devices[block.device].device_id, block.start, int(block.members.shape[0]), block.pieces) for block in layout.blocks),
         np.asarray(inputs["grid"]).shape, None if node_counts is None else tuple(int(count) for count in node_counts),
+        np.shape(inputs["log_density"]),
         inputs.get("standardization") is not None,
         None if live is None else hashlib.sha256(np.packbits(np.asarray(live, dtype=bool)).tobytes()).hexdigest(),
         tuple(bool(np.all((row == 0.0) | (row == 1.0))) for row in masks),
     )
 
 
+def _checked_blocks(layout: SweepLayout, passed: int | None) -> frozenset[int] | None:
+    """The blocks whose steps a layout's check recomputes (``_SweepCheck``): every one (None) on its configuration's
+    first layout, else each device's first block and one of the others in turn, the configuration's n-th later layout
+    taking the n-th of them (cyclically), so that a mode search's orders reach every block between them."""
+    if passed is None:
+        return None
+    devices = [block.device for block in layout.blocks]
+    firsts = {devices.index(device) for device in set(devices)}
+    others = [index for index in range(len(devices)) if index not in firsts]
+    return frozenset(firsts | ({others[(passed - 1) % len(others)]} if others else set()))
+
+
+def _order(ratio: float) -> str:
+    """A ratio as the power of ten above it ("below 1e-5"), so a log line carries its order alone."""
+    return "0" if ratio == 0.0 else f"below 1e{math.floor(math.log10(ratio)) + 1}"
+
+
 def sweep_models(xp: Any, kernels: Any, layout: SweepLayout, tiles: Iterator, **inputs) -> tuple:
     """One batched sweep, checked (``_SweepCheck``) on its layout's first sweep: the whole sweep on its configuration's
-    first layout in this process, the first block alone on each later one.
+    first layout in this process, each device's first block and one other block on each later one
+    (``_checked_blocks``).
 
     A later layout of a configuration (``_configuration``) runs the same kernels with the same launch shapes: the same
-    samples, models, blocks, devices, pieces and panel widths. Only the member order differs, as between a mode
-    search's orders (``full_data_fit._mode_mixture``), and that order reaches the kernels through the code rows, signs,
-    classes and positions of each panel's members. The first block's check reads every one of them, from a start
-    residual the sweep did not write. The whole sweep's check had run on every layout, and each of the mode search's
-    orders paid for it: about 13 minutes a whole-genome sweep, against seconds for the batched sweep [real,
-    aou-m1d-a1].
+    samples, models, covariates, classes, blocks, devices, pieces and panel widths. Only the member order differs, as
+    between a mode search's orders (``full_data_fit._mode_mixture``), and that order reaches the kernels through the
+    code rows, signs, classes and positions of each panel's members. A checked block's check reads every one of them.
+    The whole sweep's check had run on every layout, and each of the mode search's orders paid for it: about 13
+    minutes a whole-genome sweep, against seconds for the batched sweep [real, aou-m1d-a1].
 
     A failed check disables the batched sweep for its configuration for the rest of the process. A CUDA error disables
     it for this layout. Either one raises ``NoCodes``, which sends the caller to its decoded route without committing
@@ -1137,14 +1157,14 @@ def sweep_models(xp: Any, kernels: Any, layout: SweepLayout, tiles: Iterator, **
     if layout.disabled:
         raise NoCodes("the batched sweep was disabled for this fit")
     key = _configuration(kernels, layout, inputs)
-    verdict = _VERDICTS.get(key)
-    if verdict is False:
+    passed = _VERDICTS.get(key)
+    if passed == 0:
         layout.disabled = True
         raise NoCodes("the batched sweep failed its check earlier in this process")
     state = inputs["state"]
     # Device downloads can fail after one device has finished; no caller array moves before all have succeeded.
     staged = {name: values.copy() for name, values in state.items()}
-    check = None if layout.checked == key else _SweepCheck(xp, layout, inputs, whole=verdict is None)
+    check = None if layout.checked == key else _SweepCheck(xp, layout, inputs, _checked_blocks(layout, passed))
     started = time.perf_counter()
     try:
         try:
@@ -1163,13 +1183,14 @@ def sweep_models(xp: Any, kernels: Any, layout: SweepLayout, tiles: Iterator, **
         failure = check.verdict(staged, result)
         if failure is not None:
             layout.disabled = True
-            _VERDICTS[key] = False
+            _VERDICTS[key] = 0
             log(f"batched sweep disabled (check failed: {failure}); using reference sweeps")
             raise NoCodes("the batched sweep disagreed with its check")
         layout.checked = key
-        _VERDICTS[key] = True
-        log(f"batched sweep check passed ({'whole sweep' if check.whole else 'first block of a new member order'}): largest error "
-            f"{check.worst[0]:.3g} of its tolerance ({check.worst[1]}); the checked sweep took {time.perf_counter() - started:.1f} s")
+        _VERDICTS[key] = (passed or 0) + 1
+        checked = "whole sweep" if check.whole else f"{len(check.blocks)} of {len(layout.blocks)} blocks of a new member order"
+        log(f"batched sweep check passed ({checked}): largest error {_order(check.worst[0])} of its tolerance ({check.worst[1]}); "
+            f"the checked sweep took {time.perf_counter() - started:.1f} s")
     for name in MOMENTS:
         state[name][...] = staged[name]
     return result
@@ -1181,10 +1202,12 @@ def _tilted(shift: np.ndarray, squares: np.ndarray, noise: float, log_scale: np.
     nodes), then the mean, the central moments and the ELBO pieces. Returns (mean, variance, third, fourth, pieces
     (members x PIECE_COLUMNS)) and the magnitudes each one's rounding scales with, in the same order.
 
-    A moment is a weighted sum over the nodes, sum_k w_k f_k: its rounding scales with sum_k w_k |f_k|, and with the
-    mean's own error times sum_k w_k |df_k / dm| (the central moments are taken about the mean), the mean's error
-    scaling with sum_k w_k |h c_k|. Each weight exp(base_k + h^2 c_k / 2 - peak) carries the rounding of its exponent's
-    terms, so every magnitude is multiplied by 1 + max_k |base_k| + max_k h^2 c_k / 2."""
+    A moment is a weighted sum over the nodes, sum_k w_k f_k: its rounding scales with sum_k w_k |f_k| (1 + e_k + e),
+    and with the mean's own error times sum_k w_k |df_k / dm| (the central moments are taken about the mean), the
+    mean's error scaling with sum_k w_k |h c_k| (1 + e_k + e). Each weight exp(base_k + h^2 c_k / 2 - peak) carries
+    the relative rounding e_k of its exponent's terms (the log density, the log1p or the overflow branch's logs, the
+    tilt and its conditional variance's log u_j + node, the subtraction of the peak), and the normalization their
+    weighted mean e. A node whose weight is 0 adds nothing to a moment, nor to its rounding."""
     omega = (squares / noise)[:, None]
     h = shift[:, None]
     log_variance = log_scale[:, None] + nodes[None, :]
@@ -1194,6 +1217,7 @@ def _tilted(shift: np.ndarray, squares: np.ndarray, noise: float, log_scale: np.
         overflow = np.isinf(ratio)
         conditional = np.where(overflow, 1.0 / omega, np.where(variance > 0.0, 1.0 / (1.0 / variance + omega), 0.0))
         base = np.where(overflow, log_density - 0.5 * (log_variance + np.log(omega)), log_density - 0.5 * np.log1p(ratio))
+        logs = np.where(overflow, 0.5 * (np.abs(log_variance) + np.abs(np.log(omega))), 0.5 * np.log1p(ratio))
     tilt = 0.5 * h * h * conditional
     log_weight = base + tilt
     peak = np.max(log_weight, axis=1, keepdims=True)
@@ -1201,6 +1225,15 @@ def _tilted(shift: np.ndarray, squares: np.ndarray, noise: float, log_scale: np.
     total = np.sum(weight, axis=1, keepdims=True)
     mean = np.sum(weight * h * conditional, axis=1, keepdims=True) / total
     normalized = weight / total
+    reach = np.abs(log_scale)[:, None] + np.abs(nodes)[None, :]
+    with np.errstate(invalid="ignore"):
+        error = np.where(normalized > 0.0, 1.0 + reach + np.abs(log_density) + logs + tilt * (1.0 + reach) + np.abs(log_weight - peak), 0.0)
+    common = np.sum(normalized * error, axis=1, keepdims=True)
+
+    def rounding(terms: np.ndarray) -> np.ndarray:
+        """sum_k w_k f_k (1 + e_k + e) for nonnegative f_k."""
+        return np.sum(normalized * terms * (1.0 + error + common), axis=1)
+
     offset = h * conditional - mean
     offset_square = offset * offset
     distance = np.abs(offset)
@@ -1212,17 +1245,15 @@ def _tilted(shift: np.ndarray, squares: np.ndarray, noise: float, log_scale: np.
     pull = shift * mean
     shrink = 0.5 * omega[:, 0] * (mean * mean + second)
     pieces = np.column_stack([pull - shrink - log_normalizer, squares * second, np.abs(pull) + shrink + np.abs(log_normalizer)])
-    exponent = 1.0 + np.max(np.abs(np.where(np.isfinite(base), base, 0.0)), axis=1) + np.max(tilt, axis=1)
-    centre = np.sum(normalized * np.abs(h * conditional), axis=1)
-    spread = second + 2.0 * np.sum(normalized * distance, axis=1) * centre
-    skew = np.sum(normalized * (distance * offset_square + 3.0 * conditional * distance), axis=1)
+    centre = rounding(np.abs(h * conditional))
+    spread = rounding(conditional + offset_square) + 2.0 * np.sum(normalized * distance, axis=1) * centre
+    skew = rounding(distance * offset_square + 3.0 * conditional * distance)
     skew += np.sum(normalized * (3.0 * offset_square + 3.0 * conditional), axis=1) * centre
-    kurtosis = fourth + np.sum(normalized * (4.0 * distance * offset_square + 12.0 * conditional * distance), axis=1) * centre
-    size = np.abs(shift) * centre + omega[:, 0] * (np.abs(mean) * centre + spread) + np.abs(peak[:, 0]) + np.abs(log_normalizer) + 1.0
-    scales = (
-        exponent * centre, exponent * spread, exponent * skew, exponent * kurtosis,
-        exponent[:, None] * np.column_stack([size, squares * spread, size]),
-    )
+    kurtosis = rounding(offset_square * offset_square + 6.0 * conditional * offset_square + 3.0 * conditional * conditional)
+    kurtosis += np.sum(normalized * (4.0 * distance * offset_square + 12.0 * conditional * distance), axis=1) * centre
+    size = (np.abs(shift) * centre + omega[:, 0] * (np.abs(mean) * centre + spread) + np.abs(peak[:, 0]) + np.abs(log_normalizer)
+            + common[:, 0] + 1.0)
+    scales = (centre, spread, skew, kurtosis, np.column_stack([size, squares * spread, size]))
     return (mean, second, third, fourth, pieces), scales
 
 
@@ -1248,18 +1279,25 @@ class _SweepCheck:
          them).
     Each is within ``SWEEP_RTOL`` of the magnitudes its own rounding scales with. The kernels form x_j' r from the
     codes before their standardization, with the covariates' share taken out after, so a shift's magnitude is that of
-    the unprojected column and its code offset: (||M x_j|| + |mu_j / s_j| ||M 1||) (||r|| + the residual's accumulated
-    moves), and the earlier chunk members' terms alike.
+    the unprojected column and its code offset: (||M x_j|| + |mu_j / s_j| ||M 1||) (||r|| + ||the residual's
+    accumulated rounding||), and the earlier chunk members' terms alike. A move rounds at each sample on the scale of
+    the unprojected column, its code offset and the covariates' share taken out of it, which is as large as the column
+    where a covariate nearly spans it, however small the projected column is.
 
-    ``whole`` checks every block. Otherwise (a later layout of a checked configuration) the first block alone is
-    checked through 1 and 2, from the start residual, which the sweep did not write; 3 and the bookkeeping of 4 still
-    cover every member. The check reads each block's tile while the sweep holds it (``_sweep_models`` calls ``block``
-    after the block's last launch is queued), in its member order, ``gram_columns`` columns at a time, at most
-    PANEL x PANEL (the chunk's Gram). A failure names the quantity, model and member and how far outside its tolerance
-    the error is, never a value: a faulty kernel can put a sample's residual anywhere."""
+    ``blocks`` names the blocks checked through 1 and 2 (None: every one, the whole sweep); 3 and the bookkeeping of
+    4 cover every member either way. A checked block whose predecessors were all checked starts from the residual the
+    check carried there from the sweep's start residual, which the sweep did not write. After a block it skipped, the
+    check goes back from the sweep's residual after the block instead, adding back each member's own move and its
+    successors': a residual move the kernels got wrong then shows in the shifts of the members before it. The check
+    reads each block's tile while the sweep holds it (``_sweep_models`` calls ``block`` after the block's last launch
+    is queued), in its member order, ``gram_columns`` columns at a time, at most PANEL x PANEL (the chunk's Gram). A
+    failure names the quantity, model and member, never a value or how far outside its tolerance it is: a faulty
+    kernel can put a sample's residual anywhere, and a tolerance as small as ``SWEEP_ATOL`` would scale it back."""
 
-    def __init__(self, xp: Any, layout: SweepLayout, inputs: dict, whole: bool = True) -> None:
-        self.xp, self.layout, self.inputs, self.whole = xp, layout, inputs, whole
+    def __init__(self, xp: Any, layout: SweepLayout, inputs: dict, blocks: frozenset[int] | None = None) -> None:
+        self.xp, self.layout, self.inputs, self.blocks, self.whole = xp, layout, inputs, blocks, blocks is None
+        # whether ``residual`` is the next block's start residual, carried from the sweep's
+        self.following = True
         squares = np.asarray(inputs["squares"])
         members, models = squares.shape
         self.old = inputs["state"]
@@ -1290,15 +1328,18 @@ class _SweepCheck:
             if self.failure is None:
                 at = np.unravel_index(int(np.argmax(bad.reshape(-1))), actual.shape)
                 finite = np.isfinite(actual[at]) and np.isfinite(expected[at])
-                outside = f"{float(ratio[at]):.2g} times its tolerance" if finite else "a value not finite"
+                outside = "outside its tolerance" if finite else "a value not finite"
                 self.failure = f"{quantity} of model {model}{where.format(None if members is None else int(members[at[0]]))}: error {outside}"
             return
         at = np.unravel_index(int(np.argmax(ratio.reshape(-1))), actual.shape)
         if float(ratio[at]) > self.worst[0]:
             self.worst = (float(ratio[at]), f"{quantity} of model {model}{where.format(None if members is None else int(members[at[0]]))}")
 
-    def block(self, block: _BlockLayout, tile: Any, held: dict, device: _DeviceLayout, gram_columns: Callable[[int], int]) -> None:
-        """Check one block's members once the sweep's last launch on it is queued (``_sweep_models``)."""
+    def block(
+        self, index: int, block: _BlockLayout, tile: Any, held: dict, device: _DeviceLayout, residual: Any, gram_columns: Callable[[int], int],
+    ) -> None:
+        """Check the ``index``-th block's members once the sweep's last launch on it is queued (``_sweep_models``),
+        ``residual`` the sweep's own after it."""
         xp, inputs = self.xp, self.inputs
         members = block.members
         count = int(members.shape[0])
@@ -1309,18 +1350,26 @@ class _SweepCheck:
         self.covered[members] = True
         live = self.live[members]
         self._unmoved(members, live)
-        if not (self.whole or block is self.layout.blocks[0]):
+        if self.blocks is not None and index not in self.blocks:
+            self.following = False
             return
         steps = np.where(live, self.recorded["mean"][members] - self.old["mean"][members], 0.0)
-        self.residual = moved(xp, self.residual, device.device_id)
-        self.reach = moved(xp, self.reach, device.device_id)
+        forward = self.following
+        if forward:
+            self.residual = moved(xp, self.residual, device.device_id)
+            self.reach = moved(xp, self.reach, device.device_id)
+            carried, reach = self.residual, self.reach
+        else:
+            carried = xp.array(residual, dtype=xp.float64)
+            reach = xp.zeros_like(carried)
         models = steps.shape[1]
-        sample_count = int(self.residual.shape[1])
+        sample_count = int(carried.shape[1])
         standardization = inputs.get("standardization")
         projection = np.zeros((count, models))
         bound = np.zeros((count, models))
         width = min(gram_columns(count), PANEL * PANEL)
-        for first in range(0, count, width):
+        chunks = range(0, count, width)
+        for first in chunks if forward else reversed(chunks):
             last = min(first + width, count)
             rows, signs = device.rows[block.offset + first:block.offset + last], device.signs[block.offset + first:block.offset + last]
             shared = None if standardization is not None else xp.asarray(tile.columns(rows), dtype=xp.float64) * signs[None, :]
@@ -1337,25 +1386,37 @@ class _SweepCheck:
                 mask = held["masks"][model]
                 projected = dense * mask[:, None]
                 del dense
+                offsets = xp.abs(centers / scales)
                 # the unprojected column's magnitude and its code offset's, which the kernels' products carry
-                magnitudes = _to_host(xp.sqrt(xp.sum(projected * projected, axis=0)) + xp.abs(centers / scales) * xp.sqrt(mask @ mask))
+                magnitudes = _to_host(xp.sqrt(xp.sum(projected * projected, axis=0)) + offsets * xp.sqrt(mask @ mask))
                 if (device.device_id, model) not in self.pinvs:
                     self.pinvs[device.device_id, model] = (
                         device.covariates * mask[:, None], moved(xp, inputs["covariate_pinvs"][model], device.device_id),
                     )
                 covariates, pinv = self.pinvs[device.device_id, model]
-                projected -= covariates @ (pinv @ (covariates.T @ projected))
                 step = xp.asarray(np.ascontiguousarray(steps[first:last, model]))
-                residual = self.residual[model]
-                # xp_j' r_(j): the chunk's start residual less the earlier chunk members' moves
-                product = projected.T @ residual - xp.tril(projected.T @ projected, -1) @ step
-                size = float(_to_host(xp.sqrt(residual @ residual))) + float(_to_host(xp.sqrt(self.reach[model] @ self.reach[model])))
-                self.residual[model] = residual - projected @ step
-                self.reach[model] += xp.abs(projected) @ xp.abs(step)
-                del projected
+                size = float(_to_host(xp.sqrt(carried[model] @ carried[model]))) + float(_to_host(xp.sqrt(reach[model] @ reach[model])))
+                moving = xp.abs(step)
+                spread = xp.abs(projected) @ moving + mask * (offsets @ moving)
+                share = covariates @ (pinv @ (covariates.T @ projected))
+                projected -= share
+                xp.abs(share, out=share)
+                spread += share @ moving
+                del share
+                gram = projected.T @ projected
+                if forward:
+                    # xp_j' r_(j): the chunk's start residual less the earlier chunk members' moves
+                    product = projected.T @ carried[model] - xp.tril(gram, -1) @ step
+                    carried[model] -= projected @ step
+                else:
+                    # xp_j' r_(j): the chunk's end residual plus the moves of the member and those after it
+                    product = projected.T @ carried[model] + xp.triu(gram) @ step
+                    carried[model] += projected @ step
+                reach[model] += spread
+                del projected, gram
                 projection[first:last, model] = _to_host(product)
                 moves = magnitudes * np.abs(steps[first:last, model])
-                bound[first:last, model] = magnitudes * (size + np.cumsum(moves) - moves)
+                bound[first:last, model] = magnitudes * (size + (np.cumsum(moves) - moves if forward else np.cumsum(moves[::-1])[::-1]))
             del shared
         classes = _to_host(device.classes[positions])
         for first in range(0, count, PANEL * PANEL):
@@ -1502,7 +1563,7 @@ def _sweep_models(
                 masked_covariates={}, pinvs={},
             ))
     residual: Any = np.array(residuals, dtype=np.float64)
-    for block, (start, _stop, tile, device_id) in zip(layout.blocks, tiles, strict=True):
+    for block_index, (block, (start, _stop, tile, device_id)) in enumerate(zip(layout.blocks, tiles, strict=True)):
         device = layout.devices[block.device]
         if int(device_id) != device.device_id or int(start) != block.start:
             raise ValueError("a block's tile is not where the sweep's layout places it")
@@ -1570,7 +1631,7 @@ def _sweep_models(
                     *members_out,
                 ))
             if check is not None:
-                check.block(block, tile, held, device, gram_columns)
+                check.block(block_index, block, tile, held, device, residual, gram_columns)
     totals = np.zeros((model_count, PIECE_COLUMNS))
     for device, held in zip(layout.devices, arrays):
         with _cupy_device_context(xp, device.device_id):
