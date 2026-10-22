@@ -440,7 +440,13 @@ class _DeviceMeter:
 
     @gpu_guard.traced
     def settle(self) -> None:
+        """Return the pool's free blocks to the device. On the main thread, where the sharded source's reads queue
+        work on every device, each device first runs what is queued (``device_plan.moved``); freeing synchronizes only
+        this device."""
         with self._on():
+            if threading.current_thread() is threading.main_thread() and int(self.pool.free_bytes()):
+                for device_id in range(int(self.cupy.cuda.runtime.getDeviceCount())):
+                    self.cupy.cuda.Device(device_id).synchronize()
             self.pool.free_all_blocks()
 
 

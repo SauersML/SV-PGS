@@ -129,7 +129,14 @@ class ShardTileSource(Protocol):
 @gpu_guard.traced
 def moved(cupy: Any, values: Any, device_id: int) -> Any:
     """``values`` (a cupy array on any device, or a numpy array) as a contiguous array on ``device_id``,
-    with the copy ordered after the work that wrote ``values`` on its own device."""
+    with the copy ordered after the work that wrote ``values`` on its own device and run before it returns.
+
+    A peer copy is waited for, as is every device after each block of a sharded read (``ShardedDualSource.blocks``) and
+    before a pool settle on the main thread (``memory_broker._DeviceMeter.settle``). With the copy left in flight and
+    only the source device's stream ordered after it, 25 of 186 two-device whole-genome attempts died of
+    cudaErrorLaunchFailure, most at their first EB posterior solve of 130-150 columns or at a second device's first
+    read; the live round's hook that made these three synchronous (``SVPGS_GPU_GUARD=harden``) ran 41 two-device
+    attempts, about 49 such solves among them, with none [real, aou-w* and aou-m1d/m2-e1]."""
     if isinstance(values, np.ndarray):
         with _cupy_device_context(cupy, device_id):
             return cupy.asarray(values)
@@ -147,10 +154,19 @@ def moved(cupy: Any, values: Any, device_id: int) -> Any:
         target.data.copy_from_device_async(contiguous.data, contiguous.nbytes, stream)
         copied = cupy.cuda.Event()
         copied.record(stream)
-    # the source buffer must outlive the asynchronous copy
-    with _cupy_device_context(cupy, source_device):
-        cupy.cuda.get_current_stream().wait_event(copied)
+    # the source buffer outlives the copy, whichever stream or thread frees or reuses it
+    copied.synchronize()
     return target
+
+
+def _synchronize_devices(cupy: Any, device_ids: Any) -> None:
+    """Wait for every stream of each of ``device_ids``; nothing on an array module with no devices (numpy, which stands in
+    for CuPy where the sharded source is checked on the host)."""
+    device = getattr(getattr(cupy, "cuda", None), "Device", None)
+    if device is None:
+        return
+    for device_id in device_ids:
+        device(int(device_id)).synchronize()
 
 
 def _synchronize(cupy: Any) -> None:
@@ -341,8 +357,10 @@ class ShardedDualSource:
         return all(held)
 
     def blocks(self) -> Iterator[tuple[int, int, Any]]:
-        """Every block in variant order, as a tile that takes and returns home-device arrays."""
+        """Every block in variant order, as a tile that takes and returns home-device arrays, each handed over once every
+        device has run what was queued before it (``moved``)."""
         for start, stop, tile, device_id in self.native_blocks():
+            _synchronize_devices(self._cupy, self.plan.device_ids)
             yield start, stop, _PeerTile(tile, device_id, self.home_id, self._cupy)
 
     def native_blocks(self) -> Iterator[tuple[int, int, Any, int]]:

@@ -1,6 +1,8 @@
 """The device plan: LPT block assignment, the exposed-device check, and the reassociation bound."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -137,6 +139,94 @@ def test_native_blocks_are_the_shards_own_tiles_on_their_devices() -> None:
 
     assert [(tile, device) for _start, _stop, tile, device in native_blocks(Source(), np)] == [(bound, 0) for bound in bounds]
     assert block_devices(Source(), np) == [0] * len(bounds)
+
+
+def _recording_cupy(order: list[str]):
+    """A stand-in CuPy whose devices, events, streams and peer copies append to ``order`` what they queue and wait for;
+    ``Array(shape, device_id)`` is an array on a device."""
+
+    class Device:
+        current = [0]
+
+        def __init__(self, device_id: int) -> None:
+            self.device_id = device_id
+
+        def __enter__(self) -> None:
+            self.previous, Device.current[0] = Device.current[0], self.device_id
+
+        def __exit__(self, *_exc) -> None:
+            Device.current[0] = self.previous
+
+        def synchronize(self) -> None:
+            order.append(f"synchronize device {self.device_id}")
+
+    class Event:
+        def record(self, stream=None) -> None:
+            self.device = Device.current[0]
+            order.append(f"record on device {self.device}")
+
+        def synchronize(self) -> None:
+            order.append(f"wait for the event on device {self.device}")
+
+    class Stream:
+        def __init__(self, device_id: int) -> None:
+            self.device_id = device_id
+
+        def wait_event(self, event) -> None:
+            order.append(f"device {self.device_id} waits for device {event.device}")
+
+    class Array:
+        def __init__(self, shape: tuple, device_id: int) -> None:
+            self.shape, self.dtype, self.nbytes = shape, np.float64, 8 * int(np.prod(shape))
+            self.device = SimpleNamespace(id=device_id)
+
+            def copy(source, _nbytes, stream) -> None:
+                order.append(f"copy from device {source.device_id} on device {stream.device_id}")
+
+            self.data = SimpleNamespace(device_id=device_id, copy_from_device_async=copy)
+
+    cupy = SimpleNamespace(
+        ascontiguousarray=lambda values: values,
+        empty=lambda shape, dtype: Array(shape, Device.current[0]),
+        cuda=SimpleNamespace(Device=Device, Event=Event, get_current_stream=lambda: Stream(Device.current[0])),
+    )
+    return cupy, Array
+
+
+def test_a_peer_copy_has_run_before_moved_returns() -> None:
+    """``moved`` queues the copy on the target device after the source's writes and waits for it, so no stream or
+    thread can free or reuse the source while the copy reads it."""
+    from sv_pgs.device_plan import moved
+
+    order: list[str] = []
+    cupy, Array = _recording_cupy(order)
+    target = moved(cupy, Array((4, 2), 1), 0)
+    assert target.device.id == 0 and target.shape == (4, 2)
+    assert order == [
+        "record on device 1", "device 0 waits for device 1", "copy from device 1 on device 0", "record on device 0",
+        "wait for the event on device 0",
+    ]
+
+
+def test_a_sharded_read_hands_over_each_block_once_every_device_has_run_its_queued_work() -> None:
+    from sv_pgs.device_plan import ShardedDualSource
+
+    class Shard:
+        def __init__(self, count: int) -> None:
+            self.count = count
+
+        def iter_tiles(self):
+            for index in range(self.count):
+                yield index, object()
+
+    order: list[str] = []
+    cupy, _array = _recording_cupy(order)
+    plan = plan_blocks((0, 1), [5, 9, 4, 3], 10)
+    bounds = [(0, 5), (5, 14), (14, 18), (18, 21)]
+    sharded = ShardedDualSource([Shard(plan.blocks_on(position).shape[0]) for position in range(2)], plan, bounds, 10, cupy)
+    for start, _stop, _tile in sharded.blocks():
+        order.append(f"block {start}")
+    assert order == [entry for start, _stop in bounds for entry in ("synchronize device 0", "synchronize device 1", f"block {start}")]
 
 
 def test_stage2_shards_its_reads_over_the_devices_as_one_streamed_source_reads(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

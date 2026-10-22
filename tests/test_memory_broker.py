@@ -81,10 +81,11 @@ _UNIT = 512
 def _fake_device(free: int):
     """A device of ``free`` units with CuPy's pool on it: ``used`` live units, ``cached`` free blocks it can return,
     ``fragments`` free parts of partly used blocks it cannot; lowering ``free`` is a library taking device bytes past
-    the pool. Every count is in units of ``_UNIT`` bytes."""
+    the pool. Every count is in units of ``_UNIT`` bytes. ``devices`` is the process's device count, and ``order`` lists
+    each device synchronize and each return of the pool's free blocks as they happen."""
     from types import SimpleNamespace
 
-    state = {"free": free, "used": 0, "cached": 0, "fragments": 0, "calls": 0, "limit": 0}
+    state = {"free": free, "used": 0, "cached": 0, "fragments": 0, "calls": 0, "limit": 0, "devices": 1, "order": []}
 
     class Pool:
         def total_bytes(self):
@@ -100,6 +101,7 @@ def _fake_device(free: int):
             state["limit"] = size
 
         def free_all_blocks(self):
+            state["order"].append("free")
             state["free"] += state["cached"]
             state["cached"] = 0
 
@@ -117,9 +119,20 @@ def _fake_device(free: int):
             state["used"] += units
             return units
 
+    class Device:
+        def __init__(self, device_id):
+            self.device_id = device_id
+
+        def synchronize(self):
+            state["order"].append(f"synchronize {self.device_id}")
+
     pool = Pool()
-    runtime = SimpleNamespace(getDevice=lambda: 0, memGetInfo=lambda: (state["free"] * _UNIT, free * _UNIT))
-    cupy = SimpleNamespace(get_default_memory_pool=lambda: pool, cuda=SimpleNamespace(runtime=runtime, memory=SimpleNamespace(OutOfMemoryError=_Refused)))
+    runtime = SimpleNamespace(
+        getDevice=lambda: 0, getDeviceCount=lambda: state["devices"], memGetInfo=lambda: (state["free"] * _UNIT, free * _UNIT)
+    )
+    cupy = SimpleNamespace(
+        get_default_memory_pool=lambda: pool, cuda=SimpleNamespace(runtime=runtime, Device=Device, memory=SimpleNamespace(OutOfMemoryError=_Refused))
+    )
     return cupy, state
 
 
@@ -379,3 +392,27 @@ def test_the_host_allocator_setting_does_nothing_off_glibc(monkeypatch):
     monkeypatch.setattr(memory_broker.sys, "platform", "darwin")
     with memory_broker._retain_freed_host_memory() as set_:
         assert set_ is False
+
+
+def test_a_main_thread_settle_first_runs_every_devices_queued_work():
+    # A two-device fit's pool settle on the main thread, with free blocks to return, waits for both devices before it
+    # frees (a sharded read queues work on each); in a worker thread, or with nothing to return, it frees at once.
+    import threading
+
+    from sv_pgs.memory_broker import _DeviceMeter
+
+    cupy, state = _fake_device(10)
+    state["devices"] = 2
+    meter = _DeviceMeter(cupy, 0)
+    state["cached"] = 3
+    meter.settle()
+    assert state["order"] == ["synchronize 0", "synchronize 1", "free"] and state["cached"] == 0
+    state["order"].clear()
+    meter.settle()
+    assert state["order"] == ["free"]
+    state["order"].clear()
+    state["cached"] = 3
+    worker = threading.Thread(target=meter.settle)
+    worker.start()
+    worker.join()
+    assert state["order"] == ["free"] and state["cached"] == 0
