@@ -314,20 +314,41 @@ def weighted_partial_r2(weights: NDArray, covariates: NDArray, target: NDArray, 
     covariates, so the partial r^2 of score m is S_0m^2 / (S_00 S_mm), the squared correlation of the two residuals
     (``workspace_pipeline._partial_r2`` at unit weights). One matrix product forms every resample's Gram. Q rather than
     the raw covariates keeps A near the identity times the weight total whatever the covariates' scales (age squared
-    beside principal components), so S keeps its precision where a score is mostly explained by the covariates; a
-    resample that drops every row a basis direction rests on leaves A singular there, and the pseudo-inverse projects
-    on the rest. A residual without variance has no partial r^2 (NaN)."""
+    beside principal components), so S keeps its precision where a score is mostly explained by the covariates.
+
+    Each Gram entry is a sum over the n rows, so it carries a rounding error of order n eps times the sizes of its
+    terms (Higham, Accuracy and Stability of Numerical Algorithms, 2nd ed., section 3.1). A^+ therefore inverts only
+    A's eigenvalues above its largest times n eps: numpy's matrix_rank tolerance, as ``column_basis`` reads Q's rank,
+    with the rows a Gram entry sums over in place of a factor's dimensions. A resample that drops every row a basis
+    direction rests on leaves A an eigenvalue of rounding there, which pinv's default cut (1e-15 of the largest) can
+    invert; the projection is on the rest of the basis. A residual variance S_jj is D_jj less its projected part, each
+    with that relative error, so S_jj at or below n eps D_jj is rounding, not variance. The residuals lie in a space of
+    dimension the rows drawn (weight above 0) less A's rank: with none they vanish and S is cancellation noise, and
+    with one every score's residual is a multiple of the target's, so its r^2 is 1 whatever the score. The partial
+    r^2 is therefore NaN where the rows drawn exceed A's rank by fewer than two, or where the target's or the score's
+    residual variance is rounding. Such resamples are common in a small cell with many covariates: with 43 people and
+    21 covariates, 1.5-2% of resamples drew 22 people or fewer, and before this rule they gave 1 or values far outside
+    [0, 1] (up to 240) and bootstrap standard errors up to 5 [sim]. Where the partial r^2 is defined, Cauchy-Schwarz
+    bounds S_0m^2 by S_00 S_mm up to S's rounding, so a value can pass 1 only by that rounding, which no table's six
+    digits show. It is not clipped, since a clip would also hide an excess that is not rounding."""
     basis = column_basis(covariates)
     data = np.column_stack([basis, np.asarray(target, dtype=np.float64), np.atleast_2d(np.asarray(scores, dtype=np.float64)).T])
+    weights = np.atleast_2d(np.asarray(weights, dtype=np.float64))
     size, width = data.shape[1], basis.shape[1]
-    gram = (np.atleast_2d(np.asarray(weights, dtype=np.float64)) @ (data[:, :, None] * data[:, None, :]).reshape(data.shape[0], size * size)).reshape(-1, size, size)
-    cross = gram[:, :width, width:]
-    residual = gram[:, width:, width:] - np.swapaxes(cross, 1, 2) @ np.linalg.pinv(gram[:, :width, :width], hermitian=True) @ cross
-    target_variance = residual[:, 0, 0]
-    score_variance = np.diagonal(residual, axis1=1, axis2=2)[:, 1:]
+    rounding = data.shape[0] * np.finfo(np.float64).eps
+    gram = (weights @ (data[:, :, None] * data[:, None, :]).reshape(data.shape[0], size * size)).reshape(-1, size, size)
+    eigenvalues, eigenvectors = np.linalg.eigh(gram[:, :width, :width])
+    kept = eigenvalues > rounding * eigenvalues.max(axis=1, initial=0.0)[:, None]
+    # C: B in A's kept eigenvectors, each coordinate over its eigenvalue's square root, so B'A^+B = C'C.
+    coordinates = np.where(kept[:, :, None], np.swapaxes(eigenvectors, 1, 2) @ gram[:, :width, width:], 0.0)
+    coordinates = coordinates / np.sqrt(np.where(kept, eigenvalues, 1.0))[:, :, None]
+    own = gram[:, width:, width:]
+    residual = own - np.swapaxes(coordinates, 1, 2) @ coordinates
+    variance = np.diagonal(residual, axis1=1, axis2=2)
+    defined = (variance > rounding * np.diagonal(own, axis1=1, axis2=2)) & (np.sum(weights > 0.0, axis=1) - np.sum(kept, axis=1) >= 2)[:, None]
     with np.errstate(divide="ignore", invalid="ignore"):
-        result = residual[:, 0, 1:] ** 2 / (target_variance[:, None] * score_variance)
-    result[~((target_variance[:, None] > 0.0) & (score_variance > 0.0))] = np.nan
+        result = residual[:, 0, 1:] ** 2 / (variance[:, :1] * variance[:, 1:])
+    result[~(defined[:, :1] & defined[:, 1:])] = np.nan
     return result
 
 

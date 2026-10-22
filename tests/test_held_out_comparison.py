@@ -249,6 +249,71 @@ def test_a_weighted_partial_r2_projects_on_the_covariates_a_resample_keeps():
     assert np.isnan(weighted_partial_r2(np.zeros((1, rows)), covariates, target, score[None, :])[0, 0])
 
 
+def _short_of_two_residual_dimensions(weights: NDArray, covariates: NDArray) -> NDArray:
+    """Per resample, whether its drawn rows exceed the rank of their covariates by fewer than two."""
+    return np.array([drawn.sum() - np.linalg.matrix_rank(covariates[drawn]) < 2 for drawn in np.atleast_2d(weights) > 0.0])
+
+
+def test_a_weighted_partial_r2_is_the_least_squares_one_on_the_repeated_rows_wherever_two_residual_dimensions_remain():
+    rng = np.random.default_rng(6)
+    rows = 30
+    # Nine columns on 30 rows (an age-like column and its square, principal-component-like columns, a 0/1 column of
+    # two rows) and resamples from all rows drawn to only a few: some drop the 0/1 column's rows, some saturate.
+    age = rng.uniform(20.0, 80.0, rows)
+    rare = np.zeros(rows)
+    rare[:2] = 1.0
+    covariates = np.column_stack([np.ones(rows), age, age**2, rng.normal(0.0, 0.01, (rows, 5)), rare])
+    target = 0.02 * age + rare + rng.normal(size=rows)
+    scores = np.vstack([target * 0.4 + rng.normal(size=rows), rng.normal(size=rows)])
+    weights = rng.integers(0, 4, size=(400, rows)) * (rng.random((400, rows)) < rng.uniform(0.2, 1.0, (400, 1)))
+    values = weighted_partial_r2(weights, covariates, target, scores)
+    short = _short_of_two_residual_dimensions(weights, covariates)
+    assert short.any() and (~short).sum() > 200 and np.any(weights[~short, :2].sum(axis=1) == 0.0)
+    assert np.all(np.isnan(values[short]))
+    for weight, value in zip(weights[~short], values[~short]):
+        copies = np.repeat(np.arange(rows), weight)
+        np.testing.assert_allclose(value, [_residual_r2(target[copies], score[copies], covariates[copies]) for score in scores], rtol=0.0, atol=1e-10)
+
+
+def test_a_resample_with_fewer_than_two_residual_dimensions_or_a_score_the_covariates_explain_has_no_partial_r2():
+    rng = np.random.default_rng(8)
+    rows = 40
+    covariates = np.column_stack([np.ones(rows), rng.normal(size=(rows, 5))])
+    target = rng.normal(size=rows)
+    # The second score lies in the covariates' span: its residual variance is rounding.
+    scores = np.vstack([rng.normal(size=rows), covariates @ rng.normal(size=6)])
+    weights = np.zeros((4, rows))
+    # Rows drawn: the covariates' rank (no residual), one more (a residual every score's is a multiple of), two more, all.
+    for resample, drawn in enumerate((6, 7, 8, rows)):
+        weights[resample, rng.choice(rows, drawn, replace=False)] = rng.integers(1, 4, drawn)
+    values = weighted_partial_r2(weights, covariates, target, scores)
+    assert np.all(np.isnan(values[:2])) and np.all(np.isfinite(values[2:, 0])) and np.all(np.isnan(values[:, 1]))
+
+
+def test_a_small_cell_s_resampled_partial_r2_stays_in_the_unit_interval():
+    # 43 people in 40 families with 21 covariates (intercept, age, age^2, age x female, female and 16 principal
+    # components of one ancestry group), as the report's smallest shown ancestry group: a resample draws about 27 of
+    # them, and 1.5-2% draw 22 or fewer, too few for the covariates.
+    rng = np.random.default_rng(4)
+    rows = 43
+    age, female = rng.uniform(25.0, 80.0, rows), rng.integers(0, 2, rows).astype(np.float64)
+    pcs = rng.normal(0.02, 0.003, (rows, 16)) * rng.uniform(0.2, 2.0, 16)
+    covariates = np.column_stack([np.ones(rows), age, age**2, age * female, female, pcs])
+    small, structural = rng.normal(size=rows), rng.normal(size=rows)
+    target = 130.0 + 0.3 * age + 5.0 * female + 10.0 * (small + 0.5 * structural + 2.0 * rng.normal(size=rows))
+    snv_indel = small + rng.normal(size=rows)
+    scores = np.vstack([snv_indel, snv_indel + 0.5 * structural])
+    families = np.r_[np.arange(6) // 2, 3 + np.arange(rows - 6)]
+    weights = cluster_bootstrap_counts(np.zeros(families.max() + 1, dtype=np.int64), 2000, np.random.default_rng(104))[:, families]
+    values = weighted_partial_r2(weights, covariates, target, scores)
+    finite = np.isfinite(values)
+    assert np.all((values[finite] >= 0.0) & (values[finite] <= 1.0 + rows * np.finfo(np.float64).eps))
+    # A squared correlation's resampled standard deviation is at most 1/2.
+    assert all(np.std(values[finite[:, index], index], ddof=1) <= 0.5 for index in range(scores.shape[0]))
+    short = _short_of_two_residual_dimensions(weights, covariates)
+    assert 0 < short.sum() < 100 and np.all(np.isnan(values[short])) and np.all(finite[~short])
+
+
 def test_cluster_bootstrap_counts_draw_each_stratum_s_clusters_as_many_times_as_it_holds():
     strata = np.array([0, 0, 0, 1, 1, 2, 2, 2, 2, 2])
     counts = cluster_bootstrap_counts(strata, 500, np.random.default_rng(5))

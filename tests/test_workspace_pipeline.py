@@ -3032,6 +3032,57 @@ def test_the_partial_r2_tables_resample_every_method_and_trait_on_the_same_famil
         workspace_pipeline.partial_r2_tables([dataclasses.replace(traits[0], scores=partial_scores)], families, folds, list(ancestry), 7, 20, 1 << 26)
 
 
+def _small_cell_tables(with_sv_noise: float, seed: int, resamples: int) -> tuple[dict[str, dict[str, object]], np.ndarray, np.ndarray]:
+    """partial_r2_tables on one fold of 43 people in 40 families (three pairs) with 21 covariates, the report's smallest
+    shown ancestry group, whose with_sv score is the target plus ``with_sv_noise`` noise: the all cell's partial r^2 rows
+    and paired difference row by method (the pair's under "pair"), each score's resampled partial r^2 as the tables draw
+    it (each family a cluster of the one fold, in one chunk), and which resamples have one."""
+    generator = np.random.default_rng(4)
+    rows = 43
+    age, female = generator.uniform(25.0, 80.0, rows), generator.integers(0, 2, rows).astype(np.float64)
+    pcs = generator.normal(0.02, 0.003, (rows, 16)) * generator.uniform(0.2, 2.0, 16)
+    covariates = np.column_stack([np.ones(rows), age, age**2, age * female, female, pcs])
+    target = 130.0 + 0.3 * age + 20.0 * generator.normal(size=rows)
+    scores = {"snv_indel": target / 20.0 + 2.0 * generator.normal(size=rows), "with_sv": target / 20.0 + with_sv_noise * generator.normal(size=rows)}
+    families = np.r_[np.arange(6) // 2, 3 + np.arange(rows - 6)].astype(np.int64)
+    trait = workspace_pipeline.HeldOutTrait("ldl", False, target, covariates, scores, (0,))
+    tables, _incomplete = workspace_pipeline.partial_r2_tables([trait], families, np.zeros(rows, dtype=np.int64), ["mena"] * rows, seed, resamples, 1 << 26)
+    rows_of = {line[1]: dict(zip(tables["partial_r2.tsv"][0], line)) for line in tables["partial_r2.tsv"][1:] if line[2] == "all"}
+    rows_of["pair"] = next(dict(zip(tables["paired_differences.tsv"][0], line)) for line in tables["paired_differences.tsv"][1:] if line[3] == "all")
+    weights = held_out_comparison.cluster_bootstrap_counts(np.zeros(families.max() + 1, dtype=np.int64), resamples, np.random.default_rng(seed))[:, families]
+    values = held_out_comparison.weighted_partial_r2(weights, covariates, target, np.vstack([scores["snv_indel"], scores["with_sv"]]))
+    defined = np.array([drawn.sum() - np.linalg.matrix_rank(covariates[drawn]) >= 2 for drawn in weights > 0.0])
+    return rows_of, values, defined
+
+
+def test_a_partial_r2_row_counts_the_resamples_its_interval_is_read_from() -> None:
+    # About 1 in 60 resamples of 43 people draws too few of them for 21 covariates and has no partial r^2: each row
+    # says how many it read, and its error and interval are theirs.
+    rows_of, values, defined = _small_cell_tables(1.0, 11, 2000)
+    used = int(defined.sum())
+    assert 0 < 2000 - used < 100 and np.all(np.isfinite(values[defined])) and np.all(np.isnan(values[~defined]))
+    for index, method in enumerate(("snv_indel", "with_sv")):
+        row = rows_of[method]
+        assert row["resamples"] == used
+        assert float(row["standard_error"]) == pytest.approx(np.std(values[defined, index], ddof=1), rel=1e-5) and float(row["standard_error"]) <= 0.5
+        assert float(row["ci_low"]) == pytest.approx(np.quantile(values[defined, index], 0.025), rel=1e-5)
+        assert 0.0 <= float(row["ci_low"]) < float(row["ci_high"]) <= 1.0
+    pair = rows_of["pair"]
+    assert pair["resamples"] == used
+    assert float(pair["standard_error"]) == pytest.approx(np.std(values[defined, 1] - values[defined, 0], ddof=1), rel=1e-5)
+
+
+def test_the_bootstrap_p_of_a_difference_every_resample_finds_positive_is_two_over_its_resamples_plus_one() -> None:
+    # with_sv is the target up to noise a millionth of its size and snv_indel mostly noise, so every resample with a
+    # partial r^2 finds the gain positive, even one whose two residual dimensions put snv_indel's near 1: the two-sided
+    # tail p is at its floor, the estimate itself counted on each side.
+    rows_of, values, defined = _small_cell_tables(1e-6, 12, 2000)
+    assert np.all(values[defined, 1] > values[defined, 0])
+    pair = rows_of["pair"]
+    assert pair["resamples"] == int(defined.sum()) < 2000
+    assert float(pair["p_bootstrap"]) == pytest.approx(2.0 / (pair["resamples"] + 1), rel=1e-5) and float(pair["ci_low"]) > 0.0
+
+
 def test_method_pairs_and_the_stacks_scored_from_weights_fitted_on_other_families() -> None:
     assert workspace_pipeline.method_pairs(["snv_indel", "with_sv", "ldpred2_auto", "ldpred2_auto+with_sv", "prs_cs+structural"]) == [
         ("with_sv", "snv_indel"), ("with_sv", "ldpred2_auto"), ("snv_indel", "ldpred2_auto"), ("ldpred2_auto+with_sv", "ldpred2_auto"),

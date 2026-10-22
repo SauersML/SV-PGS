@@ -5217,7 +5217,9 @@ PARTIAL_R2_COLUMNS = ("trait", "method", "cell", "level", "n", "cases", "partial
 cell (all held-out rows, each ancestry group), the held-out partial r^2 of the method's genetic score (``_partial_r2``:
 the squared correlation with the outcome after both are residualized on the trait's covariates, PC1-16, age, age^2,
 age x female and sex among them; a disease's 0/1 outcome is read the same way), with its family-clustered bootstrap
-standard error and percentile interval."""
+standard error and percentile interval and the number of resamples they are read from (``resamples``): those with a
+partial r^2, which in a small cell leaves out a resample that drew too few people for its covariates
+(``held_out_comparison.weighted_partial_r2``), so fewer than BOOTSTRAP_RESAMPLES shows where that happened."""
 PAIRED_DIFFERENCE_COLUMNS = (
     "trait", "candidate", "baseline", "cell", "level", "n", "cases", "estimate", "standard_error", "ci_low", "ci_high", "z", "p_value",
     "p_bootstrap", "relative_estimate", "relative_ci_low", "relative_ci_high", "resamples", "inference",
@@ -5225,7 +5227,9 @@ PAIRED_DIFFERENCE_COLUMNS = (
 """``paired_differences.tsv``: per trait, pair of methods and cell, the candidate's partial r^2 less the baseline's on the
 same held-out people, from the same resamples: its bootstrap standard error and percentile interval, z = estimate / SE
 with its two-sided normal p, the bootstrap's own two-sided p (twice the smaller share of resampled differences on either
-side of 0, each counted with the estimate itself), and the difference relative to the baseline's partial r^2."""
+side of 0, each counted with the estimate itself), and the difference relative to the baseline's partial r^2. Its
+``resamples`` are those where both methods have a partial r^2, from which the standard error, interval and bootstrap p
+are read."""
 META_ANALYSIS_COLUMNS = (
     "candidate", "baseline", "cell", "level", "model", "traits", "estimate", "standard_error", "ci_low", "ci_high", "z", "p_value",
     "heterogeneity_q", "heterogeneity_p", "i_squared", "tau_squared", "positive_traits", "covariance",
@@ -5401,7 +5405,7 @@ def partial_r2_tables(
                 low, high = np.quantile(finite, [lower, upper]) if finite.shape[0] else (np.nan, np.nan)
                 partial_lines.append((
                     trait.name, method, cell, level, *shown_counts, _number(point[index]),
-                    _number(float(np.std(finite, ddof=1)) if finite.shape[0] > 1 else float("nan")), _number(low), _number(high), resamples, inference,
+                    _number(float(np.std(finite, ddof=1)) if finite.shape[0] > 1 else float("nan")), _number(low), _number(high), finite.shape[0], inference,
                 ))
             for candidate, baseline in pairs:
                 first, second = methods.index(candidate), methods.index(baseline)
@@ -5421,7 +5425,7 @@ def partial_r2_tables(
                     trait.name, candidate, baseline, cell, level, *shown_counts, _number(estimate), _number(standard_error), _number(low), _number(high),
                     _number(comparison.z_score) if tested else "", _number(2.0 * stats.norm.sf(abs(comparison.z_score))) if tested else "",
                     _number(bootstrap_p) if single else "", _number(estimate / point[second]) if np.isfinite(point[second]) and point[second] else "", _number(relative_low),
-                    _number(relative_high), resamples, inference,
+                    _number(relative_high), finite.shape[0], inference,
                 ))
                 if tested and standard_error > 0.0:
                     joint.setdefault((candidate, baseline, cell, level), []).append((trait.name, estimate, differences))
