@@ -89,6 +89,7 @@ REFERENCES = [
     "Byrska-Bishop et al. (2022) Cell 185:3426.",
     "Taylor et al. (2024) Nature 631:610.",
     "Privé et al. (2020) Bioinformatics 36:5424.",
+    "Browning et al. (2018) Am J Hum Genet 103:338.",
     "Wray et al. (2010) PLoS Genet 6:e1000864.",
     "All of Us Research Program Investigators (2019) N Engl J Med 381:668.",
 ]
