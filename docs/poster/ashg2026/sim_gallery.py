@@ -945,7 +945,7 @@ def poster_sv_gain_figure(grids):
                  for key, row in sets.items()},
     }
     rows = list(sets.values())
-    pitch, top, bottom, right = 2.65, 1.1, 2.3, 0.5
+    pitch, top, bottom, right = 3.1, 0.25, 2.3, 0.5
     height = top + bottom + pitch * len(rows)
     fig = plt.figure(figsize=(POSTER_GAIN, height))
     left = widest(fig, [row["label"] for row in rows], fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0) + 0.75
@@ -974,14 +974,17 @@ def poster_sv_gain_figure(grids):
     ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
     ax.set_xticks(ticks, [plain(tick, 3) for tick in ticks])
     ax.set_xlabel("Test AUC gain from adding SVs")
-    # the two genotype sources named once over the whole figure, labels and plot, each after a mark like its own
-    first = widest(fig, [SOURCES[0][0]], fontsize=POSTER_NAME, fontweight="bold")
-    for across, (label, color, filled) in ((0.3, SOURCES[0]), (0.3 + first + 1.6, SOURCES[1])):
-        fig.add_artist(Line2D([(across + 0.25) / POSTER_GAIN], [1 - 0.55 / height], marker="o", markersize=POSTER_MARK,
-                              color=color, markerfacecolor=color if filled else "white",
-                              markeredgecolor=color, markeredgewidth=0 if filled else 6.0))
-        fig.text((across + 0.75) / POSTER_GAIN, 1 - 0.55 / height, label, color=color, fontsize=POSTER_NAME,
-                 fontweight="bold", va="center", ha="left")
+    # the two genotype sources named in the empty space right of the control row, each at its own marks' height
+    # there and after a mark like its own, the longer name ending 0.2 in inside the plot's right edge
+    across = POSTER_GAIN - left - right - 0.2 - widest(fig, [label for label, _, _ in SOURCES], fontsize=POSTER_TYPE,
+                                                       fontweight="bold")
+    for offset, (label, color, filled) in ((-0.2, SOURCES[0]), (0.2, SOURCES[1])):
+        y = len(rows) - 1 + offset
+        ax.plot([0], [y], "o", transform=shifted(ax, across - 0.5), markersize=POSTER_MARK, color=color,
+                markerfacecolor=color if filled else "white", markeredgecolor=color,
+                markeredgewidth=0 if filled else 6.0, clip_on=False, zorder=4)
+        ax.text(0, y, label, transform=shifted(ax, across), color=color, fontsize=POSTER_TYPE, fontweight="bold",
+                va="center", ha="left")
     description = (
         "Test AUC gain from adding SVs to SV-PGS with true (filled) and Beagle-imputed (open) SV genotypes, mean and 95% "
         "interval over simulated truths, for every architecture with causal SVs, those whose causal SVs are well "
