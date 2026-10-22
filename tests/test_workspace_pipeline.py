@@ -1354,6 +1354,37 @@ def test_warm_start_models_key_the_fit_and_seed_it_only_where_a_saved_model_matc
     assert any(path.name.startswith("fit.superseded-") for path in config.run_directory.iterdir())
 
 
+def test_mode_orders_make_every_fit_s_mode_search_the_seeded_one_and_key_the_fit(workspace):
+    """``mode_orders`` makes every fit's mode search the seeded one (``full_data_fit._mode_mixture``), alike in both
+    arms, and ``mode_seed_models`` (which needs it) names the saved models that start it; both are in the fit step's
+    key and no earlier step's, and a run without them keeps its fit key. A pattern that finds no saved model leaves
+    each model's mode seeds empty, so its search is the main fixed point, the ridge start and the orders
+    (``test_warm_seeds`` searches from real ones)."""
+    synthetic, client = workspace
+    pattern = "/nowhere/{arm}/{trait}"
+    for wrong, match in (
+        ({"mode_orders": -1}, "mode_orders"), ({"mode_orders": True}, "mode_orders"), ({"mode_orders": 65}, "mode_orders"),
+        ({"mode_seed_models": [pattern]}, "mode_seed_models needs mode_orders"), ({"mode_seed_models": pattern, "mode_orders": 0}, "mode_seed_models"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            WorkspaceConfig.from_mapping({**synthetic.raw, **wrong})
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    assert config.mode_seed_models == () and config.mode_orders is None
+    steps = {step.name: step for step in workspace_pipeline._STEPS}
+    assert all(not isinstance(value, tuple) or value[:1] != ("mode_search",) for value in steps["fit"].inputs(config))
+    short = WorkspaceConfig.from_mapping({**synthetic.raw, "mode_orders": 0})
+    seeded = WorkspaceConfig.from_mapping({**synthetic.raw, "mode_orders": 2, "mode_seed_models": [pattern]})
+    assert seeded.mode_seed_models == (pattern,) and seeded.mode_orders == 2
+    recorder = _Recorder()
+    run_pipeline(seeded, _bindings(recorder, client), BUDGET, through="fit")
+    assert recorder.fit_calls and all(
+        call.mode_orders == 2 and call.mode_seeds == ((),) * len(call.model_names) for call in recorder.fit_calls
+    )
+    keys = [steps["fit"].inputs(entry) for entry in (config, short, seeded)]
+    assert len({repr(key) for key in keys}) == 3
+    assert all(steps[name].inputs(seeded) == steps[name].inputs(config) for name in STEP_NAMES[:STEP_NAMES.index("fit")])
+
+
 def _earlier_tree(tmp_path: Path) -> Path:
     """A copy of this source tree that keys its steps before the fit by the earlier formula, the source of the code it
     lists (here its roots' names, each listed string standing as its own source)."""

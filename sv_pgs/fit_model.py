@@ -110,7 +110,9 @@ class FitRequest:
     ``warm_seeds``) are earlier fits whose state a model's empirical Bayes starts from, and each seeded model's
     certificate notes its seed; they move only where it starts, so the problem's digest leaves them out, while the fit's
     identity names each seed's saved model (``Seed.digest``), so a completed model is never taken for the fit from
-    another start (its empirical Bayes' saved starts are resumed whatever the seed: ``fit_identity``).
+    another start (its empirical Bayes' saved starts are resumed whatever the seed: ``fit_identity``). ``mode_seeds`` and
+    ``mode_orders`` make each model's mode search the seeded one (``full_data_fit._mode_mixture``), which the identity
+    names as it names the seeds.
 
     The fit has no measurement-object and no target-variance term: the measurement model enters as the records'
     ``log_variance_offset`` (and as the store's own recalibrated dosages), and every target is taken as measured
@@ -152,6 +154,11 @@ class FitRequest:
     restart_dir: Path | None = None
     # Per model, the earlier fit its empirical Bayes starts from (``warm_seeds``), None for a model without one.
     seeds: tuple[Seed | None, ...] | None = None
+    # The seeded mode search (``full_data_fit._mode_mixture``): per model, the saved fits whose modes start it beside its
+    # seed's (``warm_seeds.start_components``; both arms' in the matched comparison), and the random orders it runs after
+    # them and the ridge start (``mode_orders``, 0 to DRAW_COUNT; None: the whole-budget search, and no mode seeds).
+    mode_seeds: tuple[tuple[Seed, ...], ...] | None = None
+    mode_orders: int | None = None
 
     def __post_init__(self) -> None:
         """Check every field's rank, kind, values and agreement, and only then convert.
@@ -249,6 +256,15 @@ class FitRequest:
             if len(seeds) != model_count or any(seed is not None and not isinstance(seed, Seed) for seed in seeds):
                 raise ValueError("seeds needs one warm_seeds.Seed or None per model.")
             set_field(self, "seeds", seeds)
+        if self.mode_orders is not None and (
+            isinstance(self.mode_orders, bool) or not isinstance(self.mode_orders, (int, np.integer)) or not 0 <= self.mode_orders <= DRAW_COUNT
+        ):
+            raise ValueError(f"mode_orders is a count of random orders in [0, {DRAW_COUNT}], or None for the whole-budget search.")
+        if self.mode_seeds is not None:
+            mode_seeds = tuple(tuple(entry) for entry in self.mode_seeds)
+            if self.mode_orders is None or len(mode_seeds) != model_count or any(not isinstance(seed, Seed) for entry in mode_seeds for seed in entry):
+                raise ValueError("mode_seeds needs mode_orders and a sequence of warm_seeds.Seed per model.")
+            set_field(self, "mode_seeds", mode_seeds)
         set_field(self, "store_columns", columns)
         set_field(self, "covariates", covariate_matrix)
         set_field(self, "targets", target_matrix)
@@ -290,6 +306,10 @@ def fit_identity(request: FitRequest, store_key: str) -> dict[str, str]:
     }
     if request.seeds is not None and any(seed is not None for seed in request.seeds):
         identity["seeds"] = ",".join("-" if seed is None else seed.digest or content_digest(seed) for seed in request.seeds)
+    if request.mode_orders is not None:
+        identity["modes"] = f"orders={int(request.mode_orders)};" + ",".join(
+            "+".join(f"{seed.digest or content_digest(seed)}:{seed.model_name}" for seed in entry) for entry in (request.mode_seeds or ((),) * request.model_count)
+        )
     return identity
 
 
@@ -328,8 +348,10 @@ def fit(request: FitRequest) -> FittedModel:
         restart=RestartStore(request.restart_dir if request.restart_dir is not None else request.work_dir),
         identity=identity,
         store_key=store_key,
-        request_key=unit_key({name: value for name, value in identity.items() if name not in ("source", "seeds")}),
+        request_key=unit_key({name: value for name, value in identity.items() if name not in ("source", "seeds", "modes")}),
         seeds=seeds,
+        mode_seeds=request.mode_seeds,
+        mode_orders=None if request.mode_orders is None else int(request.mode_orders),
     )
     parts = certificate_parts(fitted.certificate, model_count)
     trained = request.training.any(axis=1)

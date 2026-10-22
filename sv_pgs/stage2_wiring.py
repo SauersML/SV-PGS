@@ -633,6 +633,8 @@ def _fit_group(
     request_key: str | None = None,
     seeds: Sequence[Seed | None] | None = None,
     evaluation: GroupEvaluation | None = None,
+    mode_seeds: Sequence[Sequence[Seed]] | None = None,
+    mode_orders: int | None = None,
 ) -> list[_ModelFit]:
     """The group of the request's ``models`` (``model_groups``) on the sorted store columns ``training_columns``, whose
     covariates (intercept first) and targets [n, models] follow them: one Stage 0 with a target column per model, one
@@ -663,6 +665,13 @@ def _fit_group(
     start lattice (``seed_lattice``), and each such model's certificate notes its seed. A quantitative mean-field fit
     only. A seeded fit with no certified start is fitted again from the prior, as without seeds, and its certificate
     says so: a seed moves where the fit starts, never whether it is fitted.
+
+    ``mode_orders`` (None: the whole-budget search) makes every fit's mode search the seeded one
+    (``full_data_fit._mode_mixture``): its start components are ``mode_seeds``' (one sequence per model, in group order:
+    saved fits of the trait, both arms' in the matched comparison, so both arms start alike) and then each model's own
+    seed's where it is none of them, each mapped onto the model's members (``warm_seeds.start_components``), then the
+    ridge start and ``mode_orders`` random orders. A group any of whose models has no start component searches from the
+    ridge start and the orders alone.
 
     ``evaluation``, the group's evaluation rows, is the EB monitor's alone (``eb_monitor``): Stage 0's pass keeps their
     codes as it reads, and the mean-field fit logs each outer-loop call's posterior mean scored on them. Nothing of the
@@ -911,7 +920,28 @@ def _fit_group(
             "starts": [entry.hyperparameters for entry in starting], "start_noise": np.array([entry.noise for entry in starting]),
             "start_mean": np.column_stack([entry.mean for entry in starting]),
         }
-        if continuation and all(entry.components is not None and entry.component_noises is not None for entry in starting):
+        if mode_orders is not None and inference == "mean_field" and not binary:
+            # The seeded search's starts (``warm_seeds.start_components``): the mode seeds' in their order, which both arms
+            # share, then the model's own seed's where it is none of them.
+            records = int(np.asarray(table.variant_class).shape[0])
+            scales = np.asarray(statistics.scales, dtype=np.float64)
+            mapped = [
+                warm_seeds.start_components(
+                    [*(() if mode_seeds is None else mode_seeds[genetic[column]]), None if seeds is None else seeds[genetic[column]]],
+                    member_rows, scales, records, draw_count,
+                )
+                for column in columns
+            ]
+            if all(components.shape[0] > 0 for components, _noises in mapped):
+                counts = np.array([components.shape[0] for components, _noises in mapped], dtype=np.int64)
+                continuation["mixture_start"] = MixtureStart(
+                    means=tuple(np.column_stack([components[min(index, components.shape[0] - 1)] for components, _noises in mapped]) for index in range(int(counts.max()))),
+                    noises=tuple(np.array([noises[min(index, noises.shape[0] - 1)] for _components, noises in mapped]) for index in range(int(counts.max()))),
+                    counts=counts, settled=np.zeros(len(columns), dtype=bool),
+                )
+            else:
+                log(f"stage2 wiring: {sum(components.shape[0] == 0 for components, _noises in mapped)} of the group's models have no mode start: the seeded search runs from the ridge start and its orders alone")
+        elif continuation and all(entry.components is not None and entry.component_noises is not None for entry in starting):
             # The seeds' mode mixtures start this fit's (``full_data_fit.MixtureStart``), a shorter one padded with its first.
             counts = np.array([entry.components.shape[0] for entry in starting], dtype=np.int64)
             continuation["mixture_start"] = MixtureStart(
@@ -919,7 +949,7 @@ def _fit_group(
                 noises=tuple(np.array([entry.component_noises[min(index, entry.components.shape[0] - 1)] for entry in starting]) for index in range(int(counts.max()))),
                 counts=counts, settled=np.array([entry.settled for entry in starting], dtype=bool),
             )
-        seed_notes = {} if not continuation else {position: (entry.note,) for position, entry in enumerate(starting)}
+        seed_notes = {} if any(entry is None for entry in starting) else {position: (entry.note,) for position, entry in enumerate(starting)}
         # A refusal of the joint fit names the models fitted together; its "model k" is the k-th of them.
         joint = f"joint fit of models {', '.join(str(int(models[genetic[column]])) for column in columns)}: " if len(columns) > 1 else ""
 
@@ -959,7 +989,7 @@ def _fit_group(
         def solve(fit_prior: ScaleMixturePrior, **continuation) -> FullDataFit:
             fit = fit_full_data(
                 gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
-                inference=inference, sites=fit_sites, null_scale=kappa, band=fit_band, monitor=watched,
+                inference=inference, sites=fit_sites, null_scale=kappa, band=fit_band, monitor=watched, mode_orders=mode_orders,
                 **{"warm_start": WarmStart(restart, group, request_key), **continuation},
             )
             if fit_band is not None and np.any(fit.certificate.outer_criterion_met):
@@ -974,7 +1004,7 @@ def _fit_group(
                     gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
                     inference=inference, sites=fit_sites, null_scale=kappa, band=None, starts=fit.hyperparameters,
                     start_noise=np.asarray(fit.noise_variance, dtype=np.float64), start_mean=fit.member_mean, monitor=watched,
-                    warm_start=WarmStart(restart, group, request_key), mixture_start=fit.mixture_start(),
+                    warm_start=WarmStart(restart, group, request_key), mixture_start=fit.mixture_start(), mode_orders=mode_orders,
                 )
             return fit
 
@@ -989,7 +1019,7 @@ def _fit_group(
             try:
                 fit = solve(fit_prior, **continuation)
             except (FloatingPointError, np.linalg.LinAlgError) as error:
-                if not continuation:
+                if not seed_notes:
                     raise
                 # The seeds' start has no certified fixed point: the fit from the prior, as without seeds.
                 log(f"stage2 wiring: the fit of {len(columns)} models from their seeds has no certified start ({error}); fitted again from the prior")
@@ -997,8 +1027,9 @@ def _fit_group(
                     position: (f"{entry.note}; from it the fit had no certified start, so it was fitted from the prior: {error}",)
                     for position, entry in enumerate(starting)
                 }
-                # Not from the restart store's states either: the seeded fit kept its own there, under this prior's key.
-                fit = solve(fit_prior, warm_start=None)
+                # Not from the restart store's states either: the seeded fit kept its own there, under this prior's key. The
+                # seeded search keeps its mode starts.
+                fit = solve(fit_prior, warm_start=None, **({} if mode_orders is None or "mixture_start" not in continuation else {"mixture_start": continuation["mixture_start"]}))
             pending = list(range(len(columns)))
             while pending:
                 # Completed solver closures can form cycles holding large NumPy buffers. Their byte size does not
@@ -1148,6 +1179,8 @@ def fit_models(
     store_key: str | None = None,
     request_key: str | None = None,
     seeds: Sequence[Seed | None] | None = None,
+    mode_seeds: Sequence[Sequence[Seed]] | None = None,
+    mode_orders: int | None = None,
 ) -> FittedModels:
     """Every model of ``fit_model.fit``, a group at a time (``model_groups``; see the module docstring); ``inference``
     names the fixed point (``full_data_fit.fit_full_data``): the mean-field route until the EP route (structured-genome's
@@ -1164,7 +1197,8 @@ def fit_models(
     every one of its models is, and a group's seed is the request's with its models' indices, so a rerun fits it the same
     way. A group's other units (Stage 0, the band, its codes and EB starts: ``_fit_group``) are released once its models
     are checkpointed. ``seeds`` (one per model, None for a model without one) are the earlier fits the models' empirical
-    Bayes starts from (``_fit_group``, ``warm_seeds``); the caller's ``identity`` names them (``fit_model.fit_identity``)."""
+    Bayes starts from (``_fit_group``, ``warm_seeds``); ``mode_seeds`` (a sequence per model) and ``mode_orders`` make
+    each mode search the seeded one (``_fit_group``); the caller's ``identity`` names them (``fit_model.fit_identity``)."""
     if any(trait_type not in (TraitType.QUANTITATIVE, TraitType.BINARY) for trait_type in trait_types):
         raise ValueError(f"unknown trait types in {list(trait_types)}")
     # Stage 0 runs a buffer on every device, and Stage 2's reads are sharded over them by LD block (``stage2_source``).
@@ -1234,6 +1268,9 @@ def fit_models(
                         request_key,
                         None if seeds is None else [seeds[int(model)] for model in group],
                         group_evaluation,
+                        **({} if mode_orders is None else {
+                            "mode_seeds": None if mode_seeds is None else [mode_seeds[int(model)] for model in group], "mode_orders": mode_orders,
+                        }),
                     )
             except FloatingPointError as error:
                 # A fit with no certified fixed point on any route is the same failure on every rerun (its seeds are

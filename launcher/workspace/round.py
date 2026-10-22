@@ -114,13 +114,14 @@ UPSTREAM = {
 PREPARED = tuple(UPSTREAM)
 CONFIG_OVERRIDES = (
     "fit_minimum_minor_allele_frequency", "fit_minimum_r2", "fit_variant_sites", "disease_likelihood", "annotated_prior",
-    "fit_region", "fit_regions", "export", "compact_fit_store", "warm_start_models",
+    "fit_region", "fit_regions", "export", "compact_fit_store", "warm_start_models", "mode_seed_models", "mode_orders",
 )
 """The run config's keys a round may set apart from its base runs' without moving a step before the fit's key: the
 fit's and the export's own, which no step before the fit reads (compact_fit_store keys only the fit_store step, after
 direct_sv; warm_start_models, saved-model patterns such as "/mnt/disks/ops/svpgs/<earlier run>/run/fit/models/
 {arm}/{trait}", starts each arm's empirical Bayes from an earlier round's model, warm_seeds: set here, it replaces the
-patterns of the traits' warm_from runs and goes unchecked). A key the commit's driver does not name fails the plan."""
+patterns of the traits' warm_from runs and goes unchecked; mode_seed_models and mode_orders, the seeded mode search
+alike in both arms, workspace_pipeline.WorkspaceConfig). A key the commit's driver does not name fails the plan."""
 WARM_PATTERN = "{run}/run/fit*/models/{{arm}}/{{trait}}"
 """A warm_from run's saved models under OPS_MOUNT as warm_start_models names them (``workspace_pipeline._warm_seeds``
 fills {arm} and {trait}): its completed fit's and its partial's (a FIT_ARMS run's own arm before its merge), each arm

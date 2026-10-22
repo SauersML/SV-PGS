@@ -46,11 +46,18 @@ so a fit's checkpoints are never resumed from another start.
 
 What a seed cannot recover: Stage 0, the summary band and the resident codes are the run's own (a seed holds no LD),
 and a binary model's sites, an EP fit's or a model with no member are no seed (``seeds_from_model``).
+
+Mode seeds (``start_components``, ``WorkspaceConfig.mode_seed_models``): the matched comparison of two arms starts
+each arm's mode search from both arms' saved modes, each mapped onto the arm's members as the means are (the other
+arm's structural records at zero, or dropped), and both arms search alike from them (``full_data_fit._mode_mixture``'s
+seeded search). Whether an arm scores a mode the other arm found is then its own evidence's choice, not which orders
+each arm's search happened to try.
 """
 
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -107,6 +114,9 @@ class Seed:
     component_noises: F64Array | None = None
     settled: bool = False
     digest: str = ""
+    # Each component's weight in the saved mixture (``ProductMixtureDraws.weights``), parallel to ``components``; None
+    # where unknown.
+    weights: F64Array | None = None
 
     def __post_init__(self) -> None:
         rows = np.asarray(self.store_rows)
@@ -140,6 +150,8 @@ class Seed:
             noises = np.asarray(self.component_noises if self.component_noises is not None else np.zeros(0))
             if noises.shape != components.shape[:1] or not np.all(np.isfinite(noises)) or not np.all(noises > 0.0):
                 raise ValueError("a seed's mixture components each need a positive noise variance.")
+            if self.weights is not None and (np.shape(self.weights) != components.shape[:1] or not np.all(np.asarray(self.weights) >= 0.0)):
+                raise ValueError("a seed's component weights must be non-negative, one per component.")
 
 
 def content_digest(seed: Seed) -> str:
@@ -158,6 +170,8 @@ def content_digest(seed: Seed) -> str:
     if seed.components is not None:
         parts["components"] = seed.components
         parts["component_noises"] = np.asarray(seed.component_noises, dtype=np.float64)
+    if seed.weights is not None:
+        parts["weights"] = np.asarray(seed.weights, dtype=np.float64)
     return named_digest(parts)
 
 
@@ -235,6 +249,7 @@ def seeds_from_model(model: FittedModel, source: str, working_bytes: int, digest
             problem_digest=model.provenance.problem_digest, offset_digest=model.provenance.offset_digest,
             components=components, settled=components is not None and int(budgeted[index]) == 0 and bool(whole[index]), digest=digest,
             component_noises=None if components is None else np.array([component_noise(law, component, float(noise)) for component in range(count)]),
+            weights=None if components is None else np.asarray(law.weights, dtype=np.float64)[:count].copy(),
         )
     return seeds
 
@@ -397,3 +412,48 @@ def warm_start(seed: Seed, prior: ScaleMixturePrior, member_rows: I64Array, scal
         hyperparameters=hyperparameters, noise=float(seed.noise), mean=mean, note=note, components=components,
         component_noises=None if components is None else np.asarray(seed.component_noises, dtype=np.float64).copy(), settled=seed.settled and own,
     )
+
+
+def start_components(seeds: Sequence[Seed | None], member_rows: I64Array, scales: F64Array, record_count: int, draw_count: int) -> tuple[F64Array, F64Array]:
+    """The seeded search's start components (``full_data_fit._mode_mixture``) from ``seeds`` (a model's own seed and its
+    mode seeds, ``WorkspaceConfig.mode_seed_models``), each mapped onto this fit's members (``member_rows`` of a store
+    of ``record_count`` records, Stage 0's ``scales``) as ``warm_start`` maps its means: a mapped member's raw effect
+    kept, a member the seed did not fit at zero, a seed's member this fit has not dropped. A seed read twice (its saved
+    model's digest, or its content, and its model's name) starts the search once. Of each seed's mixture its main fixed point is taken, and
+    every other component of weight at least 1/K (``draw_count``): the scorer represents the mixture by K draws, each
+    from one component by weight, so a lighter one is expected in less than one draw. Returns the components (starts x
+    members, the first seed's main fixed point first) and each one's noise variance; none where no seed maps."""
+    rows = np.asarray(member_rows, dtype=np.int64)
+    means: list[F64Array] = []
+    noises: list[float] = []
+    seen: set[str] = set()
+    for seed in seeds:
+        if seed is None:
+            continue
+        name = f"{seed.digest or content_digest(seed)}:{seed.model_name}"
+        if name in seen:
+            continue
+        seen.add(name)
+        if int(seed.store_rows[-1]) >= int(record_count):
+            log(f"warm seeds: {seed.source} ({seed.model_name}) names store rows this store does not have; no mode start")
+            continue
+        _shared, at, seed_at = np.intersect1d(rows, seed.store_rows, assume_unique=True, return_indices=True)
+        ratio = np.asarray(scales, dtype=np.float64)[at] / seed.signed_scales[seed_at]
+        if seed.components is None:
+            chosen, states, state_noises = [0], seed.means[None, :], np.array([seed.noise])
+        else:
+            weights = np.ones(seed.components.shape[0]) if seed.weights is None else np.asarray(seed.weights, dtype=np.float64)
+            chosen = [0, *np.flatnonzero(weights[1:] >= 1.0 / draw_count) + 1]
+            states, state_noises = seed.components, np.asarray(seed.component_noises, dtype=np.float64)
+        for component in chosen:
+            mapped = np.zeros(rows.shape[0])
+            mapped[at] = states[component, seed_at] * ratio
+            if not np.all(np.isfinite(mapped)):
+                continue
+            means.append(mapped)
+            noises.append(float(state_noises[component]))
+        log(
+            f"warm seeds: mode starts from {seed.model_name} of {seed.source}: components {', '.join(str(int(component)) for component in chosen)} "
+            f"({at.shape[0]:,} of this fit's {rows.shape[0]:,} members mapped)"
+        )
+    return (np.array(means) if means else np.zeros((0, rows.shape[0]))), np.array(noises, dtype=np.float64)

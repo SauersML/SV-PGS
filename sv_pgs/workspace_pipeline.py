@@ -473,6 +473,16 @@ class WorkspaceConfig:
     started elsewhere can end at another of the evidence's modes. A pattern naming an earlier round's runs (their
     RUN_IDs in place of the ``*``) matches models that no longer change, so a preempted fit's restart starts from the
     model its first start did."""
+    mode_seed_models: tuple[str, ...] = ()
+    """Saved models whose mode mixtures start every fit's mode search (``_mode_seeds``): path patterns as
+    ``warm_start_models``'s, each naming its arm (both arms' models in the matched comparison, so each arm searches from
+    its own modes and the other's). Every matching model of this store's sites is a start, mapped onto the fit's
+    members (``warm_seeds.start_components``). Needs ``mode_orders``; in the fit step's key."""
+    mode_orders: int | None = None
+    """The seeded mode search's random orders (``full_data_fit._mode_mixture``), 0 to fit_model.DRAW_COUNT: every fit's
+    search is then its start components (its seed's and ``mode_seed_models``'), the ridge start and this many orders,
+    alike in both arms, in place of the whole-budget search of DRAW_COUNT orders; None keeps that search. In the fit
+    step's key."""
     accept_steps_from: str | None = None
     """A source tree (a staged one, such as /mnt/disks/ops/svpgs/<run>/source on a job's ops mount) whose completed
     steps before the fit this run may keep although their records hold keys of the earlier key formula, which listed
@@ -489,7 +499,7 @@ class WorkspaceConfig:
         unknown = sorted(set(raw) - set(CONFIG_KEYS) - {
             "genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "length_by_class", "ld_score_prior", "panel", "cross_fit",
             "fit_variant_sites", "fit_region", "fit_regions", "test_fold", "locus_panel", "baseline_directory", "warm_start_models",
-            "accept_steps_from", *_FIT_FILTER_KEYS,
+            "mode_seed_models", "mode_orders", "accept_steps_from", *_FIT_FILTER_KEYS,
         })
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
@@ -525,6 +535,13 @@ class WorkspaceConfig:
         patterns = raw.get("warm_start_models", [])
         if not isinstance(patterns, list) or any(not isinstance(pattern, str) or not pattern for pattern in patterns):
             raise ValueError("warm_start_models must be a list of saved-model path patterns over {arm} and {trait}")
+        mode_patterns, mode_orders = raw.get("mode_seed_models", []), raw.get("mode_orders")
+        if not isinstance(mode_patterns, list) or any(not isinstance(pattern, str) or not pattern for pattern in mode_patterns):
+            raise ValueError("mode_seed_models must be a list of saved-model path patterns over {arm} and {trait}")
+        if mode_orders is not None and (isinstance(mode_orders, bool) or not isinstance(mode_orders, int) or not 0 <= mode_orders <= fit_model.DRAW_COUNT):
+            raise ValueError(f"mode_orders must be a count of random orders in [0, {fit_model.DRAW_COUNT}], or null for the whole-budget search")
+        if mode_patterns and mode_orders is None:
+            raise ValueError("mode_seed_models needs mode_orders (the seeded search's random orders)")
         if raw.get("accept_steps_from") is not None and (not isinstance(raw["accept_steps_from"], str) or not raw["accept_steps_from"]):
             raise ValueError("accept_steps_from must be a source tree's path or null")
         for key, minimum in (("fold_count", 2), ("seed", 0)):
@@ -622,6 +639,8 @@ class WorkspaceConfig:
             locus_panel=raw.get("locus_panel"),
             baseline_directory=None if raw.get("baseline_directory") is None else Path(raw["baseline_directory"]),
             warm_start_models=tuple(raw.get("warm_start_models", [])),
+            mode_seed_models=tuple(raw.get("mode_seed_models", [])),
+            mode_orders=raw.get("mode_orders"),
             accept_steps_from=raw.get("accept_steps_from"),
         )
 
@@ -3625,6 +3644,41 @@ def _request_problem(request: FitRequest) -> str:
     )
 
 
+def _mode_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequest, arm: str) -> tuple[tuple[Seed, ...], ...] | None:
+    """Each of ``request``'s models' mode seeds (``warm_seeds.start_components``) from the saved models
+    ``WorkspaceConfig.mode_seed_models`` names, or None where none is configured: per trait, every matching saved model
+    that indexes this store's sites and holds a mean-field model, in path order, each read whole (an unreadable one is
+    skipped and logged), and of each its model of this model's name, else the trait's released one. The patterns name
+    both arms' models, so the two arms' fits get the same starts."""
+    if not run.config.mode_seed_models:
+        return None
+    sites = sites_digest(store.root)
+    modes: list[list[Seed]] = [[] for _name in request.model_names]
+    for trait, trait_name in enumerate(cohort.trait_names):
+        folders: list[str] = []
+        for pattern in run.config.mode_seed_models:
+            for folder in sorted(glob.glob(pattern.replace("{arm}", glob.escape(arm)).replace("{trait}", glob.escape(trait_name)))):
+                try:
+                    metadata = json.loads((Path(folder) / "model.json").read_text(encoding="utf-8"))
+                    if metadata["provenance"]["sites_digest"] != sites or "product_mixture" not in metadata["draw_laws"]:
+                        LOGGER.info("workspace pipeline: %s is no mode seed (another store's sites, or no mean-field model)", folder)
+                        continue
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    LOGGER.info("workspace pipeline: %s is no mode seed (%s)", folder, error)
+                    continue
+                if folder not in folders:
+                    folders.append(folder)
+        for folder in folders:
+            found = read_seeds(folder, run.budget.working_bytes)
+            if not found:
+                continue
+            released = list(found.values())[-1]
+            for model in cohort.trait_models(trait).tolist():
+                modes[model].append(found.get(request.model_names[model], released))
+        LOGGER.info("workspace pipeline: the %s fit of %s starts its mode search from %d saved models: %s", arm, trait_name, len(folders), ", ".join(folders))
+    return tuple(tuple(entry) for entry in modes)
+
+
 def _warm_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequest, arm: str) -> tuple[Seed | None, ...] | None:
     """Each of ``request``'s models' seed (``warm_seeds``) from the saved models ``WorkspaceConfig.warm_start_models``
     names for this ``arm``, or None where none is configured: per trait, every saved model the patterns match that
@@ -3775,6 +3829,9 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                     seeds = _warm_seeds(run, cohort, store, request, arm)
                     if seeds is not None and any(seed is not None for seed in seeds):
                         request = dataclasses.replace(request, seeds=seeds)
+                    # The seeded mode search, alike in both arms: its random orders and its starts (``_mode_seeds``).
+                    if run.config.mode_orders is not None:
+                        request = dataclasses.replace(request, mode_seeds=_mode_seeds(run, cohort, store, request, arm), mode_orders=run.config.mode_orders)
                     LOGGER.info("workspace pipeline: fitting %s: %d models of %d traits", arm, len(request.model_names), len(cohort.trait_names))
                     started = time.perf_counter()
                     fitted = run.bindings.fit(request)
@@ -6148,6 +6205,7 @@ _STEPS = (
         config.length_by_class, config.ld_score_prior,
         *(() if config.test_fold is None else (("test_fold", config.test_fold),)),
         *(() if not config.warm_start_models else (("warm_start_models", config.warm_start_models),)),
+        *(() if config.mode_orders is None else (("mode_search", config.mode_seed_models, config.mode_orders),)),
     ), (_fit_step, fit_filtered, listed_sites, region_records, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (
         _score_step, _arm_scores, arm_scores, _score_batch, _scored_traits, _opened_store, _fitted_model_directory, _split_cohort, _fit_verdicts,

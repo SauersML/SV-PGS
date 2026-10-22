@@ -46,7 +46,7 @@ from sv_pgs.scale_mixture_ep import (
     scale_mixture_prior,
     tilted_moments,
 )
-from sv_pgs.warm_seeds import Seed, content_digest, for_problem, read_seeds, seed_lattice, warm_start
+from sv_pgs.warm_seeds import Seed, content_digest, for_problem, read_seeds, seed_lattice, start_components, warm_start
 from tests.test_full_data_fit import _store, _StoreCodes
 
 _TOLERANCE = 0.5 / fit_model.DRAW_COUNT
@@ -265,6 +265,41 @@ def test_a_group_fits_on_its_seeds_lattice_only_where_every_seed_shares_one_that
     np.testing.assert_array_equal(seed_lattice([seed, fine_seed], _NODES), _NODES)
     np.testing.assert_array_equal(seed_lattice([fine_seed, None], _NODES), _NODES)
 
+
+
+def test_the_seeded_search_starts_from_each_seed_s_main_fixed_point_and_its_components_a_draw_would_represent() -> None:
+    """``start_components``: of each seed (an arm's own and the other arm's saved models) its main fixed point and each
+    other component of weight at least 1/K, each mapped onto this fit's members as the means are (the raw effect kept, a
+    member the seed did not fit at zero, a seed's member this fit dropped left out); a seed given twice starts once,
+    one without components starts from its means, and one naming rows this store lacks is no start."""
+    prior = _prior(_CLASSES, _NODES)
+    hyperparameters = _hyperparameters(prior)
+    scales = np.linspace(0.5, 1.5, 12)
+    states = np.random.default_rng(11).standard_normal((4, 12))
+    seed = _seed(
+        prior, hyperparameters, _ROWS, scales, states[0].copy(), components=states, component_noises=np.array([0.7, 0.8, 0.9, 1.0]),
+        weights=np.array([1e-21, 0.97, 0.02, 0.01]), digest="own",
+    )
+    # This fit's members: the seed's first ten (every other row up to 18) and two it never fitted (rows 25 and 27).
+    members = np.concatenate([_ROWS[:10], np.array([25, 27])])
+    fit_scales = np.linspace(1.0, 2.0, 12)
+    components, noises = start_components([seed, None, seed], members, fit_scales, 30, 64)
+    # Components 0 (the main fixed point, whatever its weight), 1 and 2 (weights at least 1/64); 3 is lighter.
+    assert components.shape == (3, 12)
+    np.testing.assert_array_equal(noises, [0.7, 0.8, 0.9])
+    for row, component in enumerate((0, 1, 2)):
+        np.testing.assert_allclose(components[row, :10], states[component, :10] * fit_scales[:10] / scales[:10], rtol=1e-15)
+        np.testing.assert_array_equal(components[row, 10:], 0.0)
+    # Another seed (the other arm's, without components) adds its means after the first seed's starts.
+    other = _seed(prior, hyperparameters, _ROWS, scales, states[3].copy(), digest="other")
+    components, noises = start_components([seed, other], members, fit_scales, 30, 64)
+    assert components.shape == (4, 12) and noises[-1] == other.noise
+    np.testing.assert_allclose(components[3, :10], states[3, :10] * fit_scales[:10] / scales[:10], rtol=1e-15)
+    # A seed of a larger store names rows this one lacks: no start, and none at all where it is the only seed.
+    components, noises = start_components([seed], members, fit_scales, 20, 64)
+    assert components.shape == (0, 12) and noises.shape == (0,)
+    with pytest.raises(ValueError, match="weights"):
+        _seed(prior, hyperparameters, _ROWS, scales, states[0].copy(), components=states, component_noises=np.ones(4), weights=np.ones(3))
 
 def _request_arguments(store, covariate, targets, offsets, work_dir: Path) -> dict:
     samples = store.n_samples
@@ -514,3 +549,95 @@ def test_a_saved_model_read_through_the_mounted_bucket_is_a_seed(arms: SimpleNam
     request = fit_model.FitRequest(**_request_arguments(arms.store, arms.covariate, arms.targets, arms.offsets["with_sv"], arms.root / "work" / "unused"))
     (seed,) = workspace_pipeline._warm_seeds(run, cohort, arms.store, request, "with_sv")
     assert seed is not None and seed.source == str(good) and asked == []
+
+
+class _Ordered(_Counted):
+    """``_Counted``, recording each oracle's order seed (a random order of the mode mixture; None for any other solve)."""
+
+    orders: ClassVar[list] = []
+
+    def __init__(self, *arguments, **keywords) -> None:
+        super().__init__(*arguments, **keywords)
+        _Ordered.orders.append(keywords.get("order_seed"))
+
+
+def _seeded_fit(arms: SimpleNamespace, arm: str, monkeypatch: pytest.MonkeyPatch, **request) -> tuple:
+    """``arm``'s fit with ``request``'s seeds and mode search, on the sample route: the model, the mode mixture's log
+    lines and the order seeds its oracles were made with."""
+    lines: list[str] = []
+    monkeypatch.setattr(full_data_fit, "log", lines.append)
+    monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp: (0.0, np.inf))
+    monkeypatch.setattr(full_data_fit, "_FullDataMeanField", _Ordered)
+    _Counted.made, _Ordered.orders = [], []
+    work = arms.root / "work" / f"{arm}_{len(list((arms.root / 'work').iterdir()))}"
+    model = fit_model.fit(fit_model.FitRequest(**_request_arguments(arms.store, arms.covariate, arms.targets, arms.offsets[arm], work), **request))
+    return model, [line for line in lines if line.startswith("mode mixture:")], [order for order in _Ordered.orders if order is not None]
+
+
+@_hook
+def test_both_arms_search_their_modes_from_both_arms_saved_modes_alike(arms: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The matched comparison's seeded search: each arm's empirical Bayes starts from its own saved model, and both
+    arms' mode searches start from both arms' saved modes (``start_components``), solve every one of them whatever the
+    earlier searches settled, then the ridge start and the same two random orders. Each arm keeps the modes its own
+    evidence weighs; nothing is counted unresolved for the shortened search, the search is not settled, and a note
+    says so. The with_sv arm reaches its cold fit."""
+    saved = {arm: tuple(read_seeds(arms.root / "models" / arm / "trait", _WORKING_BYTES).values()) for arm in ("snv_indel", "with_sv")}
+    modes = ((*saved["snv_indel"], *saved["with_sv"]),)
+    starts = start_components(modes[0], arms.fits["with_sv"].scoring[0].store_rows, np.ones(arms.fits["with_sv"].scoring[0].store_rows.shape[0]), 10**6, fit_model.DRAW_COUNT)[0].shape[0]
+    found = {}
+    for arm in ("snv_indel", "with_sv"):
+        model, lines, orders = _seeded_fit(arms, arm, monkeypatch, seeds=saved[arm], mode_seeds=modes, mode_orders=2)
+        found[arm] = model
+        print(f"seeded search: {arm}: {lines}")
+        note = next(refusal for refusal in model.refusals if "search was seeded" in refusal)
+        assert f": {starts} start components, the ridge start and 2 orders in place of the whole-budget search of {fit_model.DRAW_COUNT}" in note
+        # Every start component solved, the first too, whatever the earlier searches settled.
+        (solved,) = [int(line.split(": ")[2].split(" of ")[0]) for line in lines if f"of the earlier fit's {starts} components solved again here: a seeded search" in line]
+        assert solved == starts
+        assert sorted(set(orders)) == [1, 2]
+        assert int(model.certificate["budget_unresolved"][0]) == 0 and not bool(model.certificate["mixture_settled"][0])
+        assert any("its own hyperparameters" in refusal for refusal in model.refusals)
+    assert np.corrcoef(_held_out_scores(arms, found["with_sv"]), _held_out_scores(arms, arms.fits["with_sv"]))[0, 1] > 0.99
+    # The mode seeds name the fit: other starts or orders are another fit's checkpoint.
+    request = fit_model.FitRequest(**_request_arguments(arms.store, arms.covariate, arms.targets, arms.offsets["with_sv"], arms.root / "work" / "unused"))
+    names = {
+        fit_model.fit_identity(dataclasses.replace(request, **changes), "store").get("modes")
+        for changes in ({}, {"mode_orders": 2}, {"mode_orders": 3}, {"mode_orders": 2, "mode_seeds": modes}, {"mode_orders": 2, "mode_seeds": (modes[0][:1],)})
+    }
+    assert len(names) == 5 and None in names
+    for wrong in ({"mode_seeds": modes}, {"mode_orders": fit_model.DRAW_COUNT + 1}, {"mode_orders": True}, {"mode_orders": 1, "mode_seeds": (modes[0], modes[0])}):
+        with pytest.raises(ValueError, match="mode_"):
+            dataclasses.replace(request, **wrong)
+
+
+@_hook
+def test_a_seeded_search_with_no_start_is_the_main_fixed_point_and_the_ridge_start(arms: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cold fit with ``mode_orders`` 0 and no mode seed: its search is its main fixed point and the ridge start, no
+    random order, and it is neither unresolved nor settled."""
+    model, lines, orders = _seeded_fit(arms, "snv_indel", monkeypatch, mode_orders=0)
+    assert orders == []
+    assert any("search was seeded: 0 start components, the ridge start and 0 orders" in refusal for refusal in model.refusals)
+    assert int(model.certificate["budget_unresolved"][0]) == 0 and not bool(model.certificate["mixture_settled"][0])
+    assert np.corrcoef(_held_out_scores(arms, model), _held_out_scores(arms, arms.fits["snv_indel"]))[0, 1] > 0.99
+
+
+def test_the_fit_step_gives_every_model_both_arms_saved_models_as_mode_seeds(arms: SimpleNamespace) -> None:
+    """``_mode_seeds``: every saved model the patterns find for the trait (both arms', named explicitly), in path order,
+    one of another store's sites passed over, and none at all where no pattern is configured; both arms get the same."""
+    mirror = arms.root / "mode_mirror"
+    for arm in ("snv_indel", "with_sv"):
+        shutil.copytree(arms.root / "models" / arm / "trait", mirror / "a" / "models" / arm / "trait")
+    shutil.copytree(arms.root / "models" / "with_sv" / "trait", mirror / "b" / "models" / "with_sv" / "trait")
+    metadata = json.loads((mirror / "b" / "models" / "with_sv" / "trait" / "model.json").read_text())
+    metadata["provenance"]["sites_digest"] = "another store"
+    (mirror / "b" / "models" / "with_sv" / "trait" / "model.json").write_text(json.dumps(metadata))
+    patterns = tuple(str(mirror / "*" / "models" / arm / "{trait}") for arm in ("snv_indel", "with_sv"))
+    run = SimpleNamespace(config=SimpleNamespace(mode_seed_models=patterns), budget=_budget())
+    cohort = SimpleNamespace(trait_names=("trait",), trait_models=lambda trait: np.array([0]))
+    request = fit_model.FitRequest(**_request_arguments(arms.store, arms.covariate, arms.targets, arms.offsets["with_sv"], arms.root / "work" / "unused"))
+    found = {arm: workspace_pipeline._mode_seeds(run, cohort, arms.store, request, arm) for arm in ("snv_indel", "with_sv")}
+    assert [[seed.digest for seed in entry] for entry in found["snv_indel"]] == [[seed.digest for seed in entry] for entry in found["with_sv"]]
+    ((first, second),) = found["with_sv"]
+    assert (first.source, second.source) == tuple(str(mirror / "a" / "models" / arm / "trait") for arm in ("snv_indel", "with_sv"))
+    assert workspace_pipeline._mode_seeds(SimpleNamespace(config=SimpleNamespace(mode_seed_models=()), budget=_budget()), cohort, arms.store, request, "with_sv") is None
+

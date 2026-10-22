@@ -3150,6 +3150,7 @@ def fit_full_data(
     monitor: Any = None,
     warm_start: WarmStart | None = None,
     mixture_start: MixtureStart | None = None,
+    mode_orders: int | None = None,
 ) -> FullDataFit:
     """Stage 2 from the prior (see the module docstring); ``seed`` draws the certificate's variant-side probes.
     ``starts`` (with ``start_noise`` and ``start_mean``, the members' means per model) continue an earlier fit of this
@@ -3187,9 +3188,10 @@ def fit_full_data(
     to another local optimum, and its certificate is the returned state's own; a fit that is not interrupted does the
     same operations as without it.
 
-    ``mixture_start`` (a continuation's: the earlier fit's ``FullDataFit.mixture_start``) starts the mode mixture's
-    search from the earlier fit's components (``_mode_mixture``) on the mean-field route of quantitative models; it is
-    ignored elsewhere.
+    ``mixture_start`` (a continuation's: the earlier fit's ``FullDataFit.mixture_start``, or saved fits' modes,
+    ``stage2_wiring``) starts the mode mixture's search from those components (``_mode_mixture``) on the mean-field
+    route of quantitative models; it is ignored elsewhere. ``mode_orders`` (None: the whole-budget search of K orders) makes the search a seeded
+    one: every start component solved, then the ridge start and ``mode_orders`` random orders (``_mode_mixture``).
 
     A fit from the prior on the mean-field route whose outer loop raises ``NoCertifiedProgress`` returns every model's
     best-ELBO state, uncertified, with the loop's error among its refusals (``_ended_fits``), so the arm is scored and
@@ -3397,6 +3399,7 @@ def fit_full_data(
             )
         mixture = _mode_mixture(
             mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters, moments, None if binary.any() else mixture_start,
+            orders=mode_orders,
         )
         member_mean, components, component_weights, binary_parts = mixture.mean, mixture.components, mixture.weights, mixture.binaries
         mean_move, noise_gains = mixture.mean_move, mixture.noise_gain
@@ -3540,7 +3543,7 @@ class _Mixture:
 def _mode_mixture(
     main: "_FullDataMeanField", gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int,
     working_bytes: int, seed: int, hyperparameters: tuple[MixtureHyperparameters, ...], moments: Sequence[MomentStart] = (),
-    start: MixtureStart | None = None,
+    start: MixtureStart | None = None, orders: int | None = None,
 ) -> _Mixture:
     """The mean-field fit's mixture over coordinate ascent's modes (``small_n._mode_mixture``): between near-duplicate
     columns the posterior is multimodal and the product family holds one mode, the column visited first taking the
@@ -3603,6 +3606,15 @@ def _mode_mixture(
     repeated the earlier ones and admitted their earlier states again beside the modes they had reached, among them the
     four that had moved into held modes [sim].
 
+    A seeded search (``orders``: ``WorkspaceConfig.mode_orders``) is the comparison's short search in place of the K
+    orders. Every model solves every start component (``start``: an arm's own saved modes and the other arm's, mapped
+    onto its members, ``stage2_wiring``), whatever its earlier search settled, the first one too where this fit's main
+    fixed point is within the resolution of it, and a refused solve ends no other start's; then the ridge start, then
+    ``orders`` random orders with order seeds 1..``orders``, and keeps every mode it reached at its evidence weight.
+    Two arms given the same starts and orders search alike, so the mode each scores is the best its own evidence finds
+    among the same starts. No settling test is read and nothing is counted unresolved for the shortened budget; the search is not
+    settled (``mixture_settled``: a fit seeded from this one searches again) and a note among the refusals says so.
+
     The ridge start and the orders are solved and never factored by the dual solver (``_FullDataMeanField._solved``):
     nothing here reads a factor, neither a component's state nor the repeat and settling tests (sample-space images),
     nor a binary component (its reads of the store), and the main fixed point's own factor is put back at the end."""
@@ -3656,19 +3668,21 @@ def _mode_mixture(
     settled = np.zeros(count, dtype=bool)
     unresolved = np.zeros(count, dtype=np.int64)
     refusals: list[str] = []
+    seeded = orders is not None
     if start is not None:
         if np.asarray(start.means[0]).shape != main.mean.shape:
             raise ValueError("a mixture start's components must be this fit's members x models")
-        # Per model: its earlier search settled and no solve of its components has been refused (a model where one is
-        # solves no more of them and searches as without a start), and whether its main fixed point came back.
-        found = np.asarray(start.settled, dtype=bool).copy()
+        # Per model: its earlier search settled (a seeded search solves every model's components) and no solve of its
+        # components has been refused (a model where one is solves no more of them and searches as without a start), and
+        # whether its main fixed point came back.
+        found = np.ones(count, dtype=bool) if seeded else np.asarray(start.settled, dtype=bool).copy()
         main_found = np.zeros(count, dtype=bool)
         solved_count = np.zeros(count, dtype=np.int64)
         for index, start_means in enumerate(start.means):
             solving = [model for model in range(count) if found[model] and index < int(start.counts[model])]
-            if index == 0:
+            if index == 0 and not seeded:
                 # The earlier fit's main fixed point, where this fit's main one is within the draws' resolution of it, is
-                # that fixed point here already: it is not solved a second time.
+                # that fixed point here already: it is not solved a second time (a seeded search solves every start).
                 for model in list(solving):
                     if main._fitted_square(start_means[:, model] - main.mean[:, model], model) <= float(main.noise[model]) / draw_count:
                         main_found[model] = True
@@ -3684,22 +3698,31 @@ def _mode_mixture(
             solved = oracle._solved(list(hyperparameters), solving)
             unresolved += oracle.unresolved
             if solved is None:
-                found[solving] = False
+                # A seeded search goes on to its next start: each start is tried, whatever an earlier one did.
+                if not seeded:
+                    found[solving] = False
                 continue
             for model in solving:
                 resolution = float(main.noise[model]) / draw_count
                 solved_count[model] += 1
+                log(
+                    f"mode mixture: model {model}: start component {index}: ELBO {float(oracle.elbo[model]):.6f}, "
+                    f"{float(oracle.elbo[model]) - float(elbos[model][0][0]):+.4f} nats from the main fixed point; it moved "
+                    f"{main._fitted_square(oracle.mean[:, model] - start_means[:, model], model) / resolution:.3g} resolutions from its start"
+                )
                 # Only until the main fixed point has come back: where the other components end is not read.
                 if not main_found[model] and main._fitted_square(oracle.mean[:, model] - start_means[:, model], model) <= resolution:
                     main_found[model] = main._fitted_square(oracle.mean[:, model] - main.mean[:, model], model) <= resolution
             admit(oracle, solving)
             del oracle, solved
-        settled = found & main_found
+        settled = np.zeros(count, dtype=bool) if seeded else found & main_found
         for model in range(count):
             log(
                 f"mode mixture: model {model}: {int(solved_count[model])} of the earlier fit's {int(start.counts[model])} components solved "
                 "again here: " + (
-                    f"its main fixed point came back, so its settled search stands on their {len(means[model])} modes" if settled[model]
+                    f"a seeded search, {len(means[model])} modes held, ELBO best {max(float(value[0]) for value in elbos[model]):.6f}, main "
+                    f"{float(elbos[model][0][0]):.6f}; then the ridge start and {orders} orders" if seeded
+                    else f"its main fixed point came back, so its settled search stands on their {len(means[model])} modes" if settled[model]
                     else "searching from the ridge start and the orders as without them"
                 )
             )
@@ -3723,7 +3746,7 @@ def _mode_mixture(
             average = [weighted(model)[0] for model in range(count)]
         del ridge
     last_move = np.full(count, np.inf)
-    for component in range(1, draw_count + 1):
+    for component in range(1, (draw_count if orders is None else orders) + 1):
         if not searching:
             break
         oracle = type(main)(
@@ -3740,13 +3763,22 @@ def _mode_mixture(
             updated = weighted(model)[0]
             last_move[model] = main._fitted_square(updated - average[model], model) / float(main.noise[model])
             average[model] = updated
-    settled[searching] = last_move[searching] <= 1.0 / draw_count
-    for model in np.flatnonzero(~settled):
-        unresolved[model] += 1
-        refusals.append(
-            f"model {int(model)}: the mode mixture tried its budget of {draw_count} orders (one per draw that can represent a component) "
-            f"without settling: {len(means[model])} components, unresolved"
-        )
+    if seeded:
+        for model in range(count):
+            note = (
+                f"model {model}: the mode mixture's search was seeded: {0 if start is None else int(start.counts[model])} start components, "
+                f"the ridge start and {orders} orders in place of the whole-budget search of {draw_count}: {len(means[model])} modes, not settled"
+            )
+            log(f"mode mixture: {note}")
+            refusals.append(note)
+    else:
+        settled[searching] = last_move[searching] <= 1.0 / draw_count
+        for model in np.flatnonzero(~settled):
+            unresolved[model] += 1
+            refusals.append(
+                f"model {int(model)}: the mode mixture tried its budget of {draw_count} orders (one per draw that can represent a component) "
+                f"without settling: {len(means[model])} components, unresolved"
+            )
     main._iterate(main.site_precision, main.site_shift, main.noise)
     main._panel_grams.clear()
     counts = np.array([len(means[model]) for model in range(count)], dtype=np.int64)
