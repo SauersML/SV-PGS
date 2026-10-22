@@ -25,7 +25,8 @@ import matplotlib
 import numpy as np
 
 from sim_gallery import (
-    BLUE, INK, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_STYLE, frame, plt, shifted, widest,
+    BLUE, GREEN, INK, ORANGE, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_NAME, POSTER_STYLE, PURPLE, frame, plt,
+    shifted, widest,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -151,12 +152,67 @@ def classes_figure(enrichment: list[dict]) -> tuple:
     return fig, [title]
 
 
+LENGTH_CLASSES = (("deletion", "Deletions", ORANGE), ("insertion", "Insertions", GREEN), ("duplication", "Duplications", PURPLE))
+"""The classes drawn by length, each in its colour in the simulation figures (sim_gallery.py's SV_CLASSES)."""
+
+
+def bin_start(label: str) -> float:
+    """A length bin's lower end in bp: "<50" (the short records) as 5, "50-499" as 50."""
+    return 5.0 if label.startswith("<") else float(label.split("-")[0])
+
+
+def bin_text(start: float) -> str:
+    return "<50" if start < 50 else f"{start / 1000:g}k" if start >= 1000 else f"{start:g}"
+
+
+def length_figure(by_length: list[dict]) -> tuple:
+    """Each class's posterior effect variance per variant relative to SNVs by length, combined over traits, with its
+    95% interval: a line per class over its length bins (a bin's lower end on a log axis; the short records, under
+    50 bp, at the left), 1 being the SNVs'."""
+    height, top, bottom, left, right = 6.0, 1.0, 1.75, 1.95, 0.5
+    fig = plt.figure(figsize=(COLUMN, height))
+    ax = frame(fig, left, bottom, COLUMN - left - right, height - top - bottom)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    starts, ends = set(), [1.0]
+    for index, (name, label, colour) in enumerate(LENGTH_CLASSES):
+        bins = sorted({row["length_bin"] for row in by_length if row["variant_class"] == name}, key=bin_start)
+        points = [(bin_start(label_), *pooled([row for row in by_length if row["variant_class"] == name and row["length_bin"] == label_]))
+                  for label_ in bins]
+        points = [point for point in points if point[4]]
+        if not points:
+            continue
+        # each class a little apart along x, so overlapping intervals stay readable
+        x = np.array([point[0] for point in points]) * 1.12 ** (index - 1)
+        ax.plot(x, [point[1] for point in points], color=colour, linewidth=POSTER_BAR, zorder=3)
+        ax.vlines(x, [point[2] for point in points], [point[3] for point in points], color=colour, linewidth=POSTER_BAR, zorder=3)
+        ax.plot(x, [point[1] for point in points], "o", color=colour, markersize=POSTER_MARK * 0.8, markeredgewidth=0, zorder=4)
+        # the classes named in the empty upper left, top to bottom in their drawing order
+        ax.text(0.03, 0.97 - 0.15 * index, label, transform=ax.transAxes, color=colour, fontsize=POSTER_NAME,
+                fontweight="bold", va="top", ha="left")
+        starts.update(point[0] for point in points)
+        ends.extend(value for point in points for value in point[2:4])
+    ax.axhline(1.0, color=INK, linewidth=4.0, zorder=2)
+    ticks = sorted(starts)
+    ax.set_xticks(ticks, [bin_text(tick) for tick in ticks])
+    ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    powers = range(math.floor(math.log10(min(ends))), math.ceil(math.log10(max(ends))) + 1)
+    ax.set_yticks([10.0 ** power for power in powers], [f"{10.0 ** power:g}×" for power in powers])
+    ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    ax.set_xlabel("Variant length (bp)")
+    ax.text(0, 1, "Effect variance vs SNVs", transform=shifted(ax, -(left - 0.12), 0.3, False), ha="left", va="bottom",
+            fontsize=POSTER_LABEL)
+    return fig, ["Longer SVs have larger effects"]
+
+
 def main() -> None:
     numbers = json.loads(NUMBERS.read_text())
     with plt.rc_context({**POSTER_STYLE, "axes.labelsize": POSTER_LABEL}):
         drawn = [("aou_1_gain", gain_figure(numbers["paired"]))]
         if numbers.get("enrichment"):
             drawn.append(("aou_2_classes", classes_figure(numbers["enrichment"])))
+        if numbers.get("by_length"):
+            drawn.append(("aou_3_length", length_figure(numbers["by_length"])))
         for name, (fig, lines) in drawn:
             fig.savefig(OUT / f"{name}.png", transparent=True)
             plt.close(fig)
