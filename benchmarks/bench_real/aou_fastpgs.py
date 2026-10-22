@@ -7,8 +7,8 @@ the snv_indel records are a subset of the with_sv records and the arms share eve
 run's too: each trait's evaluated model's training rows, and its held-out rows, where SV-PGS is scored. Three methods:
 
 - LDpred2-auto, as aou_ldpred2.py fits it (ldpred2_auto_allvar.py's GWAS, band and settings), on every training row.
-- lassosum2 (bigsnpr's snp_lassosum2 at its default grid, 6 deltas by 30 lambdas) on the GWAS of the training rows
-  outside the tuning slice, with the band of every training row.
+- lassosum2 (bigsnpr's snp_lassosum2 at its default grid: in 1.12.21, deltas 0.001, 0.01, 0.1 and 1 by 30 lambdas) on
+  the GWAS of the training rows outside the tuning slice, with the band of every training row.
 - Clumping and thresholding (``ct``): greedy clumping by p at r^2 above CLUMP_R2 within the band's 3 cM window, then
   each p-value threshold in THRESHOLDS, on the same GWAS as lassosum2.
 
@@ -422,7 +422,9 @@ def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np
                 "variants": int(short.sum()) if arm == "snv_indel" else int(short.shape[0]),
                 "parameter": None if index is None else labels[index].split("|", 2)[2],
                 "nonzero_effects": None if index is None else int(np.count_nonzero(fitted["effects"][:, index])),
-                "tuning_rows": _count(tuning_rows.shape[0]), "tuning_partial_r2": None if index is None else float(tuning_r2[index]),
+                # LDpred2-auto is fitted on the tuning rows too, so its tuning partial r^2 is in-sample and not shown
+                "tuning_rows": _count(tuning_rows.shape[0]),
+                "tuning_partial_r2": None if index is None or method == "ldpred2_auto" else float(tuning_r2[index]),
                 "held_out_partial_r2": None if index is None else _partial_r2(target, held_scores[:, index], covariates),
             }
             if binary:

@@ -1,0 +1,154 @@
+"""Whether imputed SVs raise the held-out accuracy of standard PGS methods: the paired tests of aou_fastpgs.py's two
+arms on every trait's held-out people, method by method.
+
+Each trait's scores come from an aou_fastpgs.py job on its run (<run>/fastpgs/<trait>.npz in the ops bucket): every
+method fitted on the snv_indel records and on every kept record, for the same training people with the same tuning
+rule, and scored on the run's held-out people. Per method this prints:
+- per trait and ancestry group (all, EUR, AFR): both arms' partial r^2 given the trait's covariates, the paired
+  difference (with_sv less snv_indel) with its family bootstrap 95% interval, two-sided p and one-sided upper 95% bound
+  ("SVs add at most"), absolute and relative to the snv_indel arm; for a disease, both arms' AUC and their DeLong
+  difference with family-clustered variance;
+- the combined test across traits, sv_gain_meta's pre-specified analysis (``analyse`` and ``report``).
+Every method reads the same bootstrap resamples. A group enters with at least MINIMUM_GROUP_PEOPLE people and, for a
+disease, more than 20 cases and controls. Aggregates only: every count of 1 to 20 is shown as <=20.
+
+    python -m benchmarks.bench_real.fastpgs_meta RUN [RUN ...] [--methods M ...] [--resamples N] [--permutations N]
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import pathlib
+from collections.abc import Sequence
+
+import numpy as np
+from scipy import stats
+
+from benchmarks.bench_real.sv_gain_meta import (
+    MINIMUM_GROUP_PEOPLE, OPS, PERMUTATIONS, RESAMPLES, UPPER, PairedTrait, analyse, gains, report, shown, union,
+)
+from sv_pgs.held_out_comparison import auc_components, cluster_bootstrap_counts, paired_delta_auc
+
+GROUPS = ("all", "eur", "afr")
+ARMS = ("snv_indel", "with_sv")
+
+
+def read_run(name: str, root: str = OPS) -> list[dict[str, object]]:
+    """Each trait an aou_fastpgs.py job left in the run: its held-out people's ids, families, ancestry, target,
+    covariates and scores [methods, arms, people]."""
+    traits = []
+    for path in sorted(pathlib.Path(root, name, "fastpgs").glob("*.npz")):
+        with np.load(path, allow_pickle=False) as arrays:
+            if arrays["arms"].tolist() != list(ARMS):
+                raise ValueError(f"{path}: arms {arrays['arms'].tolist()}")
+            traits.append({
+                "run": name, "name": str(arrays["trait"]), "binary": bool(arrays["binary"]), "methods": arrays["methods"].tolist(),
+                "ids": np.asarray(arrays["research_ids"]).astype(object), "families": np.asarray(arrays["families"]),
+                "ancestry": np.asarray(arrays["ancestry"]).astype(object), "target": np.asarray(arrays["target"], dtype=np.float64),
+                "covariates": np.asarray(arrays["covariates"], dtype=np.float64), "scores": np.asarray(arrays["scores"], dtype=np.float64),
+                "seed": int(arrays["seed"]),
+            })
+    if not traits:
+        raise FileNotFoundError(f"{name}: no fastpgs scores under {root}/{name}/fastpgs")
+    return traits
+
+
+def paired(trait: dict[str, object], people: np.ndarray, method: str) -> PairedTrait | None:
+    """The trait's two arms of ``method`` as sv_gain_meta pairs them, or None where an arm has no score (its fit failed)."""
+    scores = trait["scores"][trait["methods"].index(method)]
+    if not np.all(np.isfinite(scores)):
+        return None
+    return PairedTrait(trait["name"], trait["binary"], people, trait["target"], trait["covariates"], scores[0], scores[1])
+
+
+def group_rows(trait: PairedTrait, ancestry: np.ndarray, group: str) -> np.ndarray | None:
+    """The trait's people in ``group`` (None for all of them), or an empty array where the group is too small to show."""
+    rows = None if group == "all" else np.flatnonzero(ancestry[trait.people] == group)
+    target = trait.target if rows is None else trait.target[rows]
+    cases = int(np.sum(target)) if trait.binary else None
+    if target.shape[0] < MINIMUM_GROUP_PEOPLE or (cases is not None and min(cases, target.shape[0] - cases) <= 20):
+        return np.zeros(0, dtype=np.int64)
+    return rows
+
+
+def cell(trait: PairedTrait, rows: np.ndarray | None, weights: np.ndarray, clusters: np.ndarray) -> dict[str, float]:
+    """Both arms' partial r^2 and their paired difference on ``rows`` of the trait's people (None: all), with the family
+    bootstrap's 95% interval, two-sided normal p and one-sided upper 95% bound; for a disease, both arms' AUC and the
+    DeLong difference with family-clustered variance."""
+    unit = np.ones((1, weights.shape[1]))
+    gain, base = (values[0] for values in gains(unit, trait, rows=rows))
+    gain_draws, base_draws = gains(weights, trait, rows=rows)
+    error = float(np.nanstd(gain_draws, ddof=1))
+    relative_error = float(np.nanstd(gain_draws / base_draws, ddof=1))
+    found = {
+        "n": trait.people.shape[0] if rows is None else rows.shape[0], "snv_indel": base, "with_sv": base + gain, "gain": gain,
+        "ci_low": float(np.nanquantile(gain_draws, 0.025)), "ci_high": float(np.nanquantile(gain_draws, 0.975)),
+        "p": float(2.0 * stats.norm.sf(abs(gain / error))) if error > 0 else math.nan, "upper": gain + UPPER * error,
+        "relative": gain / base, "relative_upper": gain / base + UPPER * relative_error,
+    }
+    if trait.binary:
+        keep = np.arange(trait.people.shape[0]) if rows is None else rows
+        target = trait.target[keep]
+        found["cases"] = int(target.sum())
+        found["auc_snv_indel"] = auc_components(target, trait.baseline[keep]).auc
+        found["auc_with_sv"] = auc_components(target, trait.candidate[keep]).auc
+        delta = paired_delta_auc(target, trait.baseline[keep], trait.candidate[keep], clusters[trait.people[keep]])
+        found.update(auc_gain=delta.estimate, auc_se=delta.standard_error, auc_upper=delta.estimate + UPPER * delta.standard_error,
+                     auc_p=float(2.0 * stats.norm.sf(abs(delta.z_score))) if math.isfinite(delta.z_score) else math.nan)
+    return found
+
+
+def cell_line(name: str, group: str, found: dict[str, float]) -> str:
+    text = (f"  {name}\t{group.upper()}\tn={shown(found['n'])}" + (f" cases={shown(found['cases'])}" if "cases" in found else "")
+            + f"\tr2 snv_indel {found['snv_indel']:.5f} with_sv {found['with_sv']:.5f}\tgain {found['gain'] * 1e4:+.2f}e-4 "
+            f"[{found['ci_low'] * 1e4:+.2f}, {found['ci_high'] * 1e4:+.2f}] p={found['p']:.3g} at most {found['upper'] * 1e4:+.2f}e-4 "
+            f"({found['relative'] * 100:+.2f}%, at most {found['relative_upper'] * 100:+.2f}%)")
+    if "auc_gain" in found:
+        half = 1.959963984540054 * found["auc_se"]
+        text += (f"\tAUC {found['auc_snv_indel']:.4f} -> {found['auc_with_sv']:.4f}, gain {found['auc_gain']:+.5f} "
+                 f"[{found['auc_gain'] - half:+.5f}, {found['auc_gain'] + half:+.5f}] p={found['auc_p']:.3g} at most {found['auc_upper']:+.5f}")
+    return text
+
+
+def method_report(method: str, traits: Sequence[dict[str, object]], people: Sequence[np.ndarray], clusters: np.ndarray, labels: np.ndarray,
+                  weights: np.ndarray, resamples: int, permutations: int) -> list[str]:
+    """One method's per-trait cells and its combined test across traits."""
+    pairs = [(trait, paired(trait, people[index], method)) for index, trait in enumerate(traits)]
+    missing = [trait["name"] for trait, pair in pairs if pair is None]
+    usable = [pair for _trait, pair in pairs if pair is not None]
+    lines = [f"=== {method}: {len(usable)} traits" + (f"; no score in an arm for {', '.join(missing)}" if missing else "")]
+    for pair in usable:
+        for group in GROUPS:
+            rows = group_rows(pair, labels, group)
+            if rows is not None and rows.shape[0] == 0:
+                lines.append(f"  {pair.name}\t{group.upper()}\ttoo few people or cases to show")
+                continue
+            lines.append(cell_line(pair.name, group, cell(pair, rows, weights, clusters)))
+    if usable:
+        result = analyse(usable, clusters, labels, int(traits[0]["seed"]), resamples, permutations)
+        lines.extend(report(result, usable))
+    return lines
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("runs", nargs="+", help="Runs an aou_fastpgs.py job finished on.")
+    parser.add_argument("--methods", nargs="+", help="Methods to test (default: every method the scores hold).")
+    parser.add_argument("--root", default=OPS, help="The ops bucket's svpgs directory as this machine mounts it.")
+    parser.add_argument("--resamples", type=int, default=RESAMPLES)
+    parser.add_argument("--permutations", type=int, default=PERMUTATIONS)
+    args = parser.parse_args(argv)
+    traits = [trait for name in args.runs for trait in read_run(name, args.root)]
+    people, clusters, labels, disagreements = union(traits)
+    seed = traits[0]["seed"]
+    weights = cluster_bootstrap_counts(np.zeros(int(clusters.max()) + 1, dtype=np.int64), args.resamples, np.random.default_rng(seed))[:, clusters]
+    print(f"runs {' '.join(args.runs)}: traits {', '.join(trait['name'] for trait in traits)}; union of held-out people {shown(labels.shape[0])}, "
+          f"clusters {shown(int(clusters.max()) + 1)}, ancestry labels differing between runs {shown(disagreements)}; "
+          f"resamples {args.resamples}, permutations {args.permutations}")
+    for method in args.methods or traits[0]["methods"]:
+        print("\n".join(method_report(method, traits, people, clusters, labels, weights, args.resamples, args.permutations)), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

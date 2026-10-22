@@ -398,15 +398,10 @@ def read_run(name: str, contrast: str = "arms") -> dict[str, object]:
             "candidate": scores.held_out_genetic[ARMS.index("with_sv"), rows, trait], "seed": run.config.seed}
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("runs", nargs="+", help="Matched pairing runs (both arms fitted by identical code), one trait each.")
-    parser.add_argument("--contrast", choices=("arms", "ablation"), default="arms",
-                        help="arms (primary): with_sv vs snv_indel; ablation (secondary, descriptive): SV terms zeroed in one fit.")
-    parser.add_argument("--permutations", type=int, default=PERMUTATIONS)
-    parser.add_argument("--resamples", type=int, default=RESAMPLES)
-    args = parser.parse_args(argv)
-    runs = [read_run(name, args.contrast) for name in args.runs]
+def union(runs: Sequence[dict[str, object]]) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, int]:
+    """The union of the traits' held-out people, matched by research id (each run's "ids", "families" and "ancestry"):
+    each trait's people as indices into it, the union clusters (``union_clusters``), each union person's ancestry label
+    (lower case; the first run's where runs differ) and how many labels differ between runs."""
     ids, index = np.unique(np.concatenate([run["ids"] for run in runs]).astype(str), return_inverse=True)
     offsets = np.cumsum([0] + [run["ids"].shape[0] for run in runs])
     people = [index[offsets[i]:offsets[i + 1]] for i in range(len(runs))]
@@ -418,11 +413,23 @@ def main(argv: list[str] | None = None) -> int:
         known = np.array([value is not None for value in ancestry[people[i]]])
         disagreements += int(np.sum(known & (ancestry[people[i]] != labels)))
         ancestry[people[i][~known]] = labels[~known]
+    return people, clusters, np.char.lower(ancestry.astype(str)), disagreements
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("runs", nargs="+", help="Matched pairing runs (both arms fitted by identical code), one trait each.")
+    parser.add_argument("--contrast", choices=("arms", "ablation"), default="arms",
+                        help="arms (primary): with_sv vs snv_indel; ablation (secondary, descriptive): SV terms zeroed in one fit.")
+    parser.add_argument("--permutations", type=int, default=PERMUTATIONS)
+    parser.add_argument("--resamples", type=int, default=RESAMPLES)
+    args = parser.parse_args(argv)
+    runs = [read_run(name, args.contrast) for name in args.runs]
+    people, clusters, labels, disagreements = union(runs)
     traits = [PairedTrait(run["name"], run["binary"], people[i], np.asarray(run["target"], dtype=np.float64), np.asarray(run["covariates"], dtype=np.float64),
                           np.asarray(run["baseline"], dtype=np.float64), np.asarray(run["candidate"], dtype=np.float64)) for i, run in enumerate(runs)]
-    print(f"runs {' '.join(args.runs)}; contrast {args.contrast}; union of held-out people {shown(ids.shape[0])}, clusters {shown(int(clusters.max()) + 1)}, "
+    print(f"runs {' '.join(args.runs)}; contrast {args.contrast}; union of held-out people {shown(labels.shape[0])}, clusters {shown(int(clusters.max()) + 1)}, "
           f"ancestry labels differing between runs {shown(disagreements)}; resamples {args.resamples}, permutations {args.permutations}")
-    labels = np.char.lower(ancestry.astype(str))
     result = analyse(traits, clusters, labels, int(runs[0]["seed"]), args.resamples, args.permutations)
     print("\n".join(report(result, traits, args.contrast)))
     return 0
