@@ -127,9 +127,8 @@ def copy(numbers: dict) -> dict:
     # the smallest training set on which SV-PGS clears LDpred2-auto trained on the largest
     sooner = next((size for size, cell in zip(sizes, ours) if cell[1] > theirs[-1][2]), None)
     beaten = "all" if wins["wins"] == wins["replicates"] else f"{wins['wins']} of"
-    share = gain["imputed_sum"] / gain["true_sum"]
-    imputed_well = gain["rows"]["tagged_sv_fold3"]
-    kept_well = imputed_well["imputed"][0] / imputed_well["true"][0]
+    every = gain["rows"]["all"]  # true and imputed: [mean, lower, upper, truths]; share: [ratio, lower, upper]
+    share, share_lower, share_upper = every["share"]
     return {
         "introduction": ["We test whether structural variants (SVs) improve polygenic scores"],
         "methods": ["Empirical Bayes priors depend on imputation r², frequency and SV length"],
@@ -141,10 +140,11 @@ def copy(numbers: dict) -> dict:
         ],
         "accuracy": f"SV-PGS at {people(sooner)} beat LDpred2-auto at {people(sizes[-1])}" if sooner else "",
         "versus": f"SV-PGS had higher AUC in {beaten} {wins['replicates']} simulations",
-        "gain_title": f"Imputed SV genotypes gave {share:.0%} of the AUC gain of true SV genotypes",
-        "gain": [f"The {gain['clear']} of {gain['shown']} architectures where true SV genotypes raised AUC (95% CI above "
-                 "0), in one 3 Mb window of chr22",
-                 f"Where causal SVs impute well, the gain with imputed genotypes was **{kept_well:.0%}** as large"],
+        "gain_title": "Imputed SVs matched true SVs when well imputed",
+        "gain": [f"Mean and 95% CI across {every['true'][3]} simulated truths, each a new draw of causal variants, "
+                 "in 3 Mb of chr22",
+                 f"Across all {every['architectures']} architectures, imputed SVs gave **{share:.0%}** of the gain of "
+                 f"true SVs (95% CI {share_lower:.0%}–{share_upper:.0%})"],
         "aou": [
             "SVs imputed into 50,000 genomes from 12,212 long-read assemblies",
             "SV-PGS fitted for LDL, hypothyroidism, AF and gout",
@@ -618,7 +618,7 @@ def build() -> None:
                 [headline(words["versus"]),
                  figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
             headline(words["gain_title"], gap="section"),
-            figure(gallery["poster_sv_gain"], legend=GALLERY / "fig3_sv_gain_true_vs_imputed.txt"),
+            figure(gallery["poster_sv_gain"]),
             text(bullets(words["gain"])),
         ],
         [

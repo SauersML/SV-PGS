@@ -37,6 +37,9 @@ from matplotlib.lines import Line2D
 from matplotlib.transforms import ScaledTranslation, blended_transform_factory
 from scipy import stats
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from benchmarks.power.truths import fieller, mean_test, truth_gains  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 LOCAL = Path.home() / "svpgs-bench" / "poster-grid2"
 SUMMARY = HERE / "simulation_summary.json"
@@ -897,69 +900,95 @@ def poster_wins_figure(grids):
     return fig
 
 
-POSTER_ROWS = {
-    "multi_feature_positive": "Effects depend on SV\nlength, type, annotation",
-    "deletion_positive": "Deletions have 3×\nlarger effects",
-    "sv_heavy_tail": "A few SVs with\nvery large effects",
-    "sparse_sv": "50 causal\nvariants",
-    "tagged_sv_fold3": "Causal SVs well\nimputed, 3× effects",
-    "common_sv": "All causal\nSVs common",
-    "sv_two_point": "All causal SVs\none effect size",
-}
-"""The poster's row labels for the architectures where adding true SV genotypes clearly raised AUC, in plain words."""
+WELL_IMPUTED = ("tagged_sv", "tagged_sv_fold3")
+"""The architectures whose causal SVs are drawn only from SVs that Beagle imputed with realized r² ≥ 0.8 (grid.py's
+sv_min_realized_r2)."""
 POSTER_GAIN, POSTER_GENOTYPES = 22.92, 11.4
 """Inches: the widths of the SV gain forest (the poster's middle column, build_pptx.py's MIDDLE) and the imputation
 figure (the left column, LEFT), each placed at its column's full width."""
 
 
+def gain_sets(grids) -> dict[str, dict]:
+    """The SV gain with true and with imputed SV genotypes over simulated truths (benchmarks/power/truths.py), for every
+    architecture with causal SVs, those whose causal SVs are well imputed, the rest, and the control with no causal
+    SVs: each set's label, architecture count, mean gain per source with its t interval and sign-flip p, and the
+    imputed gain's share of the true gain with Fieller's interval."""
+    gains = truth_gains(grids["window-truth"], grids["window"])
+    causal = [point for point in LABELS if point != "null" and point in gains]
+    sets = {}
+    for key, label, points in (
+        ("all", f"All {len(causal)} architectures\nwith causal SVs", causal),
+        ("well_imputed", "Causal SVs well\nimputed (r² ≥ 0.8)", [point for point in causal if point in WELL_IMPUTED]),
+        ("any_sv", "Causal SVs drawn\nfrom all SVs", [point for point in causal if point not in WELL_IMPUTED]),
+        ("null", "No causal SVs\n(control)", ["null"]),
+    ):
+        true = [gain for point in points for _, gain, _ in gains.get(point, [])]
+        imputed = [gain for point in points for _, _, gain in gains.get(point, [])]
+        sets[key] = {"label": label, "architectures": len(points), "true": mean_test(true),
+                     "imputed": mean_test(imputed), "share": fieller(imputed, true)}
+    return sets
+
+
 def poster_sv_gain_figure(grids):
-    """The AUC gain from adding SVs with true and with imputed SV genotypes, for the architectures whose true-genotype
-    gain has a 95% interval above zero, largest first: a row per architecture, its label at the left, the true gain's
-    mean and interval over the imputed gain's."""
-    imputed, true = defaultdict(list), defaultdict(list)
-    for row in grids["window"]:
-        imputed[row["point"]].extend(finite([row], "delta_auc"))
-    for row in grids["window-truth"]:
-        true[row["point"]].extend(finite([row], "delta_auc"))
-    shown = [point for point in LABELS if len(true[point]) >= 3 and len(imputed[point]) >= 3]
-    clear = sorted((point for point in shown if interval(true[point])[1] > 0), key=lambda point: -interval(true[point])[0])
+    """The AUC gain from adding SVs with true and with imputed SV genotypes over simulated truths (``gain_sets``), a row
+    per set with its label at the left and the true gain's mean and 95% interval over the imputed gain's; the label of
+    the set with well-imputed causal SVs in bold. Returns the figure and its one-sentence description."""
+    sets = gain_sets(grids)
+
+    def entry(test):
+        return [test["mean"], test["lower"], test["upper"], test["truths"]]
+
     NUMBERS["poster_sv_gain"] = {
-        "clear": len(clear), "shown": len(shown),
-        "true_sum": sum(interval(true[point])[0] for point in clear),
-        "imputed_sum": sum(interval(imputed[point])[0] for point in clear),
-        "rows": {point: {"true": list(interval(true[point])), "imputed": list(interval(imputed[point]))} for point in clear},
+        "shown": len({row["point"] for row in grids["window-truth"]} & {row["point"] for row in grids["window"]}),
+        "rows": {key: {"architectures": row["architectures"], "true": entry(row["true"]), "p_true": row["true"]["p"],
+                       "imputed": entry(row["imputed"]), "p_imputed": row["imputed"]["p"],
+                       "share": [None if math.isinf(value) else value for value in row["share"]]}
+                 for key, row in sets.items()},
     }
-    pitch, top, bottom, right = 1.15, 1.05, 1.95, 0.5
-    height = top + bottom + pitch * len(clear)
+    rows = list(sets.values())
+    pitch, top, bottom, right = 1.9, 1.1, 2.3, 0.5
+    height = top + bottom + pitch * len(rows)
     fig = plt.figure(figsize=(POSTER_GAIN, height))
-    left = widest(fig, [POSTER_ROWS[point] for point in clear], fontsize=POSTER_TYPE, linespacing=1.0) + 0.75
+    left = widest(fig, [row["label"] for row in rows], fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0) + 0.75
     ax = frame(fig, left, bottom, POSTER_GAIN - left - right, height - top - bottom)
-    limits = (-0.006, 0.036)
-    for y, point in enumerate(clear):
-        for offset, values, (_, color, filled) in ((-0.2, true[point], SOURCES[0]), (0.2, imputed[point], SOURCES[1])):
-            mean, low, high, _ = interval(values)
-            ax.hlines(y + offset, max(low, limits[0]), min(high, limits[1]), color=color, linewidth=POSTER_BAR,
-                      zorder=3, capstyle="round")
-            ax.plot([mean], [y + offset], "o", markersize=POSTER_MARK, color=color,
+    ends = [row[source][end] for row in rows for source in ("true", "imputed") for end in ("lower", "upper")
+            if math.isfinite(row[source][end])]
+    low, high = min(0.0, *ends), max(ends)
+    limits = (low - 0.05 * (high - low), high + 0.05 * (high - low))
+    for y, row in enumerate(rows):
+        for offset, source, (_, color, filled) in ((-0.2, "true", SOURCES[0]), (0.2, "imputed", SOURCES[1])):
+            test = row[source]
+            if math.isfinite(test["lower"]):
+                ax.hlines(y + offset, test["lower"], test["upper"], color=color, linewidth=POSTER_BAR, zorder=3,
+                          capstyle="round")
+            ax.plot([test["mean"]], [y + offset], "o", markersize=POSTER_MARK, color=color,
                     markerfacecolor=color if filled else "white", markeredgecolor=color,
                     markeredgewidth=0 if filled else 6.0, zorder=4)
-        ax.text(0, y, POSTER_ROWS[point], transform=shifted(ax, -0.3), ha="right", va="center", linespacing=1.0)
+        ax.text(0, y, row["label"], transform=shifted(ax, -0.3), ha="right", va="center", linespacing=1.0,
+                fontweight="bold" if row is sets["well_imputed"] else "normal")
     ax.axvline(0, color=INK, linewidth=4.0, zorder=2)
     ax.set_yticks([])
     ax.spines["left"].set_visible(False)
-    ax.set_ylim(len(clear) - 0.5, -0.5)
+    ax.set_ylim(len(rows) - 0.5, -0.5)
     ax.set_xlim(*limits)
-    ticks = np.arange(0, limits[1], 0.01)
-    ax.set_xticks(ticks, [plain(tick) for tick in ticks])
-    ax.set_xlabel("AUC gain from adding SVs")
+    step = 0.002
+    ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
+    ax.set_xticks(ticks, [plain(tick, 3) for tick in ticks])
+    ax.set_xlabel("Test AUC gain from adding SVs")
     # the two genotype sources named once over the whole figure, labels and plot, each after a mark like its own
-    for across, (label, color, filled) in ((left, SOURCES[0]), (left + 8.2, SOURCES[1])):
+    first = widest(fig, [SOURCES[0][0]], fontsize=POSTER_NAME, fontweight="bold")
+    for across, (label, color, filled) in ((0.3, SOURCES[0]), (0.3 + first + 1.6, SOURCES[1])):
         fig.add_artist(Line2D([(across + 0.25) / POSTER_GAIN], [1 - 0.55 / height], marker="o", markersize=POSTER_MARK,
                               color=color, markerfacecolor=color if filled else "white",
                               markeredgecolor=color, markeredgewidth=0 if filled else 6.0))
         fig.text((across + 0.75) / POSTER_GAIN, 1 - 0.55 / height, label, color=color, fontsize=POSTER_NAME,
                  fontweight="bold", va="center", ha="left")
-    return fig
+    description = (
+        "Test AUC gain from adding SVs to SV-PGS with true (filled) and Beagle-imputed (open) SV genotypes, mean and 95% "
+        "interval over simulated truths, for every architecture with causal SVs, those whose causal SVs are well "
+        "imputed, the rest, and the control with no causal SVs."
+    )
+    return fig, description
 
 
 def poster_imputation_figure(summary):
@@ -1239,15 +1268,16 @@ def main() -> None:
             gallery_page(gallery, OUT / f"{name}.png", caption)
     # the poster's own versions, not gallery figures, in the poster's type and with no legends or gallery pages
     with plt.rc_context(POSTER_STYLE):
+        gain, gain_description = poster_sv_gain_figure(grids)
         for name, panel in (("poster_accuracy_by_training_size", poster_accuracy_figure(grids, summary)),
                             ("poster_wins", poster_wins_figure(grids)),
-                            ("poster_sv_gain", poster_sv_gain_figure(grids)),
+                            ("poster_sv_gain", gain),
                             ("poster_imputation_accuracy", poster_imputation_figure(summary)),
                             ("poster_model", poster_model_figure()), ("poster_variants", poster_variants_figure(summary))):
             # transparent, so the page shows through: an opaque white ground renders a shade off the page white in a PDF
             panel.savefig(OUT / f"{name}.png", transparent=True)
             plt.close(panel)
-    for name, words in SCHEMATICS.items():
+    for name, words in (*SCHEMATICS.items(), ("poster_sv_gain", gain_description)):
         (OUT / f"{name}.txt").write_text(words + "\n")
     text = json.dumps(rounded(NUMBERS), indent=1, ensure_ascii=False)
     # each [mean, lower, upper, n] on one line

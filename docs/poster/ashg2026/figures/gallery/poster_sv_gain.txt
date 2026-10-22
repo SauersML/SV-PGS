@@ -1,0 +1,1 @@
+Test AUC gain from adding SVs to SV-PGS with true (filled) and Beagle-imputed (open) SV genotypes, mean and 95% interval over simulated truths, for every architecture with causal SVs, those whose causal SVs are well imputed, the rest, and the control with no causal SVs.
