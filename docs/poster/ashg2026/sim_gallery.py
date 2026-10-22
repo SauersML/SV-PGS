@@ -818,16 +818,16 @@ POSTER_STYLE = {
 
 def poster_accuracy_figure(grids, summary):
     """Figure 1a for the poster: test AUC against training size for SV-PGS and LDpred2-auto, pooled over 0%, 5% and 20%
-    causal SVs, each method named beside its line and its AUC at the largest size written after its last mark, under
-    the AUC of the true genetic value."""
+    causal SVs, each mean with its 95% interval as an error bar and each method named beside its line, under the AUC of
+    the true genetic value."""
     grouped = cells(grids["grid"])
     fig = plt.figure(figsize=(POSTER_HALF, POSTER_HEIGHT))
-    # the right margin holds each line's last AUC, in bold at tick size; the left one the ticks and the axis title
-    ends = widest(fig, ["0.000"], fontsize=POSTER_TYPE, fontweight="bold")
-    top, bottom, left, right = 0.25, 2.05, widest(fig, ["0.00"], fontsize=POSTER_TYPE) + 1.45, 0.3 + ends
+    # the left margin holds the ticks and the axis title
+    top, bottom, left, right = 0.25, 2.05, widest(fig, ["0.00"], fontsize=POSTER_TYPE) + 1.45, 0.3
     ax = frame(fig, left, bottom, POSTER_HALF - left - right, POSTER_HEIGHT - top - bottom)
     log_size_axis(ax)
-    ax.set_xlabel("Training size (thousands)")
+    # the title runs longer than the axis, so it ends at the axis's far end
+    ax.set_xlabel("Training size (thousands)", loc="right")
     ceiling = summary["points"]["null"]["true_value_auc"]
     ax.axhline(ceiling, color=INK, linestyle=(0, (1, 1.2)), linewidth=4.0, zorder=1)
     # named over its line, so the room under it is SV-PGS's
@@ -838,14 +838,14 @@ def poster_accuracy_figure(grids, summary):
                   for size in SIZES]
         mean, low, high = (np.array([cell[i] for cell in pooled]) for i in range(3))
         upper[method] = high
-        ax.fill_between(SIZES, low, high, color=color, alpha=0.2, linewidth=0, zorder=2)
-        ax.plot(SIZES, mean, color=color, zorder=3, marker="o", markeredgewidth=0)
-        ax.text(SIZES[-1] * 1.15, mean[-1], f"{mean[-1]:.3f}", color=color, fontweight="bold", ha="left", va="center")
-    # each method's name on the empty side of its own line: SV-PGS over its left half, clear of its band at 20,000;
-    # LDpred2-auto, wider than the axes, under its right half and on into the right margin
+        # marks smaller than the poster's usual, so each interval shows past its mark
+        ax.errorbar(SIZES, mean, yerr=(mean - low, high - mean), color=color, elinewidth=POSTER_BAR, capsize=0,
+                    marker="o", markersize=POSTER_MARK * 0.7, markeredgewidth=0, zorder=3)
+    # each method's name on the empty side of its own line: SV-PGS over its left half, clear of its bar at 20,000;
+    # LDpred2-auto under its right half
     ax.text(SIZES[0] / 1.2, upper["SV-PGS"][2] + 0.006, "SV-PGS", color=SV_PGS, fontsize=POSTER_NAME,
             fontweight="bold", ha="left", va="bottom")
-    ax.text(1, 0.496, "LDpred2-auto", transform=shifted(ax, right - 0.1), color=LDPRED2, fontsize=POSTER_NAME,
+    ax.text(1, 0.496, "LDpred2-auto", transform=shifted(ax, 0.0), color=LDPRED2, fontsize=POSTER_NAME,
             fontweight="bold", ha="right", va="bottom")
     ax.set_ylim(0.49, ceiling + 0.03)
     ax.set_yticks(np.arange(0.5, 0.651, 0.05), ["0.50", "0.55", "0.60", "0.65"])
@@ -876,25 +876,35 @@ def poster_wins_figure(grids):
                               "gain": interval(gain), "null_gain": interval(gain[null]), "window_gain": interval(window)}
     fig = plt.figure(figsize=(POSTER_HALF, POSTER_HEIGHT))
     ticks = widest(fig, ["0.00"], fontsize=POSTER_TYPE)
-    top, bottom, left, right = 0.25, 2.05, ticks + 1.6, 0.3
-    ax = frame(fig, left, bottom, POSTER_HALF - left - right, POSTER_HEIGHT - top - bottom)
-    limits = (0.465, 0.68)
-    ax.axline((limits[0], limits[0]), slope=1, color=INK, linewidth=4.0, zorder=1)
+    top, bottom, left = 0.25, 2.05, ticks + 1.6
+    width, height = POSTER_HALF - left - 0.3, POSTER_HEIGHT - top - bottom
+    ax = frame(fig, left, bottom, width, height)
+    # one scale on both axes, so the line of equal AUC runs at 45 degrees: 0.465 to 0.68 along the shorter axis, and
+    # the longer one runs on at the same scale
+    low = 0.465
+    scale = (0.68 - low) / min(width, height)
+    right, upper = low + scale * width, low + scale * height
+    ax.axline((low, low), slope=1, color=INK, linewidth=4.0, zorder=1)
     for chosen, color in ((~null, SV_PGS), (null, INK)):
         ax.vlines(theirs[chosen], ours[chosen] - half[chosen], ours[chosen] + half[chosen], color=color,
                   linewidth=POSTER_BAR * 0.5, zorder=2)
         ax.plot(theirs[chosen], ours[chosen], "o", markersize=POSTER_MARK * 0.8, color=color, markeredgewidth=0,
                 linestyle="none", zorder=3)
-    ax.set_xlim(limits[0], 0.635)
-    ax.set_ylim(*limits)
-    ax.set_xticks([0.5, 0.55, 0.6], ["0.50", "0.55", "0.60"])
-    ax.set_yticks([0.5, 0.55, 0.6, 0.65], ["0.50", "0.55", "0.60", "0.65"])
+    ax.set_xlim(low, right)
+    ax.set_ylim(low, upper)
+    ax.set_aspect("equal")
+    for axis, end in ((ax.xaxis, right), (ax.yaxis, upper)):
+        levels = np.arange(0.5, end, 0.05)
+        axis.set_ticks(levels, [plain(level) for level in levels])
     # the x axis's title runs longer than its axis, so it ends at the axis's far end
     ax.set_xlabel("LDpred2-auto test AUC", loc="right")
     ax.set_ylabel("SV-PGS test AUC")
-    ax.text(limits[0] + 0.005, limits[1] - 0.005, "SV-PGS\nbetter", color=SV_PGS, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top",
+    ax.text(low + 0.005, upper - 0.005, "SV-PGS\nbetter", color=SV_PGS, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top",
             linespacing=1.0)
-    ax.text(0.632, limits[0] + 0.004, "Black: no\ncausal SVs", color=INK, fontweight="bold", ha="right", va="bottom",
+    # under the line, where no dot falls: the training size at the foot, the key to the black dots over it
+    ax.text(right - 0.003, low + 0.003, f"Trained on\n{size:,} people", color=INK, ha="right", va="bottom",
+            linespacing=1.0)
+    ax.text(right - 0.003, low + 0.058, "Black: no\ncausal SVs", color=INK, fontweight="bold", ha="right", va="bottom",
             linespacing=1.0)
     return fig
 
