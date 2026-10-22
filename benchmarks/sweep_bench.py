@@ -13,8 +13,9 @@ them (``device_plan.plan_blocks``), one piece per block:
   panel's codes. Three sweeps of three models (the first builds the Grams; the next two are timed as the warm sweeps a
   solve repeats); one with every launch made to an empty kernel with the same arguments, the host's share (the
   launches' submissions, the state's copies, the Grams' stacking: where it is below the full sweep's time the GPU is
-  the bottleneck); and two of nine models (three groups' models, or three traits' groups, read in one pass of the
-  codes).
+  the bottleneck); two of the three models in a new member order within each block, as a mode search's next order
+  lays its members out (the first builds that order's panel Grams and is checked on each device's first block and one
+  other); and two of nine models (three groups' models, or three traits' groups, read in one pass of the codes).
 - arm: one arm's eleven traits [real] in one pass (``device_sweep.ArmTraits``, ``trait_lattices``): the codes over
   every sample, each trait with its own training rows (39-100% of the samples [real: 1.7e4 to 4.4e4 a trait]; the
   last a binary trait's root weights on them), its own Stage 0 standardization on those rows (``ArmTraits``, timed:
@@ -326,10 +327,10 @@ def _worker(samples, members, blocks, devices, host):
     def start(models, source=problem):
         return {"state": {name: np.zeros((members, models)) for name in MOMENTS}, "residuals": source["residuals"][:models].copy(), "grams": PanelGrams()}
 
-    def sweep(run, models, label, sweep_kernels=None, arm=None):
+    def sweep(run, models, label, sweep_kernels=None, arm=None, order=layout):
         started = time.perf_counter()
         swept, totals, squares = _new(
-            xp, problem, kernels if sweep_kernels is None else sweep_kernels, range(models), run["state"], run["residuals"], run["grams"], layout, arm,
+            xp, problem, kernels if sweep_kernels is None else sweep_kernels, range(models), run["state"], run["residuals"], run["grams"], order, arm,
         )
         synchronize()
         times[label] = time.perf_counter() - started
@@ -360,6 +361,15 @@ def _worker(samples, members, blocks, devices, host):
         lambda: sweep(new, MODELS, "host share", _NoKernels(kernels) if host else _EmptyKernels(xp, kernels)),
     )
     new["state"] = saved
+    shuffle = np.random.default_rng(31)
+    reordered = SweepLayout(
+        xp, problem["devices"], [shuffle.permutation(block) for block in problem["member_blocks"]], problem["bounds"], np.arange(members),
+        np.ones(members), np.zeros(members, dtype=np.int64), lambda width: iter(((0, width),)),
+    )
+    later = {"state": {name: values.copy() for name, values in new["state"].items()}, "residuals": new["residuals"].copy(), "grams": new["grams"]}
+    checks.run(f"a new member order's sweep 1 of {MODELS} models (builds its panel Grams)", lambda: sweep(later, MODELS, "order cold", order=reordered))
+    checks.run(f"a new member order's sweep 2 of {MODELS} models", lambda: sweep(later, MODELS, "order warm", order=reordered))
+    del later, reordered
 
     def alone():
         run = start(1)
@@ -448,6 +458,9 @@ def _worker(samples, members, blocks, devices, host):
         print(f"INFO new: cold {times.get('new cold', float('nan')):.3f} s, warm {warm:.3f} s a sweep of all {MODELS} models "
               f"({1e6 * warm / panels:.1f} us a panel); host share {times.get('host share', float('nan')):.3f} s "
               f"({1e6 * times.get('host share', float('nan')) / panels:.1f} us a panel)", flush=True)
+    if "order warm" in times:
+        print(f"INFO a new member order: first sweep {times.get('order cold', float('nan')):.3f} s (its panel Grams built and its sweep "
+              f"checked), warm {times['order warm']:.3f} s", flush=True)
     if "wide warm" in times:
         print(f"INFO new, {WIDE_MODELS} models a launch: cold {times.get('wide cold', float('nan')):.3f} s, warm {times['wide warm']:.3f} s "
               f"({1e6 * times['wide warm'] / panels:.1f} us a panel)", flush=True)
