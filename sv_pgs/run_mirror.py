@@ -238,8 +238,7 @@ class GcsRemote:
         from google.cloud.storage.retry import DEFAULT_RETRY
 
         with path.open("rb") as handle:
-            handle.seek(start)
-            self._bucket.blob(self._root + name).upload_from_file(handle, size=stop - start, retry=DEFAULT_RETRY)
+            self._bucket.blob(self._root + name).upload_from_file(_FileRange(handle, start, stop), size=stop - start, retry=DEFAULT_RETRY)
 
     def write(self, name: str, content: bytes) -> None:
         self._bucket.blob(self._root + name).upload_from_string(content)
@@ -395,6 +394,28 @@ def _upload_range_in_process(url: str, path: Path, start: int, stop: int, name: 
     if url not in _PROCESS_REMOTES:
         _PROCESS_REMOTES[url] = GcsRemote(url)
     _PROCESS_REMOTES[url].upload_range(path, start, stop, name)
+
+
+class _FileRange:
+    """Bytes ``start`` to ``stop`` of an open file as a stream of their own, its positions from 0: a resumable upload
+    starts only from a stream's beginning ("Stream must be at beginning.") and seeks back within it to send a chunk
+    again."""
+
+    def __init__(self, handle, start: int, stop: int) -> None:
+        self._handle, self._start, self._stop = handle, start, stop
+        handle.seek(start)
+
+    def read(self, size: int | None = -1) -> bytes:
+        left = self._stop - self._handle.tell()
+        return self._handle.read(max(0, left if size is None or size < 0 else min(size, left)))
+
+    def tell(self) -> int:
+        return self._handle.tell() - self._start
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        base = {os.SEEK_SET: self._start, os.SEEK_CUR: self._handle.tell(), os.SEEK_END: self._stop}[whence]
+        self._handle.seek(base + offset)
+        return self.tell()
 
 
 class _HashingFile:

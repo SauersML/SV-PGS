@@ -867,8 +867,13 @@ def test_a_gcs_restart_file_is_sent_in_parallel_parts_composed_into_one_object(t
         def __init__(self, name: str) -> None:
             self.name = name
 
-        def upload_from_file(self, handle, size: int, retry=None) -> None:
-            objects[self.name] = handle.read(size)
+        def upload_from_file(self, stream, size: int, retry=None) -> None:
+            # as the resumable upload: from the stream's beginning, which a retry seeks back to
+            assert stream.tell() == 0
+            stream.read(1)
+            stream.seek(0)
+            objects[self.name] = stream.read(size)
+            assert stream.read(1) == b"" and stream.tell() == size
 
         def compose(self, sources) -> None:
             objects[self.name] = b"".join(objects[source.name] for source in sources)
