@@ -36,7 +36,7 @@ What a round uses:
   and from which model, or cold and why; a trait whose two arms would start unlike (one warm, one cold) fails the plan,
   since the comparison's difference must be the data's, not the starts'.
 - Every job: SHARED_RUNTIME=1, Spot with MAX_RETRIES 3 under the job templates' RETRY_TASK lifecycle (a retry only when
-  the VM went away), unless the spec says otherwise.
+  the VM went away), unless the spec says otherwise; a GPU job's attempts capped at max_run_hours.
 - A fit job's shape: one A100 on four local SSDs (ONE_GPU) unless the spec names another. No arm has run on one GPU
   yet, so "canaries" names the arms that do first, and every other arm takes TWO_GPU, the live rounds' machine; with no
   canaries named every arm takes the round's shape, and the plan warns while that is one GPU.
@@ -54,8 +54,18 @@ ways, by what the commit's task knows:
 - without it: once both fit jobs have SUCCEEDED with one fit key, --follow copies the
   other arm's models into one run's fit partial and submits that run on the merge slot (a merge job: its restore,
   digest, both arms' scoring and the report).
---follow also submits arm_vms' fit jobs once its store job has SUCCEEDED; with --watch it looks again every so many
-minutes until nothing waits.
+--follow also submits arm_vms' fit jobs once its store job has SUCCEEDED, and resubmits a job that failed where the next
+can resume from the mirror (Follower, RESUBMITTED): after preemptions that used up Batch's retries, an attempt's time
+cap with new restart units or steps on the mirror, and once each a VM that stopped answering, a push that kept failing,
+an unreachable GPU, a failed restore or last push. It never resubmits the driver's own error (an out-of-memory error
+fails the same way on the round's code), a time cap with nothing saved (stuck), a deleted job, more than
+max_resubmissions times for one planned job, or once the round's jobs have cost spend_cap_usd. Each resubmission is the
+job's command and environment on a free budget slot of its run like its own (train-3, ...), recorded under the round's
+staging (follow/chains) before it is submitted. With --watch it looks again every so many minutes until the round has
+ended (every job SUCCEEDED or ended failed, nothing waiting); a follow/STOP object or TERM stops it, one follower holds a
+round (follow/lease.json and a lock on its machine), and every action goes to its log (--state's <round>.log, copied to
+follow/follow.log). launcher/workspace/follow.sh runs it detached on the workspace app, and starts it again when the
+app restarts.
 
 ROUND.json:
   {"round": "r7", "source_commit": "<sha>", "layout": "arm_jobs",
@@ -68,8 +78,9 @@ ROUND.json:
   "reuse_steps" (samples .. direct_sv), "config" (CONFIG_OVERRIDES' keys), "one_gpu_slowdown" (an arm's EB on one GPU
   against two under trait_jobs; 1.0), "merge_machine_type" (a merge job's without PARTNER_RUN; its run's),
   "merge_cpu_machine_type" (a merge job's with PARTNER_RUN; CPU_MERGE's), "store_machine_type" (arm_vms' store job's
-  CPU machine; STORE_MACHINE's) and "warm_start" (true: each arm from its own earlier model; false: every arm
-  cold). A trait may carry its own machine_type, gpu_type, gpu_count, run_disk_type and run_disk_gb, as a trait whose
+  CPU machine; STORE_MACHINE's), "warm_start" (true: each arm from its own earlier model; false: every arm
+  cold), "max_run_hours" (8: a GPU job's attempt's cap, submit.sh's MAX_RUN_HOURS; null for the slot's),
+  "max_resubmissions" (4) and "spend_cap_usd" (three times the round's projected dollars). A trait may carry its own machine_type, gpu_type, gpu_count, run_disk_type and run_disk_gb, as a trait whose
   codes outgrow one A100-40 does, and its "warm_from", the runs whose saved models start its arms (its base_run; name
   both runs of a live pair, such as ["aou-wl5", "aou-wl1"], while their merge has not put both arms in one); a canary
   is TRAIT:ARM, by the trait's code or name.
@@ -81,6 +92,8 @@ never a value of the data.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import datetime
 import hashlib
 import json
 import math
@@ -275,7 +288,8 @@ def read_spec(raw: dict) -> dict:
     known = {
         "round", "source_commit", "layout", "traits", "arms", "run_prefix", "provisioning_model", "max_retries", "through",
         "fit_slot", "merge_slot", "store_slot", "hourly_usd", "env_from", "reuse", "reuse_steps", "config", "one_gpu_slowdown",
-        "merge_machine_type", "merge_cpu_machine_type", "store_machine_type", "canaries", "warm_start", *SHAPE_KEYS,
+        "merge_machine_type", "merge_cpu_machine_type", "store_machine_type", "canaries", "warm_start", "max_resubmissions", "spend_cap_usd",
+        "max_run_hours", *SHAPE_KEYS,
     }
     unknown = sorted(set(raw) - known)
     if unknown:
@@ -378,6 +392,15 @@ def read_spec(raw: dict) -> dict:
     _match(r"[a-z0-9-]+", spec["store_machine_type"], "store_machine_type (arm_vms' store job's CPU machine)")
     if spec.get("hourly_usd") is not None and (not isinstance(spec["hourly_usd"], int) or spec["hourly_usd"] < 1):
         raise RoundError("hourly_usd is a whole number of dollars (budget_guard's rate)")
+    spec.setdefault("max_resubmissions", 4)
+    if isinstance(spec["max_resubmissions"], bool) or not isinstance(spec["max_resubmissions"], int) or not 0 <= spec["max_resubmissions"] <= 8:
+        raise RoundError("max_resubmissions is 0 to 8: the jobs --follow submits for one planned job after it")
+    spec.setdefault("spend_cap_usd", None)
+    if spec["spend_cap_usd"] is not None and (isinstance(spec["spend_cap_usd"], bool) or not isinstance(spec["spend_cap_usd"], (int, float)) or not 0 < spec["spend_cap_usd"] <= 3000):
+        raise RoundError("spend_cap_usd is the round's dollars past which --follow submits nothing, up to the study's $3,000")
+    spec.setdefault("max_run_hours", 8)
+    if spec["max_run_hours"] is not None and (isinstance(spec["max_run_hours"], bool) or not isinstance(spec["max_run_hours"], int) or not 1 <= spec["max_run_hours"] <= 72):
+        raise RoundError("max_run_hours is 1 to 72 whole hours, a GPU job's attempt's cap (submit.sh's MAX_RUN_HOURS), or null for the budget slot's")
     return spec
 
 
@@ -560,6 +583,42 @@ class Gcloud:
     def job_state(self, name: str, project: str, region: str):
         shown = self._run(["batch", "jobs", "describe", name, f"--project={project}", f"--location={region}", "--format=value(status.state)"])
         return (shown.stdout.strip() or None) if shown.returncode == 0 else None
+
+    def job(self, name: str, project: str, region: str):
+        """A job's record (gcloud batch jobs describe), or None where there is no such job."""
+        shown = self._run(["batch", "jobs", "describe", name, f"--project={project}", f"--location={region}", "--format=json"])
+        try:
+            return json.loads(shown.stdout) if shown.returncode == 0 else None
+        except ValueError:
+            return None
+
+    def exits(self, name: str, project: str, region: str) -> list:
+        """Each task's exit codes, attempt by attempt (its status events'), or [] where they cannot be read."""
+        shown = self._run(["batch", "tasks", "list", f"--job={name}", f"--project={project}", f"--location={region}", "--format=json"])
+        try:
+            tasks = json.loads(shown.stdout) if shown.returncode == 0 else []
+        except ValueError:
+            return []
+        return [[event["taskExecution"]["exitCode"] for event in task.get("status", {}).get("statusEvents", [])
+                 if isinstance(event.get("taskExecution", {}).get("exitCode"), int)] for task in tasks]
+
+    def stamped(self, path: str) -> dict:
+        """Every object under the directory ``path``: its name relative to it, and when it was written (seconds since
+        the epoch; a listing's time, which is UTC, is never shown)."""
+        root = self.url(path.rstrip("/") + "/")
+        shown = self._run(["storage", "ls", "-l", "-r", root])
+        found = {}
+        for line in shown.stdout.splitlines() if shown.returncode == 0 else ():
+            matched = re.match(r"^\s*\d+\s+(\S+)\s+(gs://\S+)$", line)
+            if matched and matched.group(2).startswith(root) and not matched.group(2).endswith("/"):
+                try:
+                    found[matched.group(2)[len(root):]] = spend.moment(matched.group(1)).timestamp()
+                except ValueError:
+                    continue
+        return found
+
+    def remove(self, path: str) -> None:
+        self._run(["storage", "rm", self.url(path)], change=True)
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +866,8 @@ def job_environment(spec: dict, run_id: str, slot: str, shape: dict, staging: st
     environment = {"RUN_ID": run_id, "BUDGET_SLOT": slot, "THROUGH": through or spec["through"], "STAGED_SOURCE": staging, "MACHINE_TYPE": shape["machine_type"]}
     if gpu:
         environment.update(GPU_TYPE=shape["gpu_type"], GPU_COUNT=str(shape["gpu_count"]))
+        if spec.get("max_run_hours"):
+            environment["MAX_RUN_HOURS"] = str(spec["max_run_hours"])
     environment.update({
         "PROVISIONING_MODEL": spec["provisioning_model"], "MAX_RETRIES": str(spec["max_retries"]), "RUN_DISK_TYPE": shape["run_disk_type"],
         "RUN_DISK_GB": str(shape["run_disk_gb"]), "SHARED_RUNTIME": "1", "UV_EXTRAS": UV_EXTRAS if gpu else "",
@@ -1287,7 +1348,258 @@ def execute(plan: Plan, cloud: Gcloud, launcher: Path) -> None:
         print("--follow submits the jobs that wait for these once they have ended", flush=True)
 
 
-def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str) -> list:
+# ---------------------------------------------------------------------------
+# --follow: each job submitted once it may be, and a failed one resubmitted where it can resume
+# ---------------------------------------------------------------------------
+FOLLOW = "follow"
+"""Under the round's staging, --follow's own objects: chains/<job>.json (each job it submitted for a planned job, with
+why), lease.json (the follower that holds the round), follow.log (every action), and STOP, which a person writes to
+stop every follower of the round."""
+ON_VM_EXITS = {50001: "preempted", 50003: "preempted", 50006: "preempted", 75: "preempted", 50005: "time-cap", 50002: "vm-lost", 50004: "vm-lost"}
+"""A task's last exit that Batch, not the task, chose: its VM went away and Batch's retries ran out (the job templates'
+RETRY_TASK codes), its attempt reached maxRunDuration, or its VM stopped answering."""
+TASK_EXITS = {"exit-push-stuck": "push-stuck", "exit-no-gpu": "no-gpu", "exit-restore": "restore", "exit-push": "push", "exit-install": "install",
+              "exit-source": "source", "exit-adopt": "adopt", "exit-after": "after", "merge-waiting": "merge-waiting"}
+"""run_step.sh's markers of a task that stopped before or after its driver, and why."""
+RESUBMITTED = {"preempted": None, "time-cap": None, "vm-lost": 1, "push-stuck": 1, "no-gpu": 1, "restore": 1, "push": 1}
+"""The reasons a failed job is resubmitted for, and how often one chain may fail for each (None: as often as the chain's
+resubmissions allow). A preemption is the VM's, and the next job resumes from the mirror. A time cap is resubmitted only
+where the attempt left new restart units or steps on the mirror, so a stuck job is not. A VM that stopped answering, a
+push that kept failing, a GPU the task could not reach, and a restore, a last push that failed are each given one more
+job. Every other reason (the driver's error, such as an out-of-memory error, an install, a staged source that does not
+match, an unknown exit) is this round's code or data failing the same way again: it is never resubmitted, and the
+round's next staging is the fix."""
+ACTIVE = ("QUEUED", "SCHEDULED", "SCHEDULED_PENDING_QUEUED", "RUNNING", "SUBMITTED", "CANCELLATION_IN_PROGRESS", "DELETION_IN_PROGRESS")
+SUBMITTING_SECONDS = 600
+"""A recorded job Batch does not show is taken as still being submitted for this long, then as deleted."""
+MARKER_TIME = re.compile(r"^(\d{8}T\d{6}Z)_(.+)$")
+
+
+def _local_time(seconds: float) -> str:
+    """A moment for the follower's log, in the study's time zone (Pacific), never UTC."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.datetime.fromtimestamp(seconds, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:  # noqa: BLE001 - no time zone data: the machine's own zone, named
+        return datetime.datetime.fromtimestamp(seconds).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+def spend_cap(plan: Plan) -> float:
+    """The round's default spend cap: three times round_cost.py's projection of its jobs at the high end of each phase
+    (cost_jobs: its fit jobs and merges; arm_vms' store job is not on any timeline). A follower submits nothing once the
+    round's jobs have cost it; jobs already running go on."""
+    return round(3 * round_cost.project(round_cost.from_planner(cost_jobs(plan), 1), round_cost.PREEMPTIONS_PER_HOUR)["usd"], 2)
+
+
+def classify(record: dict, exits: list, markers: list) -> tuple:
+    """Why a FAILED job failed, as (reason, detail): its tasks' last exits and its run's markers written since it was
+    created (run_step.sh's <time>_task_<event>, the driver's <time>_<step>_failed-<error>). Batch's own exits come first:
+    a job whose last attempt was preempted failed for that, whatever an earlier attempt marked."""
+    last = [codes[-1] for codes in exits if codes]
+    failed = [code for code in last if code != 0]
+    for code in failed:
+        if code in ON_VM_EXITS:
+            return ON_VM_EXITS[code], f"exit {code}"
+    events = [matched.group(2) for matched in map(MARKER_TIME.match, markers) if matched]
+    # A store fan-out's task markers carry its chromosome index: task_<index>-<event>.
+    task = [re.sub(r"^\d+-", "", event[len("task_"):]) for event in events if event.startswith("task_")]
+    if 3 in failed or "exit-push-stuck" in task:
+        return "push-stuck", "its pushes kept failing"
+    driver = [event for event in events if not event.startswith("task_") and "_failed-" in event]
+    if driver:
+        return "driver", driver[-1]
+    for marker, reason in TASK_EXITS.items():
+        if marker in task:
+            return reason, marker
+    return "unknown", f"exits {failed or last or 'unread'}, state {record.get('status', {}).get('state')}"
+
+
+class Follower:
+    """--follow's view of the round's jobs: each planned job's chain (the job the plan names, then each job --follow
+    submitted for it, recorded in FOLLOW/chains/<planned job>.json before it is submitted), the state of each chain's
+    latest job and, for a failed one, why; the round's spend against its cap; the log of every action, kept in the
+    follower's log file and copied to FOLLOW/follow.log.
+
+    ``resubmitting`` False is the plain follower of a pass without resubmissions (a failed chain counts as failed)."""
+
+    def __init__(self, plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str, log=None, resubmitting: bool = True,
+                 clock=time.time) -> None:
+        self.plan, self.cloud, self.launcher, self.project, self.region = plan, cloud, launcher, project, region
+        self.root, self.log, self.resubmitting, self.clock = f"{plan.staging}/{FOLLOW}", log, resubmitting, clock
+        self.records: dict = {}
+        self.chains: dict = {}
+        self.ended: dict = {}
+        self.cap = plan.spec["spend_cap_usd"] or spend_cap(plan)
+        budget = Path(os.environ.get("STUDY_BUDGET") or HERE / "study_budget.template.json")
+        self.slots = json.loads(budget.read_text(encoding="utf-8"))["slots"]
+
+    def entries(self) -> list:
+        """Every job of the plan: arm_vms' store job, the fit jobs, the merges and the CPU merges."""
+        return ([self.plan.store] if self.plan.store else []) + self.plan.jobs + self.plan.merges + self.plan.finishes
+
+    def say(self, action: str, **fields) -> None:
+        """One action, printed and appended to the log (with the round's copy in the bucket where --execute)."""
+        now = self.clock()
+        line = json.dumps({"time": _local_time(now), "action": action, **fields})
+        print(line, flush=True)
+        if self.log is None:
+            return
+        with open(self.log, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        if self.cloud.execute:
+            try:
+                self.cloud.write(f"{self.root}/follow.log", Path(self.log).read_text(encoding="utf-8"))
+            except RoundError as error:
+                print(f"follow.log not copied to the bucket: {error}", file=sys.stderr, flush=True)
+
+    def record(self, name: str):
+        """A job's record, read once a pass (a terminal one once)."""
+        if name not in self.records:
+            self.records[name] = self.cloud.job(name, self.project, self.region)
+        return self.records[name]
+
+    def forget(self) -> None:
+        """A new pass: every job not yet ended is read again."""
+        self.records = {name: record for name, record in self.records.items() if record and record.get("status", {}).get("state") in ("SUCCEEDED", "FAILED")}
+        self.chains = {}
+
+    def chain(self, entry: dict) -> list:
+        """The planned job's chain: its jobs in order, each {name, run_id, slot, environment, reason, time}. Without a
+        record, the job the plan names where Batch has it (for a CPU merge, either run's on the merge slot)."""
+        if entry["name"] not in self.chains:
+            text = self.cloud.read(f"{self.root}/chains/{entry['name']}.json")
+            if text is not None:
+                jobs = json.loads(text)["jobs"]
+            else:
+                runs = entry["runs"] if "finisher" in entry else [entry["run_id"]]
+                jobs = []
+                for run in runs:
+                    name = f"svpgs-{run}-{entry['environment']['BUDGET_SLOT']}"
+                    if self.record(name) is not None:
+                        partner = [other for other in runs if other != run]
+                        environment = dict(entry["environment"], RUN_ID=run, **({"PARTNER_RUN": partner[0]} if "finisher" in entry else {}))
+                        jobs.append({"name": name, "run_id": run, "slot": entry["environment"]["BUDGET_SLOT"], "environment": environment, "reason": "planned", "time": None})
+            self.chains[entry["name"]] = jobs
+        return self.chains[entry["name"]]
+
+    def state(self, entry: dict):
+        """The chain's state: its latest job's (SUBMITTED for one just submitted), FAILED once it ended failed and will not
+        be resubmitted, or None where nothing of it was submitted."""
+        if entry["name"] in self.ended:
+            return self.ended[entry["name"]][0]
+        jobs = self.chain(entry)
+        if not jobs:
+            return None
+        latest = jobs[-1]
+        record = self.record(latest["name"])
+        if record is None:
+            recent = latest["time"] is not None and self.clock() - latest["time"] < SUBMITTING_SECONDS
+            return "SUBMITTED" if recent else "DELETED"
+        return record.get("status", {}).get("state") or "QUEUED"
+
+    def spent(self) -> float:
+        """The round's dollars so far: each job of every chain, its hours RUNNING at its machine's price (spend.py)."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        total = 0.0
+        for entry in self.entries():
+            for job in self.chain(entry):
+                record = self.record(job["name"])
+                if record is None:
+                    continue
+                try:
+                    hours, _note = spend.job_hours(record, now)
+                except (KeyError, ValueError):
+                    # A record without Batch's times (createTime, its events): its hours cannot be read.
+                    hours = 0.0
+                rate, _unpriced = spend.usd_per_hour(*spend.shape_of(record))
+                total += hours * (rate if rate is not None else entry["rate"])
+        return total
+
+    def free_slot(self, run: str, slot: str):
+        """A budget slot of ``run`` for a resubmission: one with ``slot``'s allocation, not the round's own fit, merge or
+        store slot, that no reservation (budget_guard's, under the run's budget/slots) or job holds yet."""
+        spec = self.plan.spec
+        for candidate, amount in self.slots.items():
+            if amount != self.slots.get(slot) or candidate in (spec["fit_slot"], spec["merge_slot"], spec["store_slot"]):
+                continue
+            if self.cloud.size(f"{run}/budget/slots/{candidate}.json") is None and self.record(f"svpgs-{run}-{candidate}") is None:
+                return candidate
+        return None
+
+    def progressed(self, run: str, record: dict) -> bool:
+        """Whether the run's mirror holds restart units or partial steps written after the job's last attempt began."""
+        events = record.get("status", {}).get("statusEvents", [])
+        began = [spend.moment(event["eventTime"]).timestamp() for event in events if "to RUNNING" in event.get("description", "")]
+        since = max(began) if began else spend.moment(record["createTime"]).timestamp()
+        written = [stamp for path in ("run/restart", "run/fit.partial", "run/score.partial", "run/effects.partial")
+                   for stamp in self.cloud.stamped(f"{run}/{path}").values()]
+        return any(stamp > since for stamp in written)
+
+    def send(self, entry: dict, job: dict) -> bool:
+        """``job`` recorded in the entry's chain, then submitted; False where the spend cap stops it."""
+        spent = self.spent()
+        if spent >= self.cap:
+            self.say("refused", job=job["name"], why=f"the round has spent ${spent:.0f} of its ${self.cap:.0f} cap (spend_cap_usd)")
+            self.ended[entry["name"]] = ("FAILED", "spend cap")
+            return False
+        jobs = self.chain(entry) + [dict(job, time=self.clock())]
+        self.cloud.write(f"{self.root}/chains/{entry['name']}.json", json.dumps({"jobs": jobs}, indent=2) + "\n")
+        self.chains[entry["name"]] = jobs
+        submit(dict(entry, name=job["name"], run_id=job["run_id"], environment=job["environment"]), self.launcher)
+        self.say("submitted", job=job["name"], reason=job["reason"], spent_usd=round(spent, 2), cap_usd=self.cap)
+        return True
+
+    def resubmit(self) -> None:
+        """Each chain whose latest job FAILED: resubmitted on a free slot of its run where its reason allows (RESUBMITTED)
+        and the chain has resubmissions left, else ended, with why."""
+        limit = self.plan.spec["max_resubmissions"]
+        for entry in self.entries():
+            jobs = self.chain(entry)
+            if not jobs or entry["name"] in self.ended:
+                continue
+            state = self.state(entry)
+            if state == "DELETED":
+                self.ended[entry["name"]] = ("FAILED", "deleted")
+                self.say("ended", job=jobs[-1]["name"], why="Batch no longer has the job (deleted): not resubmitted")
+                continue
+            if state != "FAILED":
+                continue
+            latest = jobs[-1]
+            record = self.record(latest["name"])
+            markers = self.cloud.children(f"{latest['run_id']}/markers")
+            created = spend.moment(record["createTime"]).strftime("%Y%m%dT%H%M%SZ") if record.get("createTime") else ""
+            since = sorted(name for name in markers if MARKER_TIME.match(name) and name >= created)
+            reason, detail = classify(record, self.cloud.exits(latest["name"], self.project, self.region), since)
+            allowed = RESUBMITTED.get(reason, 0)
+            before = sum(1 for job in jobs[1:] if job["reason"] == reason)
+            why = None
+            if reason not in RESUBMITTED:
+                why = f"{reason} ({detail}) fails the same way on this round's code: not resubmitted"
+            elif allowed is not None and before >= allowed:
+                why = f"{reason} ({detail}) again: resubmitted {before} time(s) for it already"
+            elif len(jobs) - 1 >= limit:
+                why = f"{reason} ({detail}): the chain has used its {limit} resubmissions (max_resubmissions)"
+            elif reason == "time-cap" and not self.progressed(latest["run_id"], record):
+                why = f"{reason} ({detail}) with nothing new on the mirror since the attempt began: stuck, not resubmitted"
+            elif not self.resubmitting:
+                why = f"{reason} ({detail}): resubmittable, but this pass does not resubmit"
+            slot = None if why else self.free_slot(latest["run_id"], latest["slot"])
+            if why is None and slot is None:
+                why = f"{reason} ({detail}): {latest['run_id']} has no free budget slot like {latest['slot']}"
+            if why is not None:
+                self.ended[entry["name"]] = ("FAILED", why)
+                self.say("ended", job=latest["name"], reason=reason, why=why)
+                continue
+            if not self.cloud.execute:
+                self.say("would resubmit", job=latest["name"], reason=reason, detail=detail, slot=slot)
+                continue
+            name = f"svpgs-{latest['run_id']}-{slot}"
+            self.send(entry, {"name": name, "run_id": latest["run_id"], "slot": slot, "environment": dict(latest["environment"], BUDGET_SLOT=slot),
+                              "reason": reason})
+
+
+def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str, follower=None) -> list:
     """Each job that waits for others and is not yet submitted, submitted once it may be (with --execute):
     - arm_vms' fit jobs once its store job has SUCCEEDED;
     - a merge job without PARTNER_RUN once its runs' fit jobs have all SUCCEEDED with one fit key, after the other runs'
@@ -1297,23 +1609,29 @@ def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str)
       Its RUN_ID is the run that got further: one whose fit is complete or that holds both arms'
       handoffs pushed its adoption, so the merge finishes in it, its partner's models being gone from a completed fit's
       partial; otherwise the plan's order.
-    Returns what still waits, with why."""
-    states: dict = {}
+    A job it waits for is its chain (``Follower``): ended where it SUCCEEDED, or FAILED with no resubmission left.
+    Returns what still waits, with why; a job that can no longer run (a fit it needs ended failed) is the follower's
+    ``ended``, not waiting."""
+    follower = follower or Follower(plan, cloud, launcher, project, region, resubmitting=False)
+    by_name = {entry["name"]: entry for entry in follower.entries()}
 
     def state(name: str):
-        if name not in states:
-            states[name] = cloud.job_state(name, project, region)
-        return states[name]
+        entry = by_name.get(name)
+        if entry is None:
+            return cloud.job_state(name, project, region)
+        found = follower.state(entry)
+        return "FAILED" if found == "DELETED" else found
 
     waiting = []
     for entry in [entry for entry in plan.jobs if entry["after"]] + plan.merges + plan.finishes:
-        names = [f"svpgs-{run}-{plan.spec['merge_slot']}" for run in entry["runs"]] if "finisher" in entry else [entry["name"]]
-        if any(state(name) is not None for name in names):
+        planned = entry
+        if follower.chain(entry) or entry["name"] in follower.ended:
             continue
         before = {name: state(name) or "not found" for name in entry["after"]}
         if "finisher" in entry:
             complete = {run: cloud.completed(run) for run in entry["runs"]}
             if any(plan.spec["through"] in steps for steps in complete.values()):
+                follower.ended[entry["name"]] = ("SUCCEEDED", f"not needed: an arm's job finished the run through {plan.spec['through']}")
                 continue
             if any(value not in ("SUCCEEDED", "FAILED") for value in before.values()):
                 waiting.append((entry["name"], before))
@@ -1321,13 +1639,19 @@ def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str)
             handoffs = {run: [name for name in cloud.listing(f"{run}/run/effects.partial/batches") if name.endswith("/handoff.json")] for run in entry["runs"]}
             missing = [run for run, found in handoffs.items() if not found]
             if missing:
-                waiting.append((entry["name"], {run: "no handoff: its arm's parts are not mirrored, so resubmit its fit job" for run in missing}))
+                why = {run: "no handoff: its arm's parts are not mirrored, and its fit job ended failed" for run in missing}
+                follower.ended[entry["name"]] = ("FAILED", "; ".join(f"{run} {text}" for run, text in why.items()))
+                follower.say("ended", job=entry["name"], why=follower.ended[entry["name"]][1])
                 continue
             further = [run for run in entry["runs"] if "fit" in complete[run] or len(handoffs[run]) > 1]
             if further and further[0] != entry["run_id"]:
                 partner = next(run for run in entry["runs"] if run != further[0])
                 entry = dict(entry, run_id=further[0], name=f"svpgs-{further[0]}-{plan.spec['merge_slot']}",
                              environment=dict(entry["environment"], RUN_ID=further[0], PARTNER_RUN=partner))
+        elif any(value == "FAILED" for value in before.values()) and cloud.execute:
+            follower.ended[entry["name"]] = ("FAILED", "a job it waits for ended failed: " + ", ".join(name for name, value in before.items() if value == "FAILED"))
+            follower.say("ended", job=entry["name"], why=follower.ended[entry["name"]][1])
+            continue
         elif any(value != "SUCCEEDED" for value in before.values()):
             waiting.append((entry["name"], before))
             continue
@@ -1347,8 +1671,132 @@ def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str)
                 cloud.copy_tree(source, target, skip=records)
                 for name in records:
                     cloud.copy(f"{source}/{name}", f"{target}/{name}")
-        submit(entry, launcher)
+        follower.send(planned, {"name": entry["name"], "run_id": entry["run_id"], "slot": entry["environment"]["BUDGET_SLOT"],
+                                "environment": entry["environment"], "reason": "planned"})
     return waiting
+
+
+def _alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class Lease:
+    """The one follower of a round: a lock file on this machine (and the follower's pid beside it) and, in the bucket,
+    FOLLOW/lease.json naming the holder, written again each pass. A follower elsewhere whose lease is fresher than
+    ``stale`` seconds holds the round: this one refuses to start. Released on every exit."""
+
+    def __init__(self, cloud: Gcloud, plan: Plan, directory: Path, stale: float) -> None:
+        self.cloud, self.path, self.stale = cloud, f"{plan.staging}/{FOLLOW}/lease.json", stale
+        self.directory, self.round = directory, plan.spec["round"]
+        self.me = {"host": os.uname().nodename, "pid": os.getpid()}
+        self.handle = None
+
+    def __enter__(self):
+        import fcntl
+
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.handle = open(self.directory / f"{self.round}.lock", "w")
+        try:
+            fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.handle.close()
+            raise RoundError(f"a follower of round {self.round} already runs on this machine (pid {self._pid()}): follow.sh stop it first")
+        held = self.cloud.read(self.path)
+        if held is not None:
+            try:
+                holder = json.loads(held)
+            except ValueError:
+                holder = {}
+            age = time.time() - float(holder.get("time", 0))
+            dead = holder.get("host") == self.me["host"] and not _alive(holder.get("pid"))
+            if (holder.get("host"), holder.get("pid")) != (self.me["host"], self.me["pid"]) and age < self.stale and not dead:
+                self.handle.close()
+                raise RoundError(f"round {self.round} is followed by pid {holder.get('pid')} on {holder.get('host')}, seen {age / 60:.0f} minutes ago: stop it first")
+        (self.directory / f"{self.round}.pid").write_text(f"{os.getpid()}\n")
+        self.renew()
+        return self
+
+    def _pid(self) -> str:
+        try:
+            return (self.directory / f"{self.round}.pid").read_text().strip()
+        except OSError:
+            return "?"
+
+    def renew(self) -> None:
+        self.cloud.write(self.path, json.dumps(dict(self.me, time=time.time())) + "\n")
+
+    def __exit__(self, *raised) -> bool:
+        try:
+            self.cloud.remove(self.path)
+        except RoundError:
+            pass
+        (self.directory / f"{self.round}.pid").unlink(missing_ok=True)
+        self.handle.close()
+        return False
+
+
+def watch(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str, minutes: float, directory: Path) -> int:
+    """--follow: one pass (resubmissions, then the jobs that wait), and with --watch one every ``minutes`` until the round
+    has ended: every chain SUCCEEDED or ended failed, nothing waiting. A STOP object under FOLLOW, or TERM or INT (follow.sh
+    stop), ends it between passes. With --execute it holds the round's Lease, so one follower runs, and logs every action
+    to ``directory``/<round>.log and FOLLOW/follow.log; a round that ended or was STOPped leaves ``directory``/rounds, so
+    follow.sh ensure does not start it again. Returns 0 where every planned job SUCCEEDED or the follower was stopped, 1
+    where the round ended with a job failed. HUP is not caught: the follower runs in its own session (follow.sh), and a
+    terminal closing is no reason to stop."""
+    import signal
+
+    stopping: list = []
+
+    def stop(number, _frame) -> None:
+        stopping.append(signal.Signals(number).name)
+
+    for number in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(number, stop)
+    recorded = directory / "rounds" / plan.spec["round"]
+    log = directory / f"{plan.spec['round']}.log" if cloud.execute else None
+    if log is not None:
+        directory.mkdir(parents=True, exist_ok=True)
+    follower = Follower(plan, cloud, launcher, project, region, log=log)
+    stale = max(3 * minutes * 60, 1800)
+    lease = Lease(cloud, plan, directory, stale) if cloud.execute else None
+    with lease if lease is not None else contextlib.nullcontext():
+        follower.say("follow started", round=plan.spec["round"], pid=os.getpid(), every_minutes=minutes, cap_usd=follower.cap)
+        while True:
+            if cloud.read(f"{plan.staging}/{FOLLOW}/STOP") is not None:
+                follower.say("follow stopped", why=f"svpgs/{plan.staging}/{FOLLOW}/STOP exists")
+                if cloud.execute:
+                    recorded.unlink(missing_ok=True)
+                return 0
+            follower.forget()
+            follower.resubmit()
+            waiting = follow(plan, cloud, launcher, project, region, follower)
+            for name, states in waiting:
+                print(f"{name}: " + ", ".join(f"{run} {state}" for run, state in states.items()), flush=True)
+            states = {entry["name"]: follower.state(entry) for entry in follower.entries()}
+            active = sorted(name for name, state in states.items() if state in ACTIVE)
+            if not waiting and not active:
+                failed = {name: follower.ended.get(name, ("FAILED", state or "never submitted (round.py --execute submits it)"))[1]
+                          for name, state in states.items() if state != "SUCCEEDED"}
+                follower.say("follow ended", succeeded=sum(state == "SUCCEEDED" for state in states.values()), failed=failed)
+                if cloud.execute:
+                    recorded.unlink(missing_ok=True)
+                return 1 if failed else 0
+            if minutes <= 0:
+                return 0
+            if lease is not None:
+                lease.renew()
+            deadline = time.time() + minutes * 60
+            while time.time() < deadline and not stopping:
+                time.sleep(min(5.0, max(deadline - time.time(), 0)))
+            if stopping:
+                follower.say("follow stopped", why=f"signal {stopping[0]}")
+                return 0
 
 
 def main(argv=None) -> int:
@@ -1358,7 +1806,9 @@ def main(argv=None) -> int:
     parser.add_argument("--offline", action="store_true", help="Plan without reading the bucket (its checks are skipped).")
     parser.add_argument("--execute", action="store_true", help="Stage, write each run's config, copy and submit the jobs that wait for none (with --follow: the others).")
     parser.add_argument("--follow", action="store_true", help="Submit each job whose jobs before it have ended as it needs: fit jobs after a store job, merges.")
-    parser.add_argument("--watch", type=float, default=0.0, help="With --follow: look again every this many minutes until nothing waits.")
+    parser.add_argument("--watch", type=float, default=0.0, help="With --follow: look again every this many minutes until the round has ended.")
+    parser.add_argument("--state", type=Path, default=Path.home() / ".svpgs-follow",
+                        help="With --follow --execute: the directory of the follower's lock, pid file and log (launcher/workspace/follow.sh's).")
     parser.add_argument("--repository", type=Path, default=HERE.parents[1], help="The git checkout holding the source commit.")
     args = parser.parse_args(argv)
     if args.offline and (args.execute or args.follow):
@@ -1373,14 +1823,7 @@ def main(argv=None) -> int:
         cloud = None if args.offline else Gcloud(bucket, args.execute)
         plan = build(spec, label, timeline, cloud, args.repository)
         if args.follow:
-            project, region = os.environ.get("PROJECT_ID", ""), os.environ.get("REGION", "")
-            while True:
-                waiting = follow(plan, cloud, HERE, project, region)
-                for name, states in waiting:
-                    print(f"{name}: " + ", ".join(f"{run} {state}" for run, state in states.items()), flush=True)
-                if not waiting or args.watch <= 0:
-                    return 0
-                time.sleep(args.watch * 60)
+            return watch(plan, cloud, HERE, os.environ.get("PROJECT_ID", ""), os.environ.get("REGION", ""), args.watch, args.state)
         print(render(plan), flush=True)
         if args.execute:
             execute(plan, cloud, HERE)

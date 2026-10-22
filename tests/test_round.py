@@ -29,7 +29,7 @@ TRAITS = [("ldl_cholesterol", "l"), ("egfr_ckd_epi_2021", "e"), ("hypertension",
 BUCKET = "ops-bucket"
 
 FAKE_GCLOUD = r'''
-import os, shutil, sys
+import json, os, shutil, sys, time
 from pathlib import Path
 root = Path(os.environ["FAKE_GCS"])
 args = sys.argv[1:]
@@ -54,7 +54,8 @@ elif args[:2] == ["storage", "ls"]:
         if not listed:
             sys.exit(1)
         for item in listed:
-            print(f"{item.stat().st_size:>10}  2026-10-20T00:00:00Z  {show(item)}")
+            written = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(item.stat().st_mtime))
+            print(f"{item.stat().st_size:>10}  {written}  {show(item)}")
         print(f"TOTAL: {len(listed)} objects")
     elif "*" in url:
         matched = sorted(item for item in (root / "gcs").glob(url[len("gs://"):]) if item.is_file())
@@ -84,10 +85,21 @@ elif args[:2] == ["storage", "cp"]:
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, target)
 elif args[:3] == ["batch", "jobs", "describe"]:
+    # A job's file holds its state, or its whole record as JSON.
     state = root / "jobs" / args[3]
     if not state.is_file():
         sys.exit(1)
-    print(state.read_text().strip())
+    text = state.read_text().strip()
+    record = json.loads(text) if text.startswith("{") else {"status": {"state": text}}
+    print(json.dumps(record) if "--format=json" in args else record["status"]["state"])
+elif args[:3] == ["batch", "tasks", "list"]:
+    tasks = root / "jobs" / (next(value.split("=", 1)[1] for value in args if value.startswith("--job=")) + ".tasks")
+    print(tasks.read_text() if tasks.is_file() else "[]")
+elif args[:2] == ["storage", "rm"]:
+    path = local(args[2])
+    if not path.is_file():
+        sys.exit(1)
+    path.unlink()
 else:
     sys.exit(f"unexpected gcloud {args}")
 '''
@@ -351,8 +363,10 @@ def test_with_partner_run_the_later_arm_finishes_the_run_and_a_cpu_merge_is_the_
     svpgs = fake / "gcs" / BUCKET / "svpgs"
     (svpgs / "aou-r7-l1/run/effects.partial/batches/a1").mkdir(parents=True)
     (svpgs / "aou-r7-l1/run/effects.partial/batches/a1/handoff.json").write_text("{}")
-    waiting = planner.follow(plan, planner.Gcloud(BUCKET, True), cloud, "p", "r")
-    assert list(waiting[0][1]) == ["aou-r7-l2"] and "no handoff" in waiting[0][1]["aou-r7-l2"]
+    # aou-r7-l2's job failed without its arm's parts: the merge cannot run, and the follower says so and stops waiting.
+    follower = planner.Follower(plan, planner.Gcloud(BUCKET, True), cloud, "p", "r", resubmitting=False)
+    assert planner.follow(plan, planner.Gcloud(BUCKET, True), cloud, "p", "r", follower) == []
+    assert "aou-r7-l2 no handoff" in follower.ended["svpgs-aou-r7-l1-train-2"][1]
     (svpgs / "aou-r7-l2/run/effects.partial/batches/b2").mkdir(parents=True)
     (svpgs / "aou-r7-l2/run/effects.partial/batches/b2/handoff.json").write_text("{}")
     (svpgs / "aou-r7-l2/run/report").mkdir(parents=True)
@@ -364,6 +378,12 @@ def test_with_partner_run_the_later_arm_finishes_the_run_and_a_cpu_merge_is_the_
     (submitted,) = [json.loads(line) for line in (fake / "submitted.jsonl").read_text().splitlines()]
     assert (submitted["RUN_ID"], submitted["PARTNER_RUN"], submitted["MACHINE_TYPE"]) == ("aou-r7-l1", "aou-r7-l2", "n2d-standard-16")
     assert (fake / "commands.log").read_text().split() == ["merge"]
+    # The follower recorded the merge it submitted: while Batch does not show it yet, nothing is submitted again.
+    chain = svpgs / "_rounds/r7/follow/chains/svpgs-aou-r7-l1-train-2.json"
+    assert [job["name"] for job in json.loads(chain.read_text())["jobs"]] == ["svpgs-aou-r7-l1-train-2"]
+    assert planner.follow(plan, planner.Gcloud(BUCKET, True), cloud, "p", "r") == []
+    assert len((fake / "submitted.jsonl").read_text().splitlines()) == 1
+    chain.unlink()
     # The run that got further is the merge's RUN_ID (ag-score's rule): aou-r7-l2 adopted l1's parts and pushed both
     # arms' handoffs before its finish failed, so the merge finishes in it, not in l1.
     (svpgs / "aou-r7-l2/run/effects.partial/batches/c3").mkdir(parents=True)

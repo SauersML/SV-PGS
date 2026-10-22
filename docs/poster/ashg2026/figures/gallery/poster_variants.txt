@@ -1,1 +1,1 @@
-The variants each method is given: SV-PGS every imputed SNV, indel and SV; LDpred2-auto at most 16,000 SNVs of MAF ≥ 1%, at HapMap3 density.
+A table of the variants each method is given: SV-PGS all SNVs, indels and SVs; LDpred2-auto SNVs of MAF ≥ 1% thinned to HapMap3 density, and no indels or SVs.

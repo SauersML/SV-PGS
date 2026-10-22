@@ -316,6 +316,24 @@ def test_a_job_given_a_base_run_names_its_mirror_in_every_restore_and_push(tmp_p
     assert calls[""] == [f"run-mirror {action} {mirrored}" for action in ("restore", "push")]
 
 
+def test_an_attempt_s_cap_shortens_its_run_and_its_reservation_records_it(tmp_path, plan):
+    """MAX_RUN_HOURS: a stuck attempt ends at its cap, not at the end of what its slot pays for."""
+    assert guard.duration_seconds(plan, "train-1", 4.4, 3, cap_seconds=8 * 3600) == 8 * 3600
+    assert guard.duration_seconds(plan, "train-1", 4.4, 3, cap_seconds=10**7) == guard.duration_seconds(plan, "train-1", 4.4, 3)
+    with pytest.raises(ValueError, match="cap"):
+        guard.duration_seconds(plan, "train-1", 4.4, 3, cap_seconds=0)
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(MAX_RUN_HOURS="8", BUDGET_SLOT="train-1", MAX_RETRIES="3")
+    submitted = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
+    assert spec["taskGroups"][0]["taskSpec"]["maxRunDuration"] == "28800s"
+    record = json.loads(json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/budget/slots/train-1.json"])
+    assert record["max_run_seconds"] == 28800
+    refused = subprocess.run(["bash", str(launcher), "fit"], env={**environment, "MAX_RUN_HOURS": "2.5", "BUDGET_SLOT": "train-3"}, capture_output=True, text=True)
+    assert refused.returncode == 2 and "MAX_RUN_HOURS" in refused.stderr
+
+
 def test_submit_refuses_a_disk_size_that_is_not_a_whole_number_of_gb(tmp_path):
     launcher, environment = _fake_cloud(tmp_path)
     environment["RUN_DISK_GB"] = "2T"

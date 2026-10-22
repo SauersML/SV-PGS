@@ -111,7 +111,16 @@ export RUN_DISK_TYPE
 if [[ ! "$RUN_ID" =~ ^[a-z][a-z0-9-]{0,25}$ ]]; then
   echo "RUN_ID must be a lowercase study ID, at most 26 characters; keep it across restarts" >&2; exit 2
 fi
-MAX_RUN_SECONDS="$(python3 "$here/budget_guard.py" duration --plan "$STUDY_BUDGET" --slot "$BUDGET_SLOT" --hourly-usd "$HOURLY_USD" --retries "$MAX_RETRIES" --tasks "$TASK_COUNT")"
+# MAX_RUN_HOURS (optional): each attempt's cap in whole hours, below what the slot pays for. An attempt still running
+# there ends with Batch's exit 50005, which Batch does not retry; round.py --follow resubmits it only where the attempt
+# left new restart units or steps on the mirror, so a long fit goes on from them and a stuck one stops.
+MAX_RUN_HOURS="${MAX_RUN_HOURS:-}"
+cap=()
+if [ -n "$MAX_RUN_HOURS" ]; then
+  [[ "$MAX_RUN_HOURS" =~ ^[1-9][0-9]?$ ]] || { echo "MAX_RUN_HOURS is a whole number of hours, 1 to 99" >&2; exit 2; }
+  cap=(--max-seconds "$((MAX_RUN_HOURS * 3600))")
+fi
+MAX_RUN_SECONDS="$(python3 "$here/budget_guard.py" duration --plan "$STUDY_BUDGET" --slot "$BUDGET_SLOT" --hourly-usd "$HOURLY_USD" --retries "$MAX_RETRIES" --tasks "$TASK_COUNT" ${cap[@]+"${cap[@]}"})"
 export MAX_RUN_SECONDS MAX_RETRIES
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
@@ -152,7 +161,7 @@ spec["logsPolicy"]["logsPath"] = spec["logsPolicy"]["logsPath"].replace("/launch
 path.write_text(json.dumps(spec))
 PY
 python3 "$here/budget_guard.py" reserve --plan "$STUDY_BUDGET" --slot "$BUDGET_SLOT" --hourly-usd "$HOURLY_USD" --retries "$MAX_RETRIES" \
-  --tasks "$TASK_COUNT" --spec "$stage/job.json" --ledger "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/budget"
+  --tasks "$TASK_COUNT" --spec "$stage/job.json" --ledger "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/budget" ${cap[@]+"${cap[@]}"}
 gcloud storage cp "$stage/run_step.sh" "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/launcher/${BUDGET_SLOT}/run_step.sh" --if-generation-match=0
 echo "submitting ${job} in reserved slot ${BUDGET_SLOT}: ${TASK_COUNT} task(s), ${MAX_RUN_SECONDS} seconds per attempt, at most $((MAX_RETRIES + 1)) attempts"
 gcloud batch jobs submit "svpgs-${RUN_ID}-${BUDGET_SLOT}" --project="${PROJECT_ID}" --location="${REGION}" --config="$stage/job.json"

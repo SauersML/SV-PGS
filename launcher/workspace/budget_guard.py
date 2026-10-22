@@ -46,7 +46,9 @@ def validate_plan(plan):
         raise ValueError("job allocations plus the non-task reserve exceed the study budget")
 
 
-def duration_seconds(plan, slot, hourly_usd, retries, tasks=1):
+def duration_seconds(plan, slot, hourly_usd, retries, tasks=1, cap_seconds=None):
+    """Each attempt's maxRunDuration: what the slot pays for, within Batch's job lifetime, and at most ``cap_seconds``
+    where given (a stuck attempt is stopped there, not at the slot's end)."""
     validate_plan(plan)
     rate = positive(hourly_usd, "hourly_usd")
     if isinstance(retries, bool) or not isinstance(retries, int) or not 0 <= retries <= 10:
@@ -61,7 +63,9 @@ def duration_seconds(plan, slot, hourly_usd, retries, tasks=1):
     lifetime = math.floor((14 * 24 / (retries + 1) - plan["startup_hours_per_attempt"]) * 3600)
     if lifetime < 1:
         raise ValueError("startup allowances exhaust Batch's maximum job lifetime")
-    return min(seconds, lifetime)
+    if cap_seconds is not None and (isinstance(cap_seconds, bool) or not isinstance(cap_seconds, int) or cap_seconds < 1):
+        raise ValueError("an attempt's cap is a positive whole number of seconds")
+    return min(seconds, lifetime, cap_seconds or lifetime)
 
 
 def validate_job(spec, seconds, retries, tasks=1):
@@ -89,8 +93,8 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
-def reserve(plan, slot, spec, rate, retries, root, run=subprocess.run, tasks=1):
-    seconds = duration_seconds(plan, slot, rate, retries, tasks)
+def reserve(plan, slot, spec, rate, retries, root, run=subprocess.run, tasks=1, cap_seconds=None):
+    seconds = duration_seconds(plan, slot, rate, retries, tasks, cap_seconds)
     validate_job(spec, seconds, retries, tasks)
     if not root.startswith("gs://") or "#" in root or "*" in root:
         raise ValueError("the ledger must be a workspace GCS prefix")
@@ -137,6 +141,7 @@ def main():
     parser.add_argument("--hourly-usd", type=float)
     parser.add_argument("--retries", type=int, default=0)
     parser.add_argument("--tasks", type=int, default=1, help="The job's tasks, each on its own VM at --hourly-usd.")
+    parser.add_argument("--max-seconds", type=int, help="Each attempt's cap, below what the slot pays for.")
     parser.add_argument("--spec", type=Path)
     parser.add_argument("--ledger")
     parser.add_argument("--template", type=Path)
@@ -148,9 +153,9 @@ def main():
         return
     plan = json.loads(args.plan.read_text())
     if args.action == "duration":
-        print(duration_seconds(plan, args.slot, args.hourly_usd, args.retries, args.tasks))
+        print(duration_seconds(plan, args.slot, args.hourly_usd, args.retries, args.tasks, args.max_seconds))
     else:
-        reserve(plan, args.slot, json.loads(args.spec.read_text()), args.hourly_usd, args.retries, args.ledger, tasks=args.tasks)
+        reserve(plan, args.slot, json.loads(args.spec.read_text()), args.hourly_usd, args.retries, args.ledger, tasks=args.tasks, cap_seconds=args.max_seconds)
 
 
 if __name__ == "__main__":
