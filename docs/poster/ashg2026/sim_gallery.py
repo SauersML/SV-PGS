@@ -574,61 +574,92 @@ def sv_gain_figure(grids):
 # ------------------------------------------------------------------ Figure 4
 
 
+SIZE_PANEL, SIZE_TICKS, SIZE_GAP = 2.2, 1.65, 0.3
+"""Figure 4's panels, in inches: each plot's height, the room left of it for its own y tick labels, and the gap between
+one panel's plot and the next panel's tick labels."""
+DODGE = 1.08
+"""Figure 4 draws true SV genotypes at a training size / DODGE and imputed ones at x DODGE on its log axis, so the two
+intervals at a size stand side by side."""
+
+
+def gain_ticks(ax, low: float, high: float) -> None:
+    """A gain axis from ``low`` to ``high`` padded by a tenth, ticked at three to five round values, 0 among them."""
+    pad = 0.1 * (high - low)
+    ax.set_ylim(low - pad, high + pad)
+    ticks = [tick for tick in matplotlib.ticker.MaxNLocator(nbins=4, steps=[1, 2, 5, 10]).tick_values(low - pad, high + pad)
+             if low - pad <= tick <= high + pad]
+    digits = max(0, -math.floor(round(math.log10(ticks[1] - ticks[0]), 6)))
+    ax.set_yticks(ticks, [plain(tick, digits) for tick in ticks])
+
+
 def size_figure(grids):
-    """The gain from adding SVs (Figure 3) at each training size apart, true and imputed SV genotypes in each row."""
+    """The gain from adding SVs (Figure 3) against training size: a panel per architecture on its own y-scale, true and
+    imputed SV genotypes as two series, and a row of panels per group of Figure 3's architectures."""
     sizes = SIZES[:-1]
     summaries = {}
     for grid in ("window-truth", "window"):
         grouped = cells(grids[grid])
         summaries[grid] = {(point, size): interval(finite(grouped.get((point, size), []), "delta_auc"))
                            for point in LABELS for size in sizes}
-    rows = layout(lambda point: True)
-    limits = (-0.03, 0.05)
-    top, bottom, panel, space = 2.45, 1.6, 4.95, 0.45
-    height = top + bottom + PAIRED * (len(rows) + 0.1)
+    NUMBERS["fig4"] = {LABELS[point]: {source: {f"{size}": list(summaries[grid][(point, size)]) for size in sizes}
+                                       for source, grid in (("true", "window-truth"), ("imputed", "window"))}
+                       for point in LABELS}
+    left, right, top, bottom = 1.0, 0.15, 1.3, 1.05
+    heading_room, title_room, tick_room = 0.65, 0.5, 0.75
+    row = heading_room + title_room + SIZE_PANEL + tick_room
+    height = top + bottom + row * len(GROUPS)
     fig = plt.figure(figsize=(WIDE, height))
-    labels = label_width(fig, rows)
-    left = labels + 0.55
-    axes = [frame(fig, left + index * (panel + space), bottom, panel, height - top - bottom) for index in range(len(sizes))]
-    for ax, size in zip(axes, sizes):
-        zero_line(ax)
-        value_grid(ax)
-        for y, (kind, point) in enumerate(rows):
-            if kind != "point":
-                continue
-            few = []
-            for offset, grid, (_, color, filled) in ((-SPLIT, "window-truth", SOURCES[0]), (SPLIT, "window", SOURCES[1])):
-                mean, low, high, n = summaries[grid][(point, size)]
-                if n >= 3:
-                    estimate(ax, y + offset, mean, low, high, color, filled, limits=limits, size=PAIR_MARK)
-                else:
-                    few.append(offset)
-            if few:
-                ax.text(0.97, y + (few[0] if len(few) == 1 else 0.0), "n < 3", transform=blended_transform_factory(ax.transAxes, ax.transData),
-                        ha="right", va="center", color=GREY, fontstyle="italic")
-        ax.set_xlim(*limits)
-        ticks = np.arange(-0.02, 0.041, 0.02)
-        ax.set_xticks(ticks, [plain(tick) for tick in ticks])
-        ax.set_yticks([])
-        ax.spines["left"].set_visible(False)
-        ax.set_ylim(len(rows) - 0.5, -0.6)
-        ax.text(0.5, 1, f"{size:,} training", transform=shifted(ax, 0, 0.2, False), ha="center", va="baseline",
-                fontweight="bold")
-    row_labels(axes[0], rows, left - 0.15)
-    axes[1].set_xlabel("ΔAUC, with SVs − without")
-    heading(axes[0], f"Gain from adding SVs at {sizes[0]:,}–{sizes[-1]:,} training", across=-(left - 0.15), up=1.75)
-    source_legend(axes[0], -(left - 0.15), 0.8)
+    for index, (group, points) in enumerate(GROUPS):
+        base = height - top - (index + 1) * row + tick_room
+        fig.text(left / WIDE, (base + SIZE_PANEL + title_room + 0.12) / height, group, ha="left", va="baseline",
+                 fontweight="bold")
+        width = (WIDE - left - right - len(points) * SIZE_TICKS - (len(points) - 1) * SIZE_GAP) / len(points)
+        for column, point in enumerate(points):
+            ax = frame(fig, left + SIZE_TICKS + column * (SIZE_TICKS + width + SIZE_GAP), base, width, SIZE_PANEL)
+            zero_line(ax, vertical=False)
+            low = high = 0.0
+            for (_, color, filled), grid, factor in zip(SOURCES, ("window-truth", "window"), (1 / DODGE, DODGE)):
+                # a size is drawn with at least three replicates
+                drawn = [(size * factor, *summaries[grid][(point, size)][:3]) for size in sizes
+                         if summaries[grid][(point, size)][3] >= 3]
+                if not drawn:
+                    continue
+                xs, means, lows, highs = (list(values) for values in zip(*drawn))
+                ax.plot(xs, means, color=color, linewidth=3.0, zorder=3)
+                ax.vlines(xs, lows, highs, color=color, linewidth=BAR, zorder=3)
+                ax.plot(xs, means, "o", markersize=PAIR_MARK, color=color, markerfacecolor=color if filled else "white",
+                        markeredgecolor=color, markeredgewidth=BAR if not filled else 0, zorder=4)
+                low, high = min(low, *lows), max(high, *highs)
+            ax.set_xscale("log", base=2)
+            ax.set_xticks(sizes, [thousands(size) for size in sizes])
+            ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+            ax.set_xlim(sizes[0] / 1.45, sizes[-1] * 1.45)
+            gain_ticks(ax, low, high)
+            ax.text(0.5, 1, SHORT[point], transform=shifted(ax, 0, 0.15, False), ha="center", va="baseline")
+    fig.text(0.3 / WIDE, (bottom + row * len(GROUPS) / 2) / height, "ΔAUC, with SVs − without", rotation=90,
+             ha="center", va="center", fontsize=LABEL)
+    fig.text((left + (WIDE - left - right) / 2) / WIDE, 0.2 / height, "Training sample size (thousands)", ha="center",
+             va="baseline", fontsize=LABEL)
+    fig.text(left / WIDE, (height - 0.8) / height, "Gain from adding SVs, by training size", ha="left", va="baseline",
+             fontsize=TITLE, fontweight="bold")
+    handles = [Line2D([0], [0], marker="o", color=color, markerfacecolor=color if filled else "white",
+                      markeredgecolor=color, markeredgewidth=BAR if not filled else 0, markersize=PAIR_MARK,
+                      linewidth=3.0, label=label) for label, color, filled in SOURCES]
+    fig.legend(handles=handles, loc="lower right", bbox_to_anchor=((WIDE - right) / WIDE, (height - 0.95) / height),
+               ncol=2, columnspacing=1.4, handlelength=1.6, handletextpad=0.5, borderaxespad=0.0)
     # the largest size's window fits, too few per architecture to show apart; Figure 3 pools them with the rest
     largest = SIZES[-1]
     few = [len(finite(cells(grids[grid]).get((point, largest), []), "delta_auc")) for grid in ("window-truth", "window")
            for point in LABELS]
     caption = (
-        f"Figure 4 | The gain from adding SVs at each training size from {sizes[0]:,} to {sizes[-1]:,}. Mean paired "
-        "difference in test AUC between SV-PGS fitted with and without SVs on one chromosome 22 window, with SVs measured "
-        f"by their true genotypes (filled) or imputed (open), and its Student-t 95% interval; arrowheads mark intervals "
-        f"that run past {plain(limits[0])} or {plain(limits[1])}. A cell is drawn with at least three replicates (n < 3 "
-        f"marks one with fewer). The {largest:,}-person window fits number {min(few)}-{max(few)} per architecture and "
-        f"genotype source, too few to show apart; Figure 3 pools them with the other sizes. {ARCHITECTURES}"
+        f"Figure 4 | The gain from adding SVs at each training size from {sizes[0]:,} to {sizes[-1]:,}, for each "
+        "simulated architecture. Each panel shows the paired difference in test AUC between SV-PGS fitted with and "
+        "without SVs on one 3 Mb chromosome 22 window, with SVs measured by their true genotypes (filled) or imputed by "
+        "Beagle (open): the mean over replicates and its Student-t 95% interval. Each panel has its own y-axis scale. A "
+        "mean is drawn when its training size has at least three replicates. Each replicate uses the same simulated "
+        "truth and the same test people at every training size. We fitted "
+        f"{min(few)}-{max(few)} replicates per architecture and genotype source at {largest:,} training people, too few "
+        f"to show; Figure 3 pools them with the other sizes. {ARCHITECTURES}"
     )
     return fig, caption
 
@@ -930,14 +961,16 @@ def poster_sv_gain_figure(grids):
 
 
 def poster_imputation_figure(summary):
-    """The imputation figure at the foot of the poster's left column: each frequency bin's mean r² of the imputed
-    dosage with the true genotype, SNVs and SVs, each named after its line's last mark. The margins are measured from
-    the drawn type, so larger type widens them. The y axis's title, longer than the axes are tall, is centred on the
-    figure's height, and the x axis's, wider than the axes, ends at the figure's right edge."""
+    """The imputation figure in the poster's left column, wide and short: each frequency bin's mean r² of the imputed
+    dosage with the true genotype, SNVs and SVs, with frequencies below 1% shaded and the share of SVs there written
+    in the shading. The mean, not the median, so the curve agrees with the mean r² below 1% the poster's text quotes."""
     accuracy = summary["genotype_accuracy"]["r2_by_frequency"]
-    width, height, pad = POSTER_GENOTYPES, 5.2, 0.08
-    fig = plt.figure(figsize=(width, height))
-    ax = frame(fig, 0, 0, width, height)
+    height = 5.2
+    fig = plt.figure(figsize=(POSTER_GENOTYPES, height))
+    # the y axis's title sits over its tick labels, left to right, which leaves the plot the figure's width
+    top, bottom, left, right = 0.75, 1.75, 1.25, 0.4
+    ax = frame(fig, left, bottom, POSTER_GENOTYPES - left - right, height - top - bottom)
+    ax.axvspan(0.04, 1, color="#EBEBEB", zorder=0, linewidth=0)
     ends = {}
     for key, color in (("SNV", INK), ("SV", IMPUTED)):
         bins = [b for b in accuracy[key]["bins"] if b["count"]]
@@ -946,11 +979,14 @@ def poster_imputation_figure(summary):
         ax.plot(centers, mean, color=color, marker="o", markersize=POSTER_MARK * 0.9, markeredgewidth=0, zorder=3,
                 clip_on=False)
         ends[key] = (centers[-1], mean[-1])
-    # the two last marks are close, so SNVs is set a little above its mark and SVs below
-    after = POSTER_MARK * 0.9 / 2 / 72 + 0.15
-    for key, name, color, up in (("SNV", "SNVs", INK, 0.1), ("SV", "SVs", IMPUTED, -0.35)):
-        ax.text(*ends[key], name, transform=ax.transData + ScaledTranslation(after, up, fig.dpi_scale_trans),
-                color=color, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="center")
+    # SNVs named over their line's end, SVs under theirs, so neither name sits between the lines
+    ax.text(ends["SNV"][0], ends["SNV"][1] + 0.07, "SNVs", color=INK, fontsize=POSTER_NAME, fontweight="bold",
+            ha="right", va="bottom")
+    ax.text(ends["SV"][0], ends["SV"][1] - 0.16, "SVs", color=IMPUTED, fontsize=POSTER_NAME, fontweight="bold",
+            ha="right", va="top")
+    # the share of SVs in the shaded band, written in the band between the two curves
+    ax.text(0.05, 0.64, f"{accuracy['SV']['below_1pct']:.0%} of SVs", ha="left", va="center", color=INK,
+            fontweight="bold")
     ax.set_xscale("log")
     ax.set_xlim(0.04, 50)
     ax.set_ylim(0, 1)
@@ -958,20 +994,8 @@ def poster_imputation_figure(summary):
     ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
     ax.set_yticks([0, 0.5, 1], ["0", "0.5", "1"])
     ax.set_xlabel("Minor allele frequency (%)")
-    ax.set_ylabel("Imputation r²")
-    # each margin is what the type reaches past the axes, plus a pad, measured again until it settles
-    renderer = fig.canvas.get_renderer()
-    inches = fig.dpi_scale_trans.inverted()
-    for _ in range(6):
-        outer = ax.get_tightbbox(renderer).transformed(inches)
-        inner = ax.get_window_extent(renderer).transformed(inches)
-        left, bottom = inner.x0 - outer.x0 + pad, inner.y0 - outer.y0 + pad
-        right, above = outer.x1 - inner.x1 + pad, outer.y1 - inner.y1 + pad
-        across, up = width - left - right, height - bottom - above
-        ax.set_position((left / width, bottom / height, across / width, up / height))
-        ax.yaxis.label.set_y((height / 2 - bottom) / up)
-        title = ax.xaxis.label.get_window_extent(renderer).transformed(inches).width
-        ax.xaxis.label.set_x((width - pad - title / 2 - left) / across)
+    ax.text(0, 1, "Imputation r²", transform=shifted(ax, -(left - 0.12), 0.25, False), ha="left", va="bottom",
+            fontsize=POSTER_LABEL)
     return fig
 
 
