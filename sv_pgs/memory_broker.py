@@ -29,8 +29,7 @@ then refuses (on a 40 GB A100, 1.2 GB refused with 40.9 GB reserved, every cache
 blocks are held until returned: a decision the held bytes
 refuse first returns them (``settles``, the pool's ``free_all_blocks``), then evicts caches. Inside a CUDA scope every
 CuPy allocation goes through the ledger's allocator (``_LedgerAllocator``), which makes room for it (returning the
-free blocks, then evicting idle device caches, newest first, then collecting unreachable reference cycles once, as
-CuPy's pool does before it refuses) or raises ``MemoryError`` before the allocation is made.
+free blocks, then evicting idle device caches, newest first) or raises ``MemoryError`` before the allocation is made.
 So on a device "every allocation is charged before it happens" holds for every array CuPy allocates, by construction
 rather than by each consumer's accounting. A device cache (the resident genotype codes, the panel Grams) is a cache
 lease that records what to drop; its arrays are already bytes of the meter, so it adds nothing to the held bytes.
@@ -89,7 +88,6 @@ kept. Linux/glibc only: elsewhere it does nothing.
 from __future__ import annotations
 
 import ctypes
-import gc
 import platform
 import sys
 import threading
@@ -256,8 +254,7 @@ class MemoryBroker:
 
     def _make_room(self, charged: tuple[str, ...], nbytes: int, purpose: str, ignoring: Lease | None = None) -> None:
         """Return the metered pools' unused blocks, then evict idle caches charged to ``charged``, newest first (each
-        eviction's blocks returned in turn), then collect unreachable reference cycles once, until ``nbytes`` more fit;
-        MemoryError if they cannot."""
+        eviction's blocks returned in turn), until ``nbytes`` more fit; MemoryError if they cannot."""
         if self._fits(charged, nbytes, ignoring):
             return
         self._settle(charged)
@@ -265,14 +262,6 @@ class MemoryBroker:
             return
         for lease in reversed([lease for lease in self.leases if lease.cache and not lease.users and set(lease.pools) & set(charged)]):
             self._evict(lease)
-            self._settle(charged)
-            if self._fits(charged, nbytes, ignoring):
-                return
-        # Unreachable reference cycles hold arrays the meter counts as live (a replaced hyper step's closures reach its
-        # corrections and their responses: ``full_data_fit._collect_cycles``), and Python's collector runs on object
-        # counts, not bytes. CuPy's own pool collects before it refuses a request; the ledger refuses before the pool is
-        # asked, so it collects once before refusing.
-        if gc.collect():
             self._settle(charged)
             if self._fits(charged, nbytes, ignoring):
                 return
