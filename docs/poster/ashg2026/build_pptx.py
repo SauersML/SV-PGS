@@ -17,8 +17,8 @@ affiliations come from authors.local beside this file, untracked, so no personal
 
 Every simulation number in the text is read from figures/gallery/numbers.json, which sim_gallery.py writes from the
 values its figures draw. The All of Us section shows figures/aou_*.png in name order (else aou_results.py's
-fig_aou_effects.png and fig_aou_diseases.png), each under the first line of its .txt namesake, if any, as a one-line
-title and above that file's other lines as bullets; git ignores these files, so All of Us results stay local until
+fig_aou_effects.png and fig_aou_diseases.png), each with the first line of its .txt namesake, if any, as its picture's
+description and above that file's other lines as bullets; git ignores these files, so All of Us results stay local until
 they are released. Without them the section holds a dashed placeholder. The section's bullets state the matched tests
 in aou_numbers.json (its "matched" rows), which is also git-ignored.
 """
@@ -139,7 +139,7 @@ def copy(numbers: dict) -> dict:
         "discussion": [
             f"SV-PGS gained {wins['gain'][0]:.3f} AUC over LDpred2-auto on whole chr22, "
             f"{wins['window_gain'][0]:.3f} in 3 Mb",
-            "The gain was the same without SVs and grew with heritability and training size",
+            "The gain was the same without SVs and grew with heritability",
         ],
     }
 
@@ -156,9 +156,8 @@ def aou_matched() -> list[str]:
     lines = []
     for row in rows:
         lines.append(f"{row['trait']}: SVs changed test {row['metric']} by {minus(row['relative'], 1)}% (95% CI "
-                     f"{minus(row['relative_lower'], 1)}% to {minus(row['relative_upper'], 1)}%; "
-                     f"{people(row['held_out'])} people)")
-    return lines + ["More traits are running"] if rows else lines
+                     f"{minus(row['relative_lower'], 1)}% to {minus(row['relative_upper'], 1)}%)")
+    return lines
 
 
 # ------------------------------------------------------------------ DrawingML
@@ -373,7 +372,8 @@ def header(xml: str) -> str:
     lines += [Para([(entry.split(" ", 1)[0], "sup"), (entry.split(" ", 1)[1], "")], 34, bullet=False, colour="FFFFFF",
                    after=0) for entry in affiliations]
     xml = replace_text(xml, 90, "".join(line.xml() for line in lines))
-    return move(xml, 90, 1.37, 3.0, 32.5, 2.45)
+    # 3.1 in down, so the title's descenders clear the author line
+    return move(xml, 90, 1.37, 3.1, 32.5, 2.45)
 
 
 # ------------------------------------------------------------------ laying out the columns
@@ -402,13 +402,6 @@ def bar(shape_id: int, text: str) -> Block:
 
 def text(paragraphs: list[Para]) -> Block:
     return Block("text", paragraphs)
-
-
-def headline(sentence: str, gap: str = "block") -> Block:
-    """A one-line claim over a figure, in bold."""
-    block = text([Para([(words, flags + " b") for words, flags in marked(sentence)], HEADLINE, bullet=False, after=0)])
-    block.gap = gap
-    return block
 
 
 QR = 2.6
@@ -569,8 +562,7 @@ def aou_blocks() -> list[Block]:
     for path in drawn:
         notes = path.with_suffix(".txt")
         lines = [line.strip() for line in notes.read_text().splitlines() if line.strip()] if notes.is_file() else []
-        if lines:
-            blocks.append(headline(lines[0]))
+        # the first line describes the picture; any others are bullets under it
         blocks.append(figure(path, flex=True))
         if lines[1:]:
             blocks.append(text(bullets(lines[1:])))
