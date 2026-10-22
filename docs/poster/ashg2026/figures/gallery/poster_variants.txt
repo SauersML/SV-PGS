@@ -1,1 +1,1 @@
-One stretch of chromosome: SV-PGS scores every SNV, indel and SV; LDpred2-auto scores SNVs at HapMap3 density.
+The variants each method is given: SV-PGS every imputed SNV, indel and SV; LDpred2-auto at most 16,000 SNVs of MAF ≥ 1%, at HapMap3 density.
