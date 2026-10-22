@@ -175,14 +175,14 @@ def copy(numbers: dict) -> dict:
                  "0), in one 3 Mb window of chr22",
                  f"Where causal SVs impute well, the gain with imputed genotypes was **{kept_well:.0%}** as large"],
         "aou": [
-            "SVs from long-read assemblies, imputed into short-read genomes",
-            "SV-PGS with and without SVs, tested on held-out people",
+            "50,000 short-read genomes; SVs imputed by GLIMPSE2 from 12,212 long-read assemblies",
+            "Trained on 16,684–26,376 people, tested on 4,186–7,354 others; gain: each model with vs without its SVs",
         ],
         "discussion": [
             "SV-PGS beats LDpred2-auto even with no causal SVs, so the gain comes from its model and denser variant set",
-            f"True SV genotypes raised AUC in {gain['clear']} of {gain['shown']} architectures",
             f"With imputed SV genotypes the gain was **{share:.0%}** as large, so SVs add most when their genotypes are "
             "accurate",
+            "In All of Us, imputed SVs raised hypothyroidism accuracy; the LDL gain was not significant",
         ],
     }
 

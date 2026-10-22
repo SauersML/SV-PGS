@@ -225,10 +225,62 @@ def length_figure(by_length: list[dict]) -> tuple:
     return fig, ["Longer SVs have larger effects"]
 
 
+ABLATION_CELLS = ("all", "EUR", "AFR")
+"""The cells drawn under each trait: every held-out person, then the two largest ancestry groups."""
+
+
+def ablation_figure(ablation: list[dict]) -> tuple:
+    """Each trait's gain in held-out partial r² from its SV-PGS model's own SVs (the full score against the same score
+    without its SV terms, on the same people), with its bootstrap 95% interval, in units of 10⁻⁴: one panel per trait
+    side by side on one x axis, its title in bold above it, a row per cell (all held-out people, EUR, AFR) named at the
+    left of the first panel; filled where the interval excludes 0."""
+    traits = list(dict.fromkeys(row["trait"] for row in ablation))
+    found = {(row["trait"], row["cell"]): row for row in ablation}
+    pitch, top, bottom, right, gap = 0.62, 0.8, 1.75, 0.35, 0.45
+    height = top + bottom + pitch * len(ABLATION_CELLS)
+    fig = plt.figure(figsize=(COLUMN, height))
+    labels = ["All" if cell == "all" else cell for cell in ABLATION_CELLS]
+    left = widest(fig, labels, fontsize=POSTER_STYLE["font.size"]) + 0.4
+    width = (COLUMN - left - right - gap * (len(traits) - 1)) / len(traits)
+    ends = [found[key][end] * 1e4 for key in found for end in ("ci_low", "ci_high")]
+    # the axis just past the intervals, ticked every 5 inside it, so neighbouring panels' end labels stay apart
+    limits = (min(ends) - 0.6, max(ends) + 0.6)
+    ticks = [tick for tick in range(-20, 25, 5) if limits[0] <= tick <= limits[1]]
+    for index, trait in enumerate(traits):
+        ax = frame(fig, left + index * (width + gap), bottom, width, height - top - bottom)
+        for y, cell in enumerate(ABLATION_CELLS):
+            row = found.get((trait, cell))
+            if row is None:
+                continue
+            value, low, high = (row[key] * 1e4 for key in ("estimate", "ci_low", "ci_high"))
+            clear = low > 0 or high < 0
+            ax.hlines(y, low, high, color=BLUE, linewidth=POSTER_BAR, zorder=3, capstyle="round")
+            ax.plot([value], [y], "o", markersize=POSTER_MARK, color=BLUE, markerfacecolor=BLUE if clear else "white",
+                    markeredgecolor=BLUE, markeredgewidth=0 if clear else 6.0, zorder=4)
+            if index == 0:
+                ax.text(0, y, labels[y], transform=shifted(ax, -0.3), ha="right", va="center")
+        ax.axvline(0, color=INK, linewidth=4.0, zorder=2)
+        ax.set_yticks([])
+        ax.spines["left"].set_visible(False)
+        ax.set_ylim(len(ABLATION_CELLS) - 0.5, -0.5)
+        ax.set_xlim(*limits)
+        ax.set_xticks(ticks, [plain(tick, 0) for tick in ticks])
+        ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+        ax.text(0.5, 1, trait_name(trait), transform=shifted(ax, 0, 0.3, False), ha="center", va="bottom",
+                fontweight="bold")
+    fig.text((left + (COLUMN - left - right) / 2) / COLUMN, 0.15 / height, "Test partial r² gain from SVs (×10⁻⁴)",
+             ha="center", va="bottom", fontsize=POSTER_LABEL)
+    return fig, ["Imputed SVs raised accuracy for hypothyroidism"]
+
+
 def main() -> None:
     numbers = json.loads(NUMBERS.read_text())
     with plt.rc_context({**POSTER_STYLE, "axes.labelsize": POSTER_LABEL}):
-        drawn = [("aou_1_gain", gain_figure(numbers["paired"]))]
+        drawn = []
+        if numbers.get("ablation"):
+            drawn.append(("aou_1_sv_part", ablation_figure(numbers["ablation"])))
+        if numbers.get("paired"):
+            drawn.append(("aou_1_gain", gain_figure(numbers["paired"])))
         if numbers.get("enrichment"):
             drawn.append(("aou_2_classes", classes_figure(numbers["enrichment"])))
         if numbers.get("by_length"):
