@@ -1124,8 +1124,8 @@ one variant on a chromosome (one base for an SNV, a few for an indel, many for a
 SCHEMATICS = {
     "poster_model": "An SNV, an indel and an SV on a chromosome, each class with its own effect-size prior (the SV's "
                     "narrower at low imputation r²), all fitted together into SV-PGS.",
-    "poster_variants": "The variants each method is given: SV-PGS every imputed SNV, indel and SV; LDpred2-auto at most "
-                       "16,000 SNVs of MAF ≥ 1%, at HapMap3 density.",
+    "poster_variants": "A table of the variants each method is given: SV-PGS all SNVs, indels and SVs; LDpred2-auto SNVs "
+                       "of MAF ≥ 1% thinned to HapMap3 density, and no indels or SVs.",
 }
 """Each schematic's one-sentence description, which build_pptx.py uses as its picture's alt text."""
 
@@ -1202,41 +1202,26 @@ def poster_model_figure():
     return fig
 
 
-HAPMAP3_SNVS = 16_000
-"""The most SNVs LDpred2-auto is given: HapMap3's chr22 count (benchmarks/bench_sim/submissions/ldpred2_auto.py)."""
-
-
-def phrase(ax, x: float, y: float, pieces, ha: str = "left") -> None:
-    """``pieces``, (text, colour, bold), set one after another on the baseline ``y`` in tick type, starting at ``x``
-    (or ending there, for ``ha="right"``)."""
-    renderer = ax.figure.canvas.get_renderer()
-    artists = [ax.text(x, y, piece, ha="left", va="baseline", color=colour, fontweight="bold" if bold else "normal")
-               for piece, colour, bold in pieces]
-    widths = [artist.get_window_extent(renderer).width / ax.figure.dpi for artist in artists]
-    x -= sum(widths) if ha == "right" else 0.0
-    for artist, width in zip(artists, widths):
-        artist.set_x(x)
-        x += width
-
-
-def poster_variants_figure(summary):
-    """The variants each method is given in the grid, one column per method: SV-PGS every imputed SNV, indel and SV
-    (the SVs counted), LDpred2-auto at most HapMap3's chr22 count of SNVs, all of MAF >= 1%."""
-    svs = summary["genotype_accuracy"]["r2_by_frequency"]["SV"]["records"]
-    height = 2.55
+def poster_variants_figure():
+    """The variants each method is given, as a table: a row per variant class, a column per method. SV-PGS is given
+    every imputed SNV, indel and SV; LDpred2-auto only a common subset of the SNVs, those of MAF >= 1% thinned evenly
+    in genetic distance to HapMap3's chr22 count (benchmarks/bench_sim/submissions/ldpred2_auto.py)."""
+    height = 3.3
     fig, ax = canvas(height)
-    first, second = height - 0.68, height - 1.5
-    # SV-PGS's column starts at the left margin and LDpred2-auto's ends at the right one, so the two stand apart
-    columns = (
-        (EDGE, "left", "SV-PGS", SV_PGS, ([("SNVs", INK, True), (", ", INK, False), ("indels", GREEN, True)],
-                                           [(f"{svs:,} ", INK, False), ("SVs", IMPUTED, True)])),
-        (COLUMN - EDGE, "right", "LDpred2-auto", LDPRED2, ([(f"≤{HAPMAP3_SNVS:,} ", INK, False), ("SNVs", INK, True)],
-                                                           [("MAF ≥ 1%", INK, False)])),
-    )
-    for x, ha, name, colour, lines in columns:
-        ax.text(x, first, name, ha=ha, va="baseline", color=colour, fontsize=POSTER_NAME, fontweight="bold")
-        for y, pieces in zip((second, second - 0.82), lines):
-            phrase(ax, x, y, pieces, ha)
+    cells = {"SNV": ("all", "common subset"), "indel": ("all", "none"), "SV": ("all", "none")}
+    # each method's column centred: SV-PGS's on its cells a gap right of the class names (its name reaching left over
+    # the empty corner), LDpred2-auto's on the widest of its name and cells, ending at the right margin
+    ours = EDGE + widest(fig, [f"{name}s" for name in cells], fontweight="bold") + 0.6 + widest(fig, ["all"]) / 2
+    theirs = COLUMN - EDGE - max(widest(fig, ["LDpred2-auto"], fontweight="bold"),
+                                 widest(fig, [cell for _, cell in cells.values()])) / 2
+    top, pitch = height - 0.66, 0.82
+    ax.text(ours, top, "SV-PGS", ha="center", va="baseline", color=SV_PGS, fontweight="bold")
+    ax.text(theirs, top, "LDpred2-auto", ha="center", va="baseline", color=LDPRED2, fontweight="bold")
+    for row, (name, colour, _) in enumerate(VARIANTS, start=1):
+        y = top - row * pitch
+        ax.text(EDGE, y, f"{name}s", ha="left", va="baseline", color=colour, fontweight="bold")
+        for x, cell in zip((ours, theirs), cells[name]):
+            ax.text(x, y, cell, ha="center", va="baseline", color=INK)
     return fig
 
 
@@ -1269,7 +1254,7 @@ def main() -> None:
                             ("poster_wins", poster_wins_figure(grids)),
                             ("poster_sv_gain", gain),
                             ("poster_imputation_accuracy", poster_imputation_figure(summary)),
-                            ("poster_model", poster_model_figure()), ("poster_variants", poster_variants_figure(summary))):
+                            ("poster_model", poster_model_figure()), ("poster_variants", poster_variants_figure())):
             # transparent, so the page shows through: an opaque white ground renders a shade off the page white in a PDF
             panel.savefig(OUT / f"{name}.png", transparent=True)
             plt.close(panel)
