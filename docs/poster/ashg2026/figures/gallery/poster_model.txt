@@ -1,1 +1,1 @@
-An SNV, an indel and an SV on a chromosome, each class with its own effect-size prior (the SV's narrower at low imputation r²), all fitted together into SV-PGS.
+An SNV, an indel and an SV on a chromosome, each class with its own effect-size prior, all fitted together into SV-PGS.

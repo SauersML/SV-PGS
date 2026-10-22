@@ -80,7 +80,6 @@ GREEN = "#009E73"
 PURPLE = "#CC79A7"
 INK = "#000000"
 GREY = "#6E6E6E"
-LIGHT = "#BDBDBD"
 RULE = "#E4E4E4"
 SV_PGS, LDPRED2, IMPUTED = BLUE, VERMILLION, SKY
 """The colours that name a method or a genotype source wherever it appears: SV-PGS (and any SV-PGS gain), LDpred2-auto,
@@ -1126,8 +1125,8 @@ VARIANTS = (("SNV", INK, 0.09), ("indel", GREEN, 0.3), ("SV", IMPUTED, 1.1))
 """The variant classes as the left column draws them: name, colour, and the width in inches of the block that stands for
 one variant on a chromosome (one base for an SNV, a few for an indel, many for an SV)."""
 SCHEMATICS = {
-    "poster_model": "An SNV, an indel and an SV on a chromosome, each class with its own effect-size prior (the SV's "
-                    "narrower at low imputation r²), all fitted together into SV-PGS.",
+    "poster_model": "An SNV, an indel and an SV on a chromosome, each class with its own effect-size prior, all fitted "
+                    "together into SV-PGS.",
     "poster_variants": "A table of the variants each method is given: SV-PGS all SNVs, indels and SVs; LDpred2-auto SNVs "
                        "of MAF ≥ 1% thinned to HapMap3 density, and no indels or SVs.",
 }
@@ -1144,20 +1143,9 @@ def canvas(height: float):
     return fig, ax
 
 
-def chromosome(ax, left: float, right: float, y: float, marks, tall: float = 0.56) -> None:
-    """A stretch of chromosome from ``left`` to ``right`` at height ``y`` (a grey bar) with each variant of ``marks``,
-    (centre, width, colour), a block ``tall`` inches high over it."""
-    ax.add_patch(matplotlib.patches.FancyBboxPatch((left, y - 0.09), right - left, 0.18,
-                                                   boxstyle="round,pad=0,rounding_size=0.09", facecolor=LIGHT,
-                                                   edgecolor="none", zorder=1))
-    for centre, width, colour in marks:
-        ax.add_patch(matplotlib.patches.Rectangle((centre - width / 2, y - tall / 2), width, tall, facecolor=colour,
-                                                  edgecolor="none", zorder=2))
-
-
 def poster_model_figure():
     """The SV-PGS model for the poster's Methods: an SNV, an indel and an SV on a chromosome, each class with its own
-    effect-size prior (the SV's also at a low imputation r², which narrows it), all fitted together into one score."""
+    effect-size prior, all fitted together into one score."""
     height = 4.6
     fig, ax = canvas(height)
     # left to right, in inches: the class names, a stretch of chromosome after the widest, the priors, the arrows, and
@@ -1166,9 +1154,9 @@ def poster_model_figure():
     stretch = EDGE + widest(fig, [name for name, *_ in VARIANTS], **name_style) + 0.2
     stretch = (stretch, stretch + 1.45)
     box_left = COLUMN - EDGE - widest(fig, ["SV-PGS"], **name_style) - 0.3
-    box_middle, box_tall = 1.9, 1.25
+    box_middle, box_tall = 2.05, 1.25
     centre, reach = (stretch[1] + 0.2 + box_left - 1.1) / 2, (box_left - 1.1 - stretch[1] - 0.2) / 2
-    bases = (2.75, 1.8, 0.2)
+    bases = (2.75, 1.65, 0.55)
     # each class's prior SD in inches, a schematic (empirical Bayes learns the real ones); every prior encloses the
     # same area, so a narrower one stands taller, the SNV's 0.75 in
     spreads = (0.2, 0.28, 0.5)
@@ -1178,22 +1166,17 @@ def poster_model_figure():
     for (name, colour, block), base, spread in zip(VARIANTS, bases, spreads):
         middle = base + 0.4
         ax.text(EDGE, middle, name, ha="left", va="center", color=colour, **name_style)
-        chromosome(ax, *stretch, middle, [(sum(stretch) / 2, block, colour)])
-        ax.plot([centre - reach, centre + reach], [base, base], color=LIGHT, linewidth=3.2, zorder=1,
+        # the variant, a block as wide as the class is long, on a black line for the chromosome
+        ax.plot(stretch, [middle, middle], color=INK, linewidth=3.2, solid_capstyle="round", zorder=1)
+        ax.add_patch(matplotlib.patches.Rectangle((sum(stretch) / 2 - block / 2, middle - 0.28), block, 0.56,
+                                                  facecolor=colour, edgecolor="none", zorder=2))
+        ax.plot([centre - reach, centre + reach], [base, base], color=INK, linewidth=3.2, zorder=1,
                 solid_capstyle="round")
         # each curve drawn where it stands clear of its baseline, so the tails leave the baseline bare
         density = area * stats.norm.pdf(effect, scale=spread)
         shown = density > 0.03
-        ax.fill_between(centre + effect, base, base + density, color=colour, alpha=0.22, linewidth=0, zorder=2)
         ax.plot(centre + effect[shown], base + density[shown], color=colour, linewidth=6.0, zorder=3,
                 solid_capstyle="round")
-        if name == "SV":
-            # the same prior for an SV imputed with r^2 = 0.3: its variance scales by r^2
-            low = area * stats.norm.pdf(effect, scale=spread * math.sqrt(0.3))
-            shown = low > 0.03
-            ax.plot(centre + effect[shown], base + low[shown], color=colour, linewidth=5.0, linestyle=(0, (1.4, 1.1)),
-                    zorder=3)
-            ax.text(centre, base + low.max() + 0.04, "low r²", ha="center", va="bottom", color=INK)
         # every class into the one model
         ax.annotate("", xy=(box_left - 0.08, box_middle + (middle - box_middle) * 0.4),
                     xytext=(centre + reach + 0.15, middle),
