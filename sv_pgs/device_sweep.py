@@ -37,6 +37,7 @@ batching them changes no model's arithmetic: one model's sweep is the same which
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
@@ -1125,6 +1126,7 @@ def sweep_models(xp: Any, kernels: Any, layout: SweepLayout, tiles: Iterator, **
     # Device downloads can fail after one device has finished; no caller array moves before all have succeeded.
     staged = {name: values.copy() for name, values in state.items()}
     check = None if layout.checked else _SweepCheck(xp, layout, inputs)
+    started = time.perf_counter()
     try:
         try:
             result = _sweep_models(xp, kernels, layout, tiles, **{**inputs, "state": staged}, check=check)
@@ -1146,7 +1148,8 @@ def sweep_models(xp: Any, kernels: Any, layout: SweepLayout, tiles: Iterator, **
             layout.disabled = True
             log(f"batched sweep disabled (check failed: {failure}); using reference sweeps")
             raise NoCodes("the batched sweep disagreed with its check")
-        log(f"batched sweep check passed: largest error {check.worst[0]:.3g} of its tolerance ({check.worst[1]})")
+        log(f"batched sweep check passed: largest error {check.worst[0]:.3g} of its tolerance ({check.worst[1]}); "
+            f"the checked sweep took {time.perf_counter() - started:.1f} s")
     for name in MOMENTS:
         state[name][...] = staged[name]
     return result
