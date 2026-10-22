@@ -80,7 +80,7 @@ CHROMOSOME_SPACING_CM = 1e4
 genome is one band and no window reaches another chromosome."""
 MERGE_GAP = 64
 """Kept records this close in the store are read in one call (``read_codes``): a zstd store decodes a whole inner
-chunk for any row of it, so separate reads of nearby rows would decode the same chunk again."""
+chunk for any row of it, so separate reads of rows in one chunk would decode it again for each."""
 MAX_SPAN = 4096
 """The most store rows one such read spans."""
 READ_THREADS = 32
@@ -93,14 +93,17 @@ def _log(message: str) -> None:
 
 def read_codes(store: DosageStore, records: np.ndarray, columns: np.ndarray, threads: int = READ_THREADS) -> np.ndarray:
     """Codes [records, columns] (uint8, dosage = code / 127) of ``records`` in the order given, over the ascending store
-    ``columns``: kept records less than MERGE_GAP apart are read in one call of at most MAX_SPAN rows, and the calls run
-    on ``threads`` threads, each on a run of neighbouring calls."""
+    ``columns``. Kept records closer than MERGE_GAP, or than the store's inner chunk rows where those are more, are read
+    in one call, so a chunk is decoded once for all its kept records; a call spans at most MAX_SPAN rows, or four
+    chunks. The calls run on ``threads`` threads, each on a run of neighbouring calls."""
     out = np.empty((records.shape[0], columns.shape[0]), dtype=np.uint8)
     order = np.argsort(records, kind="stable")
     ascending = records[order]
+    gap = max([MERGE_GAP, *(array.layout.inner_rows for arrays in getattr(store, "_arrays", ()) for array in arrays)])
+    longest = max(MAX_SPAN, 4 * gap)
     spans, first = [], 0
     for index in range(1, ascending.shape[0] + 1):
-        if index == ascending.shape[0] or ascending[index] - ascending[index - 1] >= MERGE_GAP or ascending[index] - ascending[first] >= MAX_SPAN:
+        if index == ascending.shape[0] or ascending[index] - ascending[index - 1] >= gap or ascending[index] - ascending[first] >= longest:
             spans.append((first, index))
             first = index
 

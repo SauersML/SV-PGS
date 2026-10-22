@@ -9,6 +9,9 @@ rm -rf "$RUN/renv" && mkdir -p "$RUN/renv"
 tar -xzf "$OPS/../reference/renv.tar.gz" -C "$RUN/renv"
 # conda-unpack's shebang asks for a python on PATH, and the Batch image has none: the packed environment's own runs it
 "$RUN/renv/bin/python" "$RUN/renv/bin/conda-unpack"
+# The fastpgs code as the run's staged source holds it now, not as the task copied it at its start: a fix staged while
+# the driver restored the run reaches this job
+for file in aou_fastpgs.py aou_fastpgs.R; do cp "$OPS/source/benchmarks/bench_real/$file" "$RUN/source/benchmarks/bench_real/$file"; done
 cd "$RUN/source"
 PATH="$RUN/renv/bin:$PATH" "$RUN/venv/bin/python" -m benchmarks.bench_real.aou_fastpgs --config "$OPS/run_config.json" --out "$OPS/fastpgs.jsonl" \
   --scores "$OPS/fastpgs" --units "$OPS/fastpgs-units"
