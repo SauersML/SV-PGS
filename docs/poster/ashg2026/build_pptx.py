@@ -1,25 +1,25 @@
 """The ASHG 2026 science poster as a PowerPoint file, built on the lab's poster template (48 x 36 in): the accepted
-abstract's title and authors, the realistic simulation study (benchmarks/power/grid.py on bench-sim's 1000 Genomes
-cohort, run on MSI), and placeholders for the All of Us results.
+abstract's title and authors, the simulation study's gallery figures (sim_gallery.py) with the numbers they show, and
+the All of Us results once they are drawn.
 
-    uv run python docs/poster/ashg2026/simulation.py fetch     # from the repository root, MSI connected
-    uv run python docs/poster/ashg2026/figures.py
-    uv run --no-project --with defusedxml --with lxml --with pillow python docs/poster/ashg2026/build_pptx.py \
-        [template.pptx] [output.pptx] [simulation_summary.json] [figures directory]
+    uv run --with matplotlib python docs/poster/ashg2026/sim_gallery.py     # figures/gallery and its numbers.json
+    uv run --no-project --with defusedxml --with lxml --with pillow --with qrcode python docs/poster/ashg2026/build_pptx.py \
+        [template.pptx] [output.pptx] [figures directory]
 
 The template defaults to ~/Downloads/ASHG draft.PH.pptx and the output to ~/Downloads/ASHG SV-PGS poster.pptx; render
 the output to PDF (soffice --headless --convert-to pdf) to inspect it.
 
 The template is read from outside the repository and nothing of it is committed: its own content (another study's All
 of Us results) must not enter this public repository. Its header, University of Minnesota wordmark and section bars are
-kept; every text box, figure and caption is replaced, all in Arial at one size and in black outside the header and
-bars. The author line and affiliations come from authors.local beside this file, untracked, so no personal name is
-committed. The figures come from figures.py, and the All of Us ones from aou_results.py (``--out`` this figures
-directory) once a run's tables are exported.
+kept; every text box and figure is new, set on one grid (three columns between margins at the header's left edge) in
+Arial, the gallery's face, with the gallery's Okabe-Ito colours naming the two methods. The author line and
+affiliations come from authors.local beside this file, untracked, so no personal name is committed.
 
-Placeholders: a figure the simulation or All of Us runs will supply is a dashed "placeholder" panel (figures.py); a
-number they will supply is a bracketed bold run in the text, e.g. "[x%]". The simulation's numbers and the verbs that
-depend on them come from simulation_summary.json (simulation.py) when it exists.
+Every simulation number in the text is read from figures/gallery/numbers.json, which sim_gallery.py writes from the
+values its figures draw. The All of Us section shows figures/aou_*.png in name order (else aou_results.py's
+fig_aou_effects.png and fig_aou_diseases.png), each under the first line of its .txt namesake, if any, as a one-line
+title and above that file's other lines as bullets; git ignores these files, so All of Us results stay local until
+they are released. Without them the section holds two dashed placeholders.
 """
 
 from __future__ import annotations
@@ -33,323 +33,235 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TEMPLATE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "Downloads" / "ASHG draft.PH.pptx"
 OUTPUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.home() / "Downloads" / "ASHG SV-PGS poster.pptx"
-SUMMARY = Path(sys.argv[3]) if len(sys.argv) > 3 else HERE / "simulation_summary.json"
-FIGURES = Path(sys.argv[4]) if len(sys.argv) > 4 else HERE / "figures"
+FIGURES = Path(sys.argv[3]) if len(sys.argv) > 3 else HERE / "figures"
+GALLERY = FIGURES / "gallery"
 SKILL = Path.home() / ".claude/skills/synced/cf317dd8-fe6e-4d5f-8d52-41758c24f59e_65ab35e1-5c99-4c20-a531-f6c547fa9553/pptx"
 EMU = 914400
-PLACEHOLDER = "000000"
+
+# ------------------------------------------------------------------ the grid, type and colours (inches, points)
+
+MARGIN = 0.84
+"""Left and right page margins: the header band's left edge."""
+TOP, BOTTOM = 6.15, 35.3
+"""The columns run from just under the header to the bottom margin."""
+GUTTER = 0.8
+LEFT, RIGHT = 11.4, 10.4
+"""The outer columns' widths; the middle column, the simulation's results, takes the rest of the 48 in page. The All
+of Us column is the narrowest: its figures shrink to the room it has."""
+MIDDLE = 48 - 2 * MARGIN - 2 * GUTTER - LEFT - RIGHT
+COLUMNS = ((MARGIN, LEFT), (MARGIN + LEFT + GUTTER, MIDDLE), (48 - MARGIN - RIGHT, RIGHT))
+"""Each column's left edge and width."""
+INSET = 0.3
+"""Text sits this far inside its column, under the section bars' labels."""
+BAR, BAR_SIZE = 1.0, 54
+BODY, HEADLINE, GLOSS, REFERENCE = 40, 52, 32, 28
+NUMBER, CLAIM = 120, 56
+"""Points: a key number over its figure, and the words set between two key numbers."""
+LINE_PITCH = 1.066
+"""Line pitch per point of type at 90% line spacing, measured on the LibreOffice render."""
+SHIFTED_PITCH = 0.25
+"""Extra pitch per point of type on a line with a subscript or superscript."""
+BULLET_INDENT = 0.42
+AFTER = 14
+"""Points of space after a bullet."""
+GAPS = {"bar": 0.35, "block": 0.3, "section": 0.7}
+"""Space under a section bar, between blocks of a section, and above the next bar (before the column is justified)."""
+JUSTIFY_LIMIT = 2.0
+"""The most extra space a section break takes when a column is spread to the bottom margin."""
+
+INK, GREY, TEAL = "000000", "6E6E6E", "1482A5"
+BLUE, VERMILLION = "0072B2", "D55E00"
+"""sim_gallery.py's SV-PGS and LDpred2-auto colours; the bullets take the section bars' teal."""
+SKY = "56B4E9"
+COLOURS = {"blue": BLUE, "vermillion": VERMILLION, "grey": GREY, "sky": SKY}
 
 # ------------------------------------------------------------------ the copy
 
 TITLE = ["Enabling Polygenic Prediction from Structural", "Variants in the NIH All of Us Multi-Ancestry Biobank"]
-
-INTRODUCTION = [
-    [("Polygenic scores (PGSs) predict disease risk from the summed effects of many variants.", "")],
-    [("Most PGS methods use only SNVs, although structural variants (SVs, ≥ 50 bp) also affect disease risk.", "")],
-    [("We test whether SVs improve prediction in simulations and in the multi-ancestry NIH All of Us cohort.", "")],
-]
-
-METHODS = [
-    [("SV-PGS, open-source software, fits all variants in one model on GPUs.", "")],
-    [("For All of Us, SVs discovered in 12,212 phased genome assemblies are imputed into short-read genomes.", "")],
-]
-
-SIMULATION_DESIGN = [
-    [("50,000 people simulated from 1000 Genomes chr22 haplotypes in five ancestry groups, with SVs imputed from a separate panel.", "")],
-    [("We vary prevalence (1–10%), h² (0.01–0.1), causal count (50–2,000), SV fraction (0–20%) and SV effect SD (1× or 3× SNVs).", "")],
-    [("Rarer variants have larger effects (α = −0.38, as in UK Biobank); SV effects may also grow with length or depend on type.", "")],
-]
-
-SIMULATION_METHODS = [
-    [("SV-PGS with/without SVs and LDpred2-auto (MAF ≥ 1% SNVs at HapMap3 density, or all classes) use 5,000–40,000 training samples.", "")],
-]
-
-SIMULATION_ACCURACY = [
-    [("With 20% causal SVs and 40,000 training samples, adding SVs changed AUC by ", ""), ("[ΔAUC]", "ph"),
-     (". With no causal SVs, AUC changed by ", ""), ("[ΔAUC]", "ph"), (".", "")],
-    [("SV-PGS − LDpred2-auto ΔAUC was ", ""), ("[ ]", "ph"), (" (SNV subset) and ", ""), ("[ ]", "ph"), (" (all variant classes).", "")],
-]
-
-SIMULATION_GENOTYPES = [
-    [("With 20% causal SVs, estimated power at 40,000 samples was ", ""), ("[x%]", "ph"),
-     (" (95% CI ", ""), ("[ ]", "ph"), ("; ", ""), ("[n]", "ph"), (" replicates).", "")],
-    [("Imputed SVs below 1% frequency had mean r² ", ""), ("[ ]", "ph"), (" with their true genotypes, vs. ", ""),
-     ("[ ]", "ph"), (" for SNVs.", "")],
-    [("With true genotypes, adding SVs changed AUC by ", ""), ("[ΔAUC]", "ph"), (" (20% SVs, 3× effect).", "")],
-]
-
-HYPERTENSION = [
-    [("We fit SV-PGS to hypertension with over 200,000 SVs called in 97,000 short-read genomes.", "")],
-    [("About as many SVs increased risk as decreased it (", ""), ("[x%]", "ph"), (" vs. ", ""), ("[y%]", "ph"),
-     ("), and longer SVs had larger effects (", ""), ("[statistic]", "ph"), (").", "")],
-]
-
-DISEASES = [
-    [("Averaged over ", ""), ("[n]", "ph"), (" diseases, adding SVs changed test AUC by ", ""), ("[ΔAUC]", "ph"),
-     (" (95% CI ", ""), ("[ ]", "ph"), (").", "")],
-]
-
-WINDOW = []
-"""The chr22 window study's sentences (simulation_copy), under its figure when figures.py drew one."""
-
-DISCUSSION = [
-    [("Adding SVs ", ""), ("[improved / did not improve]", "ph"), (" prediction in simulations with causal SVs and in ", ""),
-     ("[n]", "ph"), (" All of Us diseases.", "")],
-]
-
-# ------------------------------------------------------------------ the simulation's numbers in the copy
-
-
-def number(value: float, digits: int = 3) -> str:
-    """A value with a typographic minus sign; one that rounds to zero prints unsigned, not as −0.000."""
-    text = f"{value:.{digits}f}"
-    return text.lstrip("-") if float(text) == 0.0 else text.replace("-", "−")
-
-
-def auc_change(entry: dict) -> str:
-    """'0.006 (95% CI 0.004–0.008)' style text for an AUC difference and its interval."""
-    low, high = entry["lower"], entry["upper"]
-    span = f"{number(low)}–{number(high)}" if low * high > 0 else f"{number(low)} to {number(high)}"
-    return f"{number(entry['mean'])} (95% CI {span})"
-
-
-MIN_REPLICATES = 3
-"""A sentence is filled only from (point, training size) cells with at least this many finished replicates."""
-
-
-def settled(point: dict, size: str) -> dict | None:
-    """The point's cell at ``size`` if it has enough replicates for an interval, else None."""
-    cell = point.get("sizes", {}).get(size)
-    return cell if cell and cell["replicates"] >= MIN_REPLICATES else None
-
-
-def rare_r2(bins: list[dict]) -> float:
-    """Mean imputation r^2 over the frequency bins below 1%, each weighted by its variant count."""
-    rare = [entry for entry in bins if entry["high"] <= 0.01 and entry["count"]]
-    return sum(entry["mean"] * entry["count"] for entry in rare) / sum(entry["count"] for entry in rare)
-
-
-def simulation_copy(summary: dict) -> None:
-    """Fill the simulation's bracketed numbers with estimates and uncertainty from completed replicates."""
-    global SIMULATION_METHODS, SIMULATION_ACCURACY, SIMULATION_GENOTYPES, WINDOW, DISCUSSION
-    points = summary["points"]
-    largest = str(max(summary["train_counts"]))
-    largest_text = f"{int(largest):,}"
-    cells = [cell for point in points.values() for cell in point.get("sizes", {}).values()]
-    counts = [cell["replicates"] for cell in cells]
-    # A partial real run must not leave template numbers in its simulation narrative, or imply that the earliest
-    # completed cells are a finished grid. Keep the planned sample-size range separate from observed coverage.
-    if counts:
-        SIMULATION_ACCURACY = [[(f"Interim results: {sum(counts)} paired comparisons across {len(cells)} settings and sample sizes; "
-                                 f"{min(counts)}–{max(counts)} completed replicates per cell. The grid is incomplete.", "")]]
-    else:
-        SIMULATION_ACCURACY = [[("No paired simulation comparisons have completed yet.", "")]]
-    SIMULATION_GENOTYPES = [[("Genotype-accuracy summaries appear once simulation replicates finish.", "")]]
-    DISCUSSION = [[("The simulation grid is incomplete. Predictive benefit remains under evaluation; All of Us results are pending.", "")]]
-    # the training sizes the figures draw (cells with enough replicates), else the planned ones
-    drawn = sorted({int(size) for point in points.values() for size, cell in point.get("sizes", {}).items()
-                    if cell["replicates"] >= MIN_REPLICATES}) or summary["train_counts"]
-    # the all-variant LDpred2 arm is named only where the figure draws it (enough replicates)
-    allvar = any(cell.get("ldpred2_allvar_replicates", 0) >= MIN_REPLICATES
-                 for point in points.values() for cell in point.get("sizes", {}).values())
-    SIMULATION_METHODS = [[(f"{min(drawn):,}–{max(drawn):,} training samples; LDpred2-auto uses MAF ≥ 1% "
-                           f"SNVs at HapMap3 density{', or all classes' if allvar else ''}.", "")]]
-
-    cells = {name: settled(point, largest) for name, point in points.items()}
-    accuracy = []
-    # SV-PGS against LDpred2-auto on its SNV subset; "beat" counts only architectures whose 95% interval lies above zero
-    versus = {name: cell["delta_auc_vs_ldpred2"] for name, cell in cells.items()
-              if cell and cell.get("delta_auc_vs_ldpred2", {}).get("replicates", 0) >= MIN_REPLICATES}
-    # the "up to" margin comes from an architecture SV-PGS beat, never from one whose interval crosses zero
-    ahead = {name: entry for name, entry in versus.items() if entry["lower"] > 0}
-    if ahead:
-        best = max(ahead, key=lambda name: ahead[name]["mean"])
-        accuracy.append([(f"SV-PGS beat LDpred2-auto (SNV subset) in {len(ahead)} of {len(versus)} architectures at {largest_text} "
-                          f"training samples, by up to {auc_change(ahead[best])} AUC.", "")])
-    elif versus:
-        best = max(versus, key=lambda name: versus[name]["mean"])
-        accuracy.append([(f"SV-PGS minus LDpred2-auto (SNV subset), {largest_text} training samples: {auc_change(versus[best])}.", "")])
-    if accuracy:
-        SIMULATION_ACCURACY = accuracy
-
-    # what adding SVs does where causal SVs are measured well (SNP-tagged or common SVs imputed; any architecture on true
-    # genotypes), then how well the rare majority of SVs imputes
-    genotypes, raised = [], []
-    true_gains = summary.get("genotype_accuracy", {}).get("delta_auc", {})
-    for point, label in ARCHITECTURE_LABELS:
-        sizes_done = [size for size in sorted(points.get(point, {}).get("sizes", {}), key=int, reverse=True) if settled(points[point], size)]
-        imputed = settled(points[point], sizes_done[0])["delta_auc"] if point in WELL_IMPUTED and sizes_done else None
-        true = true_gains.get(point, {}).get("true")
-        true = true if true and true["replicates"] >= MIN_REPLICATES else None
-        if imputed:
-            genotypes.append([(f"{label}, imputed: adding SVs changed AUC by {auc_change(imputed)}.", "")])
-        if true:
-            genotypes.append([(f"{label}, true SV genotypes: {auc_change(true)}.", "")])
-        raised += [label for entry in (imputed, true) if entry and entry["lower"] > 0]
-    accuracy_by_frequency = summary.get("genotype_accuracy", {}).get("r2_by_frequency")
-    if accuracy_by_frequency:
-        rare = {name: rare_r2(accuracy_by_frequency[name]["bins"]) for name in ("SV", "SNV")}
-        genotypes.append([(f"{accuracy_by_frequency['SV']['below_1pct']:.0%} of SVs are below 1% frequency, where imputation "
-                           f"r² averages {number(rare['SV'], 2)} (SNVs: {number(rare['SNV'], 2)}).", "")])
-    if genotypes:
-        SIMULATION_GENOTYPES = genotypes
-
-    # the window study: the design, then the architecture with the largest true-genotype gain at its largest settled
-    # size, its imputed gain there, and the no-causal-SV control
-    window = summary.get("window", {})
-    cohort = window.get("cohort")
-
-    def window_gain(measurement: str, point: str) -> tuple[int, dict] | None:
-        cells = window.get(measurement, {}).get(point, {})
-        done = [size for size in sorted(cells.get("sizes", {}), key=int, reverse=True) if settled(cells, size)]
-        return (int(done[0]), cells["sizes"][done[0]]["delta_auc"]) if done else None
-
-    true_gains = {point: window_gain("true", point) for point, _label in ARCHITECTURE_LABELS}
-    true_gains = {point: gain for point, gain in true_gains.items() if gain}
-    if cohort and true_gains:
-        megabases = (cohort["end_bp"] - cohort["start_bp"]) / 1e6
-        # the training sizes the window figure draws (cells with enough replicates)
-        window_sizes = sorted({int(size) for cells in window.get("true", {}).values() for size in cells.get("sizes", {})
-                               if settled(cells, size)}) or summary["train_counts"]
-        # the window's design joins the methods line; its figure's text is the headline gain
-        SIMULATION_METHODS = [[(SIMULATION_METHODS[0][0][0].rstrip(".") + f"; one {megabases:.0f}-Mb chr22 window "
-                                f"({cohort['last_record'] - cohort['first_record']:,} variants) repeats every architecture at "
-                                f"{min(window_sizes):,}–{max(window_sizes):,}.", "")]]
-        # the headline is the largest gain whose 95% interval lies above zero, else the largest gain
-        window_raised = {point: gain for point, gain in true_gains.items() if gain[1]["lower"] > 0}
-        candidates = window_raised or true_gains
-        best = max(candidates, key=lambda point: candidates[point][1]["mean"])
-        count, true = true_gains[best]
-        # the imputed gain and the control at the same training size as the true-genotype gain
-        imputed = settled(window.get("imputed", {}).get(best, {}), str(count))
-        sentence = f"{dict(ARCHITECTURE_LABELS)[best]}, {count // 1000}k: SVs added {auc_change(true)} AUC on true genotypes"
-        if imputed:
-            sentence += f", {number(imputed['delta_auc']['mean'])} imputed"
-        control = settled(window.get("true", {}).get("null", {}), str(count))
-        if control:
-            sentence += f"; no causal SVs: {number(control['delta_auc']['mean'])}"
-        WINDOW = [[(sentence + ".", "")]]
-        # the per-architecture sentences give way to the window figure: the genotype text keeps the r^2 sentence only
-        if accuracy_by_frequency:
-            SIMULATION_GENOTYPES = [genotypes[-1]]
-
-    conclusions = []
-    if ahead:
-        conclusions.append([(f"SV-PGS beat LDpred2-auto by up to {number(ahead[max(ahead, key=lambda name: ahead[name]['mean'])]['mean'])} AUC.", "")])
-    window_raised = {point: gain for point, gain in true_gains.items() if gain[1]["lower"] > 0} if cohort else {}
-    if window_raised:
-        best = max(window_raised, key=lambda point: window_raised[point][1]["mean"])
-        label = dict(ARCHITECTURE_LABELS)[best]
-        # lower-case the label's first letter unless it starts an acronym (SNP-tagged, SV)
-        label = label if label[1:2].isupper() else label[0].lower() + label[1:]
-        conclusions.append([(f"Measured SVs raised AUC by up to {number(window_raised[best][1]['mean'])} ({label}).", "")])
-    elif raised:
-        conclusions.append([(f"Adding well-measured SVs raised AUC ({'; '.join(dict.fromkeys(raised))}).", "")])
-    elif accuracy_by_frequency:
-        conclusions.append([(f"Rare SVs impute at r² {number(rare_r2(accuracy_by_frequency['SV']['bins']), 2)} from a 2,072-haplotype "
-                             "panel; imputed rare SVs added little.", "")])
-    if conclusions:
-        DISCUSSION = conclusions
-
-
-ARCHITECTURE_LABELS = (
-    # (point, label): the architectures the copy reports adding SVs for, in order
-    ("tagged_sv_fold3", "SNP-tagged causal SVs, 3× effect"),
-    ("tagged_sv", "SNP-tagged causal SVs"),
-    ("common_sv", "Common causal SVs"),
-    ("sv_20pct_fold3", "20% causal SVs, 3× effect"),
-    ("deletion_positive", "Deletions 3×"),
-    ("multi_feature_positive", "SV effects by length, type and annotation"),
-)
-WELL_IMPUTED = {"tagged_sv_fold3", "tagged_sv", "common_sv"}
-"""Architectures whose causal SVs are imputed accurately (Beagle r^2 >= 0.8, or common); elsewhere the copy reports only
-the true-genotype gain."""
-
-
-if SUMMARY.is_file():
-    simulation_copy(json.loads(SUMMARY.read_text()))
-
-
 REFERENCES = [
     "Byrska-Bishop et al. (2022) Cell 185:3426.",
     "Taylor et al. (2024) Nature 631:610.",
     "Privé et al. (2020) Bioinformatics 36:5424.",
+    "Wray et al. (2010) PLoS Genet 6:e1000864.",
     "All of Us Research Program Investigators (2019) N Engl J Med 381:668.",
 ]
+PLACEHOLDERS = [
+    ("SV effects on hypertension", "Estimated SV effects by SV type and length"),
+    ("Test AUC by disease", "SV-PGS with or without SVs, LDpred2-auto"),
+]
 
-BARS = {97: "Introduction", 91: "Methods", 93: "Simulation design", 118: "Simulation results", 119: "All of Us",
-        95: "Discussion", 96: "References"}
 
-# ------------------------------------------------------------------ DrawingML in the template's own formats
+def marked(text: str) -> list[tuple[str, str]]:
+    """Runs of ``text``: **bold**, {{words|colour}} bold in a figure colour (a genotype source named as its bars are
+    drawn), and each method's name bold in its figure colour."""
+    runs = []
+    for piece in re.split(r"(\*\*.+?\*\*|\{\{.+?\}\}|SV-PGS|LDpred2-auto)", text):
+        if piece.startswith("**"):
+            runs.append((piece[2:-2], "b"))
+        elif piece.startswith("{{"):
+            words, colour = piece[2:-2].split("|")
+            runs.append((words, f"b {colour}"))
+        elif piece in ("SV-PGS", "LDpred2-auto"):
+            runs.append((piece, "b blue" if piece == "SV-PGS" else "b vermillion"))
+        elif piece:
+            runs.append((piece, ""))
+    return runs
+
+
+NBSP = "\u00a0"
+"""A space no line breaks at, which keeps a number with its unit."""
+
+
+def auc(value: float) -> str:
+    return f"{value:.3f}"
+
+
+def gain(value: float) -> str:
+    return f"{value:+.3f}".replace("-", "−")
+
+
+def people(count: int) -> str:
+    return f"{count:,}"
+
+
+def copy(numbers: dict) -> dict:
+    """The poster's sentences, each number from the gallery figure that shows it."""
+    accuracy, wins, gain, svs = numbers["fig1"], numbers["poster_wins"], numbers["poster_sv_gain"], numbers["fig5"]
+    sizes = accuracy["train_counts"]
+    ours, theirs = accuracy["SV-PGS"], accuracy["LDpred2-auto"]  # [mean, lower, upper, n] per size
+    # SV-PGS is ahead at a size when its interval clears LDpred2-auto's
+    ahead = all(ours[index][1] > theirs[index][2] for index in range(len(sizes)))
+    # the smallest training set on which SV-PGS clears LDpred2-auto trained on the largest
+    sooner = next((size for size, cell in zip(sizes, ours) if cell[1] > theirs[-1][2]), None)
+    every = wins["wins"] == wins["replicates"]
+    rare = svs["rare_r2"]
+    share = gain["imputed_sum"] / gain["true_sum"]
+    imputed_well = gain["rows"]["tagged_sv_fold3"]
+    kept_well = imputed_well["imputed"][0] / imputed_well["true"][0]
+    thousand = lambda count: f"{count // 1000}k"
+    return {
+        "introduction": [
+            "Polygenic scores (PGSs) rarely include structural variants (SVs)",
+            "Many SVs are rare and hard to genotype",
+            "We test whether adding SVs makes PGSs more accurate",
+        ],
+        "methods": ["Fit by empirical Bayes on GPUs"],
+        "code": ["Code:", "github.com/", "SauersML/SV-PGS"],
+        "design": [
+            f"{people(svs['people'])} people simulated from 1000 Genomes chr22; SVs imputed by Beagle",
+            f"Baseline: binary trait, liability h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}, "
+            f"{accuracy['causal']} causal variants",
+            f"{gain['shown']} genetic architectures vary the causal SVs or the trait",
+            f"Train on {people(sizes[0])}–{people(sizes[-1])} people; test on {people(accuracy['test_people'])} others",
+            "LDpred2-auto uses SNVs at HapMap3 density",
+        ],
+        "svs_title": "Rare SVs impute poorly",
+        "svs": [f"Below 1% MAF, mean r² is **{rare['SV']:.2f}** for SVs and **{rare['SNV']:.2f}** for SNVs"],
+        # the three key numbers, each over the figure that shows it
+        "accuracy_number": [(thousand(sooner), "b blue"), ("  beats  ", f"b pt{CLAIM}"), (thousand(sizes[-1]), "b vermillion")]
+                           if sooner and sooner < sizes[-1] and ahead else None,
+        "accuracy": f"SV-PGS trained on {people(sooner)} people beats LDpred2-auto trained on {people(sizes[-1])} "
+                    f"(AUC{NBSP}{auc(ours[sizes.index(sooner)][0])}{NBSP}vs{NBSP}{auc(theirs[-1][0])})" if sooner else "",
+        "versus_number": [(f"{wins['wins']} of {wins['replicates']}", "b blue")],
+        "versus": f"simulated data sets where SV-PGS beats LDpred2-auto, both trained on {people(sizes[-1])}{NBSP}people "
+                  "(black: no causal SVs)",
+        "gain_number": [(f"{share:.0%}", "b sky")],
+        "gain_claim": ["of the AUC gain from {{true SV genotypes|blue}}", "remains when SVs are {{imputed|sky}}"],
+        "gain": [f"The {gain['clear']} of {gain['shown']} architectures where true SV genotypes raised AUC (95% CI above "
+                 "0), in one 3 Mb window of chr22",
+                 f"With well-imputed causal SVs, **{kept_well:.0%}** of the gain remains"],
+        "aou": [
+            "SVs from long-read assemblies, imputed into short-read genomes",
+            "SV-PGS with and without SVs, tested on held-out people",
+        ],
+        "discussion": [
+            "SV-PGS beats LDpred2-auto even with no causal SVs, so the gain comes from its model and denser variant set",
+            f"True SV genotypes raised AUC in {gain['clear']} of {gain['shown']} architectures",
+            f"Imputed SVs gave **{share:.0%}** of that gain, so SVs add most when their genotypes are accurate",
+        ],
+    }
+
+
+# The model: (formula runs, its plain-language gloss); flags as in run()
+EQUATION = [
+    ([("logit P(", ""), ("y", "i"), (" = 1) = Σ", ""), ("j", "i sub"), (" x", "i"), ("j", "i sub"), ("β", ""),
+      ("j", "i sub"), (" + covariates", "")],
+     "One model for all SNVs, indels and SVs"),
+    ([("β", ""), ("j", "i sub"), (" ~ N(0, ", ""), ("s", "i"), ("j", "i sub"), ("τ", ""), ("j", "i sub"), (")   τ", ""),
+      ("j", "i sub"), (" ~ ", ""), ("g", "i"), ("class", "sub")],
+     "Each variant class has its own effect-size prior"),
+    ([("log ", ""), ("s", "i"), ("j", "i sub"), (" = log ", ""), ("r", "i"), ("2", "sup"), ("j", "i sub"), (" + ", ""),
+      ("h", "i"), ("(freq.) + ", ""), ("f", "i"), ("(length) + …", "")],
+     "Prior variance depends on imputation r², frequency and SV length"),
+]
+
+# ------------------------------------------------------------------ DrawingML
 
 FONT = '<a:latin typeface="Arial"/><a:ea typeface="Arial"/><a:cs typeface="Arial"/><a:sym typeface="Arial"/>'
 
 
-def run(text: str, flags: str, size: int, colour: str = "000000", bold: bool = False) -> str:
+def emu(inches: float) -> int:
+    return round(inches * EMU)
+
+
+def run_size(flags: str, size: float) -> float:
+    """A run's size: ``size``, or the points its "ptNN" flag names."""
+    return next((float(flag[2:]) for flag in flags.split() if flag.startswith("pt")), size)
+
+
+def run(text: str, flags: str, size: float, colour: str = INK) -> str:
     flags_set = set(flags.split())
-    if "ph" in flags_set:
-        colour, bold = PLACEHOLDER, True
+    size = run_size(flags, size)
+    colour = next((COLOURS[flag] for flag in flags_set if flag in COLOURS), colour)
     baseline = ' baseline="30000"' if "sup" in flags_set else (' baseline="-25000"' if "sub" in flags_set else "")
-    b = "1" if bold or "b" in flags_set else "0"
-    i = "1" if "i" in flags_set else "0"
     space = ' xml:space="preserve"' if text != text.strip() else ""
     return (
-        f'<a:r><a:rPr lang="en-US" sz="{size}" b="{b}" i="{i}" u="none" strike="noStrike" cap="none"{baseline} dirty="0">'
-        f'<a:solidFill><a:srgbClr val="{colour}"/></a:solidFill>{FONT}</a:rPr><a:t{space}>{escape(text, quote=False)}</a:t></a:r>'
+        f'<a:r><a:rPr lang="en-US" sz="{round(size * 100)}" b="{int("b" in flags_set)}" i="{int("i" in flags_set)}" '
+        f'u="none" strike="noStrike" cap="none"{baseline} dirty="0"><a:solidFill><a:srgbClr val="{colour}"/></a:solidFill>'
+        f'{FONT}</a:rPr><a:t{space}>{escape(text, quote=False)}</a:t></a:r>'
     )
 
 
-def bullet(runs: list[tuple[str, str]], size: int = 4900, after: int = 600) -> str:
-    return (
-        '<a:p><a:pPr marL="50800" marR="0" lvl="0" indent="-311150" algn="l" rtl="0"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc>'
-        f'<a:spcBef><a:spcPts val="0"/></a:spcBef><a:spcAft><a:spcPts val="{after}"/></a:spcAft><a:buClr><a:srgbClr val="000000"/></a:buClr>'
-        f'<a:buSzPts val="{size}"/><a:buFont typeface="Arial"/><a:buChar char="•"/></a:pPr>'
-        + "".join(run(text, flags, size) for text, flags in runs)
-        + "</a:p>"
-    )
+@dataclass
+class Para:
+    runs: list[tuple[str, str]]
+    size: float = BODY
+    bullet: bool = True
+    colour: str = INK
+    after: float = AFTER
+    align: str = "l"
+
+    def xml(self) -> str:
+        spacing = (f'<a:lnSpc><a:spcPct val="90000"/></a:lnSpc><a:spcBef><a:spcPts val="0"/></a:spcBef>'
+                   f'<a:spcAft><a:spcPts val="{round(self.after * 100)}"/></a:spcAft>')
+        if self.bullet:
+            properties = (f'<a:pPr marL="{emu(BULLET_INDENT)}" marR="0" lvl="0" indent="{-emu(BULLET_INDENT)}" '
+                          f'algn="{self.align}" rtl="0">{spacing}<a:buClr><a:srgbClr val="{TEAL}"/></a:buClr>'
+                          '<a:buSzPct val="100000"/><a:buFont typeface="Arial"/><a:buChar char="•"/></a:pPr>')
+        else:
+            properties = (f'<a:pPr marL="0" marR="0" lvl="0" indent="0" algn="{self.align}" rtl="0">{spacing}'
+                          '<a:buNone/></a:pPr>')
+        return "<a:p>" + properties + "".join(run(text, flags, self.size, self.colour) for text, flags in self.runs) + "</a:p>"
+
+    def height(self, width: float) -> float:
+        room = width - (BULLET_INDENT if self.bullet else 0.0)
+        shifted = any({"sub", "sup"} & set(flags.split()) for _, flags in self.runs)
+        tallest = max(run_size(flags, self.size) for _, flags in self.runs)
+        return wrapped_lines(self.runs, room, self.size) * tallest * (LINE_PITCH + SHIFTED_PITCH * shifted) / 72
 
 
-def heading(text: str, size: int = 4900) -> str:
-    return (
-        '<a:p><a:pPr marL="0" marR="0" lvl="0" indent="0" algn="l" rtl="0"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc>'
-        '<a:spcBef><a:spcPts val="600"/></a:spcBef><a:spcAft><a:spcPts val="600"/></a:spcAft><a:buNone/></a:pPr>'
-        + run(text, "", size, bold=True)
-        + "</a:p>"
-    )
-
-
-def line(runs: list[tuple[str, str]], size: int, colour: str, after: int = 0, spacing: int = 100000) -> str:
-    return (
-        f'<a:p><a:pPr marL="0" marR="0" lvl="0" indent="0" algn="l" rtl="0"><a:lnSpc><a:spcPct val="{spacing}"/></a:lnSpc>'
-        f'<a:spcBef><a:spcPts val="0"/></a:spcBef><a:spcAft><a:spcPts val="{after}"/></a:spcAft><a:buNone/></a:pPr>'
-        + "".join(run(text, flags, size, colour) for text, flags in runs)
-        + "</a:p>"
-    )
-
-
-def caption(text: str) -> str:
-    # the template's caption style (italic, dark text), at the poster's one text size
-    return (
-        '<a:p><a:pPr marL="0" lvl="0" indent="0" algn="l" rtl="0"><a:spcBef><a:spcPts val="0"/></a:spcBef><a:spcAft><a:spcPts val="0"/></a:spcAft><a:buNone/></a:pPr>'
-        f'<a:r><a:rPr lang="en-US" sz="4900" i="1"><a:solidFill><a:srgbClr val="000000"/></a:solidFill>{FONT}</a:rPr><a:t>{escape(text, quote=False)}</a:t></a:r></a:p>'
-    )
-
-
-def body(items: list) -> str:
-    return "".join(heading(item[1]) if isinstance(item, tuple) and item[0] == "head" else bullet(item) for item in items)
+def bullets(lines: list[str], size: float = BODY) -> list[Para]:
+    return [Para(marked(text), size) for text in lines]
 
 
 LIBERATION = Path("/Applications/LibreOffice.app/Contents/Resources/fonts/truetype")
-LINE_PITCH = 1.066
-"""Line pitch per point of type at the bullets' 90% spacing, measured on the LibreOffice render."""
-BULLET_INDENT = 0.35
-"""Inches from a text box's inset edge to a bullet's text, measured on the LibreOffice render."""
 
 
 @functools.cache
@@ -360,20 +272,19 @@ def face(bold: bool, italic: bool):
     return ImageFont.truetype(str(LIBERATION / f"{name}.ttf"), 100)
 
 
-def wrapped_lines(runs: list[tuple[str, str]], width: float, size_pt: float, italic: bool = False) -> int:
+def wrapped_lines(runs: list[tuple[str, str]], width: float, size_pt: float) -> int:
     """Lines a paragraph of ``runs`` takes at ``width`` inches, wrapped greedily at spaces."""
-    scale = size_pt / 100 / 72
-    words: list[tuple[str, bool]] = []
+    words: list[tuple[str, bool, bool, float]] = []
     for text, flags in runs:
-        bold = "ph" in flags.split() or "b" in flags.split()
+        bold, italic = "b" in flags.split(), "i" in flags.split()
+        scale = run_size(flags, size_pt) / 100 / 72
         for index, piece in enumerate(text.split(" ")):
             if index:
-                words.append((" ", bold))
+                words.append((" ", bold, italic, scale))
             if piece:
-                words.append((piece, bold))
-    lines, used = 1, 0.0
-    pending = 0.0
-    for piece, bold in words:
+                words.append((piece, bold, italic, scale))
+    lines, used, pending = 1, 0.0, 0.0
+    for piece, bold, italic, scale in words:
         length = face(bold, italic).getlength(piece) * scale
         if piece == " ":
             pending += length
@@ -386,29 +297,45 @@ def wrapped_lines(runs: list[tuple[str, str]], width: float, size_pt: float, ita
     return lines
 
 
-def insets(xml: str, shape_id: int) -> tuple[float, float, float, float]:
-    start, end = shape_span(xml, shape_id)
-    found = re.search(r'<a:bodyPr[^>]*lIns="(\d+)" tIns="(\d+)" rIns="(\d+)" bIns="(\d+)"', xml[start:end])
-    return tuple(int(value) / EMU for value in found.groups()) if found else (0.1, 0.05, 0.1, 0.05)
+def textbox(shape_id: int, name: str, x: float, y: float, width: float, height: float, paragraphs: str) -> str:
+    return (
+        f'<p:sp><p:nvSpPr><p:cNvPr id="{shape_id}" name="{escape(name)}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>'
+        f'<p:spPr><a:xfrm><a:off x="{emu(x)}" y="{emu(y)}"/><a:ext cx="{emu(width)}" cy="{emu(height)}"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></p:spPr>'
+        f'<p:txBody><a:bodyPr wrap="square" lIns="{emu(INSET)}" tIns="0" rIns="{emu(INSET)}" bIns="0" anchor="t" '
+        f'anchorCtr="0"><a:noAutofit/></a:bodyPr><a:lstStyle/>{paragraphs}</p:txBody></p:sp>'
+    )
 
 
-def authors_and_affiliations() -> tuple[list[tuple[str, str]], list[str]]:
-    """authors.local: "Name | 1,2" per author in order (an empty mark list for a group author), then affiliation lines
-    that start with their number."""
-    authors, affiliations = [], []
-    for raw in (HERE / "authors.local").read_text().splitlines():
-        text = raw.strip()
-        if not text or text.startswith("#"):
-            continue
-        if "|" in text:
-            name, marks = (part.strip() for part in text.split("|", 1))
-            authors.append((name, marks))
-        else:
-            affiliations.append(text)
-    return authors, affiliations
+def image(shape_id: int, name: str, rel: str, x: float, y: float, width: float, height: float, description: str) -> str:
+    return (
+        f'<p:pic><p:nvPicPr><p:cNvPr id="{shape_id}" name="{escape(name)}" descr="{escape(description)}"/>'
+        '<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>'
+        f'<p:blipFill><a:blip r:embed="{rel}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>'
+        f'<p:spPr><a:xfrm><a:off x="{emu(x)}" y="{emu(y)}"/><a:ext cx="{emu(width)}" cy="{emu(height)}"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></p:spPr></p:pic>'
+    )
 
 
-# ------------------------------------------------------------------ editing the slide
+def placeholder(shape_id: int, x: float, y: float, width: float, height: float, title: str, detail: str) -> str:
+    """A dashed panel where an All of Us figure will go."""
+    text = "".join(
+        Para([(words, flags)], size, bullet=False, colour=colour, after=after, align="ctr").xml()
+        for words, flags, size, colour, after in (("All of Us · result pending", "b", 26, TEAL, 18),
+                                                  (title, "b", HEADLINE, INK, 12), (detail, "", GLOSS, GREY, 0))
+    )
+    return (
+        f'<p:sp><p:nvSpPr><p:cNvPr id="{shape_id}" name="All of Us placeholder"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>'
+        f'<p:spPr><a:xfrm><a:off x="{emu(x)}" y="{emu(y)}"/><a:ext cx="{emu(width)}" cy="{emu(height)}"/></a:xfrm>'
+        '<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 4000"/></a:avLst></a:prstGeom>'
+        '<a:solidFill><a:srgbClr val="F4F6F8"/></a:solidFill><a:ln w="38100"><a:solidFill><a:srgbClr val="BDBDBD"/>'
+        '</a:solidFill><a:prstDash val="dash"/></a:ln></p:spPr>'
+        f'<p:txBody><a:bodyPr wrap="square" lIns="{emu(0.5)}" tIns="{emu(0.3)}" rIns="{emu(0.5)}" bIns="{emu(0.3)}" '
+        f'anchor="ctr" anchorCtr="0"><a:noAutofit/></a:bodyPr><a:lstStyle/>{text}</p:txBody></p:sp>'
+    )
+
+
+# ------------------------------------------------------------------ the template's slide
 
 def shape_span(xml: str, shape_id: int) -> tuple[int, int]:
     for kind in ("sp", "pic"):
@@ -430,30 +357,15 @@ def move(xml: str, shape_id: int, x: float, y: float, w: float, h: float) -> str
     start, end = shape_span(xml, shape_id)
     shape = re.sub(
         r'<a:off x="-?\d+" y="-?\d+"/><a:ext cx="\d+" cy="\d+"/>',
-        f'<a:off x="{round(x * EMU)}" y="{round(y * EMU)}"/><a:ext cx="{round(w * EMU)}" cy="{round(h * EMU)}"/>',
+        f'<a:off x="{emu(x)}" y="{emu(y)}"/><a:ext cx="{emu(w)}" cy="{emu(h)}"/>',
         xml[start:end], count=1,
     )
-    return xml[:start] + shape + xml[end:]
-
-
-def retitle(xml: str, shape_id: int, text: str) -> str:
-    """Set a section bar's label, keeping its run formatting."""
-    start, end = shape_span(xml, shape_id)
-    shape = re.sub(r"<a:t>[^<]*</a:t>", f"<a:t>{escape(text, quote=False)}</a:t>", xml[start:end], count=1)
     return xml[:start] + shape + xml[end:]
 
 
 def delete(xml: str, shape_id: int) -> str:
     start, end = shape_span(xml, shape_id)
     return xml[:start] + xml[end:]
-
-
-def picture(xml: str, shape_id: int, rel: str) -> str:
-    """Point picture ``shape_id`` at relationship ``rel``, uncropped (the new figure fills its frame)."""
-    start, end = shape_span(xml, shape_id)
-    shape = re.sub(r'r:embed="[^"]+"', f'r:embed="{rel}"', xml[start:end], count=1)
-    shape = re.sub(r"<a:srcRect[^>]*/>", "<a:srcRect/>", shape, count=1)
-    return xml[:start] + shape + xml[end:]
 
 
 def duplicate(xml: str, shape_id: int, new_id: int, name: str) -> str:
@@ -467,7 +379,282 @@ def png_size(path: Path) -> tuple[int, int]:
     return int.from_bytes(data[:4], "big"), int.from_bytes(data[4:], "big")
 
 
+def authors_and_affiliations() -> tuple[list[tuple[str, str]], list[str]]:
+    """authors.local: "Name | 1,2" per author in order (an empty mark list for a group author), then affiliation lines
+    that start with their number."""
+    authors, affiliations = [], []
+    for raw in (HERE / "authors.local").read_text().splitlines():
+        text = raw.strip()
+        if not text or text.startswith("#"):
+            continue
+        if "|" in text:
+            name, marks = (part.strip() for part in text.split("|", 1))
+            authors.append((name, marks))
+        else:
+            affiliations.append(text)
+    return authors, affiliations
+
+
+def header(xml: str) -> str:
+    """The abstract's title (two lines, as the template sets it), then its authors and affiliations."""
+    title = "".join(Para([(text, "b")], 76, bullet=False, colour="FFFFFF", after=0).xml() for text in TITLE)
+    xml = replace_text(xml, 89, title.replace('<a:spcPct val="90000"/>', '<a:spcPct val="100000"/>'))
+    authors, affiliations = authors_and_affiliations()
+    author_runs: list[tuple[str, str]] = []
+    for position, (name, marks) in enumerate(authors):
+        author_runs.append((name, ""))
+        if marks:
+            author_runs.append((marks.replace(" ", ""), "sup"))
+        if position < len(authors) - 1:
+            author_runs.append((", ", ""))
+    plain = "".join(text for text, _flags in author_runs)
+    # the template's three-name line (about 56 characters at 72 pt) clears the wordmark with room for some 64
+    names_size = min(72, 72 * 64 // max(len(plain), 1))
+    lines = [Para(author_runs, names_size, bullet=False, colour="FFFFFF", after=3)]
+    lines += [Para([(entry.split(" ", 1)[0], "sup"), (entry.split(" ", 1)[1], "")], 22, bullet=False, colour="FFFFFF",
+                   after=0) for entry in affiliations]
+    xml = replace_text(xml, 90, "".join(line.xml() for line in lines))
+    return move(xml, 90, 1.37, 2.55, 32.5, 2.9)
+
+
+# ------------------------------------------------------------------ laying out the columns
+
+@dataclass
+class Block:
+    """One thing in a column: a section bar, a text box, a figure, a dashed placeholder or a row of two columns.
+    ``flex`` blocks share whatever height the column leaves."""
+
+    kind: str
+    content: object = None
+    flex: bool = False
+    gap: str = "block"
+    children: list = field(default_factory=list)
+    legend: Path | None = None
+    """A figure's legend, whose first sentence is its picture's description."""
+
+
+def gap(previous: Block, block: Block) -> float:
+    return GAPS["bar"] if previous.kind == "bar" else GAPS[block.gap]
+
+
+def bar(shape_id: int, text: str) -> Block:
+    return Block("bar", (shape_id, text), gap="section")
+
+
+def text(paragraphs: list[Para]) -> Block:
+    return Block("text", paragraphs)
+
+
+def headline(sentence: str, gap: str = "block") -> Block:
+    """A one-line claim over a figure, in bold."""
+    block = text([Para([(words, flags + " b") for words, flags in marked(sentence)], HEADLINE, bullet=False, after=0)])
+    block.gap = gap
+    return block
+
+
+def callout(number: list[tuple[str, str]] | None, statement: str) -> Block:
+    """A key number in giant type over the one sentence that says what it counts."""
+    paragraphs = [Para(number, NUMBER, bullet=False, after=2)] if number else []
+    return text(paragraphs + [Para(marked(statement), BODY, bullet=False, after=0)])
+
+
+def run_width(runs: list[tuple[str, str]], size: float) -> float:
+    """Inches ``runs`` take on one line."""
+    return sum(face("b" in flags.split(), "i" in flags.split()).getlength(words) * run_size(flags, size) / 100 / 72
+               for words, flags in runs)
+
+
+def aside(number: list[tuple[str, str]], claim: list[str]) -> Block:
+    """A key number in giant type with its claim, one bold line per entry, set beside it as a headline."""
+    return Block("aside", ([Para(number, NUMBER, bullet=False, after=0)],
+                           [Para([(words, flags + " b") for words, flags in marked(line)], HEADLINE, bullet=False,
+                                 after=0) for line in claim]))
+
+
+QR = 2.6
+"""Inches: the side of the QR code to the repository."""
+
+
+def code(lines: list[str]) -> Block:
+    """A QR code to the repository with its address beside it."""
+    return Block("qr", [Para([(line, "b" if index else "")], BODY, bullet=False, after=0) for index, line in enumerate(lines)])
+
+
+def row(*children: list, shares: tuple = ()) -> Block:
+    """Stacks side by side, a gutter apart, each taking its share of the width (equal shares by default)."""
+    return Block("row", shares or (1 / len(children),) * len(children), children=list(children))
+
+
+def parts(block: Block, width: float) -> list[float]:
+    """The widths of a row's stacks."""
+    room = width - GUTTER * (len(block.children) - 1)
+    return [room * share for share in block.content]
+
+
+def figure(path: Path, flex: bool = False, legend: Path | None = None) -> Block:
+    return Block("figure", path, flex=flex, legend=legend or path.with_suffix(".txt"))
+
+
+class Poster:
+    def __init__(self, xml: str, rels: str, media: Path) -> None:
+        self.xml, self.rels, self.media = xml, rels, media
+        self.shapes: list[str] = []
+        self.next_id = 200
+        self.images: dict[Path, str] = {}
+        self.qr = Path(tempfile.mkdtemp(prefix="svpgs_qr_")) / "qr.png"
+        import qrcode
+
+        qrcode.make("https://github.com/SauersML/SV-PGS", border=1, box_size=40).save(self.qr)
+
+    def fresh(self) -> int:
+        self.next_id += 1
+        return self.next_id
+
+    def image(self, path: Path) -> str:
+        """The relationship id of ``path`` copied into the deck's media, without an alpha channel when it is opaque (so
+        a PDF export draws no soft mask over the white page)."""
+        if path not in self.images:
+            from PIL import Image
+
+            rel = f"rIdSvpgs{len(self.images) + 1}"
+            with Image.open(path) as picture:
+                if picture.mode == "RGBA" and picture.getchannel("A").getextrema() == (255, 255):
+                    picture.convert("RGB").save(self.media / f"svpgs_{path.name}")
+                else:
+                    shutil.copy(path, self.media / f"svpgs_{path.name}")
+            self.rels = self.rels.replace(
+                "</Relationships>",
+                f'<Relationship Id="{rel}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                f'Target="../media/svpgs_{path.name}"/></Relationships>')
+            self.images[path] = rel
+        return self.images[path]
+
+    # heights
+
+    def natural(self, block: Block, width: float) -> float:
+        if block.kind == "bar":
+            return BAR
+        if block.kind == "text":
+            paragraphs = block.content
+            return (sum(para.height(width - 2 * INSET) for para in paragraphs)
+                    + sum(para.after for para in paragraphs[:-1]) / 72)
+        if block.kind == "figure":
+            pixels_w, pixels_h = png_size(block.content)
+            return 0.0 if block.flex else width * pixels_h / pixels_w
+        if block.kind == "placeholder":
+            return 0.0
+        if block.kind == "qr":
+            return QR
+        if block.kind == "row":
+            return max(self.stack_height(child, part) for child, part in zip(block.children, parts(block, width)))
+        if block.kind == "aside":
+            number, claim = block.content
+            return max(sum(para.height(width) for para in number), sum(para.height(width) for para in claim))
+        raise ValueError(block.kind)
+
+    def most(self, block: Block, width: float) -> float:
+        """The tallest a flex block can use: a figure as tall as the column's width lets it be, a placeholder any."""
+        if block.kind == "figure":
+            pixels_w, pixels_h = png_size(block.content)
+            return width * pixels_h / pixels_w
+        return math.inf
+
+    def stack_height(self, blocks: list[Block], width: float) -> float:
+        return (sum(self.natural(block, width) for block in blocks)
+                + sum(gap(previous, block) for previous, block in zip(blocks, blocks[1:])))
+
+    # placing
+
+    def place(self, block: Block, x: float, y: float, width: float, height: float) -> None:
+        if block.kind == "bar":
+            shape_id, label = block.content
+            self.xml = move(self.xml, shape_id, x, y, width, BAR)
+            start, end = shape_span(self.xml, shape_id)
+            shape = re.sub(r"<a:t>[^<]*</a:t>", f"<a:t>{escape(label, quote=False)}</a:t>", self.xml[start:end], count=1)
+            shape = re.sub(r'sz="\d+"', f'sz="{BAR_SIZE * 100}"', shape)
+            shape = re.sub(r'(<a:rPr lang="en-US" sz="\d+") b="0"', r'\1 b="1"', shape)
+            self.xml = self.xml[:start] + shape + self.xml[end:]
+        elif block.kind == "text":
+            paragraphs = "".join(para.xml() for para in block.content)
+            self.shapes.append(textbox(self.fresh(), "Text", x, y, width, height, paragraphs))
+        elif block.kind == "figure":
+            pixels_w, pixels_h = png_size(block.content)
+            shown = min(width, height * pixels_w / pixels_h)
+            description = block.legend.read_text().split(". ")[0] if block.legend.is_file() else block.content.stem
+            self.shapes.append(image(self.fresh(), block.content.stem, self.image(block.content), x, y, shown,
+                                     shown * pixels_h / pixels_w, description))
+        elif block.kind == "placeholder":
+            self.shapes.append(placeholder(self.fresh(), x, y, width, height, *block.content))
+        elif block.kind == "qr":
+            self.shapes.append(image(self.fresh(), "Repository QR code", self.image(self.qr), x + INSET, y, QR, QR,
+                                     "QR code to github.com/SauersML/SV-PGS"))
+            words = sum(para.height(width - QR - 3 * INSET) for para in block.content)
+            paragraphs = "".join(para.xml() for para in block.content)
+            self.shapes.append(textbox(self.fresh(), "Repository", x + QR + INSET, y + (QR - words) / 2,
+                                       width - QR - INSET, words, paragraphs))
+        elif block.kind == "aside":
+            number, claim = block.content
+            across = run_width(number[0].runs, number[0].size) + 2 * INSET + 0.4
+            tall = sum(para.height(width) for para in number)
+            words = sum(para.height(width - across) for para in claim)
+            self.shapes.append(textbox(self.fresh(), "Key number", x, y + (height - tall) / 2, across, tall,
+                                       "".join(para.xml() for para in number)))
+            self.shapes.append(textbox(self.fresh(), "Claim", x + across - INSET, y + (height - words) / 2,
+                                       width - across + INSET, words, "".join(para.xml() for para in claim)))
+        elif block.kind == "row":
+            for child, part in zip(block.children, parts(block, width)):
+                self.stack(child, x, y, part, None)
+                x += part + GUTTER
+
+    def stack(self, blocks: list[Block], x: float, top: float, width: float, bottom: float | None) -> float:
+        """Place ``blocks`` top down; with a ``bottom``, flex blocks share the room left (a figure no taller than the
+        column's width allows), then the section breaks take what remains (up to JUSTIFY_LIMIT each), so the column
+        ends on the bottom margin."""
+        room = (bottom - top - self.stack_height(blocks, width)) if bottom is not None else 0.0
+        if room < 0:
+            raise SystemExit(f"column at x = {x:.2f} in runs {-room:.2f} in past the bottom margin")
+        flexible = sorted((block for block in blocks if block.flex), key=lambda block: self.most(block, width))
+        heights = {}
+        for index, block in enumerate(flexible):
+            heights[id(block)] = min(self.most(block, width), room / (len(flexible) - index))
+            room -= heights[id(block)]
+        breaks = sum(block.gap == "section" for block in blocks[1:])
+        spread = min(room / breaks, JUSTIFY_LIMIT) if breaks else 0.0
+        y = top
+        for index, block in enumerate(blocks):
+            if index:
+                y += gap(blocks[index - 1], block) + (spread if block.gap == "section" else 0.0)
+            height = heights[id(block)] if block.flex else self.natural(block, width)
+            self.place(block, x, y, width, height)
+            y += height
+        return y
+
+
+def aou_blocks() -> list[Block]:
+    """The All of Us figures drawn locally (figures/aou_*.png), each with its .txt's title and bullets, or the
+    placeholders."""
+    drawn = sorted(FIGURES.glob("aou_*.png")) or [path for name in ("fig_aou_effects.png", "fig_aou_diseases.png")
+                                                   if (path := FIGURES / name).is_file()]
+    if not drawn:
+        return [Block("placeholder", entry, flex=True) for entry in PLACEHOLDERS]
+    blocks = []
+    for path in drawn:
+        notes = path.with_suffix(".txt")
+        lines = [line.strip() for line in notes.read_text().splitlines() if line.strip()] if notes.is_file() else []
+        if lines:
+            blocks.append(headline(lines[0]))
+        blocks.append(figure(path, flex=True))
+        if lines[1:]:
+            blocks.append(text(bullets(lines[1:])))
+    return blocks
+
+
 def build() -> None:
+    numbers_path = GALLERY / "numbers.json"
+    if not numbers_path.is_file():
+        raise SystemExit(f"{numbers_path} is missing: run sim_gallery.py first")
+    words = copy(json.loads(numbers_path.read_text()))
+
     work = Path(tempfile.mkdtemp(prefix="svpgs_pptx_"))
     with zipfile.ZipFile(TEMPLATE) as archive:
         archive.extractall(work)
@@ -482,178 +669,51 @@ def build() -> None:
     types = work / "[Content_Types].xml"
     types.write_text(re.sub(r'<Override PartName="/ppt/comments/[^"]+"[^>]*/>', "", types.read_text()))
 
-    # the figures as media of their own
-    figures = {
-        "equation": "equation.png", "accuracy": "ph_sim_accuracy.png",
-        "advantage": "ph_sim_advantage.png", "genotypes": "ph_sim_genotypes.png", "hypertension": "ph_aou_hypertension.png",
-        "diseases": "ph_aou_diseases.png",
-    }
-    # the per-scenario gains exist once the grid has more than one scenario (figures.py)
-    if (FIGURES / "fig_sim_architectures.png").is_file():
-        figures["architectures"] = "fig_sim_architectures.png"
-    if (FIGURES / "fig_sim_window.png").is_file():
-        figures["window"] = "fig_sim_window.png"
-    # the All of Us figures, once aou_results.py has drawn them from a run's exported tables into this directory
-    for key, name in (("hypertension", "fig_aou_effects.png"), ("diseases", "fig_aou_diseases.png")):
-        if (FIGURES / name).is_file():
-            figures[key] = name
-    ids = {}
-    for index, (key, name) in enumerate(figures.items()):
-        target = f"svpgs_{name}"
-        shutil.copy(FIGURES / name, work / "ppt/media" / target)
-        ids[key] = f"rIdSvpgs{index + 1}"
-        rels = rels.replace(
-            "</Relationships>",
-            f'<Relationship Id="{ids[key]}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/{target}"/></Relationships>',
-        )
+    # a white page, so the figures' white grounds meet it without an edge
+    xml = re.sub(r"<p:bg>.*?</p:bg>", '<p:bg><p:bgPr><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>'
+                 "<a:effectLst/></p:bgPr></p:bg>", xml, count=1, flags=re.S)
+    xml = header(xml)
+    # every text box, figure and caption of the template's own study; its header, wordmark and bars stay
+    for shape_id in (92, 94, 98, 99, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114):
+        xml = delete(xml, shape_id)
+    xml = duplicate(duplicate(xml, 93, 118, "Simulation results bar"), 93, 119, "All of Us bar")
 
-    # header: the abstract's title (two lines, as the template sets it), then its authors and affiliations
-    title = "".join(
-        '<a:p><a:pPr marL="0" lvl="0" indent="0" algn="l" rtl="0"><a:spcBef><a:spcPts val="0"/></a:spcBef><a:spcAft><a:spcPts val="0"/></a:spcAft><a:buNone/></a:pPr>'
-        + f'<a:r><a:rPr lang="en-US" sz="7600" b="1" dirty="0"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill>{FONT}</a:rPr><a:t>{escape(text)}</a:t></a:r></a:p>'
-        for text in TITLE
-    )
-    xml = replace_text(xml, 89, title)
-    authors, affiliations = authors_and_affiliations()
-    author_runs: list[tuple[str, str]] = []
-    for position, (name, marks) in enumerate(authors):
-        author_runs.append((name, ""))
-        if marks:
-            author_runs.append((marks.replace(" ", ""), "sup"))
-        if position < len(authors) - 1:
-            author_runs.append((", ", ""))
-    plain = "".join(text for text, _flags in author_runs)
-    # the template's three-name line (about 56 characters at 72 pt) clears the wordmark with room for some 64
-    names_size = min(7200, 7200 * 64 // max(len(plain), 1) // 100 * 100)
-    affiliation_lines = [
-        line([(entry.split(" ", 1)[0], "sup"), (entry.split(" ", 1)[1], "")], 2200, "FFFFFF") for entry in affiliations
+    gallery = {name: GALLERY / f"{name}.png" for name in (
+        "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy")}
+    model = [para for formula, gloss in EQUATION for para in (
+        Para(formula, BODY, bullet=False, after=4), Para([(gloss, "")], GLOSS, bullet=False, colour=GREY, after=20))]
+    columns = [
+        [
+            bar(97, "Introduction"), text(bullets(words["introduction"])),
+            bar(91, "Methods"), text(model), text(bullets(words["methods"])),
+            bar(93, "Simulation design"), text(bullets(words["design"])),
+            headline(words["svs_title"]),
+            figure(gallery["poster_imputation_accuracy"], flex=True, legend=GALLERY / "fig5_simulated_svs.txt"),
+            text(bullets(words["svs"])),
+        ],
+        [
+            bar(118, "Simulation results"),
+            row([callout(words["accuracy_number"], words["accuracy"]),
+                 figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
+                [callout(words["versus_number"], words["versus"]),
+                 figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
+            Block("aside", aside(words["gain_number"], words["gain_claim"]).content, gap="section"),
+            figure(gallery["poster_sv_gain"], legend=GALLERY / "fig3_sv_gain_true_vs_imputed.txt"),
+            text(bullets(words["gain"])),
+        ],
+        [
+            bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks(),
+            bar(95, "Discussion"), text(bullets(words["discussion"])),
+            bar(96, "References"), text([Para([(entry, "")], REFERENCE, bullet=False, after=6) for entry in REFERENCES]),
+            code(words["code"]),
+        ],
     ]
-    xml = replace_text(xml, 90, line(author_runs, names_size, "FFFFFF", after=300) + "".join(affiliation_lines))
-    xml = move(xml, 90, 1.37, 2.55, 32.5, 2.9)
-    for patch in (102, 103, 104, 105, 108, 111):
-        xml = delete(xml, patch)
+    poster = Poster(xml, rels, work / "ppt/media")
+    for (x, width), blocks in zip(COLUMNS, columns):
+        poster.stack(blocks, x, TOP, width, BOTTOM)
+    xml = poster.xml.replace("</p:spTree>", "".join(poster.shapes) + "</p:spTree>")
+    rels = poster.rels
 
-    # the template's shapes, duplicated where the poster needs more of a kind: section bars, pictures, captions, text
-    for source, new, name in (
-        (93, 118, "Simulation results bar"), (93, 119, "All of Us bar"),
-        (106, 120, "Simulation genotypes"), (106, 121, "Hypertension"), (106, 122, "Diseases"),
-        (113, 123, "Simulation genotypes caption"), (113, 124, "Hypertension caption"), (113, 125, "Diseases caption"),
-        (94, 126, "Simulation accuracy text"), (94, 127, "Simulation genotypes text"), (94, 128, "Hypertension text"),
-        (94, 129, "Diseases text"), (106, 130, "Simulation architectures"), (113, 131, "Simulation architectures caption"),
-        (94, 132, "Simulation methods text"), (106, 133, "Simulation window"), (113, 134, "Simulation window caption"),
-        (94, 135, "Simulation window text"),
-    ):
-        xml = duplicate(xml, source, new, name)
-    for bar, text in BARS.items():
-        xml = retitle(xml, bar, text)
-
-    class Column:
-        """Stacks a column's bars, text boxes, figures and captions top down, each text box as tall as its wrapped
-        text, and refuses to run past the poster's bottom margin."""
-
-        def __init__(self, x: float, width: float) -> None:
-            self.x, self.width, self.y = x, width, 6.0
-
-        def bar(self, xml: str, shape_id: int) -> str:
-            xml = move(xml, shape_id, self.x, self.y, self.width, 0.9)
-            self.y += 1.0
-            return xml
-
-        def text(self, xml: str, shape_id: int, items: list, paragraphs=body, indent: float = BULLET_INDENT) -> str:
-            left, top, right, bottom = insets(xml, shape_id)
-            room = self.width - left - right - indent
-            height = top + bottom + sum(wrapped_lines(item, room, 49) * 49 * LINE_PITCH / 72 + 6 / 72 for item in items)
-            xml = move(xml, shape_id, self.x, self.y, self.width, height)
-            self.y += height + 0.15
-            return replace_text(xml, shape_id, paragraphs(items))
-
-        def figure(self, xml: str, shape_id: int, key: str, width: float | None = None, x: float | None = None) -> str:
-            width = width or self.width - 0.25
-            pixels_w, pixels_h = png_size(FIGURES / figures[key])
-            height = width * pixels_h / pixels_w
-            xml = move(picture(xml, shape_id, ids[key]), shape_id, self.x + 0.12 if x is None else x, self.y, width, height)
-            self.y += height
-            return xml
-
-        def caption(self, xml: str, shape_id: int, text: str, width: float | None = None, x: float | None = None) -> str:
-            width = width or self.width - 0.25
-            left, top, right, bottom = insets(xml, shape_id)
-            height = top + bottom + wrapped_lines([(text, "")], width - left - right, 49, italic=True) * 49 * 1.17 / 72
-            xml = move(xml, shape_id, self.x + 0.12 if x is None else x, self.y, width, height)
-            self.y += height + 0.3
-            return replace_text(xml, shape_id, caption(text))
-
-        def finish(self) -> None:
-            if self.y > 35.75:
-                raise SystemExit(f"column at x = {self.x} in runs to {self.y:.2f} in, past the bottom margin (35.75 in)")
-
-    # the template's own picture and caption that no section uses
-    xml = delete(delete(xml, 107), 114)
-
-    # column 1: introduction, methods with the model, the simulation's design
-    column = Column(1.01, 13.6)
-    xml = column.bar(xml, 97)
-    xml = column.text(xml, 98, INTRODUCTION)
-    xml = column.bar(xml, 91)
-    xml = column.figure(xml, 110, "equation", width=13.2)
-    xml = column.text(xml, 92, METHODS)
-    xml = column.bar(xml, 93)
-    xml = column.text(xml, 94, SIMULATION_DESIGN)
-    column.finish()
-
-    # column 2: the simulation's results, in four figures
-    column = Column(14.85, 17.2)
-    xml = column.bar(xml, 118)
-    xml = column.text(xml, 132, SIMULATION_METHODS)
-    xml = column.figure(xml, 101, "accuracy")
-    xml = column.caption(xml, 112, "Test AUC (mean and 95% t interval)")
-    xml = column.text(xml, 126, SIMULATION_ACCURACY)
-    half = (column.width - 0.5) / 2
-    top = column.y
-    xml = column.figure(xml, 106, "advantage", width=half)
-    xml = column.caption(xml, 113, "Gain over LDpred2-auto", width=half)
-    # the text below starts under the taller of the two figure-and-caption stacks
-    left_bottom, column.y = column.y, top
-    xml = column.figure(xml, 120, "genotypes", width=half, x=column.x + 0.37 + half)
-    xml = column.caption(xml, 123, "SV genotype accuracy", width=half, x=column.x + 0.37 + half)
-    column.y = max(column.y, left_bottom)
-    xml = column.text(xml, 127, SIMULATION_GENOTYPES)
-    # the window study covers the architectures at every size with more replicates: its figure takes their place
-    if "architectures" in figures and "window" not in figures:
-        xml = column.figure(xml, 130, "architectures")
-        xml = column.caption(xml, 131, "AUC gain by architecture (95% t interval)")
-    else:
-        xml = delete(delete(xml, 130), 131)
-    if "window" in figures:
-        xml = column.figure(xml, 133, "window")
-        xml = column.caption(xml, 134, "AUC gain from adding SVs, chr22 window")
-        xml = column.text(xml, 135, WINDOW) if WINDOW else delete(xml, 135)
-    else:
-        xml = delete(delete(delete(xml, 133), 134), 135)
-    column.finish()
-
-    # column 3: All of Us (hypertension, then the diseases), discussion, references
-    column = Column(32.25, 15.65)
-    xml = column.bar(xml, 119)
-    xml = column.text(xml, 128, HYPERTENSION)
-    xml = column.figure(xml, 121, "hypertension")
-    xml = column.caption(xml, 124, "SV effects on hypertension" if figures["hypertension"].startswith("ph_")
-                         else "SV effect variance relative to SNVs on hypertension, by SV class and length")
-    xml = column.text(xml, 129, DISEASES)
-    xml = column.figure(xml, 122, "diseases")
-    xml = column.caption(xml, 125, "Test AUC by disease" if figures["diseases"].startswith("ph_")
-                         else "Held-out partial r² by disease, and the gain from adding SVs (95% CI)")
-    xml = column.bar(xml, 95)
-    xml = column.text(xml, 109, DISCUSSION)
-    xml = column.bar(xml, 96)
-    xml = column.text(xml, 99, [[(reference, "")] for reference in REFERENCES], indent=0.0,
-                      paragraphs=lambda items: "".join(line(runs, 4900, "000000", after=600, spacing=90000) for runs in items))
-    column.finish()
-
-    # the section bars all at the template's 60 pt (its References bar was set smaller)
-    for bar in BARS:
-        start, end = shape_span(xml, bar)
-        xml = xml[:start] + re.sub(r'sz="\d+"', 'sz="6000"', xml[start:end]) + xml[end:]
     # one sans-serif face throughout, which PowerPoint and LibreOffice (as metric-identical Liberation Sans) set alike
     xml = xml.replace('typeface="Century Schoolbook"', 'typeface="Arial"').replace('typeface="Merriweather"', 'typeface="Arial"')
     # the comment anchor in the slide's extensions, and every relationship the new slide no longer references (the old
@@ -679,3 +739,4 @@ def build() -> None:
 
 if __name__ == "__main__":
     build()
+
