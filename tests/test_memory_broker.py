@@ -221,6 +221,46 @@ def test_a_metered_pool_counts_its_live_bytes_and_admits_caches_from_what_they_l
         broker.make_room("device0", 60, "past what anything frees")
 
 
+def test_an_allocation_the_ledger_would_refuse_first_collects_unreachable_cycles():
+    # A replaced hyper step's closures form reference cycles that reach device arrays (full_data_fit._collect_cycles),
+    # and Python's collector runs on object counts, not bytes. CuPy's pool collects before it refuses; the ledger refuses
+    # before the pool is asked, so it collects once before refusing, and a request past what that frees is still refused.
+    import gc
+
+    broker, allocate, state = _metered_device(1000)
+
+    class Block:
+        def __init__(self, units: int) -> None:
+            self.units = units
+
+        def __del__(self) -> None:
+            state["used"] -= self.units
+            state["cached"] += self.units
+
+    class Step:
+        pass
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        gc.collect()
+        allocate(600)
+        step = Step()
+        step.itself = step
+        step.block = Block(600)
+        del step
+        assert broker.held("device0") == 600 * _UNIT
+        assert allocate(700) == 700, "the cycle's 600 units are collected and returned before the ledger refuses"
+        assert broker.held("device0") == 700 * _UNIT
+        calls = state["calls"]
+        with pytest.raises(_Refused):
+            allocate(400)
+        assert state["calls"] == calls
+    finally:
+        if enabled:
+            gc.enable()
+
+
 def test_a_scope_shares_one_ledger_and_outside_it_each_caller_has_its_own():
     assert current_broker() is None
     with memory_scope(_budget(1000)) as broker:

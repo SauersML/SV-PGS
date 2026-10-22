@@ -2780,99 +2780,45 @@ def _directional_derivatives(
             both = _host(xp.stack([third_here, fourth_here]))
             third += both[0]
             fourth += both[1]
-    for class_position, rows, terms in (() if not prior.scale_size else _class_terms(prior, coefficients, cavity, working_bytes)):
-        xp = _DEVICE.get()
-        weights = terms.responsibility
-        steps = xp.asarray(directions_z[class_position * grid_size : (class_position + 1) * grid_size])
-        scale_steps = xp.asarray(prior.scale_design[rows]) @ xp.asarray(directions_z[scale_span])
-        # Per variant, with no direction in them: the derivatives centred in their row and their w-moments.
-        first = terms.first
-        centred = first - xp.sum(weights * first, axis=1, keepdims=True)
-        del first
-        second = terms.second
-        centred_second = second - xp.sum(weights * second, axis=1, keepdims=True)
-        del second
-        third_terms = terms.third
-        mean_third = xp.sum(weights * third_terms, axis=1)
-        centred_third = third_terms - mean_third[:, None]
-        del third_terms
-        mean_fourth = xp.sum(weights * terms.fourth, axis=1)
-        weighted = weights * centred
-        weighted_square = weighted * centred
-        weighted_cube = weighted_square * centred
-        weighted_second = weights * centred_second
-        weighted_mixed = weighted * centred_second
-        weighted_third = weights * centred_third
-        square_mean = xp.sum(weighted_square, axis=1)
-        cube_mean = xp.sum(weighted_cube, axis=1)
-        fourth_power_mean = xp.sum(weighted_cube * centred, axis=1)
-        mixed_mean = xp.sum(weighted_mixed, axis=1)
-        mixed_square_mean = xp.sum(weighted_square * centred_second, axis=1)
-        second_square_mean = xp.sum(weighted_second * centred_second, axis=1)
-        third_mixed_mean = xp.sum(weighted * centred_third, axis=1)
-        del centred, centred_second, centred_third
-        modes = xp.argmax(weights, axis=1)
-        # Reserve all seven possible gathered node arrays (weights and the six weighted arrays), and 29 named
-        # row-by-direction arrays below plus five expression temporaries. The named arrays are four moments,
-        # six cross moments, four derivative moments, s, eight u moments, three central moments and three mixed
-        # derivatives. The available four row-by-node arrays are the seven plus three temporaries reserved by
-        # _ROW_INTERMEDIATES, less the six weighted arrays retained above. This bounds piece size, not accuracy.
-        piece = max(1, 4 * weights.shape[0] * grid_size // (7 * grid_size + 34 * directions.shape[1]))
-        third_here = xp.zeros(directions.shape[1])
-        fourth_here = xp.zeros(directions.shape[1])
-        for node in _host(xp.unique(modes)).tolist():
-            members = xp.flatnonzero(modes == node)
-            offset = steps - steps[node][None, :]
-            offset_square = offset * offset
-            offset_cube = offset_square * offset
-            offset_fourth = offset_square * offset_square
-            for begin in range(0, int(members.shape[0]), piece):
-                chosen = members[begin : begin + piece]
-                node_weights = weights[chosen]
-                mean = node_weights @ offset
-                moment_2 = node_weights @ offset_square
-                moment_3 = node_weights @ offset_cube
-                moment_4 = node_weights @ offset_fourth
-                del node_weights
-                part = weighted[chosen]
-                cross_11, cross_21, cross_31 = part @ offset, part @ offset_square, part @ offset_cube
-                part = weighted_square[chosen]
-                cross_12, cross_22 = part @ offset, part @ offset_square
-                cross_13 = weighted_cube[chosen] @ offset
-                part = weighted_second[chosen]
-                second_10, second_20 = part @ offset, part @ offset_square
-                second_11 = weighted_mixed[chosen] @ offset
-                third_10 = weighted_third[chosen] @ offset
-                del part
-                s = scale_steps[chosen]
-                square = square_mean[chosen][:, None]
-                cube = cube_mean[chosen][:, None]
-                mixed = mixed_mean[chosen][:, None]
-                # The central moments of u and its joint moments with l1, from the moments about the modal node.
-                u2 = moment_2 - mean * mean
-                u3 = moment_3 - 3.0 * mean * moment_2 + 2.0 * mean**3
-                u4 = moment_4 - 4.0 * mean * moment_3 + 6.0 * mean * mean * moment_2 - 3.0 * mean**4
-                u2_l1 = cross_21 - 2.0 * mean * cross_11
-                u3_l1 = cross_31 - 3.0 * mean * cross_21 + 3.0 * mean * mean * cross_11
-                u_l1sq = cross_12 - mean * square
-                u2_l1sq = cross_22 - 2.0 * mean * cross_12 + mean * mean * square
-                u_l1cu = cross_13 - mean * cube
-                variance = u2 + 2.0 * s * cross_11 + s * s * square
-                central_3 = u3 + 3.0 * s * u2_l1 + 3.0 * s * s * u_l1sq + s**3 * cube
-                central_4 = u4 + 4.0 * s * u3_l1 + 6.0 * s * s * u2_l1sq + 4.0 * s**3 * u_l1cu + s**4 * fourth_power_mean[chosen][:, None]
-                # E[(u + s l1) g2], E[(u + s l1)^2 g2] and E[(u + s l1) g3]; w'g2 = w'g3 = 0.
-                with_second = second_10 + s * mixed
-                square_with_second = second_20 - 2.0 * mean * second_10 + 2.0 * s * (second_11 - mean * mixed) + s * s * mixed_square_mean[chosen][:, None]
-                with_third = third_10 + s * third_mixed_mean[chosen][:, None]
-                third_here += xp.sum(central_3 + 3.0 * s * s * with_second + s**3 * mean_third[chosen][:, None], axis=0)
-                fourth_here += xp.sum(
-                    central_4 - 3.0 * variance**2 + 6.0 * s * s * square_with_second + 3.0 * s**4 * second_square_mean[chosen][:, None]
-                    + 4.0 * s**3 * with_third + s**4 * mean_fourth[chosen][:, None],
-                    axis=0,
-                )
-        both = _host(xp.stack([third_here, fourth_here]))
-        third += both[0]
-        fourth += both[1]
+    if prior.scale_size:
+        if _DEVICE.get() is not np:
+            # As in ``_variant_derivatives``: the step's held kernel rows are an optional cache the allocator cannot
+            # evict, and this pass forms its own, so it releases them first.
+            cache = _STEP_CACHE.get()
+            if cache is not None:
+                cache.pop("rows", None)
+        # A block of a class's rows at a time, each formed (its kernel rows, their responsibilities and derivatives) and
+        # consumed in one frame (``_scale_direction_block``) that leaves only its two sums, sized from the room the
+        # device has left; a block the ledger refuses is halved, down to one row, and the halved size caps every later
+        # block. The class's chunks of ``_class_terms`` held 22 rows x K arrays where they were sized for 20, refused
+        # allocations outside the retry of ``_kernel_pieces`` (in ``components``, ``derivatives`` and this pass's own
+        # arrays), and kept one chunk's arrays while the next formed: 1.0 GB refused with 40.8 GB held on device0
+        # [real, aou-m1d-h1 hypertension and aou-m2-e1 train-3].
+        scales = log_scale(prior, coefficients)
+        log_density = class_log_density(prior, coefficients)
+        scale_directions = directions_z[scale_span]
+        refused = None
+        for class_position, class_rows in enumerate(prior.class_rows):
+            steps = directions_z[class_position * grid_size : (class_position + 1) * grid_size]
+            limit = _directional_rows(grid_size, directions.shape[1], working_bytes)
+            if refused is not None:
+                limit = min(limit, refused)
+            begin = 0
+            while begin < class_rows.shape[0]:
+                size = min(limit, class_rows.shape[0] - begin)
+                try:
+                    both = _scale_direction_block(
+                        prior, scales, log_density[class_position], cavity, class_rows[begin : begin + size], steps, scale_directions,
+                    )
+                except MemoryError:
+                    if size == 1:
+                        raise
+                    limit = refused = (size + 1) // 2
+                    log(f"eb laplace: a block of {size} rows was refused; blocks of {limit} rows from here in this pass")
+                    continue
+                third += both[0]
+                fourth += both[1]
+                begin += size
     for class_position, class_rows in enumerate(prior.class_rows):
         span = slice(class_position * grid_size, (class_position + 1) * grid_size)
         class_density = density[class_position]
@@ -2883,6 +2829,138 @@ def _directional_derivatives(
             third[column] -= class_rows.shape[0] * float(class_density @ centred**3)
             fourth[column] -= class_rows.shape[0] * (float(class_density @ centred**4) - 3.0 * variance**2)
     return third, fourth
+
+
+# The rows x K float64 arrays ``_scale_direction_moments`` holds at once, per row: the three centred derivatives and the
+# six weighted arrays with one expression temporary, and, once the centred ones are freed, the six weighted arrays with
+# the four its node pieces take (``piece``).
+_DIRECTIONAL_ROW_ARRAYS = 10
+
+
+def _directional_rows(grid_size: int, direction_count: int, working_bytes: int) -> int:
+    """Rows of one block of ``_scale_direction_block``: as many as leave its arrays within the room the device has left
+    (``_device_room``), at least one. Per row: its kernel rows (``_HELD_ARRAYS_PER_ROW_SET``, the derivatives formed),
+    their responsibilities and ``_DIRECTIONAL_ROW_ARRAYS``, rows x K arrays with a per-row value each, and its scale
+    steps (one entry per direction). Forming the kernel rows and their derivatives peaks below that."""
+    arrays = _HELD_ARRAYS_PER_ROW_SET + 1 + _DIRECTIONAL_ROW_ARRAYS
+    per_row = np.dtype(np.float64).itemsize * (arrays * (grid_size + 1) + direction_count)
+    return max(1, _device_room(working_bytes) // per_row)
+
+
+def _scale_direction_block(
+    prior: ScaleMixturePrior, scales: F64Array, log_density: F64Array, cavity: Cavity, rows: I64Array, steps: F64Array, scale_directions: F64Array,
+) -> F64Array:
+    """The sums over ``rows`` (one class's) of the third and the fourth derivatives along every direction with an
+    annotation design, on the fit's device: [third, fourth] on the host. Its kernel rows, responsibilities, derivatives
+    and moments are formed and freed in this frame, so a refused block's arrays are gone before the next is formed and
+    nothing of one block is held while the next forms."""
+    xp = _DEVICE.get()
+    kernel_rows = _KernelRows(
+        xp.asarray(scales[rows]), xp.asarray(prior.log_variance_grid), xp.asarray(cavity.precision[rows]), xp.asarray(cavity.shift[rows])
+    )
+    terms = kernel_rows.components(log_density)
+    del kernel_rows
+    moments = _scale_direction_moments(
+        xp, terms.responsibility, (terms.first, terms.second, terms.third, terms.fourth), xp.asarray(steps),
+        xp.asarray(prior.scale_design[rows]) @ xp.asarray(scale_directions),
+    )
+    del terms
+    return _host(xp.stack(moments))
+
+
+def _scale_direction_moments(xp: ModuleType, weights: F64Array, derivatives: tuple, steps: F64Array, scale_steps: F64Array) -> tuple:
+    """One block's sums of the third and the fourth derivatives along every direction with an annotation design
+    (``_directional_derivatives``), on ``xp``: ``weights`` the block's responsibilities, ``derivatives`` its rows of
+    d^n log Z_jk / d eta^n for n = 1..4, ``steps`` the class's density steps (K x directions) and ``scale_steps`` the
+    block's b_e (rows x directions). Each node piece's arrays are freed before the next piece forms its own."""
+    first, second, third_terms, fourth_terms = derivatives
+    grid_size, direction_count = int(steps.shape[0]), int(steps.shape[1])
+    # Per variant, with no direction in them: the derivatives centred in their row and their w-moments.
+    centred = first - xp.sum(weights * first, axis=1, keepdims=True)
+    centred_second = second - xp.sum(weights * second, axis=1, keepdims=True)
+    mean_third = xp.sum(weights * third_terms, axis=1)
+    centred_third = third_terms - mean_third[:, None]
+    mean_fourth = xp.sum(weights * fourth_terms, axis=1)
+    weighted = weights * centred
+    weighted_square = weighted * centred
+    weighted_cube = weighted_square * centred
+    weighted_second = weights * centred_second
+    weighted_mixed = weighted * centred_second
+    weighted_third = weights * centred_third
+    square_mean = xp.sum(weighted_square, axis=1)
+    cube_mean = xp.sum(weighted_cube, axis=1)
+    fourth_power_mean = xp.sum(weighted_cube * centred, axis=1)
+    mixed_mean = xp.sum(weighted_mixed, axis=1)
+    mixed_square_mean = xp.sum(weighted_square * centred_second, axis=1)
+    second_square_mean = xp.sum(weighted_second * centred_second, axis=1)
+    third_mixed_mean = xp.sum(weighted * centred_third, axis=1)
+    del centred, centred_second, centred_third
+    modes = xp.argmax(weights, axis=1)
+    # Reserve all seven possible gathered node arrays (weights and the six weighted arrays), and 29 named
+    # row-by-direction arrays below plus five expression temporaries. The named arrays are four moments,
+    # six cross moments, four derivative moments, s, eight u moments, three central moments and three mixed
+    # derivatives. The available four row-by-node arrays are the block's ``_DIRECTIONAL_ROW_ARRAYS`` less the six
+    # weighted arrays retained above. This bounds piece size, not accuracy.
+    piece = max(1, 4 * weights.shape[0] * grid_size // (7 * grid_size + 34 * direction_count))
+    third_here = xp.zeros(direction_count)
+    fourth_here = xp.zeros(direction_count)
+    for node in _host(xp.unique(modes)).tolist():
+        members = xp.flatnonzero(modes == node)
+        offset = steps - steps[node][None, :]
+        offset_square = offset * offset
+        offset_cube = offset_square * offset
+        offset_fourth = offset_square * offset_square
+        for begin in range(0, int(members.shape[0]), piece):
+            chosen = members[begin : begin + piece]
+            node_weights = weights[chosen]
+            mean = node_weights @ offset
+            moment_2 = node_weights @ offset_square
+            moment_3 = node_weights @ offset_cube
+            moment_4 = node_weights @ offset_fourth
+            del node_weights
+            part = weighted[chosen]
+            cross_11, cross_21, cross_31 = part @ offset, part @ offset_square, part @ offset_cube
+            part = weighted_square[chosen]
+            cross_12, cross_22 = part @ offset, part @ offset_square
+            cross_13 = weighted_cube[chosen] @ offset
+            part = weighted_second[chosen]
+            second_10, second_20 = part @ offset, part @ offset_square
+            second_11 = weighted_mixed[chosen] @ offset
+            third_10 = weighted_third[chosen] @ offset
+            del part
+            s = scale_steps[chosen]
+            square = square_mean[chosen][:, None]
+            cube = cube_mean[chosen][:, None]
+            mixed = mixed_mean[chosen][:, None]
+            # The central moments of u and its joint moments with l1, from the moments about the modal node.
+            u2 = moment_2 - mean * mean
+            u3 = moment_3 - 3.0 * mean * moment_2 + 2.0 * mean**3
+            u4 = moment_4 - 4.0 * mean * moment_3 + 6.0 * mean * mean * moment_2 - 3.0 * mean**4
+            u2_l1 = cross_21 - 2.0 * mean * cross_11
+            u3_l1 = cross_31 - 3.0 * mean * cross_21 + 3.0 * mean * mean * cross_11
+            u_l1sq = cross_12 - mean * square
+            u2_l1sq = cross_22 - 2.0 * mean * cross_12 + mean * mean * square
+            u_l1cu = cross_13 - mean * cube
+            variance = u2 + 2.0 * s * cross_11 + s * s * square
+            central_3 = u3 + 3.0 * s * u2_l1 + 3.0 * s * s * u_l1sq + s**3 * cube
+            central_4 = u4 + 4.0 * s * u3_l1 + 6.0 * s * s * u2_l1sq + 4.0 * s**3 * u_l1cu + s**4 * fourth_power_mean[chosen][:, None]
+            # E[(u + s l1) g2], E[(u + s l1)^2 g2] and E[(u + s l1) g3]; w'g2 = w'g3 = 0.
+            with_second = second_10 + s * mixed
+            square_with_second = second_20 - 2.0 * mean * second_10 + 2.0 * s * (second_11 - mean * mixed) + s * s * mixed_square_mean[chosen][:, None]
+            with_third = third_10 + s * third_mixed_mean[chosen][:, None]
+            third_here += xp.sum(central_3 + 3.0 * s * s * with_second + s**3 * mean_third[chosen][:, None], axis=0)
+            fourth_here += xp.sum(
+                central_4 - 3.0 * variance**2 + 6.0 * s * s * square_with_second + 3.0 * s**4 * second_square_mean[chosen][:, None]
+                + 4.0 * s**3 * with_third + s**4 * mean_fourth[chosen][:, None],
+                axis=0,
+            )
+            # Freed here, not as the next piece rebinds each name: the piece size counts one piece's arrays.
+            del (
+                chosen, mean, moment_2, moment_3, moment_4, cross_11, cross_21, cross_31, cross_12, cross_22, cross_13, second_10, second_20,
+                second_11, third_10, s, square, cube, mixed, u2, u3, u4, u2_l1, u3_l1, u_l1sq, u2_l1sq, u_l1cu, variance, central_3,
+                central_4, with_second, square_with_second, with_third,
+            )
+    return third_here, fourth_here
 
 
 @numba.njit(cache=True, error_model="numpy", inline="always")

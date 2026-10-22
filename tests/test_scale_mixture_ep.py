@@ -792,6 +792,64 @@ def test_directional_derivatives_of_every_direction_at_once_are_the_direct_cumul
     np.testing.assert_allclose(fourth, expected_fourth, rtol=1e-9, atol=1e-9 * np.max(np.abs(expected_fourth)))
 
 
+def test_directional_derivatives_in_row_blocks_and_after_refused_blocks_are_the_whole_chunks(monkeypatch):
+    # With an annotation design the Laplace pass forms each chunk's moments a block of rows at a time and halves a block
+    # the ledger refuses (the whole chunk at once refused 1.0 GB with 40.8 GB held on device0 [real, aou-m1d-h1]): any
+    # blocking sums the same per-row terms, so the derivatives agree with the whole chunk's to rounding.
+    prior, cavity = _problem(variant_count=400, seed=41, node_count=24)
+    assert prior.scale_size
+    coefficients = _hyperparameters(prior, 42).coefficients
+    directions = np.random.default_rng(43).standard_normal((prior.coefficient_size, 9))
+    working_bytes = engine._ROW_INTERMEDIATES * 8 * prior.grid_size * prior.variant_count
+    monkeypatch.setattr(engine, "_directional_rows", lambda grid_size, direction_count, working_bytes: prior.variant_count)
+    whole = _directional_derivatives(prior, coefficients, cavity, directions, working_bytes)
+    monkeypatch.setattr(engine, "_directional_rows", lambda grid_size, direction_count, working_bytes: 7)
+    sizes: list[int] = []
+    moments = engine._scale_direction_moments
+
+    def counted(xp, weights, derivatives, steps, scale_steps):
+        sizes.append(int(weights.shape[0]))
+        return moments(xp, weights, derivatives, steps, scale_steps)
+
+    monkeypatch.setattr(engine, "_scale_direction_moments", counted)
+    blocked = _directional_derivatives(prior, coefficients, cavity, directions, working_bytes)
+    assert max(sizes) == 7 and sum(sizes) == prior.variant_count
+    for got, expected in zip(blocked, whole):
+        np.testing.assert_allclose(got, expected, rtol=1e-11, atol=1e-11 * np.max(np.abs(expected)))
+
+    # A refused block is halved, down to one row, and the halved size holds for the class's later blocks.
+    monkeypatch.setattr(engine, "_directional_rows", lambda grid_size, direction_count, working_bytes: prior.variant_count)
+    sizes.clear()
+
+    def refusing(xp, weights, derivatives, steps, scale_steps):
+        if weights.shape[0] > 5:
+            raise MemoryError("a device allocation needs more than the budget holds")
+        return counted(xp, weights, derivatives, steps, scale_steps)
+
+    monkeypatch.setattr(engine, "_scale_direction_moments", refusing)
+    halved = _directional_derivatives(prior, coefficients, cavity, directions, working_bytes)
+    assert max(sizes) <= 5 and sum(sizes) == prior.variant_count
+    for got, expected in zip(halved, whole):
+        np.testing.assert_allclose(got, expected, rtol=1e-11, atol=1e-11 * np.max(np.abs(expected)))
+
+    # A refused single row is a refusal of the pass.
+    monkeypatch.setattr(engine, "_scale_direction_moments", lambda *arguments: (_ for _ in ()).throw(MemoryError("refused")))
+    with pytest.raises(MemoryError):
+        _directional_derivatives(prior, coefficients, cavity, directions, working_bytes)
+
+
+def test_directional_blocks_are_sized_from_the_room_the_device_has_left(monkeypatch):
+    # Per row: the block's kernel rows, their responsibilities and its moments' rows x K arrays, each with a per-row
+    # value, and its scale steps; at least one row.
+    grid_size, direction_count = 24, 9
+    arrays = engine._HELD_ARRAYS_PER_ROW_SET + 1 + engine._DIRECTIONAL_ROW_ARRAYS
+    per_row = 8 * (arrays * (grid_size + 1) + direction_count)
+    monkeypatch.setattr(engine, "_device_room", lambda working_bytes: min(working_bytes, 7 * per_row + per_row - 1))
+    assert engine._directional_rows(grid_size, direction_count, 1 << 40) == 7
+    assert engine._directional_rows(grid_size, direction_count, 3 * per_row) == 3
+    assert engine._directional_rows(grid_size, direction_count, 1) == 1
+
+
 def test_quadrature_corrections_are_the_exact_integrals_along_the_standardized_directions():
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
