@@ -115,8 +115,10 @@
   }
  },
  "poster_wins": {
+  "train_count": 40000,
   "replicates": 59,
   "wins": 59,
+  "clear": 46,
   "null_replicates": 6,
   "architectures": 13
  },

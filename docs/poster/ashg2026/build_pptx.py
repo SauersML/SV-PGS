@@ -62,8 +62,6 @@ INSET = 0.3
 """Text sits this far inside its column, under the section bars' labels."""
 BAR, BAR_SIZE = 1.0, 54
 BODY, HEADLINE, GLOSS, REFERENCE = 40, 40, 40, 32
-NUMBER = 120
-"""Points: a key number over its figure."""
 LINE_PITCH = 1.066
 """Line pitch per point of type at 90% line spacing, measured on the LibreOffice render."""
 SHIFTED_PITCH = 0.25
@@ -139,7 +137,7 @@ def copy(numbers: dict) -> dict:
     ours, theirs = accuracy["SV-PGS"], accuracy["LDpred2-auto"]  # [mean, lower, upper, n] per size
     # the smallest training set on which SV-PGS clears LDpred2-auto trained on the largest
     sooner = next((size for size, cell in zip(sizes, ours) if cell[1] > theirs[-1][2]), None)
-    every = wins["wins"] == wins["replicates"]
+    beaten = "all" if wins["wins"] == wins["replicates"] else f"{wins['wins']} of"
     share = gain["imputed_sum"] / gain["true_sum"]
     imputed_well = gain["rows"]["tagged_sv_fold3"]
     kept_well = imputed_well["imputed"][0] / imputed_well["true"][0]
@@ -161,8 +159,7 @@ def copy(numbers: dict) -> dict:
         "svs_title": "Rare SVs impute poorly",
         "accuracy": f"SV-PGS trained on {people(sooner)} people beat LDpred2-auto trained on {people(sizes[-1])} "
                     f"(AUC{NBSP}{auc(ours[sizes.index(sooner)][0])}{NBSP}vs{NBSP}{auc(theirs[-1][0])})" if sooner else "",
-        "versus_number": [(f"{wins['wins']} of {wins['replicates']}", "b blue")],
-        "versus": f"simulated data sets where SV-PGS beats LDpred2-auto, both trained on {people(sizes[-1])}{NBSP}people",
+        "versus": f"SV-PGS was more accurate in {beaten} {wins['replicates']} traits",
         "gain_title": f"Imputed SV genotypes gave {share:.0%} of the AUC gain of true SV genotypes",
         "gain": [f"The {gain['clear']} of {gain['shown']} architectures where true SV genotypes raised AUC (95% CI above "
                  "0), in one 3 Mb window of chr22",
@@ -430,12 +427,6 @@ def headline(sentence: str, gap: str = "block") -> Block:
     return block
 
 
-def callout(number: list[tuple[str, str]] | None, statement: str) -> Block:
-    """A key number in giant type over the one sentence that says what it counts."""
-    paragraphs = [Para(number, NUMBER, bullet=False, after=2)] if number else []
-    return text(paragraphs + [Para(marked(statement), BODY, bullet=False, after=0)])
-
-
 QR = 2.6
 """Inches: the side of the QR code to the repository."""
 
@@ -646,7 +637,7 @@ def build() -> None:
             bar(118, "Simulation results"),
             row([*([headline(words["accuracy"])] if words["accuracy"] else []),
                  figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
-                [callout(words["versus_number"], words["versus"]),
+                [headline(words["versus"]),
                  figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
             headline(words["gain_title"], gap="section"),
             figure(gallery["poster_sv_gain"], legend=GALLERY / "fig3_sv_gain_true_vs_imputed.txt"),

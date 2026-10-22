@@ -783,22 +783,6 @@ POSTER_STYLE = {
 }
 
 
-def swarm(values, across: float, diameter: float) -> list[float]:
-    """Vertical offsets, in inches, that stack ``values`` (an axis ``across`` inches per data unit) into a beeswarm of
-    dots ``diameter`` inches wide: each dot, smallest value first, goes at the offset nearest the centre line where it
-    overlaps no dot already placed."""
-    placed: list[tuple[float, float]] = []
-    offsets = [0.0] * len(values)
-    for index in np.argsort(values):
-        x = values[index] * across
-        candidates = sorted({0.0, *(y + sign * math.sqrt(max(diameter ** 2 - (x - px) ** 2, 0.0))
-                                    for px, y in placed if abs(x - px) < diameter for sign in (1, -1))}, key=abs)
-        offsets[index] = next(y for y in candidates
-                              if all((x - px) ** 2 + (y - py) ** 2 >= diameter ** 2 * 0.999 for px, py in placed))
-        placed.append((x, offsets[index]))
-    return offsets
-
-
 def poster_accuracy_figure(grids, summary):
     """Figure 1a for the poster: test AUC against training size for SV-PGS and LDpred2-auto, pooled over 0%, 5% and 20%
     causal SVs, each method named beside its line and its AUC at the largest size written after its last mark, under
@@ -834,44 +818,49 @@ def poster_accuracy_figure(grids, summary):
     return fig
 
 
+POSTER_WINS_HEIGHT = 7.6
+"""Inches: the height of the figure of every simulated trait's two test AUCs, beside Figure 1a."""
+
+
 def poster_wins_figure(grids):
-    """Every replicate's paired AUC difference between SV-PGS and LDpred2-auto at the largest training size, in every
-    architecture, as one beeswarm right of a zero line; the replicates with no causal SVs are dark."""
+    """SV-PGS's test AUC against LDpred2-auto's for every simulated trait at the largest training size, over the line of
+    equal AUC: one dot per trait (black with no causal SVs), with the 95% interval of the paired AUC difference drawn
+    through it, so a dot above the line is a trait SV-PGS predicted better."""
     size = SIZES[-1]
     grouped = cells(grids["grid"])
-    found = {point: finite(grouped.get((point, size), []), "delta_auc_vs_ldpred2") for point in LABELS}
-    kept = [point for point in LABELS if found[point]]
-    values = np.asarray([value for point in kept for value in found[point]])
-    null = np.asarray([point == "null" for point in kept for _ in found[point]])
-    NUMBERS["poster_wins"] = {"replicates": int(values.size), "wins": int((values > 0).sum()),
-                              "null_replicates": int(null.sum()), "architectures": len(kept)}
-    fig = plt.figure(figsize=(POSTER_HALF, POSTER_HEIGHT))
-    top, bottom, left, right = 0.25, 2.05, 0.45, 0.75
-    width, height = POSTER_HALF - left - right, POSTER_HEIGHT - top - bottom
-    ax = frame(fig, left, bottom, width, height)
-    limits = (-0.008, 0.082)
-    diameter = 0.44
-    offsets = np.asarray(swarm(values, width / (limits[1] - limits[0]), diameter))
-    # one data unit on y is one inch, so the dots stay round; the words and arrow take the top 1.5 in, the swarm sits
-    # centred in the rest
-    ax.set_ylim(-height / 2, height / 2)
-    upper, words = height / 2 - 0.1, 1.4
-    centre = (upper - words - height / 2) / 2 - (offsets.max() + offsets.min()) / 2
-    area = (diameter * 72) ** 2 * 0.9
-    ax.scatter(values[~null], centre + offsets[~null], s=area, color=SV_PGS, linewidths=0, zorder=3)
-    ax.scatter(values[null], centre + offsets[null], s=area, color=INK, linewidths=0, zorder=3)
-    ax.axvline(0, color=INK, linewidth=5.0, zorder=2)
-    ax.set_xlim(*limits)
-    ax.set_yticks([])
-    ax.spines["left"].set_visible(False)
-    ticks = np.arange(0, limits[1], 0.02)
-    ax.set_xticks(ticks, [plain(tick) for tick in ticks])
-    ax.set_xlabel("AUC gain over LDpred2-auto")
-    ax.text(0.003, upper, "SV-PGS better", color=SV_PGS, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top")
-    ax.text(0.081, upper, "Black: no\ncausal SVs", color=INK, fontweight="bold", ha="right", va="top", linespacing=1.05)
-    ax.annotate("", xy=(0.052, upper - 1.05), xytext=(0.003, upper - 1.05), xycoords="data",
-                arrowprops={"arrowstyle": "-|>,head_length=0.9,head_width=0.45", "color": SV_PGS, "linewidth": 5.0,
-                            "shrinkA": 0, "shrinkB": 0})
+    rows = [row for point in LABELS for row in grouped.get((point, size), [])
+            if row.get("delta_auc_vs_ldpred2") is not None and math.isfinite(row["delta_auc_vs_ldpred2"])]
+    theirs = np.asarray([row["ldpred2_auc"] for row in rows])
+    gain = np.asarray([row["delta_auc_vs_ldpred2"] for row in rows])
+    ours = theirs + gain
+    # the paired test's standard error is the gain over its z
+    half = stats.norm.ppf(0.975) * np.abs(gain / np.asarray([row["z_vs_ldpred2"] for row in rows]))
+    null = np.asarray([row["point"] == "null" for row in rows])
+    NUMBERS["poster_wins"] = {"train_count": size, "replicates": len(rows), "wins": int((gain > 0).sum()),
+                              "clear": int((gain - half > 0).sum()), "null_replicates": int(null.sum()),
+                              "architectures": len({row["point"] for row in rows})}
+    fig = plt.figure(figsize=(POSTER_HALF, POSTER_WINS_HEIGHT))
+    ticks = widest(fig, ["0.00"], fontsize=POSTER_TYPE)
+    top, bottom, left, right = 0.25, 2.05, ticks + 1.6, 0.3
+    ax = frame(fig, left, bottom, POSTER_HALF - left - right, POSTER_WINS_HEIGHT - top - bottom)
+    limits = (0.465, 0.68)
+    ax.axline((limits[0], limits[0]), slope=1, color=INK, linewidth=4.0, zorder=1)
+    for chosen, color in ((~null, SV_PGS), (null, INK)):
+        ax.vlines(theirs[chosen], ours[chosen] - half[chosen], ours[chosen] + half[chosen], color=color,
+                  linewidth=POSTER_BAR * 0.5, zorder=2)
+        ax.plot(theirs[chosen], ours[chosen], "o", markersize=POSTER_MARK * 0.8, color=color, markeredgewidth=0,
+                linestyle="none", zorder=3)
+    ax.set_xlim(limits[0], 0.635)
+    ax.set_ylim(*limits)
+    ax.set_xticks([0.5, 0.55, 0.6], ["0.50", "0.55", "0.60"])
+    ax.set_yticks([0.5, 0.55, 0.6, 0.65], ["0.50", "0.55", "0.60", "0.65"])
+    # both titles run longer than their axis, so each ends at the axis's far end
+    ax.set_xlabel("LDpred2-auto test AUC", loc="right")
+    ax.set_ylabel("SV-PGS test AUC", loc="top")
+    ax.text(limits[0] + 0.005, limits[1] - 0.005, "SV-PGS\nbetter", color=SV_PGS, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top",
+            linespacing=1.0)
+    ax.text(0.632, limits[0] + 0.004, "Black: no\ncausal SVs", color=INK, fontweight="bold", ha="right", va="bottom",
+            linespacing=1.0)
     return fig
 
 
