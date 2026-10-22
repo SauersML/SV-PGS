@@ -13,4 +13,5 @@ verify_fix.txt
 # All of Us results drawn for the poster (aou_results.py): aggregate, but kept out of the public repository until the
 # results are released
 docs/poster/ashg2026/figures/fig_aou_*
-docs/poster/ashg2026/figures/aou_*.tsv
+docs/poster/ashg2026/figures/aou_*
+docs/poster/ashg2026/aou_numbers.json
