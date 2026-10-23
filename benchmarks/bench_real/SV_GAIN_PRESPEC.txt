@@ -1,4 +1,4 @@
-SV gain in All of Us: pre-specified analysis, amendment 4
+SV gain in All of Us: pre-specified analysis, amendment 5
 Written 2026-10-22 17:58 PDT and committed before any matched pairing run other than aou-wl15 had been scored.
 
 What had been seen when this was written
@@ -211,6 +211,38 @@ Continued fits (amendment 4, written 2026-10-22 about 23:20 PDT, after hypertens
   If not, the pre-amendment result is reported at that time, labelled as such, with the uncertified arms flagged. The
   amendment-4 result follows when the continuations finish, and it is the primary result.
 
+
+Frozen primary and two tests of g (amendment 5, written 2026-10-23 about 00:15 PDT, after a read-only review of this
+analysis and after the interim combination; the primary has not run)
+- Amendment 4 is withdrawn as the primary. It was triggered by an outcome: a negative result (hypertension, -53.7%,
+  read 23:14 PDT) prompted a second fit that a positive result might not have prompted, and an uncertified arm does not
+  prove that non-convergence caused the loss. The primary is the original frozen analysis as it stood before amendment
+  4: the primary statistic on the original fits, uncertified arms counted and flagged as amendment 2 says. Keeping it
+  is the conservative direction.
+- The continued fits (round c4: aou-c4-h1/h2, -g1/g2, -l1/l2, submitted together 23:50 PDT) still run. Their result is
+  a post-amendment sensitivity analysis, reported beside the primary and labelled as such, with its trigger (above),
+  its times (amendment 4 written about 23:20 PDT, runs submitted 23:50 PDT, finish time), both results, and each
+  continued arm's certificate before and after.
+- g is tested two ways. Both are one-sided, H1: g > 0 at 0.05, and both are reported every time.
+  - Weak null, g = 0: the family-clustered bootstrap test. z = g / SE, the SE taken over the joint family bootstrap
+    resamples with the weights a held fixed. One-sided p = 1 - Phi(z), with g's one-sided 95% lower bound g - 1.645 SE
+    and upper bound g + 1.645 SE.
+  - Sharp null: the family arm-swap permutation p tests that the two arms' scores are exchangeable within families.
+    That is stronger than g = 0. Two scores can be equally accurate and still differ in distribution, and g = 0 allows
+    traits whose gains have opposite signs. Its observed statistic is computed from the same bootstrap resamples, and
+    as many, as each swapped one.
+  - SVs are said to raise accuracy only if both p are below 0.05. If one is below 0.05 and the other is not, both are
+    reported and the result is called inconclusive. Neither is chosen after the two are seen. This replaces the
+    Calibration rule that set the normal p aside when the primary z's null SD fell outside 0.8 to 1.25. That null SD is
+    still reported, as a check of the bootstrap SE under the sharp null.
+- Wording and computing fixes that change no test definition:
+  - g is a fraction of the two arms' mean partial r^2, not of the snv_indel arm's, as the Primary section already
+    defines it. Every label and bound says so. A trait's printed share is a r^2 / sum(a r^2), the weight its own
+    gain / r^2 takes in g.
+  - Several runs of one trait (LDL) are merged with their family memberships joined across the runs, so two people in
+    one family in any of the runs share a bootstrap cluster and a swap coin.
+  - REML + HKSJ treats the traits as independent although they share people. It is reported as an independence-based
+    sensitivity analysis.
 
 Results seen (log; no test definition changes because of them)
 - Before 2bf5cb24: aou-wl15 (LDL), as listed at the top.
