@@ -36,7 +36,7 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Protocol, Sequence
@@ -289,17 +289,6 @@ class BlockStatistics:
     @property
     def width(self) -> int:
         return self.stop - self.start
-
-    def on_host(self, buffer: GenotypeBuffer) -> BlockStatistics:
-        """The same statistics as NumPy arrays (``buffer`` holds the block)."""
-        return replace(
-            self,
-            sums=buffer.to_host(self.sums),
-            grams=buffer.to_host(self.grams),
-            cross_products=None if self.cross_products is None else buffer.to_host(self.cross_products),
-            previous_grams=None if self.previous_grams is None else buffer.to_host(self.previous_grams),
-            array_module=np,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -670,7 +659,7 @@ def read_array(path: Path, offset: int, shape: tuple[int, int], dtype: np.dtype,
 class LdGramStore:
     """The projected LD blocks of one fit on disk (memory-mapped, read by Stage 2).
 
-    ``correlation_block(b) = X~_b^T X~_b / n``, with
+    Block b's LD is ``block(b).projected_gram / n`` = X~_b^T X~_b / n, with
     the per-column diagonal and within-block LD scores computed once in Stage 0, and the sums the fit would otherwise
     read every Gram again for: each block's lag profile (``lag_excess``) and its squared Grams' sums (``square_columns``,
     ``adjacent_square_rows``, ``adjacent_square_columns``, ``square_sum``, ``adjacent_square_sum``).
@@ -752,10 +741,6 @@ class LdGramStore:
 
     def _read(self, name: str, offset: int, shape: tuple[int, int], out: NDArray | None) -> NDArray:
         return read_array(self.directory / _LD_ARRAYS[name][0], offset, shape, np.dtype(_LD_ARRAYS[name][1]), out)
-
-    def correlation_block(self, block_index: int) -> NDArray[np.float32]:
-        """``R_b = X~_b^T X~_b / n`` (exactly symmetric, float32)."""
-        return self.block(block_index).projected_gram * np.float32(1.0 / self.sample_count)
 
     def lag_excess(self, block_index: int) -> NDArray[np.float64]:
         """Block ``block_index``'s LD by lag, one entry per lag up to its width: its ordered pairs' summed r^2 less their

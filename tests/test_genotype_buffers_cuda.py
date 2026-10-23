@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -24,6 +26,18 @@ def _source(seed: int, variant_counts: dict[str, int]) -> InMemoryTileSource:
     )
 
 
+def _on_host(block, buffer):
+    """The block's statistics as NumPy arrays (``buffer`` holds the block)."""
+    return replace(
+        block,
+        sums=buffer.to_host(block.sums),
+        grams=buffer.to_host(block.grams),
+        cross_products=None if block.cross_products is None else buffer.to_host(block.cross_products),
+        previous_grams=None if block.previous_grams is None else buffer.to_host(block.previous_grams),
+        array_module=np,
+    )
+
+
 def _run(source, sample_groups, backend_kind, columns, devices=1):
     layout = build_sample_layout(sample_groups, profile_target=300)
     plan = plan_genotype_pass(BLOCK_CAP)
@@ -36,7 +50,7 @@ def _run(source, sample_groups, backend_kind, columns, devices=1):
             for index in range(devices)
         ]
     blocks = []
-    summary = run_genotype_pass(source, layout, buffers, plan, lambda block, buffer: blocks.append(block.on_host(buffer)))
+    summary = run_genotype_pass(source, layout, buffers, plan, lambda block, buffer: blocks.append(_on_host(block, buffer)))
     return summary, sorted(blocks, key=lambda block: (block.chromosome, block.start))
 
 

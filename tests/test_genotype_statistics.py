@@ -279,7 +279,7 @@ def test_projected_ld_matches_a_dense_float64_reference(tmp_path) -> None:
     ])
     np.testing.assert_allclose(ld.ld_scores(), reference_scores, rtol=2e-5)
     for block_index in range(ld.block_count):
-        block_correlation = ld.correlation_block(block_index)
+        block_correlation = ld.block(block_index).projected_gram * np.float32(1.0 / ld.sample_count)
         assert block_correlation.dtype == np.float32
         np.testing.assert_array_equal(block_correlation, block_correlation.T)
     # the adjacent blocks' coupling: every intermediate is a sum of at most n + k terms of
