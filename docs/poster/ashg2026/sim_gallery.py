@@ -46,7 +46,7 @@ SUMMARY = HERE / "simulation_summary.json"
 OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "figures" / "gallery"
 SIZES = (5_000, 10_000, 20_000, 40_000)
 PEOPLE = 50_000
-"""People in the simulated cohort (bench-sim v7): the training people and the 10,000 held out."""
+"""Individuals in the simulated cohort (bench-sim v7): the training individuals and the 10,000 held out."""
 
 WIDE = 22.32
 """Inches: the poster's middle column (build_pptx.py's MIDDLE, 22.92) less its 0.3 in INSET each side, the width a
@@ -182,7 +182,7 @@ NUMBERS: dict = {}
 """What each figure shows, by figure, for numbers.json: means with Student-t 95% intervals as [mean, lower, upper, n]."""
 ARCHITECTURES = (
     "The baseline architecture has liability h² = 0.1, prevalence 10%, 200 causal variants and 20% causal SVs with SV "
-    "effects drawn like small-variant effects; each other architecture changes one or more of these settings or how "
+    "effects drawn like small-variant effects. Each other architecture changes one or more of these settings or how "
     "SV effects are drawn: '3×' triples the SV effect SD, "
     "'a few very large' draws SV effects from a Student t with 3 degrees of freedom, 'all one size' gives every causal "
     "SV the same effect size with a random sign, 'well-imputed' draws causal SVs only from those imputed with r² ≥ 0.8, "
@@ -416,19 +416,19 @@ def accuracy_figure(grids, summary, height: float = 9.6):
     gap.set_ylim(-0.006, 0.08)
     gap.set_yticks(np.arange(0, 0.061, 0.02))
     gap.set_ylabel("ΔAUC, SV-PGS − LDpred2-auto")
-    gap.legend(title="Causal SVs; bars: 95% CI", loc="upper left", ncol=3, handlelength=2.2, columnspacing=1.0, handletextpad=0.4,
+    gap.legend(title="Causal SVs (bars: 95% CI)", loc="upper left", ncol=3, handlelength=2.2, columnspacing=1.0, handletextpad=0.4,
                alignment="left", borderaxespad=0.0)
     heading(gap, "Same gain with no causal SVs", "b", across=-1.95)
     caption = (
         "Figure 1 | SV-PGS is more accurate than LDpred2-auto at every training size, by a similar margin whether 0%, "
         "5% or 20% of the causal variants are SVs, so the gain does not come from causal SVs. "
         "A simulated binary trait on chromosome 22 (liability h² = 0.1, "
-        "prevalence 10%, 200 causal variants) scored in the same 10,000 held-out people; SV-PGS fits every SNV, indel "
-        "and imputed SV, LDpred2-auto HapMap3-density SNVs of the same training people. a, Test AUC, mean and "
+        "prevalence 10%, 200 causal variants) scored in the same 10,000 held-out individuals. SV-PGS fits every SNV, indel "
+        "and imputed SV, and LDpred2-auto HapMap3-density SNVs of the same training individuals. a, Test AUC, mean and "
         "Student-t 95% interval over the three settings' simulations pooled ("
         + ", ".join(f"{n}" for n in counts["SV-PGS"])
-        + " at 5k-40k); dotted, the largest AUC any score can reach, that of the true genetic value at h² = 0.1 (Wray "
-        "et al. 2010). b, Paired difference in AUC on the same held-out people, per setting, mean and Student-t 95% "
+        + " at 5k-40k). Dotted line: the largest AUC any score can reach, that of the true genetic value at h² = 0.1 (Wray "
+        "et al. 2010). b, Paired difference in AUC on the same held-out individuals, per setting, mean and Student-t 95% "
         "interval."
     )
     return fig, caption
@@ -474,11 +474,11 @@ def ldpred2_figure(grids):
     ax.set_xlabel("ΔAUC, SV-PGS − LDpred2-auto")
     caption = (
         f"Figure 2 | SV-PGS is more accurate than LDpred2-auto across simulated genetic architectures. Paired difference "
-        f"in test AUC on the same 10,000 held-out people between SV-PGS (every SNV, indel and imputed SV) and "
-        f"LDpred2-auto (HapMap3-density SNVs), both trained on the same {size:,} people: each simulation (light blue), mean and "
-        f"Student-t 95% interval (blue; an arrowhead marks one that runs past {limits[1]:.2f}), n simulations at right. "
+        f"in test AUC on the same 10,000 held-out individuals between SV-PGS (every SNV, indel and imputed SV) and "
+        f"LDpred2-auto (HapMap3-density SNVs), both trained on the same {size:,} individuals: each simulation (light blue), mean and "
+        f"Student-t 95% interval (blue, with an arrowhead where one runs past {limits[1]:.2f}), n simulations at right. "
         f"SV-PGS had the higher AUC in {wins} of {total} simulations. {ARCHITECTURES} Fewer than three simulations at "
-        f"{size:,}: {'; '.join(sentence(PLAIN.get(point, LABELS[point])) for point in missing)}."
+        f"{size:,}: {', '.join(sentence(PLAIN.get(point, LABELS[point])) for point in missing)}."
     )
     return fig, caption
 
@@ -486,8 +486,10 @@ def ldpred2_figure(grids):
 # ------------------------------------------------------------------ Figure 3
 
 
-SOURCES = (("True SV genotypes", SV_PGS, True), ("Imputed SV genotypes", IMPUTED, False))
-"""Figures 3 and 4's two genotype sources: their legend names, colours and whether their means are filled."""
+SOURCES = (("True genotypes", SV_PGS, True), ("Called SNVs and imputed SVs", IMPUTED, False))
+"""Figures 3 and 4's two genotype sources: their legend names, colours and whether their means are filled. The true
+source (grid.py --measurement truth) has every record at its true genotype. The other (the beagle arm) has SNVs and
+indels called from simulated reads and TRs and SVs imputed by Beagle, so the two differ in their SNVs too."""
 
 
 def source_legend(ax, across: float, up: float) -> None:
@@ -501,7 +503,7 @@ def source_legend(ax, across: float, up: float) -> None:
 def sv_gain_figure(grids):
     """The gain from adding SVs per architecture with true and with imputed SV genotypes, over simulations: each
     simulation's gain is its mean over the training sizes both sources finished (benchmarks/power/truths.py), since a
-    simulation's sizes share its causal variants and test people and are not independent replicates."""
+    simulation's sizes share its causal variants and test individuals and are not independent replicates."""
     gains = truth_gains(grids["window-truth"], grids["window"])
     true = {point: [gain for _, gain, _ in rows] for point, rows in gains.items()}
     imputed = {point: [gain for _, _, gain in rows] for point, rows in gains.items()}
@@ -549,15 +551,15 @@ def sv_gain_figure(grids):
               f"{plain(float(farthest), 3)}." if spread > 0 and abs(farthest - np.median(others)) > 3.5 * spread else "")
     named = ", ".join(f"'{SHORT[point]}'" for point in clear)
     caption = (
-        f"Figure 3 | Adding SVs changed test AUC little in each architecture; with true SV genotypes the gain's interval "
+        f"Figure 3 | Adding SVs changed test AUC little in each architecture. With true genotypes the gain's interval "
         f"lies above zero for {len(clear)} of {len(shown)} architectures{': ' + named if clear else ''}. Paired "
-        "difference in test AUC on the same held-out people between SV-PGS fitted with and without SVs on one 3 Mb "
-        "chromosome 22 window (60,000 records), with every SV measured by its true genotype (filled) or imputed by "
-        "Beagle from SNV haplotypes (open). Each simulation's difference is its mean over the training sizes both "
-        f"genotype sources finished, from {sizes[0]:,} to {sizes[-1]:,} (Figure 4 shows the sizes apart); mean and "
+        "difference in test AUC on the same held-out individuals between SV-PGS fitted with and without SVs on one 3 Mb "
+        "chromosome 22 window (60,000 records), with true genotypes at every variant (filled) or with SNVs and indels "
+        "called from simulated reads and SVs imputed by Beagle (open). Each simulation's difference is its mean over the training sizes both "
+        f"genotype sources finished, from {sizes[0]:,} to {sizes[-1]:,} (Figure 4 shows the sizes apart). Mean and "
         f"Student-t 95% interval over {min(counts)}-{max(counts)} simulations per architecture, an arrowhead marking "
-        "an interval that runs off the axis. Same simulated people, causal variants and fits; only the SV genotypes "
-        f"differ.{driven} {ARCHITECTURES}"
+        "an interval that runs off the axis. Both sources use the same simulated individuals and causal variants."
+        f"{driven} {ARCHITECTURES}"
     )
     return fig, caption
 
@@ -645,12 +647,12 @@ def size_figure(grids):
     caption = (
         f"Figure 4 | The gain from adding SVs at each training size from {sizes[0]:,} to {sizes[-1]:,}, for each "
         "simulated architecture. Each panel shows the paired difference in test AUC between SV-PGS fitted with and "
-        "without SVs on one 3 Mb chromosome 22 window, with SVs measured by their true genotypes (filled) or imputed by "
-        "Beagle (open): the mean over simulations and its Student-t 95% interval. Each panel has its own y-axis scale. "
+        "without SVs on one 3 Mb chromosome 22 window, with true genotypes at every variant (filled) or with SNVs called "
+        "from simulated reads and SVs imputed by Beagle (open): the mean over simulations and its Student-t 95% interval. Each panel has its own y-axis scale. "
         "A mean is drawn when its training size has at least three simulations. Each simulation uses the same causal "
-        "variants and the same test people at every training size. We fitted "
-        f"{min(few)}-{max(few)} simulations per architecture and genotype source at {largest:,} training people, too "
-        f"few to show; Figure 3 averages them into each simulation's gain. {ARCHITECTURES}"
+        "variants and the same test individuals at every training size. We fitted "
+        f"{min(few)}-{max(few)} simulations per architecture and genotype source at {largest:,} training individuals, too "
+        f"few to show. Figure 3 averages them into each simulation's gain. {ARCHITECTURES}"
     )
     return fig, caption
 
@@ -765,13 +767,13 @@ def genotype_figure(summary):
                        "classes": {label: int(mask.sum()) for label, mask, _ in groups}}
     caption = (
         f"Figure 5 | The simulated SVs are mostly rare and short, and rare SVs impute poorly. a, The r² of each "
-        f"variant's measured dosage with its true genotype over all {PEOPLE:,} simulated people (not Beagle's DR2), "
+        f"variant's measured dosage with its true genotype over all {PEOPLE:,} simulated individuals (not Beagle's DR2), "
         f"for {accuracy['SV']['records']:,} SVs imputed by Beagle and {accuracy['SNV']['records']:,} sampled SNVs "
         f"called from simulated reads on chromosome 22, by "
-        f"minor allele frequency: each bin's median (points) with an approximate 95% interval ({MEDIAN_Z:.2f} IQR/√n; "
+        f"minor allele frequency: each bin's median (points) with an approximate 95% interval ({MEDIAN_Z:.2f} IQR/√n, "
         f"bars), SNVs black and SVs blue. b, Lengths of the "
         f"{int(records['measured'].sum()):,} measured SVs, stacked by class (records without a type are classed by the "
-        f"sign of their length change)" + ("; the insertions' peak near 300 bp is where Alu elements lie" if alu else "")
+        f"sign of their length change)" + (". The insertions' peak near 300 bp is where Alu elements lie" if alu else "")
         + ". bench-sim v7 cohort from public 1000 Genomes haplotypes."
     )
     return fig, caption
@@ -835,7 +837,7 @@ def poster_accuracy_figure(grids, summary):
             color=INK, ha="left", va="bottom")
     ax.set_ylim(0.49, ceiling + 0.03)
     ax.set_yticks(np.arange(0.5, 0.651, 0.05), ["0.50", "0.55", "0.60", "0.65"])
-    ax.set_ylabel("Test AUC")
+    ax.set_ylabel("Mean test AUC (95% CI)")
     return fig
 
 
@@ -885,10 +887,13 @@ def poster_wins_figure(grids):
     # the x axis's title runs longer than its axis, so it ends at the axis's far end
     ax.set_xlabel("LDpred2-auto test AUC", loc="right")
     ax.set_ylabel("SV-PGS test AUC")
-    ax.text(low + 0.005, upper - 0.005, "SV-PGS\nbetter", color=SV_PGS, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top",
-            linespacing=1.0)
-    # under the line, where no dot falls: the training size at the foot, the key to the black dots over it
-    ax.text(right - 0.003, low + 0.003, f"Trained on\n{size:,} people", color=INK, ha="right", va="bottom",
+    # over the dots at the top left, on one line each and reaching into the top margin, so the second line clears the
+    # highest bar: which side is SV-PGS's, then the training size
+    ax.text(low + 0.005, upper + 0.006, "SV-PGS better", color=SV_PGS, fontsize=POSTER_NAME, fontweight="bold",
+            ha="left", va="top")
+    ax.text(low + 0.005, upper - 0.019, f"Training N = {size:,}", color=INK, ha="left", va="top")
+    # under the line, where no dot falls: what a dot and its bar are at the foot, the key to the black dots over them
+    ax.text(right - 0.003, low + 0.003, "Dot: simulation\nBar: 95% CI", color=INK, ha="right", va="bottom",
             linespacing=1.0)
     ax.text(right - 0.003, low + 0.058, "Black: no\ncausal SVs", color=INK, fontweight="bold", ha="right", va="bottom",
             linespacing=1.0)
@@ -901,20 +906,24 @@ sv_min_realized_r2)."""
 POSTER_GAIN, POSTER_GENOTYPES = 22.92, 11.4
 """Inches: the widths of the SV gain forest (the poster's middle column, build_pptx.py's MIDDLE) and the imputation
 figure (the left column, LEFT), each placed at its column's full width."""
+FOREST_SIZES = SIZES[:3]
+"""The training sizes the SV gain forest averages over, 5,000 to 20,000. Both genotype sources reached 40,000 in one
+simulation only, a control one, and the gain grows with training size: with it, the control's gain with imputed SVs
+was 0.00068 (95% CI 0.00002 to 0.00134), and without it 0.00022 (-0.00084 to 0.00128)."""
 
 
 def gain_sets(grids) -> dict[str, dict]:
-    """The SV gain with true and with imputed SV genotypes over simulated truths (benchmarks/power/truths.py), for every
-    architecture with causal SVs, those whose causal SVs are well imputed, the rest, and the control with no causal
-    SVs: each set's label, architecture count, mean gain per source with its t interval and sign-flip p, and the
-    imputed gain's share of the true gain with Fieller's interval."""
-    gains = truth_gains(grids["window-truth"], grids["window"])
+    """The SV gain with true genotypes and with called SNVs and imputed SVs over simulated truths
+    (benchmarks/power/truths.py) at FOREST_SIZES, for every architecture with causal SVs, those whose causal SVs are
+    well imputed, and the control with no causal SVs: each set's label, architecture count, mean gain per source with
+    its t interval and sign-flip p, and the imputed gain's share of the true gain with Fieller's interval."""
+    gains = truth_gains(*([row for row in grids[grid] if int(row["train_count"]) in FOREST_SIZES]
+                          for grid in ("window-truth", "window")))
     causal = [point for point in LABELS if point != "null" and point in gains]
     sets = {}
     for key, label, points in (
         ("all", f"All {len(causal)} architectures\nwith causal SVs", causal),
         ("well_imputed", "Causal SVs well\nimputed (r² ≥ 0.8)", [point for point in causal if point in WELL_IMPUTED]),
-        ("any_sv", "Causal SVs drawn\nfrom all SVs", [point for point in causal if point not in WELL_IMPUTED]),
         ("null", "No causal SVs\n(control)", ["null"]),
     ):
         true = [gain for point in points for _, gain, _ in gains.get(point, [])]
@@ -925,8 +934,8 @@ def gain_sets(grids) -> dict[str, dict]:
 
 
 def poster_sv_gain_figure(grids):
-    """The AUC gain from adding SVs with true and with imputed SV genotypes over simulated truths (``gain_sets``), a row
-    per set with its label at the left and the true gain's mean and 95% interval over the imputed gain's; the label of
+    """The AUC gain from adding SVs with true genotypes and with called SNVs and imputed SVs over simulated truths
+    (``gain_sets``), a row per set with its label at the left and the true gain's mean and 95% interval over the imputed gain's; the label of
     the set with well-imputed causal SVs in bold. Returns the figure and its one-sentence description."""
     sets = gain_sets(grids)
 
@@ -941,11 +950,11 @@ def poster_sv_gain_figure(grids):
                  for key, row in sets.items()},
     }
     rows = list(sets.values())
-    pitch, top, bottom, right = 1.7375, 0.25, 2.3, 0.5
-    height = top + bottom + pitch * len(rows)
+    pitch, key, top, bottom, right = 1.7375, 1.0, 0.25, 2.3, 0.5
+    height = key + top + bottom + pitch * len(rows)
     fig = plt.figure(figsize=(POSTER_GAIN, height))
     left = widest(fig, [row["label"] for row in rows], fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0) + 0.75
-    ax = frame(fig, left, bottom, POSTER_GAIN - left - right, height - top - bottom)
+    ax = frame(fig, left, bottom, POSTER_GAIN - left - right, height - key - top - bottom)
     ends = [row[source][end] for row in rows for source in ("true", "imputed") for end in ("lower", "upper")
             if math.isfinite(row[source][end])]
     low, high = min(0.0, *ends), max(ends)
@@ -970,21 +979,22 @@ def poster_sv_gain_figure(grids):
     ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
     ax.set_xticks(ticks, [plain(tick, 3) for tick in ticks])
     ax.set_xlabel("Test AUC gain from adding SVs")
-    # the two genotype sources named in the empty space right of the control row, 0.55 rows apart so the first
-    # name's descenders clear the second's capitals, each after a mark like its own and the longer name ending 0.2 in
-    # inside the plot's right edge
-    across = POSTER_GAIN - left - right - 0.2 - widest(fig, [label for label, _, _ in SOURCES], fontsize=POSTER_TYPE,
-                                                       fontweight="bold")
-    for y, (label, color, filled) in ((len(rows) - 1.35, SOURCES[0]), (len(rows) - 0.8, SOURCES[1])):
-        ax.plot([0], [y], "o", transform=shifted(ax, across - 0.5), markersize=POSTER_MARK, color=color,
+    # the two genotype sources named on one line in the band over the plot, ending at its right edge, each name 0.5 in
+    # after a mark like its own and 1 in after the name before it
+    widths = [widest(fig, [label], fontsize=POSTER_TYPE, fontweight="bold") for label, _, _ in SOURCES]
+    across, up = POSTER_GAIN - right - sum(widths) - 2 * 0.5 - 1.0, height - key / 2
+    for (label, color, filled), width in zip(SOURCES, widths):
+        ax.plot([across], [up], "o", transform=fig.dpi_scale_trans, markersize=POSTER_MARK, color=color,
                 markerfacecolor=color if filled else "white", markeredgecolor=color,
                 markeredgewidth=0 if filled else 6.0, clip_on=False, zorder=4)
-        ax.text(0, y, label, transform=shifted(ax, across), color=color, fontsize=POSTER_TYPE, fontweight="bold",
-                va="center", ha="left")
+        fig.text(across + 0.5, up, label, transform=fig.dpi_scale_trans, color=color, fontsize=POSTER_TYPE,
+                 fontweight="bold", va="center", ha="left")
+        across += 0.5 + width + 1.0
     description = (
-        "Test AUC gain from adding SVs to SV-PGS with true (filled) and Beagle-imputed (open) SV genotypes, mean and 95% "
-        "interval over simulated truths, for every architecture with causal SVs, those whose causal SVs are well "
-        "imputed, the rest, and the control with no causal SVs."
+        "Test AUC gain from adding SVs to SV-PGS with true genotypes (filled) and with SNVs called from simulated reads "
+        "and SVs imputed by Beagle (open), mean and 95% interval over simulations at training N 5,000 to 20,000, for "
+        "every architecture with causal SVs, those whose causal SVs are well imputed, and the control with no causal "
+        "SVs."
     )
     return fig, description
 
@@ -1091,11 +1101,11 @@ def compute_figure(grids):
               borderaxespad=0.0, labelspacing=0.3)
     heading(ax, "Time to fit chromosome 22", across=-1.95)
     caption = (
-        "Figure 6 | SV-PGS fits take hours and LDpred2-auto's minutes; SVs add no time. Wall time of one fit on "
+        "Figure 6 | SV-PGS fits take hours and LDpred2-auto's minutes, and SVs add no time. Wall time of one fit on "
         "chromosome 22 per method and training size, pooled over every architecture: median and its distribution-free "
-        f"95% interval ({min(counts)}-{max(counts)} fits each; capped bars, most within the marks). MSI Slurm jobs, one "
-        "fit per job; SV-PGS fits every variant by empirical Bayes (circles and solid line, with SVs; squares and dashed "
-        "line, without), LDpred2-auto HapMap3-density SNVs. The results do not record each job's hardware, so the gap "
+        f"95% interval ({min(counts)}-{max(counts)} fits each, capped bars, most within the marks). MSI Slurm jobs, one "
+        "fit per job. SV-PGS fits every variant by empirical Bayes (circles and solid line with SVs, squares and dashed "
+        "line without), LDpred2-auto HapMap3-density SNVs. The results do not record each job's hardware, so the gap "
         "compares the methods as they were run, not on equal resources."
     )
     return fig, caption
@@ -1146,7 +1156,7 @@ def canvas(height: float):
 def poster_model_figure():
     """The SV-PGS model for the poster's Methods: an SNV, an indel and an SV on a chromosome, each class with its own
     effect size prior, all fitted together into one score."""
-    height = 4.6
+    height = 4.15
     fig, ax = canvas(height)
     # left to right, in inches: the class names, a stretch of chromosome after the widest, the priors, the arrows, and
     # the score's box as wide as its name
@@ -1154,9 +1164,9 @@ def poster_model_figure():
     stretch = EDGE + widest(fig, [name for name, *_ in VARIANTS], **name_style) + 0.2
     stretch = (stretch, stretch + 1.45)
     box_left = COLUMN - EDGE - widest(fig, ["SV-PGS"], **name_style) - 0.3
-    box_middle, box_tall = 2.05, 1.25
+    box_middle, box_tall = 1.6, 1.25
     centre, reach = (stretch[1] + 0.2 + box_left - 1.1) / 2, (box_left - 1.1 - stretch[1] - 0.2) / 2
-    bases = (2.75, 1.65, 0.55)
+    bases = (2.3, 1.2, 0.1)
     # each class's prior SD in inches, a schematic (empirical Bayes learns the real ones); every prior encloses the
     # same area, so a narrower one stands taller, the SNV's 0.75 in
     spreads = (0.2, 0.28, 0.5)

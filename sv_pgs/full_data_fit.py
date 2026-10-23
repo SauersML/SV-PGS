@@ -2599,8 +2599,15 @@ class _FullDataMeanField:
             return [None] * self.model_count
         try:
             self._iterate(self.site_precision, self.site_shift, self.noise)
-        except np.linalg.LinAlgError as error:
-            self.refusals.append(f"the dual solver has no factor at q's sites: {error}")
+        except (np.linalg.LinAlgError, MemoryError) as error:
+            # The resolved sites are the dual solve's columns (``DualGaussian.iterate``): a trial far from the held point
+            # can resolve more of them than the device holds, and is refused as one with no factor, so the outer loop
+            # halves. The oracle's first call has no point to fall back to.
+            if isinstance(error, MemoryError):
+                if self.refreshes == 0:
+                    raise
+                log(f"mean-field oracle: the trial's dual solve does not fit ({str(error).split(' | ')[0]}); the trial is refused")
+            self.refusals.append(f"the dual solver has no {'room' if isinstance(error, MemoryError) else 'factor'} at q's sites: {error}")
             for model, state in zip(solving, entry):
                 self._restore_state(state, model)
             return [None] * self.model_count

@@ -91,6 +91,7 @@ REFERENCES = [
     "Browning 2018 AJHG",
     "Wray 2010 PLoS Genet",
     "All of Us 2019 N Engl J Med",
+    "Rubinacci 2023 Nat Genet",
 ]
 """First author, year and journal, one to a line, numbered in superscript as the text cites them."""
 SUPERSCRIPT = dict(zip(range(1, 10), "¹²³⁴⁵⁶⁷⁸⁹"))
@@ -128,7 +129,8 @@ def copy(numbers: dict) -> dict:
     return {
         # ¹ is Byrska-Bishop 2022, the first of REFERENCES: ~9,679 SVs discovered per genome
         "introduction": ["Each genome carries ~9,700 structural variants (SVs)¹",
-                         "Polygenic scores rarely use SVs; we test if imputed SVs improve accuracy"],
+                         "Polygenic scores rarely use SVs",
+                         "We test if imputed SVs improve accuracy"],
         "methods": ["Priors depend on imputation r², frequency, SV length"],
         "code": ["Code:", "github.com/", "SauersML/SV-PGS"],
         "design": [
@@ -141,9 +143,11 @@ def copy(numbers: dict) -> dict:
             # 16,000 (benchmarks/bench_sim/submissions/ldpred2_auto.py)
             "SV-PGS: all SNVs, indels and SVs. LDpred2-auto: up to 16,000 SNVs with MAF ≥ 1%",
         ],
-        "whole_note": f"Simulations on whole chr22, tested on {people(accuracy['test_people'])} people",
+        "whole_note": f"Simulations on whole chr22 with test N = {people(accuracy['test_people'])}",
         "gain_note": f"Mean and 95% CI over {simulations} simulations in 3 Mb of chr22",
-        "aou": ["SVs imputed into 50,000 genomes from 12,212 long-read assemblies", *aou_matched()],
+        # GLIMPSE2 is Rubinacci 2023
+        "aou": ["We imputed SVs from 12,212 long-read assemblies into 100,000 All of Us genomes with "
+                f"GLIMPSE2{SUPERSCRIPT[REFERENCES.index('Rubinacci 2023 Nat Genet') + 1]}", *aou_matched()],
         "discussion": [
             f"SV-PGS gained {wins['gain'][0]:.3f} AUC over LDpred2-auto on whole chr22",
             "The gain was as large without causal SVs and grew with h²",
@@ -152,21 +156,14 @@ def copy(numbers: dict) -> dict:
 
 
 def aou_matched() -> list[str]:
-    """The All of Us tests of SV-PGS with SVs against the same model fitted without SVs by identical code, on the
-    same held-out people (aou_numbers.json's "matched" rows: aggregates, every count > 20): what each compares, its
-    held-out people in each genetic ancestry group the figure shows, and its test partial r² without SVs, the scale of
-    the change figures/aou_1_gain.png shows."""
+    """What the All of Us figure compares, when aou_numbers.json holds its "matched" rows (aggregates, every count >
+    20): for each trait, SV-PGS fitted with SVs and without them, tested in the same held-out people."""
     path = HERE / "aou_numbers.json"
     rows = json.loads(path.read_text()).get("matched", {}).get("rows", []) if path.is_file() else []
-    lines = []
-    for row in rows:
-        lines.append(f"{row['trait']}: SV-PGS fit with and without SVs by identical code, tested on the same "
-                     f"{people(row['held_out'])} people")
-        if row.get("ancestries"):
-            lines.append("Of them, " + ", ".join(f"{people(group['held_out'])} {group['group']}"
-                                                  for group in row["ancestries"]))
-        lines.append(f"Test {row['metric']} without SVs: {row['snv_indel_r2']:.3f}")
-    return lines
+    # every matched run's run_config.json: fit_minimum_minor_allele_frequency 0.01, fit_minimum_r2 0.3 and
+    # fit_variant_sites HapMap3, which keeps the SNVs at HapMap3 sites and every SV (workspace_pipeline.fit_filtered)
+    return ["We fit SV-PGS with and without SVs for each trait and compared them in held-out people",
+            "Variants with MAF ≥ 1% and imputation r² ≥ 0.3: HapMap3 SNVs and SVs"] if rows else []
 
 
 # ------------------------------------------------------------------ DrawingML

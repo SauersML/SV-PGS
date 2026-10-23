@@ -599,6 +599,35 @@ def test_a_joint_call_keeps_a_model_at_its_held_fixed_point(tmp_path: Path) -> N
     assert third[0] is not first[0] and third[1] is not second[1]
 
 
+def test_a_trial_whose_dual_solve_does_not_fit_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A trial whose dual solve has no room (a MemoryError from the device's broker, as aou-m3f-y1's 25,018-column
+    block) is refused like one with no factor: the call returns no fixed point, the model is back at the point it held,
+    and the next call solves. The oracle's first call, with no point to fall back to, raises."""
+    from sv_pgs.scale_mixture_ep import MixtureHyperparameters
+
+    oracle_of, starts, _statistics, _prior = _two_trait_oracle(tmp_path)
+    oracle = oracle_of([0])
+    first = oracle(starts[:1])
+    assert first[0] is not None
+    iterate = oracle._iterate
+
+    def full(*arguments):
+        raise MemoryError("a device allocation needs 5.007 GB of device0 memory that the budget does not hold | leases")
+
+    monkeypatch.setattr(oracle, "_iterate", full)
+    moved = MixtureHyperparameters(coefficients=starts[0].coefficients * 0.9, log_smoothing=starts[0].log_smoothing.copy())
+    assert oracle([moved]) == [None]
+    assert oracle.refusals[-1].startswith("the dual solver has no room at q's sites: a device allocation needs 5.007 GB")
+    np.testing.assert_array_equal(oracle.mean[:, 0], first[0].mean)
+    monkeypatch.setattr(oracle, "_iterate", iterate)
+    assert oracle([moved])[0] is not None
+
+    fresh = oracle_of([0])
+    monkeypatch.setattr(fresh, "_iterate", full)
+    with pytest.raises(MemoryError):
+        fresh(starts[:1])
+
+
 def test_a_restored_model_waits_while_another_model_solves(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A trial of the first model lost its evidence test; after its accepted point is restored it waits while the
     second model moves. Only the second model takes carried and cold solves, just as if it had been fitted alone.
