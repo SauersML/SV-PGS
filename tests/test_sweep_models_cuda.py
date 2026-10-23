@@ -172,7 +172,7 @@ def _store_oracles(tmp_path: Path, budget):
             source=sources[kind], training=mask, targets=traits, offsets=np.zeros((_SAMPLES, 2)), covariates=covariates,
             grams=block_grams(statistics), probe_count=_DRAWS, seed=11,
         )
-        return _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, starts, noise)
+        return _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, noise)
 
     return oracle, starts
 

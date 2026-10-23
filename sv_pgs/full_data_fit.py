@@ -8,8 +8,8 @@ EP's oracle refused 59 of 65 calls on the wiring store, "the EP refreshes' updat
 For every model (a quantitative trait on its training rows) q(beta) is ``dual_solve.DualGaussian``'s Gaussian:
 its mean is exact on the full-data operator and certified in the posterior metric, and non-positive sites are
 eliminated exactly, so EP is unclipped. Every cavity comes from q's certified marginal variances
-(``marginal_variances``, leave-block-out; lead ruling). Block-Jacobi variances are block conditionals: their
-cavity-precision errors reach p99 28-58% at production (speed-floor [semi-real]), and they appear nowhere here.
+(``marginal_variances``, leave-block-out). Block-Jacobi variances are block conditionals: their
+cavity-precision errors reach p99 28-58% at production, and they appear nowhere here.
 The variant side, from tilted moments to the prior's empirical Bayes, is ``scale_mixture_ep``.
 
 The fit starts from the prior itself (moment-matched sites) at a start that splits each trait's residual variance
@@ -143,7 +143,7 @@ outer loop's own stopping rule has no bound on its work, and a fit that walks ou
 fit of three models spent 10,252 sweeps [real], where the chr22 fits that certified spent 85-400). A model that has
 spent it is refused every new trial, so the loop ends uncertified by its own rules, and the fit returns its best-ELBO
 state with its certificate's outer criterion unmet. The round's empirical Bayes has 75 minutes on its slowest arm at
-about 1 s a sweep (lead ruling: under ~4,000 sweeps a cold fit, the mode mixture included), and the mixture's ridge
+about 1 s a sweep (under ~4,000 sweeps a cold fit, the mode mixture included), and the mixture's ridge
 start and at most K = 64 orders from zero take the rest at 7-16 sweeps a cold solve [real]."""
 
 
@@ -277,7 +277,7 @@ class FitCertificate:
     - ``mean_move``: an upper bound on twice the KL(q || q') still to go to the EP fixed point at the final refresh,
       KL_k / (1 - rho)^2 with KL_k the undamped update's (the mean's move in the posterior metric plus half the
       variances' move, dtau'(Sigma o Sigma) dtau, halved) and rho = sqrt(KL_k / KL_(k-1)) the refreshes' measured
-      contraction (theory-ep's ruled form), against ``draw_tolerance`` = 1 / K, i.e. at most 1 / (2K) nats (evidence
+      contraction, against ``draw_tolerance`` = 1 / K, i.e. at most 1 / (2K) nats (evidence
       units, defined as p_eff -> 0); ``noise_gain``: the noise update's evidence gain there;
     - ``mean_error``: the certified ||mu_hat - mu||_A of the final solve;
     - ``information_bound`` and ``information_tolerance``: the final refresh's largest family-wise upper bound on a
@@ -321,7 +321,7 @@ class FitCertificate:
     #
     # This is NOT certification of the fit, and nothing may report it as such. ``OuterFit.fixed_point_term_measured``
     # is False for every fit this package can produce, so the outer steps' decisions charge the fixed points' own
-    # error along them as zero (theory-ep: the oracles' perturbation probes are not wired yet); its docstring says a
+    # error along them as zero (the oracles' perturbation probes are not wired yet); its docstring says a
     # caller must then treat the result as uncertified. The name says what the outer loop did establish, so no reader
     # has to know that rule to avoid overclaiming. None where a route does not record it.
     outer_criterion_met: BoolArray | None = None
@@ -1000,7 +1000,7 @@ class _FullDataFixedPoints:
             reached = float(np.max(np.asarray(_host(residual_norm), dtype=np.float64)))
             if not reached <= residual:
                 # float64 stopped the solve above the residual the certificate's products need (it returns the residual
-                # reached rather than raise, speed-krylov cf364bd; speed-recycle's note): nothing certifies the block.
+                # reached rather than raise): nothing certifies the block.
                 raise NoFixedPoint(
                     f"model {model}: the information solve stops at relative residual {reached:.3e}, above the {residual:.3e} its certificate needs"
                 )
@@ -1053,7 +1053,7 @@ class _FullDataFixedPoints:
         With no ``threshold`` the norm is resolved to relative accuracy sqrt(1 / K), the accuracy the mean itself is
         solved to in the posterior metric (``_iterate``), so the refreshes' ratio is measured at the scorer's own
         resolution; with one, the solve's bound halves until the bounds fall on one side of it. Where float64's floor
-        stops the solve first (its certificate above the bound asked for, speed-krylov cf364bd), the bounds are
+        stops the solve first (its certificate above the bound asked for), the bounds are
         returned as they are and the caller reads them on the cautious side.
 
         With ``other``, it also returns other' Sigma right from the same solve and that value's error bound
@@ -1140,13 +1140,13 @@ class _FullDataFixedPoints:
             cavities = [Cavity(precision=frozen[:, model], shift=mean[:, model] / variances[:, model] - self.site_shift[:, model]) for model in range(model_count)]
             target_precision, target_shift = self._targets(hyperparameters, cavities)
             if not (np.all(np.isfinite(target_precision)) and np.all(np.isfinite(target_shift))):
-                # A trial whose tilted laws give no finite site (review-mathbugs N2) has no fixed point here: refused,
+                # A trial whose tilted laws give no finite site has no fixed point here: refused,
                 # so the outer loop counts it unresolved and shortens its step.
                 raise NoFixedPoint("a site target is not finite at these hyperparameters")
             # The undamped update's KL(q || q') to second order in the site change (dtau, dnu): 1/2 r'Sigma r +
             # 1/4 dtau'(Sigma o Sigma) dtau with r = dnu - dtau o mu, the Fisher metric of q's statistics (beta, -beta^2/2)
-            # (speed-smalln: the mean part alone left the site variances off). The fixed point is where the refreshes
-            # converge, so the certificate is on the distance to it (theory-ep's ruled form, the lead's ruling): with
+            # (the mean part alone left the site variances off). The fixed point is where the refreshes
+            # converge, so the certificate is on the distance to it: with
             # rho = sqrt(KL_k / KL_(k-1)) the measured contraction, the remaining steps' KL sums to at most
             # KL_k / (1 - rho)^2, certified at 1/(2K) nats. For KL_(k-1) = b that is KL_k <= c b / (sqrt b + sqrt c)^2,
             # c = 1/(2K): a threshold on KL_k, taken at b's lower bound so the rate is never understated. Where the sites
@@ -1177,7 +1177,7 @@ class _FullDataFixedPoints:
                 if previous is None:
                     continue
                 last = float(previous[0][model])
-                # The ratio is the damped map's contraction only across steps at one share (theory-ep): a refresh
+                # The ratio is the damped map's contraction only across steps at one share: a refresh
                 # reached right after the share changed is measured, not certified.
                 steady = previous[3] is None or previous[3] == arrived
                 certified[model] = steady and upper[model] <= budget * last / (fraction * np.sqrt(last) + np.sqrt(budget)) ** 2
@@ -1189,7 +1189,7 @@ class _FullDataFixedPoints:
                     mean_lower, mean_upper, _cross, _error = self._move_bounds(model, right[:, model], 2.0 * (last - fixed))
                     lower[model], upper[model] = 0.5 * mean_lower + fixed, 0.5 * mean_upper + fixed
                 if not upper[model] <= last:
-                    # Which mode fails to contract (theory-ep): successive updates that alternate, r_k' Sigma r_(k-1) < 0,
+                    # Which mode fails to contract: successive updates that alternate, r_k' Sigma r_(k-1) < 0,
                     # are J's eigenvalue -lambda, which the damping removes; ones that line up are an eigenvalue at least
                     # 1, which no share contracts (1 - f (1 - mu) >= 1), and that needs the double loop this route lacks.
                     if cross > cross_error:
@@ -1488,7 +1488,7 @@ class _FullDataFixedPoints:
             ratio = float(np.max(mean_move / previous_move))
             if ratio >= 1.0:
                 # The ratio is the damped map's at this pass's fraction f: f / (1 + rho) removes the alternating mode it
-                # measures (theory-ep, as for the refreshes), where 1 / (1 + rho) would hold f once it is below that.
+                # measures (as for the refreshes), where 1 / (1 + rho) would hold f once it is below that.
                 damping = min(damping, fraction / (1.0 + np.sqrt(ratio)))
             previous_move = mean_move
             cavities = [
@@ -1692,7 +1692,7 @@ class _FullDataMeanField:
 
     def __init__(
         self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
-        starts: Sequence[MixtureHyperparameters], noise: F64Array, order_seed: int | None = None, start_mean: F64Array | None = None,
+        noise: F64Array, order_seed: int | None = None, start_mean: F64Array | None = None,
         sites: Sequence[BernoulliSites | None] | None = None,
     ) -> None:
         self.gaussian = gaussian
@@ -2882,7 +2882,7 @@ class _GramMeanField(_FullDataMeanField):
 
     def __init__(
         self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
-        starts: Sequence[MixtureHyperparameters], noise: F64Array, order_seed: int | None = None, start_mean: F64Array | None = None,
+        noise: F64Array, order_seed: int | None = None, start_mean: F64Array | None = None,
         sites: Sequence[BernoulliSites | None] | None = None, band: GramBand | None = None,
     ) -> None:
         if sites is not None and any(entry is not None for entry in sites):
@@ -2900,7 +2900,7 @@ class _GramMeanField(_FullDataMeanField):
         self._last_residual_square = 0.0
         self._last_rounding = 0.0
         self.refinements = 0
-        super().__init__(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, noise, order_seed=order_seed, start_mean=start_mean, sites=sites)
+        super().__init__(gaussian, statistics, prior, draw_count, working_bytes, seed, noise, order_seed=order_seed, start_mean=start_mean, sites=sites)
         # The sweep's blocks are the band's (its parts: the summary band re-cuts Stage 0's blocks), each part's members in
         # their order, or in a mixture component's random order within the part.
         part = np.searchsorted(self.band.starts, self.ties.group, side="right") - 1
@@ -3203,7 +3203,7 @@ def fit_full_data(
     # route's do: on the host each was a numba pass over every variant on the VM's cores while its GPUs waited, the
     # fit's silent bulk (AoU chr22 disease fits: twenty-minute stretches inside hyper_step's evidence maximizations).
     device = gaussian.array_module
-    # EB starts where each trait's genetic variance fits inside its phenotypic variance (lead ruling): the first mean
+    # EB starts where each trait's genetic variance fits inside its phenotypic variance: the first mean
     # solve's iterations grow with the prior signal per sample, which a start at the lattice centre puts far past it.
     moments = moment_starts(statistics, prior)
     if len(moments) != gaussian.model_count:
@@ -3262,7 +3262,7 @@ def fit_full_data(
                 starts[model], noise[model] = entry[0], entry[1].noise
         extra = {} if start_mean is None else {"start_mean": start_mean}
         extra["sites"] = list(start_sites)
-        oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra, **extra_oracle)
+        oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, noise, **extra, **extra_oracle)
         for model, entry in enumerate(resumed):
             if entry is not None:
                 # A solver version is this process's: the saved one names nothing here. The residual is made again from
@@ -3717,7 +3717,7 @@ def _mode_mixture(
         for index in range(max(len(entries) for entries in restarted)):
             solving = [model for model in range(count) if index < len(restarted[model])]
             oracle = type(main)(
-                gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters),
+                gaussian, statistics, prior, draw_count, working_bytes, seed,
                 np.array([restarted[model][index][2] if model in solving else float(main.noise[model]) for model in range(count)]), **main._siblings,
                 start_mean=np.column_stack([restarted[model][index][1] if model in solving else main.mean[:, model] for model in range(count)]),
                 sites=list(main.sites),
@@ -3754,7 +3754,7 @@ def _mode_mixture(
                 continue
             # Each component from its own means and noise, the pair at which it was a fixed point.
             oracle = type(main)(
-                gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters),
+                gaussian, statistics, prior, draw_count, working_bytes, seed,
                 np.where(index < np.asarray(start.counts), np.asarray(start.noises[index], dtype=np.float64), main.noise), **main._siblings,
                 start_mean=np.asarray(start_means, dtype=np.float64).copy(), sites=list(main.sites),
             )
@@ -3797,7 +3797,7 @@ def _mode_mixture(
         # the evidence weights decide between the basins.
         main._sync()
         ridge = type(main)(
-            gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), **main._siblings,
+            gaussian, statistics, prior, draw_count, working_bytes, seed, main.noise.copy(), **main._siblings,
             start_mean=_ridge_mean(
                 gaussian, statistics, prior, moments, draw_count,
                 np.where([model_sites is not None for model_sites in main.sites], 1.0, [float(moment.noise) for moment in moments]),
@@ -3814,7 +3814,7 @@ def _mode_mixture(
         if not searching:
             break
         oracle = type(main)(
-            gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), order_seed=component, **main._siblings,
+            gaussian, statistics, prior, draw_count, working_bytes, seed, main.noise.copy(), order_seed=component, **main._siblings,
             sites=list(main.sites),
         )
         solved = oracle._solved(list(hyperparameters), searching)

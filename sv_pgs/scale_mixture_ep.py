@@ -45,7 +45,7 @@ with no point mass at zero.
   ``spacing_bound``). Below the floor every kernel is flat to
   that tolerance (log Z's error there is bounded), but each node keeps its own
   variance v = u e^t in the kernel, so a density with its mass below the floor
-  is a near-zero effect, never a point mass at zero (review-mathbugs N1).
+  is a near-zero effect, never a point mass at zero.
 - o_j is the unit offset, log(kappa_j^2 Var(D_j)) of the stored column D_j
   with calibration slope kappa_j (``imputation_reliability.ColumnMeasurement``),
   with coefficient exactly 1 by derivation: the prior is on the raw effect per
@@ -138,7 +138,7 @@ _HALF_PRECISION = _EPSILON**0.5
 # The mixing density's roughness penalty: the integral of its squared derivative of this order, with a learned
 # weight. Third order is derived: its null space, the quadratics (a normal density in log s), is the only lambda =
 # infinity limit that is proper on the real line and does not move with the range (<= 1e-4 nats when the range
-# doubles or quadruples; the first- and second-order limits move by 4-100 nats: math-density, lead ruling).
+# doubles or quadruples; the first- and second-order limits move by 4-100 nats).
 ROUGHNESS_ORDER = 3
 # The (rows x K) float64 arrays alive at once in a chunk: the ten of ``_Components``, the seven directional-derivative
 # arrays of ``_directional_derivatives`` and three expression temporaries.
@@ -736,7 +736,7 @@ def relattice(
     whose derivatives m to 2m - 2 vanish at both ends (Schoenberg; Wahba 1990, Section 1.3), and beyond the ends
     it continues as the polynomial of degree m - 1 its end derivatives set: the continuation of no roughness at
     all. The two roughnesses agree to the discretization's order in the spacing, not exactly (nine nodes over four
-    units of sin t + 0.1 t^4: 14.1 by differences against 19.1 integrated; the audit's M22), so a finer or wider
+    units of sin t + 0.1 t^4: 14.1 by differences against 19.1 integrated), so a finer or wider
     lattice holds the same density to that order, and ``halved_lattice`` is what refines it.
 
     Each part moves on its own: the pooled shape and the deviations are one decomposition of the class densities
@@ -778,7 +778,7 @@ def transfer_hyperparameters(
     part_count = 1 + deviation_count
     parts = coefficients[: part_count * prior.pooled_size].reshape(part_count, prior.pooled_size)
     functions = parts @ old_basis.T
-    # One end condition per part: the spline is vector-valued over the parts (review-mathbugs L-0).
+    # One end condition per part: the spline is vector-valued over the parts.
     natural = [(order, np.zeros(part_count)) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
     spline = make_interp_spline(old_nodes, functions.T, k=2 * ROUGHNESS_ORDER - 1, bc_type=(natural, natural), axis=0)
     values = spline(np.clip(new_nodes, old_nodes[0], old_nodes[-1])).T
@@ -849,7 +849,7 @@ class LatticeCheck:
 
     This is a numerical comparison at the actual state, not a bound: the start lattice's floor, top and spacing are
     derived from single-variant likelihoods at the start (``derived_lattice``), and a fitted density concentrated more
-    sharply than those kernels, or with its mass at a lattice end, is exactly what they do not certify (review F17)."""
+    sharply than those kernels, or with its mass at a lattice end, is exactly what they do not certify."""
 
     refined_log_normalizer: float
     extended_log_normalizer: float
@@ -949,10 +949,10 @@ def _kernel_terms(
 ) -> tuple[F64Array, F64Array, F64Array, F64Array, F64Array]:
     """(v r = v/(1 + vP), r = 1/(1 + vP), qr = vP/(1 + vP), log pi_k + log Z_jk, h^2 v r) at every node, with the
     node's own variance v = u e^t (below the kernel floor too: the floor only bounds log Z's error there, and a flat
-    kernel's v = 0 would make those nodes a point mass at zero, which the model does not have; review-mathbugs N1).
+    kernel's v = 0 would make those nodes a point mass at zero, which the model does not have).
     Written so that an overflowing v (a node far past every effect's scale, at a finite log v) gives its limits
     v r = 1/P, r = 0, qr = 1 and the log component's own limit, -1/2 (log v + log P) + h^2 / (2P): finite, as the
-    mathematical value is (log v = 1000 at P = 1 and h = 0 is -500, not -inf; the audit's M18), and never inf * 0;
+    mathematical value is (log v = 1000 at P = 1 and h = 0 is -500, not -inf), and never inf * 0;
     an underflowing v gives v r = 0 and r = 1 exactly."""
     with np.errstate(over="ignore", divide="ignore"):
         log_variance = log_scale_rows[:, None] + grid[None, :]
@@ -1962,7 +1962,7 @@ class GaussianPosterior:
 
     ``linear_response(left, right, diagonal, weight, B)``, when a posterior can give it, is the exact solution X of
     (I - (I - diag(weight) (Sigma o Sigma)) (diag(left) Sigma diag(right) + diag(diagonal))) X = B: the linear response
-    ``_total_curvature_columns`` otherwise finds by GMRES (speed-smalln: the small-n route factors this p x p matrix once).
+    ``_total_curvature_columns`` otherwise finds by GMRES (the small-n route factors this p x p matrix once).
 
     ``cavity_response(m_x E, s2_x E)``, for a fixed point that is not EP's (the mean-field fixed point, whose cavity
     is the pseudo-likelihood: ``mean_field``), is that fixed point's own response (dh, dP) of every variant's cavity
@@ -1973,7 +1973,7 @@ class GaussianPosterior:
     variance_jvp: Callable[[F64Array], F64Array] | None = None
     linear_response: Callable[[F64Array, F64Array, F64Array, F64Array, F64Array], F64Array] | None = None
     # ``local_response(left, right, diagonal, weight)``: V -> M^-1 V for the same matrix with Sigma replaced by its
-    # block-local part (read-free), the preconditioner of the Krylov route (``krylov_recycle``, lane speed-recycle).
+    # block-local part (read-free), the preconditioner of the Krylov route (``krylov_recycle``).
     local_response: Callable[[F64Array, F64Array, F64Array, F64Array], Callable[[F64Array], F64Array]] | None = None
     cavity_response: Callable[[F64Array, F64Array, float], tuple[F64Array, F64Array]] | None = None
     # Whether the responses are exact to rounding whatever tolerance they are asked for (a dense factor, or
@@ -2012,7 +2012,7 @@ class CurvatureCorrection:
     Either given whole (``coefficient_map`` and ``matrix``), or formed only where it is asked (``columns``, from
     ``curvature_correction``): B's linear response is solved for the directions of the views asked for, starting
     with the free coefficients of the current edges, and extended by the new directions when a view releases an
-    edge (lead ruling: the response on d_free directions, not all D).
+    edge (the response on d_free directions, not all D).
     """
 
     def __init__(
@@ -2079,7 +2079,7 @@ class CurvatureCorrection:
 class _Anchor:
     """The EP evidence's local model about the fixed point x_k where ``correction`` (C = B - A) was solved: EP
     stationarity makes E and the fixed-cavity F_k share their gradient at x_k, with Hessians -B and -A, so
-    E(x) = F_k(x) - 1/2 (x - x_k)'C(x - x_k) + const + O(|x - x_k|^3) (theory-ep). The objective V integrates is
+    E(x) = F_k(x) - 1/2 (x - x_k)'C(x - x_k) + const + O(|x - x_k|^3). The objective V integrates is
     that model minus the penalty, whose curvature A + C + S is the one V's determinant takes: its maximizer, its
     responses and its line integrals then belong to the same integrand. ``center`` is z_k = M x_k, the same in every
     view; ``matrix``, ``linear`` and ``constant`` are this prior's K'CK, K'C x_k and x_k'C x_k (x = K x_view), so the
@@ -2504,7 +2504,7 @@ def _total_curvature_columns(
     assert solve is not None and variance_jvp is not None
     # A variant whose tilted law is a point mass at zero (all its prior mass where v = u e^t underflows to 0) does not
     # respond: its mean and every derivative are zero for every cavity, so dh = dP = 0 exactly (the limit of the map,
-    # whose 1/v factors are 0/0 there). Its rows are identity rows of the fixed point, with zero offset (speed-smalln).
+    # whose 1/v factors are 0/0 there). Its rows are identity rows of the fixed point, with zero offset.
     live = derivatives.variance > 0.0
     inverse = np.where(live, 1.0 / np.where(live, derivatives.variance, 1.0), 0.0)
     inverse_column = inverse[:, None]
@@ -2513,7 +2513,7 @@ def _total_curvature_columns(
     def through(precision_step: F64Array, inner: float, affine: bool = True) -> tuple[F64Array, F64Array, F64Array]:
         # The map is affine in dP. With ``affine`` False its constant (the E terms) is dropped, which leaves its linear
         # part exactly: GMRES applies that, so each solve inside is accurate relative to what it applies, not to the
-        # constant, as a difference of two solves would be (speed-recycle a7752ae).
+        # constant, as a difference of two solves would be.
         # A scalar zero, so the linear part applies to any number of columns (a block Krylov step's).
         mean_constant = mean_by_z if affine else 0.0
         mean_step = solve(
@@ -2545,7 +2545,7 @@ def _total_curvature_columns(
             raise LinearResponseError(f"the EP fixed point's linear response is singular: {error}") from error
         return _total_from_response(prior, fixed_cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step)
     # The linear part applies one p x p operator to every direction column, so the solve is block Krylov over the
-    # columns (``krylov_recycle.block_gcro_dr``, speed-recycle): each application serves them all, restarts keep the
+    # columns (``krylov_recycle.block_gcro_dr``): each application serves them all, restarts keep the
     # slowest harmonic Ritz space, and ``local_response`` (read-free) preconditions it; it stops where a cycle no longer
     # lowers its residual. Each product solves the posterior only to ``inner``, so the operator itself errs,
     # and the Krylov residual estimate can sit far below the true one (inexact Krylov: Simoncini and Szyld, SIAM J. Sci.
@@ -2587,8 +2587,8 @@ def _total_curvature_columns(
             break
         # The residual is measured with products at ``inner``, so it carries their error: the inner solves tighten by
         # the measured excess each round, which ends where they reach float64's attainable accuracy rather than on one
-        # noisy comparison (speed-recycle: 3.61 then 4.26 against 3.34). That end is either the solver refusing (above)
-        # or, where it returns a certificate above the request instead (speed-krylov cf364bd), float64's unit roundoff:
+        # noisy comparison (3.61 then 4.26 against 3.34). That end is either the solver refusing (above)
+        # or, where it returns a certificate above the request instead, float64's unit roundoff:
         # no solve delivers a request below it, so the solves stay there, and the Krylov solve continues from its true
         # residual for as long as each such round lowers it.
         tightened = inner * 0.5 * target / residual
@@ -3432,7 +3432,7 @@ def _laplace_corrections(
 ) -> tuple[F64Array, F64Array, F64Array]:
     """``_laplace_corrections_once``, each distinct input once per cavity (and per correction, held by identity). The
     corrections depend on the evidence's -H and responses, which come from the correction, so those are keyed too:
-    equal coefficients can come with a different -H once a lazy correction has grown (e2e review)."""
+    equal coefficients can come with a different -H once a lazy correction has grown."""
     return _repeated(
         "corrections", cavity,
         (*_prior_digest(prior), log_smoothing, evidence.coefficients, evidence.precision, evidence.responses, working_bytes, tolerance),
@@ -3452,7 +3452,7 @@ def _laplace_corrections_once(
     directions are integrated (the largest terms are replaced until the remaining ones sum to at most
     tolerance / 2), and the quadratures of the replaced ones are each certified to tolerance / (2 m) in its log
     (m of them). What is not certified: the terms are the expansion's leading ones, not a remainder bound (a log
-    integrand -x^2/2 - x^6 has both zero and a correction of -0.45: the audit's M08), and the integrals are
+    integrand -x^2/2 - x^6 has both zero and a correction of -0.45), and the integrals are
     one-dimensional along each direction, so the mixed cumulants between directions are not represented
     (-x^2/2 - y^2 - x^2 y^2 has exact Gaussian slices and a joint correction of -0.24: M07). A replaced
     direction's correction is the log of the exact line integral's ratio to the Laplace term (its limit covers a
@@ -3613,7 +3613,7 @@ def _corrected(
     prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence | None, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
     """Directional approximation to the evidence, with selected Laplace terms replaced by one-dimensional
-    integrals along every standardized direction whose Tierney-Kadane term exceeds the tolerance (lead ruling for
+    integrals along every standardized direction whose Tierney-Kadane term exceeds the tolerance (for
     basins, and for every comparison of V: where that term is large the Laplace value is not V to the tolerance).
 
     It matters most at a fold of the inner maximum, where the data's negative curvature nearly cancels the penalty:
@@ -3762,7 +3762,7 @@ def _evidence_once(
     screen: float | None = None,
 ) -> _Evidence | None:
     """V(rho) with the total curvature B, and its exact rho-gradient; x_rho re-maximized from ``start``. None when x_rho is not a strict maximum of the objective V integrates, i.e. B + S is not
-    positive definite there (lead ruling: such a point is never accepted, and its V never reported).
+    positive definite there (such a point is never accepted, and its V never reported).
 
     With ``maximize`` false, V's formula is taken at ``start`` itself (an outer state's own x, ``_outer_state``): its
     error then carries x's own decrement there, as the inner maximizer's share does.
@@ -3807,7 +3807,7 @@ def _evidence_once(
         # x-hat's error moves the determinant terms by this much at first order, and F itself by the decrement (the
         # quadratic model's own gain); together, the inner maximizer's share of V's error. Both are the local
         # quadratic model's estimates, not bounds: they hold to the order the model holds, and the certificate's
-        # reader knows them as that (the audit's M03; ``OuterFit.fixed_point_term_measured``).
+        # reader knows them as that (``OuterFit.fixed_point_term_measured``).
         inner_error = 0.5 * float(np.sqrt(sensitivity * 2.0 * newton_decrement)) + newton_decrement
         if not maximize or 0.5 * np.sqrt(sensitivity * 2.0 * newton_decrement) <= tolerance or newton_decrement <= rounding:
             break
@@ -3824,7 +3824,7 @@ def _evidence_once(
     # (``CurvatureCorrection.resolution``: its rounding where the posterior is exact, 0 for a correction given whole).
     # That charge is first order in e and blind to conditioning: near a singular B + S the log-determinant moves
     # more than D e / 2 for the same residual (a whitened bound, d (-log(1 - eta)) for eta the whitened
-    # perturbation's norm, is the audit's M13 and is not formed here).
+    # perturbation's norm, is not formed here).
     if prior.anchor is not None:
         # With the local model's anchor, -H is already A + C + S (``_Anchor``): C enters once, and x_rho's own factor
         # is the determinant's.
@@ -3993,7 +3993,7 @@ def _ascend_evidence(
     """
     weights = np.clip(start_weights, lower, upper)
     current = start
-    # The Laplace gradient proposes the steps; every acceptance is on the certified V (lead ruling A), and the final
+    # The Laplace gradient proposes the steps; every acceptance is on the certified V, and the final
     # stationarity check takes V's own gradient, corrections included (``_stationarity``).
     gradient = current.gradient
     hessian = np.eye(weights.shape[0])
@@ -4037,7 +4037,7 @@ def _certified_evidence(
     prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float, flat_start: F64Array
 ) -> _Evidence | None:
     """V at the certified inner maximum from ``start``, or from the flat start when that is not a certified
-    maximum (the two structural starts; lead ruling); None when neither is."""
+    maximum (the two structural starts); None when neither is."""
     warm = _evidence(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance)
     chosen = warm if warm is not None else _evidence(prior, log_smoothing, flat_start, cavity, correction, working_bytes, tolerance)
     return _corrected(prior, log_smoothing, chosen, cavity, correction, working_bytes, tolerance)
@@ -4150,11 +4150,11 @@ def _maximize_evidence(
 ) -> tuple[F64Array, F64Array, _Evidence]:
     """Maximize V over every weight in (0, infinity]: the interior by the trust-region ascent inside the resolvable
     range, and the lambda = infinity edge evaluated exactly (x confined to the block's null space), never by fitting
-    at an extreme weight. Once the interior ascent converges, every finite weight is compared with its infinity edge
-    (lead ruling), and the best edge that raises V past the tolerance is taken; an edge weight is released to the
+    at an extreme weight. Once the interior ascent converges, every finite weight is compared with its infinity edge,
+    and the best edge that raises V past the tolerance is taken; an edge weight is released to the
     centre of its resolvable range when the certified V is higher there. That is one probe of the interior per
     block, not a proof over its range: a V below the edge at the centre and above it elsewhere in the range keeps
-    the block at its edge (the audit's M06), and what the fit then certifies is the stationarity it reached, as
+    the block at its edge, and what the fit then certifies is the stationarity it reached, as
     ``OuterFit`` says. There is no lambda = 0 edge (see the module
     docstring), so a start weight of -inf means its range's lower end, and one past its upper end the edge. Every V is the best certified maximum over the warm, flat and
     global log-normal starts. Returns the log weights (+inf at an edge), x in full coordinates, and V there.
@@ -4238,7 +4238,7 @@ def _maximize_evidence(
             # Laplace V is itself above the edge, and the ascent from the centre then searches the interior. The
             # screen is a heuristic on the search, not a certificate: a correction can be positive (measured on
             # bench-real chr22 [real]: 2 of 89 on ENSG00000254709.8, the larger +0.55 nats, against 1-66 nats of
-            # lowering elsewhere; the audit's M05), so a trial whose Laplace V sits within such a correction below
+            # lowering elsewhere), so a trial whose Laplace V sits within such a correction below
             # the edge is missed, and the fit ends at the edge with its certificate as a local one. What the screen
             # buys: on ENSG00000274602.5 [real] the corrections are 59% of a 412 s fit.
             for position in sorted(edges):
@@ -4281,7 +4281,7 @@ class _Stationarity:
     folds: F64Array
     gain: float
     better: tuple[F64Array, _Evidence] | None
-    # The gain's parts (theory-ep's split): ``floor`` with exact correction slopes (E at its fixed part), ``decrement``
+    # The gain's parts: ``floor`` with exact correction slopes (E at its fixed part), ``decrement``
     # 1/2 g'K^-1 g on the open weights, ``fold`` the folded weights' (|g| + E) h; the rest of ``gain`` is E's.
     floor: float = np.inf
     decrement: float = np.inf
@@ -4316,11 +4316,11 @@ def _stationarity(
     tolerance: float,
     budget: float = np.inf,
 ) -> _Stationarity:
-    """The weights' Newton decrement at a certified maximum, from V's analytic gradient (lead ruling: in place of
+    """The weights' Newton decrement at a certified maximum, from V's analytic gradient (in place of
     central differences of V, which cannot certify where the base's inner basin ends within their step).
 
     ``budget`` is the gain the certificate leaves the weights (``HyperStep.tighten``): where the bound exceeds it only
-    through the correction slopes' error, the slopes are resolved again to the error that meets it (theory-ep), for
+    through the correction slopes' error, the slopes are resolved again to the error that meets it, for
     as long as every slope's error falls. Where it exceeds it even with exact slopes (``floor``), the slopes are not
     what stops the certificate. Infinite, the bound is reported as measured.
 
@@ -4333,7 +4333,7 @@ def _stationarity(
     there: the difference is taken on the other side, and the gain along that weight is at most (|g| + E) h, the
     most V can climb before the fold. Elsewhere the gain is the most the Newton decrement 1/2 (g + d)'K^-1 (g + d)
     reaches over the gradient's error box |d| <= E on the other interior weights, 1/2 g'K^-1 g + |K^-1 g|'E +
-    1/2 E'|K^-1|E (theory-ep), with K the symmetrized difference matrix; an indefinite K has no decrement (infinite gain),
+    1/2 E'|K^-1|E, with K the symmetrized difference matrix; an indefinite K has no decrement (infinite gain),
     as an indefinite B + S has none for x. A side whose certified V beats the base's by the tolerance, both at their
     certified bounds, is returned as ``better`` at once: the base is then not the maximum, and the search resumes
     from it.
@@ -4404,7 +4404,7 @@ def _stationarity(
 
     def terms(gradient: F64Array, fixed: F64Array, slopes: F64Array, curvature: F64Array) -> tuple[float, float, float, float, float]:
         """(alpha, beta, gamma, decrement, fold): the gain bound alpha + beta t + gamma t^2 for the gradient's error
-        E = F + t E_c (theory-ep), 1/2 g'K^-1 g, and the folded weights' part at t = 1. On the open weights the bound
+        E = F + t E_c, 1/2 g'K^-1 g, and the folded weights' part at t = 1. On the open weights the bound
         is the most 1/2 (g + d)'K^-1 (g + d) reaches over the box |d| <= E, with the signed g:
         1/2 g'K^-1 g + |K^-1 g|'E + 1/2 E'|K^-1|E (|.| elementwise; K^-1's off-diagonals can be negative, where
         1/2 (|g| + E)'K^-1 (|g| + E) would understate it). On the folded weights it is (|g| + E) h. Infinite where a
@@ -4492,7 +4492,7 @@ def hyper_step(
 
     The search is over the EP evidence's local model about the fixed point at ``hyperparameters.coefficients``, where
     ``correction`` was solved (``_Anchor``): x_rho maximizes F - 1/2 (x - x_k)'C(x - x_k) - P, whose curvature
-    A + C + S is the one V's determinant takes, so V is the Laplace evidence of one integrand (theory-ep (a)).
+    A + C + S is the one V's determinant takes, so V is the Laplace evidence of one integrand.
     """
     prior = _anchored(prior, correction, prior.coefficient_map @ hyperparameters.coefficients)
     start_objective = _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes)
@@ -4579,7 +4579,7 @@ def hyper_step(
                 if trial is not None and trial.value - trial.error > evidence.value + evidence.error + tolerance:
                     moved = (trial_weights, trial)
                     break
-                # The band (theory-ep): where the remaining gain is real but within the tolerance, no move resolves it.
+                # The band: where the remaining gain is real but within the tolerance, no move resolves it.
                 # The full Newton step is then taken on a certified rise, and kept only when the next check's decrement
                 # falls (natural monotonicity): Newton's local convergence ends it, not the tolerance's count.
                 if step_length == 1.0 and trial is not None and trial.value - trial.error > evidence.value + evidence.error:
@@ -4735,7 +4735,7 @@ class OuterFit:
     visible in the certificate.
 
     ``fixed_point_term_measured`` is False while the decisions charge the fixed points' own error along the steps as
-    zero (theory-ep: the oracles' perturbation probes are not wired yet); callers treat such a fit as uncertified
+    zero (the oracles' perturbation probes are not wired yet); callers treat such a fit as uncertified
     even where ``certified`` holds.
     """
 
@@ -4907,7 +4907,7 @@ def _inner_step_agreement(start_gradient: F64Array, end_gradient: F64Array, prop
 def _cauchy_radius(newton: _NewtonB) -> float:
     """The first trust radius: the Cauchy step's length on |B + S|, ||g||^3 / g'|B + S| g, the model's steepest-ascent
     maximizer. Newton's step on |B + S| divides each direction's gradient by its own curvature, which the rounding
-    floor on a direction the data barely curve makes astronomically long (review-mathbugs: |x| 1.3e4 on the first
+    floor on a direction the data barely curve makes astronomically long (|x| 1.3e4 on the first
     trial of a real gene, which put a class's density below the lattice); the Cauchy step weighs the gradient by
     all the curvature it sees."""
     components = newton.eigenvectors.T @ newton.gradient
@@ -4918,8 +4918,8 @@ def _cauchy_radius(newton: _NewtonB) -> float:
 
 @dataclass(frozen=True)
 class _State:
-    """V's formula at an outer state (x_j, rho_j) and its fixed point, with x_j itself, not re-maximized (theory-ep
-    (b)): W_j = E(x_j) - P(x_j) + 1/2 log|S|_+ - 1/2 log|B_j + S|_N + T_j, which V(rho_j) is within ``error`` of
+    """V's formula at an outer state (x_j, rho_j) and its fixed point, with x_j itself, not re-maximized:
+    W_j = E(x_j) - P(x_j) + 1/2 log|S|_+ - 1/2 log|B_j + S|_N + T_j, which V(rho_j) is within ``error`` of
     (x_j's own decrement and its first-order move of the determinant and the corrections, and their rounding:
     ``_evidence``'s and ``_corrected``'s error at x_j). E's value is not needed: ``value`` is W_j with the
     fixed-cavity F_j(x_j) in E's place (the units ``hyper_step``'s V takes at this fixed point), ``rest`` is
@@ -4978,11 +4978,11 @@ def _outer_state(
 
 def _path_gain(prior: ScaleMixturePrior, start: _State, end: _State, move: F64Array) -> tuple[float, float]:
     """(G, eps): V's realized gain from ``start`` to ``end`` over the step ``move`` = x_end - x_start, and its
-    resolution (theory-ep (b)). On the EP route E's change is estimated by the trapezoid rule of its path integral
+    resolution. On the EP route E's change is estimated by the trapezoid rule of its path integral
     with its Euler-Maclaurin end correction, (g_start + g_end)'s / 2 + s'(B_end - B_start)s / 12 (exact where E is
     quartic along s), and the end correction's size |s'(B_end - B_start)s| / 12 is charged as the rule's resolution.
     That charge is the next term's size, not a bound on the omitted ones: an E whose end derivatives vanish to
-    second order while it rises along s (10t^3 - 15t^4 + 6t^5 on [0, 1]: the audit's M10) has estimate 0 and
+    second order while it rises along s (10t^3 - 15t^4 + 6t^5 on [0, 1]) has estimate 0 and
     charge 0 against a gain of 1. The penalty and the determinant terms change in closed form (the states'
     ``rest``), and eps adds both states' own errors. The fixed points' gradient error along s (their perturbation
     probes) is not charged yet (``OuterFit.fixed_point_term_measured``).
@@ -5010,7 +5010,7 @@ def _rises(gain: float, resolution: float, end: _State, tolerance: float) -> boo
 
     A state's error is two-sided, and its share x's own decrement delta is not: V(rho_end) is the evidence at the
     maximizer of E - P at rho_end, where E - P is at least its value at x_end, so x_end short of that maximizer
-    leaves V(rho_end) above W_end by about delta_end (theory-ep (b)), never below. Only the rest of the end's error
+    leaves V(rho_end) above W_end by about delta_end, never below. Only the rest of the end's error
     (the determinant's and the corrections' first-order move with x, and the rounding) can put V(rho_end) below
     W_end; the start's whole error bounds how far V(rho_start) lies above W_start. So the lower bound of V's rise is
     the gain less its resolution plus the end's decrement. A joint trial ends at the x the model placed, short of
@@ -5070,9 +5070,9 @@ def fit_hyperparameters(
     prior: ScaleMixturePrior, starts: Sequence[MixtureHyperparameters], fixed_points: FixedPoints, working_bytes: int, tolerance: float
 ) -> list[OuterFit]:
     """Every model's empirical Bayes at its EP fixed point, run until its remaining gain on the computed V is within
-    ``tolerance`` nats (lead ruling: Newton-B, never plain EP-EM), as the ascent of one function: V(rho), the
-    EP-Laplace evidence of the weights with its directional Tierney-Kadane corrections, with x its inner solve
-    (theory-ep). The tolerance is a numerical convergence criterion on that computed V, not a bound on its error
+    ``tolerance`` nats (Newton-B, never plain EP-EM), as the ascent of one function: V(rho), the
+    EP-Laplace evidence of the weights with its directional Tierney-Kadane corrections, with x its inner solve.
+    The tolerance is a numerical convergence criterion on that computed V, not a bound on its error
     against the exact evidence (``_laplace_corrections_once``).
 
     At an EP fixed point x_k the EP evidence's x-gradient is the fixed-cavity g and its negative Hessian the total
@@ -5109,7 +5109,7 @@ def fit_hyperparameters(
     gain and the prediction's measured error (the model's realized remainder at its last whole joint trial and both
     values' own errors) is at most ``tolerance``, and the joint trial then moves q's mean by at most 1 / K in q's
     posterior metric, KL(q || q') <= 1 / (2K) nats (the certificate includes the prediction change; in
-    evidence units, lead ruling via speed-smalln), at the trial's own EP fixed point. With K = 1 / (2 tolerance)
+    evidence units), at the trial's own EP fixed point. With K = 1 / (2 tolerance)
     posterior draws that is the scorer's own Monte Carlo resolution, as for the EP fixed point. A trial that fails
     the check is taken as an ordinary joint trial. Where the weights' stationarity bound is what stops the
     certificate, it is tightened to the share the rest leaves it (``HyperStep.tighten``). A polished state whose
@@ -5338,7 +5338,7 @@ def fit_hyperparameters(
         and S the resolvable pieces: the polish's remaining tail, the state's certified V error, the step's, and the
         weights' remaining gain. The tail can fall through more inner steps, so it is never treated as fixed. Where
         predicted + fixed < tolerance < remaining, every piece is scaled by theta = M / S, M = tolerance - predicted -
-        fixed (theory-ep's per-decision tightening: no fixed shares): each V is re-certified to theta times its
+        fixed (no fixed shares): each V is re-certified to theta times its
         error (``_outer_state`` and ``HyperStep.resolve``: more directions integrated exactly) and the weights' bound
         is tightened to theta times their gain (``HyperStep.tighten``), and the certificate is read again. A piece
         that cannot reach its share stays as measured, so a decision fails only on what no resolution removes."""
@@ -5648,7 +5648,7 @@ def fit_hyperparameters(
                     worst = int(np.argmax(shares))
                     if bool(np.all(moves <= allowed)):
                         # The oracle's state is the trial's certified fixed point: the fit returns the trial, so its
-                        # hyperparameters and its fixed point are one model (review-mathbugs E1). The certificate covers
+                        # hyperparameters and its fixed point are one model. The certificate covers
                         # the move: V's remaining gain at the state, and q's mean moved by at most 1 / K in its metric.
                         hyperparameters[model], points[model], displaced[model] = trial, trial_point, False
                         fits[model] = OuterFit(

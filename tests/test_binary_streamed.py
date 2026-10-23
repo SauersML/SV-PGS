@@ -98,7 +98,7 @@ def test_the_streamed_binary_fixed_point_is_joint_and_its_moments_are_the_dense_
     _store_, _covariate, _labels_, sites, statistics, prior, gaussian, standardized, covariates = _problem(tmp_path, 5)
     moments = moment_starts(statistics, prior)
     start = initial_hyperparameters(prior, moments[0].mean_variance)
-    oracle = _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, [start], np.ones(1), sites=[sites])
+    oracle = _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, np.ones(1), sites=[sites])
     (point,) = oracle([start])
     assert point is not None
     assert oracle.noise[0] == 1.0 and oracle.reweights >= 1
@@ -132,8 +132,6 @@ def test_a_binary_models_column_squares_are_read_once_per_sites_held(tmp_path: P
     from sv_pgs.memory_broker import HOST, memory_scope
 
     _store_, _covariate, _labels_, sites, statistics, prior, gaussian, _standardized, _covariates = _problem(tmp_path, 9)
-    moments = moment_starts(statistics, prior)
-    start = initial_hyperparameters(prior, moments[0].mean_variance)
     generator = np.random.default_rng(10)
     purpose = "a binary model's column squares at sites held"
 
@@ -148,7 +146,7 @@ def test_a_binary_models_column_squares_are_read_once_per_sites_held(tmp_path: P
         return [lease for lease in broker.leases if lease.purpose == purpose]
 
     with memory_scope(_budget()) as broker:
-        oracle = _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, [start], np.ones(1), sites=[sites])
+        oracle = _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, np.ones(1), sites=[sites])
         entries = len(held(broker))
         first, second = moved(), moved()
         before = reads()

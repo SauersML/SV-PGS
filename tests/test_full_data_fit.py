@@ -567,7 +567,7 @@ def _two_trait_oracle(tmp_path: Path):
             source=source, training=mask[:, columns], targets=traits[:, columns], offsets=np.zeros((_SAMPLES, len(columns))),
             covariates=store_covariates, grams=block_grams(statistics), probe_count=_DRAWS, seed=11,
         )
-        return _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, [starts[column] for column in columns], noise[columns])
+        return _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, noise[columns])
 
     return oracle, starts, statistics, prior
 
