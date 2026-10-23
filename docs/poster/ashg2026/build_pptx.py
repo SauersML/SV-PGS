@@ -607,6 +607,11 @@ def build() -> None:
     gallery = {name: GALLERY / f"{name}.png" for name in (
         "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy",
         "poster_model")}
+    references = [Para([(f"{SUPERSCRIPT[index]}{reference}", "")], REFERENCE, bullet=False, after=0)
+                  for index, reference in enumerate(REFERENCES, start=1)]
+    half = math.ceil(len(references) / 2)
+    # the poster reads Introduction and Methods, the simulation's results, All of Us, then Discussion at the foot of
+    # the last column. The references take the foot of the middle column in two columns.
     columns = [
         [
             bar(97, "Introduction"), text(bullets(words["introduction"])),
@@ -621,13 +626,11 @@ def build() -> None:
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
             Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)], gap="section"),
             figure(gallery["poster_sv_gain"]),
-            bar(95, "Discussion"), text(bullets(words["discussion"])),
+            bar(96, "References"), row([text(references[:half])], [text(references[half:])]),
         ],
         [
             bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks(),
-            bar(96, "References"),
-            text([Para([(f"{SUPERSCRIPT[index]}{reference}", "")], REFERENCE, bullet=False, after=0)
-                  for index, reference in enumerate(REFERENCES, start=1)]),
+            bar(95, "Discussion"), text(bullets(words["discussion"])),
             code(words["code"]),
         ],
     ]
