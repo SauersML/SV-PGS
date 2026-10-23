@@ -56,16 +56,20 @@ def trait_name(trait: str) -> str:
 
 
 def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list[float], tick_text, log: bool,
-           reference: float | None = None):
+           reference: float | None = None, estimates: bool = False):
     """A forest at the column's width in the imputed SVs' sky blue: a row per (label, estimate, low, high), its label
     at the left of the canvas and its interval level with it, each estimate an open mark as imputed SVs' are in the
     simulation figures (every All of Us SV is imputed), with the reference drawn (0, or 1 on a log axis, unless given).
-    Every margin and the rows' pitch are measured from the type, so the forest is as short as its type allows."""
+    The axis runs from the first tick to the last, or with ``estimates`` symmetric about the reference over the
+    estimates alone, so that each estimate's mark clears an arrowhead at the axis's end. Every margin and the rows'
+    pitch are measured from the type, so the forest is as short as its type allows."""
     reference = (1.0 if log else 0.0) if reference is None else reference
     fig = plt.figure(figsize=(COLUMN, 1.0))
     labels = [label for label, *_ in rows]
     pitch = tallest(fig, labels, fontsize=POSTER_STYLE["font.size"]) + ROW_GAP
-    left = widest(fig, labels, fontsize=POSTER_STYLE["font.size"]) + LABEL_GAP
+    # an arrowhead at the axis's start reaches half its width to the left, toward the names
+    arrow = POSTER_MARK * 0.7 / 2 / 72
+    left = widest(fig, labels, fontsize=POSTER_STYLE["font.size"]) + LABEL_GAP + arrow
     # the right margin holds half of the end tick's label; the bottom, the ticks and the axis title
     right = widest(fig, [tick_text(ticks[-1])], fontsize=POSTER_STYLE["font.size"]) / 2 + POSTER_PAD
     top, bottom = POSTER_PAD, under_axes(fig, [xlabel])
@@ -75,6 +79,12 @@ def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list
     if log:
         ax.set_xscale("log")
     low_limit, high_limit = ticks[0], ticks[-1]
+    if estimates:
+        # inches each estimate keeps from the axis's end: its mark's radius and edge, an arrowhead's half, and a pad
+        clear = (POSTER_MARK / 2 + 3.0) / 72 + arrow + POSTER_PAD
+        reach = max(abs(value - reference) for _, value, _, _ in rows) / (1 - 2 * clear / (COLUMN - left - right))
+        reach = max(reach, reference - ticks[0], ticks[-1] - reference)
+        low_limit, high_limit = reference - reach, reference + reach
     for row, (label, value, low, high) in enumerate(rows):
         ax.hlines(row, max(low, low_limit), min(high, high_limit), color=SKY, linewidth=POSTER_BAR, zorder=3,
                   capstyle="round")
@@ -116,11 +126,9 @@ def gain_figure(matched: list[dict]) -> tuple:
     its 95% interval, a row per trait."""
     rows = [(trait_name(row["trait"]), row["relative"] / 100, row["relative_lower"] / 100, row["relative_upper"] / 100)
             for row in matched]
-    # the axis spans every estimate and each interval up to twice the median interval's width; a wider one runs off
-    # the axis in arrowheads, so one imprecise trait does not flatten the rest
-    typical = 2 * float(np.median([high - low for _, _, low, high in rows]))
-    ends = [end for _, value, low, high in rows for end in ((value,) if high - low > typical else (low, high))]
-    fig = forest(rows, "Change in r² with SVs (%)\nand 95% CI", span(ends), percent, log=False)
+    # the axis spans the estimates, not their intervals; an interval that runs past it ends in an arrowhead
+    fig = forest(rows, "Change in r² with SVs (%)", span([value for _, value, _, _ in rows]), percent, log=False,
+                 estimates=True)
     return fig, ["Change in held-out partial r² from adding SVs to SV-PGS for each trait, as a percentage of the two "
                  "models' mean partial r², with 95% intervals, an arrowhead marking an interval that runs past the axis"]
 
