@@ -80,10 +80,9 @@ LABEL_GAP = 0.3
 MARK = 1.5
 """The forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR) when its rows are a line of type
 apart."""
-HEIGHT = 0.0
-"""Inches: the gain forest's least height, which fills the right column from its text to the Discussion band at the
-poster's foot (build_pptx.py's layout). Rows further apart than a line of type have marks up to GROWTH times MARK."""
-GROWTH = 4 / 3
+HEIGHT = 19.90
+"""Inches: the All of Us figure's height, the room the poster's right column gives it (build_pptx.py's layout). What it
+has beyond the figure's natural height goes between the panels; the rows stay a line of type apart."""
 TRAITS = {
     "ldl_cholesterol": "LDL cholesterol", "egfr": "eGFR", "hypertension": "Hypertension",
     "type_2_diabetes": "Type 2 diabetes", "coronary_artery_disease": "Coronary disease",
@@ -124,8 +123,8 @@ def forest(panels: list[Panel], least: float = 0.0):
     follows its marks or its name (Panel). A log panel spans its estimates and is ticked at the
     decades inside; a linear one is symmetric about 0 over its estimates. Either way each mark clears an arrowhead at
     the axis's end, and an interval past the axis ends in one. Every margin and row height is measured from the type,
-    so the figure is as short as its type allows, unless ``least`` inches is taller: then its rows share the extra
-    height and their marks grow with it, up to GROWTH."""
+    so the figure is as short as its type allows, unless ``least`` inches is taller: then the extra height goes
+    between the panels, or over a lone panel."""
     fig = plt.figure(figsize=(COLUMN, 1.0))
     size = POSTER_STYLE["font.size"]
     shown = {name: name for panel in panels for name, _ in panel.rows}
@@ -162,14 +161,13 @@ def forest(panels: list[Panel], least: float = 0.0):
     bottoms[-1] += EDGE - POSTER_PAD
     natural = EDGE + sum(key + sum(rows) + bottom for key, rows, bottom in zip(keys, heights, bottoms))
     height = max(least, natural)
-    extra = (height - natural) / sum(len(rows) for rows in heights)
+    spare = height - natural
     # an arrowhead at the axis's start reaches half its width to the left, toward the names
-    arrow = max(marks) * GROWTH * 0.7 / 2 / 72
+    arrow = max(marks) * 0.7 / 2 / 72
     left = EDGE + max(named.values()) + LABEL_GAP + arrow
     fig.set_size_inches(COLUMN, height)
-    growths = [min(1 + extra / min(rows), GROWTH) for rows in heights]
     # each mark clears the axis's ends by its half width, its ring, an arrowhead and a pad
-    halves = [(mark + RING) * growth / 2 / 72 for mark, growth in zip(marks, growths)]
+    halves = [(mark + RING) / 2 / 72 for mark in marks]
     clears = [half + arrow + POSTER_PAD for half in halves]
     # the notes of rows with marks at the rows' ends, or, when that leaves too narrow an axis, in the notes' column
     width = plot_width(fig, panels, clears, halves, COLUMN - left, arrow, ends_noted=True)
@@ -181,10 +179,11 @@ def forest(panels: list[Panel], least: float = 0.0):
         width = plot_width(fig, panels, clears, halves, COLUMN - left, arrow, ends_noted=False)
     star = widest(fig, [STAR], fontsize=size)
     top = height - EDGE
-    for panel, mark, rows, key, key_rows, bottom, growth, clear, half, notes, column in zip(
-            panels, marks, heights, keys, lines, bottoms, growths, clears, halves, wrapped, columns):
-        mark, bar, ring = mark * growth, POSTER_BAR * growth, RING * growth
-        span = sum(rows) + extra * len(rows)
+    top -= spare if len(panels) == 1 else 0.0
+    for panel, mark, rows, key, key_rows, bottom, clear, half, notes, column in zip(
+            panels, marks, heights, keys, lines, bottoms, clears, halves, wrapped, columns):
+        bar, ring = POSTER_BAR, RING
+        span = sum(rows)
         # the key over the panel from the canvas's left edge, a line at a time: each series' mark, then its name
         for index, row in enumerate(key_rows):
             middle = top - index * key / len(key_rows) - (key / len(key_rows) - ROW_GAP) / 2
@@ -199,11 +198,11 @@ def forest(panels: list[Panel], least: float = 0.0):
         top -= key
         # the axes' y is inches down from its top, each row centred in its height
         ax = frame(fig, left, top - span, width, span)
-        centres = np.cumsum([0.0, *(row + extra for row in rows)])[:-1] + (np.array(rows) + extra) / 2
+        centres = np.cumsum([0.0, *rows])[:-1] + np.array(rows) / 2
         low_limit, high_limit = limits(panel, width, clear)
         if panel.log:
             ax.set_xscale("log")
-        for (name, estimates), centre, row in zip(panel.rows, centres, rows):
+        for (name, estimates), centre in zip(panel.rows, centres):
             each, past = ends(panel, name, estimates, width, low_limit, high_limit, half, arrow, star)
             for index, ((label, colour, marker, filled), (value, low, high)) in enumerate(zip(panel.series, estimates)):
                 y = centre + (index - (len(panel.series) - 1) / 2) * (mark / 72 + (0.0 if filled else ring / 72)
@@ -246,7 +245,7 @@ def forest(panels: list[Panel], least: float = 0.0):
         ax.set_xlabel(panel.xlabel, labelpad=TITLE_PAD)
         # centred on the canvas, not on the axes, whose margins differ: a title wider than the axes then fits either side
         ax.xaxis.label.set_x((COLUMN / 2 - left) / width)
-        top -= span + bottom
+        top -= span + bottom + (spare / (len(panels) - 1) if len(panels) > 1 else 0.0)
     return fig
 
 

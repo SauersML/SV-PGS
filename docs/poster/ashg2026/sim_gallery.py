@@ -825,7 +825,7 @@ sources written beside their marks. A poster figure carries no legend and no tit
 figure's own labels, state its message."""
 POSTER_LINE, POSTER_MARK, POSTER_BAR = 8.0, 26.0, 6.0
 """Points: a data line's width, a mean's marker and an interval's line in the poster's figures."""
-POSTER_HEIGHT = 9.6
+POSTER_HEIGHT = 9.25
 """Inches: the height of the two figures side by side at the top of the poster's middle column."""
 POSTER_HALF = 10.56
 """Inches: the width each of those two figures is placed at (half of build_pptx.py's 21.92 in middle column less its
@@ -851,6 +851,9 @@ simulations' dots take. No figure carries a citation mark; the poster's text cit
 build_pptx.py's REFERENCES). SV-PGS fits every SNV, indel and SV with no frequency or r² floor
 (stage2_wiring.fit_models); LDpred2-auto SNVs of training MAF >= 1% thinned to HapMap3's chr22 count, at most 16,000
 (benchmarks/bench_sim/submissions/ldpred2_auto.py)."""
+POSTER_AUC_FLOOR = 0.47
+"""The AUC every poster AUC axis starts at, under the lowest simulation's AUC, so that every dot shows at its value; the
+ticks start at 0.5. A dot under it stops the build."""
 DOT_OFFSET, DOT_JITTER, DOT_ALPHA = 0.12, 0.05, 0.25
 """Doublings of training size a method's simulation dots sit to its side of the size, the most a dot moves at random
 about that, and the dots' opacity."""
@@ -870,9 +873,8 @@ def poster_accuracy_figure(grids, summary):
     """Figure 1a for the poster: test AUC against training size for SV-PGS (circles) and LDpred2-auto (squares), pooled
     over the architectures with 0%, 5% and 20% causal SVs. Each mean has its 95% interval as an error bar, over every
     simulation's own AUC as a faint dot in its architecture's colour, left of its size for SV-PGS and right for
-    LDpred2-auto. The y axis starts at 0.5 AUC and ticks every 0.1 up to the first tick over the AUC of the true genetic
-    value, a dotted line labelled "Best possible"; a simulation's AUC under 0.5 is left out, and the build prints each
-    one. Each method is named beside its marks where its name fits: SV-PGS over the marks its name spans from the left,
+    LDpred2-auto. The y axis starts at POSTER_AUC_FLOOR and ticks every 0.1 from 0.5 up to the first tick over the AUC
+    of the true genetic value, a dotted line labelled "Best possible". Each method is named beside its marks where its name fits: SV-PGS over the marks its name spans from the left,
     under the best possible AUC, and LDpred2-auto under the marks its name spans to the right end, over the x axis.
     When either does not fit, both stand on one line over the colours' key, ending at the plot's right edge. The key,
     "0%, 5% or 20% causal SVs", is one line over the plot, ending at its right edge: at tick size it is wider than the
@@ -895,19 +897,19 @@ def poster_accuracy_figure(grids, summary):
     first, last = ax.get_xlim()
     doubling = width / math.log2(last / first)
     random = np.random.default_rng(0)
-    floor, step = 0.5, 0.1
-    marks, dots = [], []
+    floor, step = POSTER_AUC_FLOOR, 0.1
+    marks = []
     for key, _, color, marker, side in POSTER_METHODS:
         for point, _, share in POSTER_SHARES:
             for size in SIZES:
-                values = np.asarray(finite(grouped.get((point, size), []), key))
+                values = finite(grouped.get((point, size), []), key)
+                if values and min(values) < floor:
+                    raise SystemExit(f"poster_accuracy_by_training_size: a {key} AUC of {min(values):.3f} is under "
+                                     f"POSTER_AUC_FLOOR, {floor}")
                 across = size * 2.0 ** (side * DOT_OFFSET + random.uniform(-DOT_JITTER, DOT_JITTER, len(values)))
-                # a dot over the floor is drawn whole, one under it not at all
-                shown = values >= floor
-                ax.plot(across[shown], values[shown], marker, color=share, alpha=DOT_ALPHA,
-                        markersize=POSTER_MARK * 0.5, markeredgewidth=0, linestyle="none", zorder=2, clip_on=False)
-                marks.extend(zip(across[shown], values[shown]))
-                dots.extend(values)
+                ax.plot(across, values, marker, color=share, alpha=DOT_ALPHA, markersize=POSTER_MARK * 0.5,
+                        markeredgewidth=0, linestyle="none", zorder=2)
+                marks.extend(zip(across, values))
         pooled = [interval(finite([row for point, *_ in POSTER_SHARES for row in grouped.get((point, size), [])], key))
                   for size in SIZES]
         mean, low, high = (np.array([cell[i] for cell in pooled]) for i in range(3))
@@ -917,11 +919,7 @@ def poster_accuracy_figure(grids, summary):
         marks.extend([*zip(SIZES, low), *zip(SIZES, high)])
     marks = np.asarray(marks)
     ceiling = summary["points"]["null"]["true_value_auc"]
-    below = sorted(value for value in dots if value < floor)
-    if below:
-        print(f"poster_accuracy_by_training_size: {len(below)} simulation AUCs under {floor} fall below the y axis: "
-              + ", ".join(f"{value:.3f}" for value in below))
-    levels = np.arange(floor, ceiling + step, step)
+    levels = np.arange(0.5, ceiling + step, step)
     style = {"fontsize": POSTER_NAME, "fontweight": "bold"}
     ours, theirs = (method for _, method, *_ in POSTER_METHODS)
     tall = {method: tallest(fig, [method], **style) for method in (ours, theirs)}
@@ -985,7 +983,8 @@ starts."""
 def poster_wins_figure(grids):
     """SV-PGS's test AUC against LDpred2-auto's in every simulation at the largest training size, over the line of equal
     AUC: one dot per simulation (black with no causal SVs), with the 95% interval of the paired AUC difference drawn
-    through it, so a dot above the line is a simulation in which SV-PGS predicted better. Both axes start at 0.5 AUC."""
+    through it, so a dot above the line is a simulation in which SV-PGS predicted better. Both axes start at
+    POSTER_AUC_FLOOR and tick every 0.1 from 0.5."""
     size = SIZES[-1]
     grouped = cells(grids["grid"])
     rows = [row for point in LABELS for row in grouped.get((point, size), [])
@@ -1011,14 +1010,12 @@ def poster_wins_figure(grids):
     # the training size over the dots at the top left, reaching WINS_ABOVE inches into the top margin
     note = f"Training N = {size:,}"
     need = tallest(fig, [note], fontsize=POSTER_TYPE) - WINS_ABOVE + POSTER_PAD
-    # one scale on both axes, so the line of equal AUC runs at 45 degrees: up the y axis from 0.5 to at least 0.705,
-    # and far enough that the note clears the highest bar, and along the x axis at the same scale; an AUC or an
-    # interval's end under 0.5 falls outside the axes, and the build prints each one
-    low, reach = 0.5, (ours + half).max()
-    outside = [(a, b, b - c) for a, b, c in zip(theirs, ours, half) if min(a, b - c) < low]
-    if outside:
-        print(f"poster_wins: {len(outside)} simulations reach under {low} (LDpred2-auto AUC, SV-PGS AUC, its "
-              "interval's lower end): " + "; ".join(f"{a:.3f}, {b:.3f}, {c:.3f}" for a, b, c in outside))
+    # one scale on both axes, so the line of equal AUC runs at 45 degrees: up the y axis from POSTER_AUC_FLOOR to at
+    # least 0.705, and far enough that the note clears the highest bar, and along the x axis at the same scale; an
+    # interval may run under the floor, a dot may not
+    low, reach = POSTER_AUC_FLOOR, (ours + half).max()
+    if min(theirs.min(), ours.min()) < low:
+        raise SystemExit(f"poster_wins: an AUC of {min(theirs.min(), ours.min()):.3f} is under POSTER_AUC_FLOOR, {low}")
     upper = max(0.705, (reach * height - low * need) / (height - need))
     right = low + (upper - low) / height * width
     # the line of equal AUC stops under the note at the top left
@@ -1060,14 +1057,15 @@ sv_min_realized_r2)."""
 POSTER_GAIN, POSTER_GENOTYPES = POSTER_HALF, POSTER_HALF
 """Inches: the widths of the SV gain forest and the imputation figure, side by side in the lower row of the poster's
 middle column (build_pptx.py's layout), each placed at that width so its type prints at its own size."""
-POSTER_GAIN_HEIGHT = 10.07
+POSTER_GAIN_HEIGHT = 8.52
 """Inches: the SV gain forest's height. Its rows share what the key and the x axis leave, and the build stops when that
 is less than the rows need."""
 POSTER_GENOTYPES_HEIGHT = POSTER_GAIN_HEIGHT
 """Inches: the imputation figure's height, the SV gain forest's, so the two sit flush side by side."""
-GAIN_WEIGHT, GAIN_OFFSET = 1.0, 0.24
-"""The SV gain forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR), and the rows each
-source's interval sits above (true genotypes) or below (imputed SVs) its set's row."""
+GAIN_WEIGHT = 1.0
+"""The SV gain forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR)."""
+GAIN_TITLE = "Test AUC gain from SVs"
+"""The SV gain forest's x axis title, short enough for one line."""
 FOREST_SIZES = SIZES[:3]
 """The training sizes the SV gain forest averages over, 5,000 to 20,000. Both genotype sources reached 40,000 in one
 simulation only, a control one, and the gain grows with training size: with it, the control's gain with imputed SVs
@@ -1096,44 +1094,51 @@ def gain_sets(grids) -> dict[str, dict]:
 
 
 def gain_forest(rows: list[dict], bold: dict):
-    """The SV gain forest of ``poster_sv_gain_figure``, POSTER_GAIN wide and POSTER_GAIN_HEIGHT tall, its rows sharing
-    the height between the key and the measured x axis, ``bold``'s label in bold. The key names the two genotype sources
-    after marks like their own, stacked over the plot and ending at its right edge. A row needs the height at which its
-    two marks clear each other by POSTER_PAD and its label clears the next; a shorter POSTER_GAIN_HEIGHT stops the
-    build."""
+    """The SV gain forest of ``poster_sv_gain_figure``, POSTER_GAIN wide and POSTER_GAIN_HEIGHT tall, ``bold``'s label
+    in bold. Each row's true-genotype interval stands over its imputed one, their marks a pad apart, and the rows stand
+    as close as their marks and labels allow, a pad apart. The key names the two genotype sources after marks like
+    their own, stacked over the plot and ending at its right edge. A POSTER_GAIN_HEIGHT under what the key, the rows and
+    the x axis need stops the build with that height; over it, the rows spread out."""
     top, right, height = POSTER_PAD, 0.5, POSTER_GAIN_HEIGHT
     mark, bar, ring = POSTER_MARK * GAIN_WEIGHT, POSTER_BAR * GAIN_WEIGHT, 6.0 * GAIN_WEIGHT
     fig = plt.figure(figsize=(POSTER_GAIN, height))
     style = dict(fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0)
-    # inches from a key mark's centre to its name: the mark's reach and a pad
-    gap = (mark + ring) / 2 / 72 + 2 * POSTER_PAD
+    # inches: a mark's radius, its ring included, and from a key mark's centre to its name
+    reach = (mark + ring) / 2 / 72
+    gap = reach + 2 * POSTER_PAD
     # the key's names, wrapped after "and", each over a pad
     names = [label.replace(" and ", " and\n") for label, _, _ in SOURCES]
     heights = [tallest(fig, [name], **style) for name in names]
     key = sum(heights) + len(names) * POSTER_PAD
-    # the x axis's title is wider than the plot on one line
-    title = "Test AUC gain\nfrom adding SVs"
-    bottom = under_axes(fig, [title])
+    bottom = under_axes(fig, [GAIN_TITLE])
     labels = [row["label"] for row in rows]
     left = widest(fig, labels, **style) + 0.75
-    # a row's two marks stand GAIN_OFFSET rows either side of it
-    pitch = max(((mark + ring) / 72 + POSTER_PAD) / (2 * GAIN_OFFSET), tallest(fig, labels, **style) + POSTER_PAD)
-    need = top + key + len(rows) * pitch + bottom
+    # inches down the plot to each row's centre: a pad over the first mark, a pad between the marks of neighbouring
+    # rows and between their labels, and a pad under the last mark
+    offset = reach + POSTER_PAD / 2
+    tall = [tallest(fig, [label], **style) for label in labels]
+    centres = [POSTER_PAD + reach + offset]
+    for upper, lower in zip(tall, tall[1:]):
+        centres.append(centres[-1] + max(2 * (offset + reach) + POSTER_PAD, (upper + lower) / 2 + POSTER_PAD))
+    span = centres[-1] + offset + reach + POSTER_PAD
+    need = top + key + span + bottom
     if height < need - 0.005:
         raise SystemExit(f"poster_sv_gain: POSTER_GAIN_HEIGHT is {height} in, under the {need:.2f} in its rows need")
+    plot = height - top - key - bottom
+    centres = [centre * plot / span for centre in centres]
     width = POSTER_GAIN - left - right
-    ax = frame(fig, left, bottom, width, height - key - top - bottom)
+    ax = frame(fig, left, bottom, width, plot)
     ends = [row[source][end] for row in rows for source in ("true", "imputed") for end in ("lower", "upper")
             if math.isfinite(row[source][end])]
     low, high = min(0.0, *ends), max(ends)
     limits = (low - 0.05 * (high - low), high + 0.05 * (high - low))
-    for y, row in enumerate(rows):
-        for offset, source, (_, color, filled) in ((-GAIN_OFFSET, "true", SOURCES[0]), (GAIN_OFFSET, "imputed", SOURCES[1])):
+    for y, row in zip(centres, rows):
+        for shift, source, (_, color, filled) in ((-offset, "true", SOURCES[0]), (offset, "imputed", SOURCES[1])):
             test = row[source]
             if math.isfinite(test["lower"]):
-                ax.hlines(y + offset, test["lower"], test["upper"], color=color, linewidth=bar, zorder=3,
+                ax.hlines(y + shift, test["lower"], test["upper"], color=color, linewidth=bar, zorder=3,
                           capstyle="round")
-            ax.plot([test["mean"]], [y + offset], "o", markersize=mark, color=color,
+            ax.plot([test["mean"]], [y + shift], "o", markersize=mark, color=color,
                     markerfacecolor=color if filled else "white", markeredgecolor=color,
                     markeredgewidth=0 if filled else ring, zorder=4)
         ax.text(0, y, row["label"], transform=shifted(ax, -0.3), ha="right", va="center", linespacing=1.0,
@@ -1141,7 +1146,8 @@ def gain_forest(rows: list[dict], bold: dict):
     ax.axvline(0, color=INK, linewidth=4.0, zorder=2)
     ax.set_yticks([])
     ax.spines["left"].set_visible(False)
-    ax.set_ylim(len(rows) - 0.5, -0.5)
+    # the y axis in inches down the plot
+    ax.set_ylim(plot, 0)
     ax.set_xlim(*limits)
     # the finest tick step whose labels stand 0.3 in apart
     wide = widest(fig, ["0.000"], fontsize=POSTER_TYPE) + 0.3
@@ -1149,17 +1155,18 @@ def gain_forest(rows: list[dict], bold: dict):
                 if step * width / (limits[1] - limits[0]) >= wide)
     ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
     ax.set_xticks(ticks, [plain(tick, 3) for tick in ticks])
-    ax.set_xlabel(title, loc="right")
+    # the title runs longer than the axis, so it ends at the axis's far end
+    ax.set_xlabel(GAIN_TITLE, loc="right")
     # the key over the plot, the names ending at its right edge, each mark before its name and level with its first
     # line
     line = tallest(fig, ["Called"], **style)
     across, up = POSTER_GAIN - right - widest(fig, names, **style), height - top
-    for (label, color, filled), name, tall in zip(SOURCES, names, heights):
+    for (label, color, filled), name, tall_name in zip(SOURCES, names, heights):
         ax.plot([across - gap], [up - line / 2], "o", transform=fig.dpi_scale_trans, markersize=mark, color=color,
                 markerfacecolor=color if filled else "white", markeredgecolor=color,
                 markeredgewidth=0 if filled else ring, clip_on=False, zorder=4)
         fig.text(across, up, name, transform=fig.dpi_scale_trans, color=color, va="top", ha="left", **style)
-        up -= tall + POSTER_PAD
+        up -= tall_name + POSTER_PAD
     return fig
 
 

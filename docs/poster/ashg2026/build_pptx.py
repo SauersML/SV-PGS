@@ -145,11 +145,9 @@ def copy(numbers: dict) -> dict:
         "methods": ["Priors use SV type, length, frequency and imputation r²."],
         # the grid varies one or two settings at a time from its base disease: the causal SV share, the SV effects' size
         # or shape, h² 0.01, prevalence 1%, 50 or 2,000 causal variants, and which SVs are causal
-        "design": [
-            f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22.",
-            f"Simulated diseases vary the causal SV share ({listed([f'{share:.0%}' for share in DESIGN_SHARES])}), SV "
-            "effects, h², prevalence and causal count.",
-        ],
+        "design": [f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22."],
+        "grid": [f"Simulated diseases vary the causal SV share ({listed([f'{share:.0%}' for share in DESIGN_SHARES])}), "
+                 "SV effects, h², prevalence and causal count."],
         # GLIMPSE2 is Rubinacci 2023; the assemblies are the accepted abstract's 12,212 phased genome assemblies
         # the forest's matched fits: SV-PGS with and without SVs on every trait, tested in its held-out people
         "aou": ["We imputed SVs from 12,212 long-read assemblies into 100,000 All of Us"
@@ -442,15 +440,13 @@ def width_of(runs: list[tuple[str, str]], size_pt: float) -> float:
 
 
 def references() -> list[Block]:
-    """The References section at the foot of the right column: its bar, then the QR code to the repository with the
-    references in small type beside it, one to a line."""
+    """The References section: its bar, then the QR code to the repository with the references in small type under it,
+    one to a line."""
     lines = [marked(f"{SUPERSCRIPT[index]}{reference}") for index, reference in enumerate(REFERENCES, start=1)]
-    words = Block("text", [Para(runs, REFERENCE, bullet=False, after=0) for runs in lines])
-    type_width = max(width_of(runs, REFERENCE) for runs in lines) + 2 * INSET + 0.05
-    share = QR / (RIGHT - GUTTER)
-    if QR + GUTTER + type_width > RIGHT:
-        raise SystemExit("the references do not fit beside the QR code")
-    return [bar(96, "References"), row([Block("qr", None)], [words], shares=(share, 1 - share))]
+    if max(width_of(runs, REFERENCE) for runs in lines) + 2 * INSET > RIGHT:
+        raise SystemExit("a reference runs past the right column")
+    return [bar(96, "References"), Block("qr", None),
+            Block("text", [Para(runs, REFERENCE, bullet=False, after=0) for runs in lines])]
 
 
 def row(*children: list, shares: tuple = ()) -> Block:
@@ -644,30 +640,34 @@ def build() -> None:
         "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy",
         "poster_model")}
     discussion = [bar(95, "Discussion"), text(bullets([*words["discussion"], *aou_result()]))]
-    # the poster reads Introduction and Methods, the simulation's results with the Discussion at their foot, then All of
-    # Us with the QR code to the repository and the references at its foot. The All of Us result (its common gain) adds
-    # a Discussion bullet.
+    # the poster reads Introduction and Methods (with how All of Us was imputed, beside the imputation figure), the
+    # simulation's results, All of Us, then the Discussion and the References in a band across the foot of the middle
+    # and right columns. The All of Us result (its common gain) adds a Discussion bullet.
     columns = [
         [
             bar(97, "Introduction"), text(bullets(words["introduction"])),
-            bar(91, "Methods"), figure(gallery["poster_model"]), text(bullets(words["methods"])),
-            figure(IMPUTATION / "sv_imputation_by_context.png", flex=True), text(bullets(words["design"])),
+            bar(91, "Methods"), figure(gallery["poster_model"]),
+            text(bullets([*words["methods"], *words["design"], *words["aou"]])),
+            figure(IMPUTATION / "sv_imputation_by_context.png", flex=True),
         ],
         [
-            bar(118, "Simulation results"),
+            bar(118, "Simulation results"), text(bullets(words["grid"])),
             row([figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
             row([figure(gallery["poster_sv_gain"])],
                 [figure(gallery["poster_imputation_accuracy"], legend=GALLERY / "fig5_simulated_svs.txt")]),
         ],
-        [bar(119, "All of Us cohort results"), text(bullets(words["aou"])), *aou_blocks(), *references()],
+        [bar(119, "All of Us cohort results"), *aou_blocks()],
     ]
     poster = Poster(xml, rels, work / "ppt/media")
-    # the Discussion at the foot of the middle column, which ends above it
-    top = BOTTOM - poster.stack_height(discussion, MIDDLE)
-    poster.stack(discussion, COLUMNS[1][0], top, MIDDLE, None)
+    # the band across the foot of the middle and right columns: the Discussion under the middle column, the References
+    # under the right
+    across = MIDDLE + GUTTER + RIGHT
+    band = [row(discussion, references(), shares=(MIDDLE / (across - GUTTER), RIGHT / (across - GUTTER)))]
+    top = BOTTOM - poster.stack_height(band, across)
+    poster.stack(band, COLUMNS[1][0], top, across, None)
     for index, ((x, width), blocks) in enumerate(zip(COLUMNS, columns)):
-        poster.stack(blocks, x, TOP, width, top - GAPS["section"] if index == 1 else BOTTOM)
+        poster.stack(blocks, x, TOP, width, top - GAPS["section"] if index else BOTTOM)
     xml = poster.xml.replace("</p:spTree>", "".join(poster.shapes) + "</p:spTree>")
     rels = poster.rels
 

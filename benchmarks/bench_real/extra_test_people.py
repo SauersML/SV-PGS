@@ -356,7 +356,7 @@ def read_crosswalk(path: str | Path) -> dict[str, str]:
         rows = list(csv.DictReader(handle, delimiter="\t"))
     sequencing = [row["sequencing_id"] for row in rows]
     research = [row["research_id"] for row in rows]
-    if (any(not value for value in sequencing + research) or
+    if (not rows or any(not value for value in sequencing + research) or
             len(set(sequencing)) != len(sequencing) or len(set(research)) != len(research)):
         raise ValueError("Crosswalk must be nonempty and one-to-one")
     return dict(zip(sequencing, research))

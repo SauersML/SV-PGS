@@ -134,7 +134,7 @@ def test_poster_design_lists_the_causal_sv_shares_the_grid_simulates(monkeypatch
 
     poster = poster_module(monkeypatch, tmp_path)
     assert set(poster.DESIGN_SHARES) == {point["sv_causal_fraction"] for point in grid.POINTS.values()}
-    assert "causal SV share (0%, 5% or 20%)" in poster_copy(poster)["design"][1]
+    assert "causal SV share (0%, 5% or 20%)" in poster_copy(poster)["grid"][0]
 
 
 def test_poster_cites_every_reference_in_order(monkeypatch, tmp_path):
@@ -142,8 +142,9 @@ def test_poster_cites_every_reference_in_order(monkeypatch, tmp_path):
 
     poster = poster_module(monkeypatch, tmp_path)
     words = poster_copy(poster)
-    # in reading order: the left column, the All of Us column, then the Discussion; figures cite nothing
-    lines = [*words["introduction"], *words["methods"], *words["design"], *words["aou"], *words["discussion"]]
+    # in reading order: the left column, the simulation's column, then the Discussion; figures cite nothing
+    lines = [*words["introduction"], *words["methods"], *words["design"], *words["aou"], *words["grid"],
+             *words["discussion"]]
     assert not any(mark in name for _, name, *_ in sim_gallery.POSTER_METHODS for mark in "¹²³⁴⁵⁶⁷⁸⁹")
     # h² and r² are exponents, not citations
     text = re.sub(r"[hr]²", "", " ".join(lines))
@@ -154,7 +155,7 @@ def test_poster_cites_every_reference_in_order(monkeypatch, tmp_path):
 
 def test_every_poster_bullet_ends_with_a_full_stop(monkeypatch, tmp_path):
     words = poster_copy(poster_module(monkeypatch, tmp_path))
-    for key in ("introduction", "methods", "design", "aou", "discussion"):
+    for key in ("introduction", "methods", "design", "aou", "grid", "discussion"):
         for line in words[key]:
             # a citation's number follows the full stop
             assert line.rstrip("¹²³⁴⁵⁶⁷⁸⁹").endswith("."), line
@@ -184,19 +185,15 @@ def test_aou_result_states_the_common_change_over_its_traits(monkeypatch, tmp_pa
     assert "changed r² by +0.03% (95% CI −0.11 to 0.17%) over 5 traits," in sentence
 
 
-def test_references_sit_beside_the_qr_code_within_the_right_column(monkeypatch, tmp_path):
+def test_references_sit_under_the_qr_code_within_the_right_column(monkeypatch, tmp_path):
     poster = poster_module(monkeypatch, tmp_path)
-    heading, beside = poster.references()
+    heading, qr, words = poster.references()
     assert (heading.kind, heading.content) == ("bar", (96, "References"))
-    (qr,), (words,) = beside.children
-    assert (beside.kind, qr.kind, words.kind) == ("row", "qr", "text")
+    assert (qr.kind, words.kind) == ("qr", "text")
     assert ["".join(text for text, _ in para.runs) for para in words.content] == [
         f"{poster.SUPERSCRIPT[index]}{reference}" for index, reference in enumerate(poster.REFERENCES, start=1)]
-    qr_width, type_width = poster.parts(beside, poster.RIGHT)
-    assert qr_width == pytest.approx(poster.QR)
     longest = max(poster.width_of(para.runs, poster.REFERENCE) for para in words.content)
-    assert poster.QR + poster.GUTTER + longest + 2 * poster.INSET <= poster.RIGHT
-    assert longest + 2 * poster.INSET <= type_width
+    assert longest + 2 * poster.INSET <= poster.RIGHT
 
 
 def test_poster_copy_never_mentions_convergence_certification_or_a_dagger(monkeypatch, tmp_path):
