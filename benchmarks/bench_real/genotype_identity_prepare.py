@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -122,14 +123,13 @@ def prepare(work):
     key_index = {tuple(site): index for index, site in enumerate(sites)}
     query_arrays, query_ids, quality = [], [], []
     encoding = {'0/0': 0, '0|0': 0, '0/1': 1, '1/0': 1, '0|1': 1, '1|0': 1, '1/1': 2, '1|1': 2}
-    for batch in range(5):
+    def extract_batch(batch):
         status('extracting_new_callset', completed='in progress')
-        os.environ['GCS_OAUTH_TOKEN'] = command(['gcloud', 'auth', 'print-access-token'], text=True).strip()
         path = pattern.format(batch=batch)
         names = command(['bcftools', 'query', '-l', path], text=True).split()
         data = np.full((len(names), len(sites)), 3, dtype=np.uint8)
         q = np.zeros(len(sites))
-        error_file = work / 'bcftools.private.stderr'
+        error_file = work / f'bcftools_batch_{batch}.private.stderr'
         with error_file.open('w') as error:
             process = subprocess.Popen(['bcftools', 'query', '-R', str(region),
                                         '-f', '%POS\t%REF\t%ALT\t%INFO/INFO[\t%GT]\n', path],
@@ -150,9 +150,12 @@ def prepare(work):
                 q[column] = float(fields[3]) if fields[3] != '.' else 0
             if process.wait():
                 raise RuntimeError('New VCF extraction failed')
-        query_arrays.append(data)
-        query_ids.extend(names)
-        quality.append((q >= .97) & ((data != 3).mean(axis=0) >= .99))
+        return data, names, (q >= .97) & ((data != 3).mean(axis=0) >= .99)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for data, names, good in pool.map(extract_batch, range(5)):
+            query_arrays.append(data)
+            query_ids.extend(names)
+            quality.append(good)
     usable = np.logical_and.reduce(quality)
     if usable.sum() < 2048:
         raise ValueError('Insufficient common high-quality sites across batches')
