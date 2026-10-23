@@ -6,6 +6,7 @@ import json
 import math
 import re
 import sys
+from collections import Counter
 
 import numpy as np
 import pytest
@@ -129,22 +130,18 @@ def poster_copy(poster) -> dict:
     return poster.copy(json.loads((poster.HERE / "figures/gallery/numbers.json").read_text()))
 
 
-def test_poster_design_lists_each_setting_value_the_grid_simulates(monkeypatch, tmp_path):
+def test_poster_design_gives_the_grids_base_disease_and_its_other_sv_shares(monkeypatch, tmp_path):
     from benchmarks.power import grid
 
     poster = poster_module(monkeypatch, tmp_path)
-    simulated = {
-        "h2": {point.get("truth", {}).get("h2", grid.HERITABILITY) for point in grid.POINTS.values()},
-        "prevalence": {point.get("truth", {}).get("prevalence", grid.PREVALENCE) for point in grid.POINTS.values()},
-        "causal_variants": {point.get("causal_variants", grid.CAUSAL_VARIANTS) for point in grid.POINTS.values()},
-        "sv_causal_fraction": {point["sv_causal_fraction"] for point in grid.POINTS.values()},
-    }
-    assert {name: set(values) for name, values in poster.DESIGN_SETTINGS.items()} == simulated
-    line = " ".join(poster_copy(poster)["design"][1:3])
-    # each value is named and none is given as a range
-    assert "–" not in line
-    assert "h² 0.01 or 0.1" in line and "prevalence 1% or 10%" in line
-    assert "50, 200 or 2,000 causal variants" in line and "0%, 5% or 20% are SVs" in line
+    shares = Counter(point["sv_causal_fraction"] for point in grid.POINTS.values())
+    base = shares.most_common(1)[0][0]
+    assert poster.DESIGN_BASE == {"h2": grid.HERITABILITY, "prevalence": grid.PREVALENCE,
+                                  "causal_variants": grid.CAUSAL_VARIANTS, "sv_causal_fraction": base}
+    assert set(poster.DESIGN_SHARES) == set(shares) - {base}
+    base_line, others = poster_copy(poster)["design"][1:3]
+    assert "h² 0.1, prevalence 10%, 200 causal variants, 20% of them SVs" in base_line
+    assert "SV share (0% or 5%)" in others
 
 
 def test_poster_cites_every_reference_in_order(monkeypatch, tmp_path):
@@ -163,7 +160,15 @@ def test_poster_gain_note_counts_the_simulations_the_forest_draws(monkeypatch, t
     poster = poster_module(monkeypatch, tmp_path)
     rows = json.loads((poster.HERE / "figures/gallery/numbers.json").read_text())["poster_sv_gain"]["rows"]
     drawn = sum(row["true"][3] for row in rows.values() if row is not rows.get("well_imputed"))
-    assert f"over {drawn} simulations" in poster_copy(poster)["gain_note"]
+    assert poster_copy(poster)["gain_note"].startswith(f"{drawn} simulations ")
+
+
+def test_every_poster_bullet_ends_with_a_full_stop(monkeypatch, tmp_path):
+    words = poster_copy(poster_module(monkeypatch, tmp_path))
+    for key in ("introduction", "methods", "design", "aou", "discussion"):
+        for line in words[key]:
+            # a citation's number follows the full stop
+            assert line.rstrip("¹²³⁴⁵⁶⁷⁸⁹").endswith("."), line
 
 
 def test_the_whole_chr22_note_gives_the_prevalence_every_whole_chr22_architecture_has(monkeypatch, tmp_path):

@@ -46,8 +46,12 @@ ROW_GAP = 0.05
 LABEL_GAP = 0.3
 """Inches between the widest row name and the plot."""
 MARK = 1.5
-"""The forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR): its rows are a line of type
-apart, and the room the right column has over them goes to the marks."""
+"""The forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR) when its rows are a line of type
+apart."""
+HEIGHT = 17.22
+"""Inches: the gain forest's least height, which fills the right column from its text to the Discussion band at the
+poster's foot (build_pptx.py's layout). Rows further apart than a line of type have marks up to GROWTH times MARK."""
+GROWTH = 4 / 3
 TRAITS = {
     "ldl_cholesterol": "LDL cholesterol", "egfr": "eGFR", "hypertension": "Hypertension",
     "type_2_diabetes": "Type 2 diabetes", "coronary_artery_disease": "Coronary disease",
@@ -65,14 +69,15 @@ def trait_name(trait: str) -> str:
 
 def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list[float], tick_text, log: bool,
            reference: float | None = None, estimates: bool = False, bold: frozenset = frozenset(),
-           note: str | None = None):
+           note: str | None = None, least: float = 0.0):
     """A forest at the column's width in the imputed SVs' sky blue: a row per (label, estimate, low, high), its label
     at the left of the canvas and its interval level with it, each estimate an open mark as imputed SVs' are in the
     simulation figures (every All of Us SV is imputed), with the reference drawn (0, or 1 on a log axis, unless given).
     The axis runs from the first tick to the last, or with ``estimates`` symmetric about the reference over the
     estimates alone, so that each estimate's mark clears an arrowhead at the axis's end. Every margin and the rows'
-    pitch are measured from the type, so the forest is as short as its type allows. The labels in ``bold`` are set in
-    bold, and ``note`` is one line under the axis title."""
+    pitch are measured from the type, so the forest is as short as its type allows, unless ``least`` inches is taller:
+    then its rows share that height and its marks grow with them. The labels in ``bold`` are set in bold, and ``note``
+    is one line under the axis title."""
     reference = (1.0 if log else 0.0) if reference is None else reference
     fig = plt.figure(figsize=(COLUMN, 1.0))
     labels = [label for label, *_ in rows]
@@ -83,8 +88,9 @@ def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list
     right = widest(fig, [tick_text(ticks[-1])], fontsize=POSTER_STYLE["font.size"]) / 2 + POSTER_PAD
     line = tallest(fig, [note], fontsize=POSTER_STYLE["font.size"]) + POSTER_PAD if note else 0.0
     top, bottom = POSTER_PAD, under_axes(fig, [xlabel]) + line
-    height = top + bottom + pitch * len(rows)
-    mark, bar, ring = POSTER_MARK * MARK, POSTER_BAR * MARK, 6.0 * MARK
+    height = max(top + bottom + pitch * len(rows), least)
+    growth = MARK * min((height - top - bottom) / len(rows) / pitch, GROWTH)
+    mark, bar, ring = POSTER_MARK * growth, POSTER_BAR * growth, 6.0 * growth
     # an arrowhead at the axis's start reaches half its width to the left, toward the names
     arrow = mark * 0.7 / 2 / 72
     left = max(widest(fig, [label], fontsize=POSTER_STYLE["font.size"], fontweight=weight[label])
@@ -167,7 +173,7 @@ def gain_figure(matched: list[dict], common: dict | None = None) -> tuple:
     note = UNCONVERGED if any(row.get("unconverged") for row in matched) else None
     # the axis spans the estimates, not their intervals; an interval that runs past it ends in an arrowhead
     fig = forest(rows, "Change in r² with SVs (%)", span([value for _, value, _, _ in rows]), percent, log=False,
-                 estimates=True, bold=frozenset({COMBINED}), note=note)
+                 estimates=True, bold=frozenset({COMBINED}), note=note, least=HEIGHT)
     return fig, ["Change in held-out partial r² from adding SVs to SV-PGS for each trait, relative to the r² without "
                  "SVs, with 95% intervals, an arrowhead marking an interval that runs past the axis"
                  + (", and in bold the traits' common change relative to the two models' mean r²" if common else "")]

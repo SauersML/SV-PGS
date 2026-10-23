@@ -60,7 +60,7 @@ COLUMNS = ((MARGIN, LEFT), (MARGIN + LEFT + GUTTER, MIDDLE), (48 - MARGIN - RIGH
 """Each column's left edge and width."""
 INSET = 0.3
 """Text sits this far inside its column, under the section bars' labels."""
-BAR, BAR_SIZE = 1.25, 72
+BAR, BAR_SIZE = 1.25, 68
 BODY, HEADLINE, GLOSS, REFERENCE, PENDING = 56, 60, 56, 28, 50
 LINE_PITCH = 1.066
 """Line pitch per point of type at 90% line spacing, measured on the LibreOffice render."""
@@ -92,10 +92,11 @@ REFERENCES = [
 """First author, year and journal, one to a line, numbered in superscript in the order the text first cites them
 (``cite``): the SVs per genome, LDpred2, All of Us and GLIMPSE2."""
 SUPERSCRIPT = dict(zip(range(1, 10), "¹²³⁴⁵⁶⁷⁸⁹"))
-DESIGN_SETTINGS = {"h2": (0.01, 0.1), "prevalence": (0.01, 0.1), "causal_variants": (50, 200, 2000),
-                   "sv_causal_fraction": (0.0, 0.05, 0.2)}
-"""The values each setting takes over benchmarks/power/grid.py's POINTS (a point's own value, else HERITABILITY,
-PREVALENCE or CAUSAL_VARIANTS), which tests/test_poster_simulation.py checks against the grid."""
+DESIGN_BASE = {"h2": 0.1, "prevalence": 0.1, "causal_variants": 200, "sv_causal_fraction": 0.2}
+"""The base disease of benchmarks/power/grid.py, from which each of its POINTS changes one or two settings: its
+HERITABILITY, PREVALENCE and CAUSAL_VARIANTS, and the SV share most points have."""
+DESIGN_SHARES = (0.0, 0.05)
+"""The other SV shares the grid's points take. tests/test_poster_simulation.py checks both against the grid."""
 
 
 WHOLE_PREVALENCE = 0.1
@@ -118,9 +119,9 @@ PLACEHOLDERS = [
 
 def marked(text: str) -> list[tuple[str, str]]:
     """Runs of ``text``: **bold**, {{words|colour}} bold in a figure colour (a genotype source named as its bars are
-    drawn), and each method's name bold in its figure colour."""
+    drawn), each method's name, and the program's name *All of Us* in italics, as its style asks."""
     runs = []
-    for piece in re.split(r"(\*\*.+?\*\*|\{\{.+?\}\}|SV-PGS|LDpred2-auto)", text):
+    for piece in re.split(r"(\*\*.+?\*\*|\{\{.+?\}\}|SV-PGS|LDpred2-auto|All of Us)", text):
         if piece.startswith("**"):
             runs.append((piece[2:-2], "b"))
         elif piece.startswith("{{"):
@@ -128,6 +129,8 @@ def marked(text: str) -> list[tuple[str, str]]:
             runs.append((words, f"b {colour}"))
         elif piece in ("SV-PGS", "LDpred2-auto"):
             runs.append((piece, ""))
+        elif piece == "All of Us":
+            runs.append((piece, "i"))
         elif piece:
             runs.append((piece, ""))
     return runs
@@ -144,18 +147,18 @@ def copy(numbers: dict) -> dict:
     simulations = rows["all"]["true"][3] + rows["null"]["true"][3]
     return {
         # Byrska-Bishop 2022: "On average, ~9,679 SVs were discovered in each genome"
-        "introduction": [f"Each genome has ~9,700 structural variants (SVs){cite('Byrska-Bishop 2022 Cell')}",
-                         "Polygenic scores rarely use SVs",
-                         "We test if imputed SVs improve accuracy"],
-        "methods": ["Priors depend on imputation r², frequency, SV length"],
+        "introduction": [f"Each genome has ~9,700 structural variants (SVs).{cite('Byrska-Bishop 2022 Cell')}",
+                         "Polygenic scores rarely use SVs, so we test if imputed SVs improve accuracy."],
+        "methods": ["Priors use SV type, length, frequency and imputation r²."],
         "code": ["Code:", "github.com/SauersML/SV-PGS"],
         "design": [
-            f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22",
-            # each setting's values over the grid's points (DESIGN_SETTINGS), listed rather than as a range
-            f"{gain['shown']} architectures: h² {listed([f'{h2:g}' for h2 in DESIGN_SETTINGS['h2']])}, prevalence "
-            f"{listed([f'{share:.0%}' for share in DESIGN_SETTINGS['prevalence']])}",
-            f"{listed([f'{count:,}' for count in DESIGN_SETTINGS['causal_variants']])} causal variants, of which "
-            f"{listed([f'{share:.0%}' for share in DESIGN_SETTINGS['sv_causal_fraction']])} are SVs",
+            f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22.",
+            f"Base disease: h² {DESIGN_BASE['h2']:g}, prevalence {DESIGN_BASE['prevalence']:.0%}, "
+            f"{DESIGN_BASE['causal_variants']:,} causal variants, {DESIGN_BASE['sv_causal_fraction']:.0%} of them SVs.",
+            # the other points: SV effect size or shape (fold 3, length, deletion, heavy tail, two point), 50 or
+            # 2,000 causal variants, h² 0.01, prevalence 1%, and causal SVs only well imputed or common
+            f"Others change the SV share ({listed([f'{share:.0%}' for share in DESIGN_SHARES])}), SV effects, causal "
+            "count, h², prevalence or which SVs are causal.",
         ],
         # what each plotted method fits, over the simulation's figures: SV-PGS every measured record with no
         # frequency or r² floor (stage2_wiring.fit_models), LDpred2-auto SNVs of training MAF >= 1% thinned evenly in
@@ -163,34 +166,22 @@ def copy(numbers: dict) -> dict:
         "compared": ["SV-PGS: all SNVs, indels and SVs",
                      f"LDpred2-auto{cite('Privé 2020 Bioinformatics')}: up to 16,000 SNVs with MAF ≥ 1%"],
         # every whole-chr22 architecture has the grid's PREVALENCE: rare_disease, at 1%, ran in the 3 Mb window alone
-        "whole_note": f"Whole chr22 at {WHOLE_PREVALENCE:.0%} prevalence with test N = {people(accuracy['test_people'])}",
-        "gain_note": f"Mean and 95% CI over {simulations} simulations in 3 Mb of chr22",
+        "whole_note": f"Whole chr22 at {WHOLE_PREVALENCE:.0%} prevalence, test N = {people(accuracy['test_people'])}",
+        "gain_note": f"{simulations} simulations in 3 Mb of chr22 (mean, 95% CI)",
         # GLIMPSE2 is Rubinacci 2023; the assemblies are the accepted abstract's 12,212 phased genome assemblies
+        # the forest's matched fits: SV-PGS with and without SVs on every trait, tested in its held-out people
         "aou": ["We imputed SVs from 12,212 long-read assemblies into 100,000 All of Us"
-                f"{cite('All of Us 2019 N Engl J Med')} genomes with GLIMPSE2{cite('Rubinacci 2023 Nat Genet')}",
-                *aou_matched()],
+                f"{cite('All of Us 2019 N Engl J Med')} genomes with GLIMPSE2.{cite('Rubinacci 2023 Nat Genet')}",
+                "We compare held-out r² with and without SVs."],
         # what the simulations mean. SV-PGS's AUC gain over LDpred2-auto at training N 40,000 holds without causal
         # SVs (wins' null_gain, its 95% interval above 0), so causal SVs are not its source. Imputed SVs' gain is
         # largest where the causal SVs are well imputed, where it matches the gain with true SV genotypes (the SV-gain
         # forest's well_imputed and all rows: imputed share of the true gain about 1 against about a third)
         "discussion": [
-            "SV-PGS beat LDpred2-auto with and without causal SVs, so its advantage comes from the model and its "
-            "larger variant set",
-            "Imputed SVs helped most when the causal SVs were well imputed, so the gain depends on SV imputation "
-            "accuracy",
+            "SV-PGS beat LDpred2-auto with and without causal SVs, so its advantage comes from the model and variant set.",
+            "Imputed SVs helped most when causal SVs were well imputed, so the gain depends on imputation accuracy.",
         ],
     }
-
-
-def aou_matched() -> list[str]:
-    """What the All of Us figure compares, when aou_numbers.json holds its "matched" rows (aggregates, every count
-    below 40 masked): for each trait, SV-PGS fitted with SVs and without them, tested in the same held-out people."""
-    path = HERE / "aou_numbers.json"
-    rows = json.loads(path.read_text()).get("matched", {}).get("rows", []) if path.is_file() else []
-    # every matched run's run_config.json: fit_minimum_minor_allele_frequency 0.01, fit_minimum_r2 0.3 and
-    # fit_variant_sites HapMap3, which keeps the SNVs at HapMap3 sites and every SV (workspace_pipeline.fit_filtered)
-    return ["We fit SV-PGS with and without SVs and tested both in held-out people",
-            "HapMap3 SNVs and SVs, MAF ≥ 1%, imputation r² ≥ 0.3"] if rows else []
 
 
 def signed(share: float) -> str:
@@ -206,8 +197,8 @@ def aou_result() -> list[str]:
     common = json.loads(path.read_text()).get("matched", {}).get("common") if path.is_file() else None
     if not common:
         return []
-    return [f"In All of Us, imputed SVs raised r² by at most {signed(common['relative_bound'] / 100)} across "
-            f"{common['traits']} traits, so these traits have few SVs with large effects or poorly imputed causal SVs"]
+    return [f"In All of Us, imputed SVs raised r² by at most {signed(common['relative_bound'] / 100)} over "
+            f"{common['traits']} traits, so these traits have few SVs with large effects or poorly imputed causal SVs."]
 
 
 # ------------------------------------------------------------------ DrawingML
@@ -328,7 +319,8 @@ def image(shape_id: int, name: str, rel: str, x: float, y: float, width: float, 
 def placeholder(shape_id: int, x: float, y: float, width: float, height: float, title: str, detail: str) -> str:
     """A dashed panel where an All of Us figure will go."""
     text = "".join(
-        Para([(words, flags)], size, bullet=False, colour=colour, after=after, align="ctr").xml()
+        Para([(piece, f"{flags} {style}") for piece, style in marked(words)], size, bullet=False, colour=colour,
+             after=after, align="ctr").xml()
         for words, flags, size, colour, after in (("All of Us · result pending", "b", PENDING, TEAL, 18),
                                                   (title, "b", HEADLINE, INK, 12), (detail, "", GLOSS, GREY, 0))
     )
@@ -405,12 +397,13 @@ def authors_and_affiliations() -> tuple[list[tuple[str, str]], list[str]]:
 
 def header(xml: str) -> str:
     """The abstract's title (two lines, as the template sets it), then its authors and affiliations."""
-    title = "".join(Para([(text, "b")], 92, bullet=False, colour="FFFFFF", after=0).xml() for text in TITLE)
+    title = "".join(Para([(piece, f"b {flags}") for piece, flags in marked(text)], 92, bullet=False, colour="FFFFFF",
+                         after=0).xml() for text in TITLE)
     xml = replace_text(xml, 89, title.replace('<a:spcPct val="90000"/>', '<a:spcPct val="100000"/>'))
     authors, affiliations = authors_and_affiliations()
     author_runs: list[tuple[str, str]] = []
     for position, (name, marks) in enumerate(authors):
-        author_runs.append((name, ""))
+        author_runs.extend(marked(name))
         if marks:
             author_runs.append((marks.replace(" ", ""), "sup"))
         if position < len(authors) - 1:
@@ -456,16 +449,21 @@ def text(paragraphs: list[Para]) -> Block:
 
 QR = 2.6
 """Inches: the side of the QR code to the repository."""
-ENDING = 6.3
-"""Inches: the width of the QR code and the small type under it at the right end of the Discussion band, the least that
-sets the repository's address on one line."""
+ENDINGS = (6.3, 10.0)
+"""Inches: the widths of the QR code and its small type at the right end of the Discussion band, the type under the
+code or beside it, each the least that sets the repository's address on one line."""
 
 
-def code(lines: list[str]) -> list[Block]:
-    """A QR code to the repository over ``lines`` in small type: "Code:", the address in bold, then the references."""
-    return [Block("qr", None),
-            Block("text", [Para([(line, "b" if index == 1 else "")], REFERENCE, bullet=False, after=0)
-                           for index, line in enumerate(lines)])]
+def code(lines: list[str], beside: bool) -> list[Block]:
+    """A QR code to the repository with ``lines`` in small type under it, or ``beside`` it: "Code:", the address in
+    bold, then "References:" and the references."""
+    blocks = [Block("qr", None),
+              Block("text", [Para([(piece, f"b {flags}" if index == 1 else flags) for piece, flags in marked(line)],
+                                  REFERENCE, bullet=False, after=0) for index, line in enumerate(lines)])]
+    if not beside:
+        return blocks
+    share = QR / (ENDINGS[1] - GUTTER)
+    return [row([blocks[0]], [blocks[1]], shares=(share, 1 - share))]
 
 
 def row(*children: list, shares: tuple = ()) -> Block:
@@ -555,9 +553,14 @@ class Poster:
             shape_id, label = block.content
             self.xml = move(self.xml, shape_id, x, y, width, BAR)
             start, end = shape_span(self.xml, shape_id)
-            shape = re.sub(r"<a:t>[^<]*</a:t>", f"<a:t>{escape(label, quote=False)}</a:t>", self.xml[start:end], count=1)
-            shape = re.sub(r'sz="\d+"', f'sz="{BAR_SIZE * 100}"', shape)
-            shape = re.sub(r'(<a:rPr lang="en-US" sz="\d+") b="0"', r'\1 b="1"', shape)
+            shape = self.xml[start:end]
+            first = re.search(r"<a:r>.*?</a:r>", shape).group(0)
+            # the template's run, bold at the bars' size, once for each piece of the label (*All of Us* in italics)
+            styled = re.sub(r'sz="\d+" b="0" i="0"', f'sz="{BAR_SIZE * 100}" b="1" i="{{italic}}"', first)
+            styled = re.sub(r"<a:t>[^<]*</a:t>", '<a:t xml:space="preserve">{text}</a:t>', styled)
+            runs = "".join(styled.format(italic=int("i" in flags.split()), text=escape(piece, quote=False))
+                           for piece, flags in marked(label))
+            shape = shape.replace(first, runs, 1)
             self.xml = self.xml[:start] + shape + self.xml[end:]
         elif block.kind == "text":
             paragraphs = "".join(para.xml() for para in block.content)
@@ -647,7 +650,7 @@ def build() -> None:
     # every text box, figure and caption of the template's own study; its header, wordmark and bars stay
     for shape_id in (92, 94, 98, 99, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114):
         xml = delete(xml, shape_id)
-    xml = duplicate(duplicate(xml, 93, 118, "Simulation results bar"), 93, 119, "All of Us bar")
+    xml = delete(duplicate(duplicate(xml, 93, 118, "Simulation results bar"), 93, 119, "All of Us bar"), 93)
 
     # the template's References bar goes: the references are a small block at the end of the reading order
     xml = delete(xml, 96)
@@ -662,8 +665,7 @@ def build() -> None:
     columns = [
         [
             bar(97, "Introduction"), text(bullets(words["introduction"])),
-            bar(91, "Methods"), figure(gallery["poster_model"]), text(bullets(words["methods"])),
-            bar(93, "Simulation design"), text(bullets(words["design"])),
+            bar(91, "Methods"), figure(gallery["poster_model"]), text(bullets([*words["methods"], *words["design"]])),
             figure(gallery["poster_imputation_accuracy"], flex=True, legend=GALLERY / "fig5_simulated_svs.txt"),
         ],
         [
@@ -674,13 +676,16 @@ def build() -> None:
             Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)]),
             figure(gallery["poster_sv_gain"]),
         ],
-        [bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks()],
+        [bar(119, "All of Us cohort results"), text(bullets(words["aou"])), *aou_blocks()],
     ]
     poster = Poster(xml, rels, work / "ppt/media")
     across = COLUMNS[2][0] + RIGHT - COLUMNS[1][0]
     references = [f"{SUPERSCRIPT[index]}{reference}" for index, reference in enumerate(REFERENCES, start=1)]
-    band = [discussion[0], row(discussion[1:], code([*words["code"], *references]),
-                               shares=(1 - ENDING / (across - GUTTER), ENDING / (across - GUTTER)))]
+    # the code's type under it or beside it, whichever makes the shorter band: under it while the Discussion is long
+    bands = [[discussion[0], row(discussion[1:], code([*words["code"], "References:", *references], beside),
+                                 shares=(1 - ending / (across - GUTTER), ending / (across - GUTTER)))]
+             for ending, beside in zip(ENDINGS, (False, True))]
+    band = min(bands, key=lambda band: poster.stack_height(band, across))
     top = BOTTOM - poster.stack_height(band, across)
     poster.stack(band, COLUMNS[1][0], top, across, None)
     for index, ((x, width), blocks) in enumerate(zip(COLUMNS, columns)):

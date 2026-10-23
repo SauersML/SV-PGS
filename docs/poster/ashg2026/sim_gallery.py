@@ -1006,9 +1006,11 @@ WELL_IMPUTED = ("tagged_sv", "tagged_sv_fold3")
 """The architectures whose causal SVs are drawn only from SVs that Beagle imputed with realized r² ≥ 0.8 (grid.py's
 sv_min_realized_r2)."""
 POSTER_GAIN, POSTER_GENOTYPES = 21.92, 11.4
+POSTER_GENOTYPES_HEIGHT = 7.5
+"""Inches: the imputation figure's height, which fills the left column under the Methods bullets."""
 """Inches: the widths of the SV gain forest (the poster's middle column, build_pptx.py's MIDDLE) and the imputation
 figure (the left column, LEFT), each placed at its column's full width."""
-POSTER_GAIN_HEIGHT = 8.22
+POSTER_GAIN_HEIGHT = 10.07
 """Inches: the SV gain forest's height, which fills the middle column from the training-size figures to the band of
 Discussion, code and references at its foot (build_pptx.py's layout)."""
 GAIN_WEIGHT, GAIN_OFFSET = 2.0, 0.24
@@ -1030,9 +1032,9 @@ def gain_sets(grids) -> dict[str, dict]:
     causal = [point for point in LABELS if point != "null" and point in gains]
     sets = {}
     for key, label, points in (
-        ("all", f"All {len(causal)} architectures\nwith causal SVs", causal),
-        ("well_imputed", "Causal SVs well\nimputed (r² ≥ 0.8)", [point for point in causal if point in WELL_IMPUTED]),
-        ("null", "No causal SVs\n(control)", ["null"]),
+        ("all", "With causal SVs", causal),
+        ("well_imputed", "Causal SVs with r² ≥ 0.8", [point for point in causal if point in WELL_IMPUTED]),
+        ("null", "No causal SVs (control)", ["null"]),
     ):
         true = [gain for point in points for _, gain, _ in gains.get(point, [])]
         imputed = [gain for point in points for _, _, gain in gains.get(point, [])]
@@ -1157,7 +1159,7 @@ def poster_imputation_figure(summary):
     after the lines' last marks. The margins are measured from the drawn type, so larger type widens them. The y axis's
     title is centred on the figure's height, and the x axis's, wider than the axes, ends at the figure's right edge."""
     accuracy = summary["genotype_accuracy"]["r2_by_frequency"]
-    width, height, pad = POSTER_GENOTYPES, 5.2, 0.08
+    width, height, pad = POSTER_GENOTYPES, POSTER_GENOTYPES_HEIGHT, 0.08
     fig = plt.figure(figsize=(width, height))
     ax = frame(fig, 0, 0, width, height)
     mark = POSTER_MARK * 0.7
