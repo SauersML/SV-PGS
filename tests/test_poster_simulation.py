@@ -138,6 +138,7 @@ def test_poster_design_lists_the_causal_sv_shares_the_grid_simulates(monkeypatch
 
 
 def test_poster_cites_every_reference_in_order(monkeypatch, tmp_path):
+    pytest.importorskip("matplotlib")  # sim_gallery draws with it
     from docs.poster.ashg2026 import sim_gallery
 
     poster = poster_module(monkeypatch, tmp_path)
@@ -208,6 +209,7 @@ def test_aou_result_states_the_common_change_over_its_traits(monkeypatch, tmp_pa
 
 
 def test_references_sit_beside_the_qr_code_and_fill_the_discussions_height(monkeypatch, tmp_path):
+    pytest.importorskip("PIL")  # references() measures its type with PIL's ImageFont
     poster = poster_module(monkeypatch, tmp_path)
     height = 7.0
     heading, band = poster.references(height)
