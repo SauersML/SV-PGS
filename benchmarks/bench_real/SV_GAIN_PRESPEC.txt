@@ -336,6 +336,14 @@ seen, by the user's decision "remake all figures but obviously dont use non-conv
     aou-m3g-k2). CAD and hyperlipidemia are out because they had not finished, and asthma because its seed was null.
 - The analysis is the primary's (amendment 5: g, 95% CI, one-sided swap p from 1,000 family arm swaps, one-sided
   bootstrap p, one-sided 95% upper bound, long-read people excluded), on these 4 traits, plus each pair alone.
+- Addendum, written 2026-10-23 at 06:45 PDT at the coordinator's request, before any HDL or BMI value was read: the
+  converged set is every finished SV-PGS pair whose two arms are both certified, whatever its family. A Q8 pair counts
+  as well. State at 06:42 PDT, from job states and report markers alone:
+  - HDL (aou-q8a-l2, arms l1 and l2's train-3, both SUCCEEDED, report written) enters if both arms are certified.
+  - BMI is out: cardio stopped its with_sv arm aou-q8a-b2 after 4 h with no EB iteration, so it has no pair.
+  - Also out: hyperlipidemia (aou-m3h-y2 FAILED), CAD (seed aou-m3fs-c1 still training), SBP (aou-q8a-s2 failed twice),
+    HbA1c (both arms stopped by ops) and height (GPU out-of-memory).
+  The converged analysis is rerun with HDL when HDL's arms are certified, and aou_numbers.json takes its rows.
 
 Results seen (log; no test definition changes because of them)
 - Before 2bf5cb24: aou-wl15 (LDL), as listed at the top.
