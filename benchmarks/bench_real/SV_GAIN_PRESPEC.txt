@@ -360,6 +360,12 @@ Results seen (log; no test definition changes because of them)
   writes each family's Holm-adjusted p over the two families beside its own p, for the sharp-null and the weak-null
   one-sided p separately (~/xw/svgain_HOLM.log). Then it runs the combined g over both families' pairs, a secondary
   result only (~/xw/svgain_COMBINED_secondary.log). Neither changes the rule that decides each family.
+- 00:53 PDT on 2026-10-23, read: CKD, aou-m3g-k2 (arms k2 and k1; db70b15; k2 finished at 00:39 PDT). It is valid under
+  amendment 2. Its held-out score variance is 4.49e-05 (snv_indel) and 0.000447 (with_sv), there is no NULL_COLLAPSE
+  marker in either run, and both arms share seed 1 and the fit key. The with_sv arm is uncertified (outer_criterion_met,
+  prediction_move, remaining_gain, restored_best) and is counted and flagged. Arm agreement 0.4855. Alone, with 1,000
+  swaps and the long-read people excluded: g = -98.26% [-189.16, -7.37], sharp p 0.97, weak p 0.983. As with T2D, it
+  is not continued, since a continuation would land after the primary. The primary's watcher counts it.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
