@@ -88,11 +88,11 @@ REFERENCES = [
     "Byrska-Bishop 2022 Cell",
     "Taylor 2024 Nature",
     "Privé 2020 Bioinformatics",
-    "Browning 2018 Am J Hum Genet",
+    "Browning 2018 AJHG",
     "Wray 2010 PLoS Genet",
     "All of Us 2019 N Engl J Med",
 ]
-"""First author, year and journal, set as one paragraph."""
+"""First author, year and journal, one to a line."""
 PLACEHOLDERS = [
     ("Change in test r² with SVs", "All held-out people and by genetic ancestry"),
 ]
@@ -620,7 +620,7 @@ def build() -> None:
         ],
         [
             bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks(),
-            bar(96, "References"), text([Para([("; ".join(REFERENCES), "")], REFERENCE, bullet=False, after=0)]),
+            bar(96, "References"), text([Para([(reference, "")], REFERENCE, bullet=False, after=0) for reference in REFERENCES]),
             code(words["code"]),
         ],
     ]
