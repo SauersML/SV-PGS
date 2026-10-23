@@ -366,6 +366,6 @@ def test_the_discussion_states_the_common_all_of_us_gain_only_when_it_is_given(m
     (tmp_path / "aou_numbers.json").write_text(json.dumps({"matched": {"rows": [], "common": {
         "relative": -2.0, "relative_lower": -4.0, "relative_upper": 0.5, "relative_bound": 0.1, "traits": 10}}}))
     # the primary's common g with its 95% interval
-    assert build_pptx.aou_result() == ["In All of Us, imputed SVs changed r² by −2.00% (95% CI −4.00 to 0.50%) over "
-                                       "10 traits, so these traits have few SVs with large effects or poorly imputed "
-                                       "causal SVs."]
+    assert build_pptx.aou_result() == ["In All of Us, imputed SVs changed r² by −2.00% (95% CI −4.00 to 0.50%) "
+                                       "across 10 traits. These traits may have few SVs with large effects or poorly "
+                                       "imputed causal SVs."]

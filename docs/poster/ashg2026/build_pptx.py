@@ -193,8 +193,8 @@ def aou_result() -> list[str]:
     if not common:
         return []
     return [f"In All of Us, imputed SVs changed r² by {percent(common['relative'], sign=True)}% (95% CI "
-            f"{percent(common['relative_lower'])} to {percent(common['relative_upper'])}%) over {common['traits']} "
-            "traits, so these traits have few SVs with large effects or poorly imputed causal SVs."]
+            f"{percent(common['relative_lower'])} to {percent(common['relative_upper'])}%) across {common['traits']} "
+            "traits. These traits may have few SVs with large effects or poorly imputed causal SVs."]
 
 
 # ------------------------------------------------------------------ DrawingML

@@ -187,7 +187,8 @@ def test_aou_result_states_the_common_change_over_its_traits(monkeypatch, tmp_pa
     poster = poster_module(monkeypatch, tmp_path)
     matched_common(poster, monkeypatch, tmp_path, COMMON)
     [sentence] = poster.aou_result()
-    assert "changed r² by +0.03% (95% CI −0.11 to 0.17%) over 5 traits," in sentence
+    assert sentence == ("In All of Us, imputed SVs changed r² by +0.03% (95% CI −0.11 to 0.17%) across 5 traits. "
+                        "These traits may have few SVs with large effects or poorly imputed causal SVs.")
 
 
 def test_references_sit_beside_the_qr_code_and_fill_the_discussions_height(monkeypatch, tmp_path):

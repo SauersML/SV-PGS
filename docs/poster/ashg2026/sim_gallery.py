@@ -1101,7 +1101,7 @@ POSTER_GENOTYPES_HEIGHT = POSTER_GAIN_HEIGHT
 """Inches: the imputation figure's height, the SV gain forest's, so the two sit flush side by side."""
 GAIN_WEIGHT = 1.0
 """The SV gain forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR)."""
-GAIN_TITLE, GAIN_SCALE = "AUC gain from SVs ×1,000", 1000
+GAIN_TITLE, GAIN_SCALE = "ΔAUC with SVs ×1,000", 1000
 """The SV gain forest's x axis title, short enough for one line, and the factor its tick labels show the gain times,
 so three or more short labels fit along the axis."""
 FOREST_SIZES = SIZES[:3]
