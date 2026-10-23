@@ -53,17 +53,19 @@ ANCESTRY = HERE / "aou_ancestry.json"
 OUT = HERE / "figures"
 COLUMN = 11.4
 """Inches: the poster's right column (build_pptx.py's RIGHT), each figure's width, so its type prints at its own size."""
-ROW_GAP = 0.03
+ROW_GAP = 0.01
 """Inches at least between the marks of one row and the next: a row is a line of poster type (its size in points
 over 72 inches), or its marks and this gap when they are taller."""
 AXIS_GAP = 0.375
 """Inches between a panel's last row and its x axis, about half a line of type, when that row is a note without marks,
 whose type would otherwise sit on the axis."""
-MARK_GAP = 0.02
+MARK_GAP = 0.01
 """Inches between the marks that stand one above the next in a row."""
+PANEL_PAD = 0.05
+"""Inches between a panel's axis title and the next panel's first row."""
 EDGE = 0.02
 """Inches between the figure's outermost type or mark and its canvas's edge."""
-TITLE_PAD = 4.0
+TITLE_PAD = 2.0
 """Points between an axis's tick labels and its title."""
 RING = 6.0
 """Points: an open mark's ring at MARK times the poster's mark."""
@@ -83,9 +85,6 @@ LABEL_GAP = 0.3
 MARK = 1.5
 """The forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR) when its rows are a line of type
 apart."""
-HEIGHT = 19.90
-"""Inches: the All of Us figure's height, the room the poster's right column gives it (build_pptx.py's layout). What it
-has beyond the figure's natural height goes between the panels; the rows stay a line of type apart."""
 TRAITS = {
     "ldl_cholesterol": "LDL cholesterol", "egfr": "eGFR", "hypertension": "Hypertension",
     "type_2_diabetes": "Type 2 diabetes", "coronary_artery_disease": "Coronary disease",
@@ -137,7 +136,7 @@ def forest(panels: list[Panel], least: float = 0.0):
     # one series' marks at MARK times the poster's, two or more at the poster's own, one above the next in a row
     marks = [POSTER_MARK * (MARK if len(panel.series) == 1 else 1.0) for panel in panels]
     # a row is a line of type, or as many lines as its name or note takes, or its marks one above the next when taller
-    line = size / 72
+    line = tallest(fig, ["Hg"], fontsize=size)
     stacks = [sum(mark / 72 + (0.0 if filled else RING / 72) for *_, filled in panel.series)
               + (len(panel.series) - 1) * MARK_GAP for panel, mark in zip(panels, marks)]
     # each panel's notes start in a column right of the widest name among its rows with notes
@@ -157,10 +156,6 @@ def forest(panels: list[Panel], least: float = 0.0):
     keys = [len(rows) * max(line, mark / 72 + ROW_GAP) for rows, mark in zip(lines, marks)]
     # under each axis: its ticks, tick labels and title, and then POSTER_PAD to the next panel or EDGE to the canvas's foot
     style = matplotlib.rcParams
-    bottoms = [(style["xtick.major.size"] + style["xtick.major.pad"] + TITLE_PAD) / 72
-               + tallest(fig, ["0.1"], fontsize=style["xtick.labelsize"])
-               + tallest(fig, [panel.xlabel], fontsize=style["axes.labelsize"]) + POSTER_PAD for panel in panels]
-    bottoms[-1] += EDGE - POSTER_PAD
     # an arrowhead at the axis's start reaches half its width to the left, toward the names
     # an arrowhead ends at the axis's end, so it reaches its full length, twice this, inside the axis
     arrow = max(marks) * 0.7 / 2 / 72
@@ -176,6 +171,14 @@ def forest(panels: list[Panel], least: float = 0.0):
                            for panel, column in zip(panels, columns) for name, estimates in panel.rows
                            if estimates and name in panel.notes))
         width = plot_width(fig, panels, clears, halves, COLUMN - left, ends_noted=False)
+    # a title that fits left of its axis sits there, on its tick labels' line, so it takes no line of its own
+    titled = matplotlib.rcParams["axes.labelsize"]
+    beside = [widest(fig, [panel.xlabel], fontsize=titled) + LABEL_GAP <= left - EDGE for panel in panels]
+    labels = tallest(fig, ["0.1"], fontsize=style["xtick.labelsize"])
+    bottoms = [(style["xtick.major.size"] + style["xtick.major.pad"]) / 72 + labels
+               + (0.0 if aside else TITLE_PAD / 72 + tallest(fig, [panel.xlabel], fontsize=titled)) + PANEL_PAD
+               for panel, aside in zip(panels, beside)]
+    bottoms[-1] += EDGE - PANEL_PAD
     # notes at the rows' ends sit over the axis, so AXIS_GAP keeps the last of them off it; in the notes' column they
     # sit left of it
     gaps = [AXIS_GAP if panel.notes and ending else 0.0 for panel in panels]
@@ -186,8 +189,8 @@ def forest(panels: list[Panel], least: float = 0.0):
     star = widest(fig, [STAR], fontsize=size)
     top = height - EDGE
     top -= spare if len(panels) == 1 else 0.0
-    for panel, mark, rows, key, key_rows, bottom, clear, half, notes, column, gap in zip(
-            panels, marks, heights, keys, lines, bottoms, clears, halves, wrapped, columns, gaps):
+    for panel, mark, rows, key, key_rows, bottom, clear, half, notes, column, gap, aside in zip(
+            panels, marks, heights, keys, lines, bottoms, clears, halves, wrapped, columns, gaps, beside):
         bar, ring = POSTER_BAR, RING
         span = sum(rows) + gap
         # the key over the panel from the canvas's left edge, a line at a time: each series' mark, then its name
@@ -252,9 +255,15 @@ def forest(panels: list[Panel], least: float = 0.0):
         ax.set_xticks(drawn, [tick_text(panel)(tick) for tick in drawn])
         ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
         ax.tick_params(axis="x", which="major", pad=style["xtick.major.pad"])
-        ax.set_xlabel(panel.xlabel, labelpad=TITLE_PAD)
-        # centred on the canvas, not on the axes, whose margins differ: a title wider than the axes then fits either side
-        ax.xaxis.label.set_x((COLUMN / 2 - left) / width)
+        if aside:
+            ax.text(0, 0, panel.xlabel, fontsize=titled, ha="right", va="center", gid="title",
+                    transform=shifted(ax, -LABEL_GAP, -(style["xtick.major.size"] + style["xtick.major.pad"]) / 72
+                                      - labels / 2, data_rows=False))
+        else:
+            ax.set_xlabel(panel.xlabel, labelpad=TITLE_PAD)
+            # centred on the canvas, not on the axes, whose margins differ: a title wider than the axes then fits
+            # either side
+            ax.xaxis.label.set_x((COLUMN / 2 - left) / width)
         top -= span + bottom + (spare / (len(panels) - 1) if len(panels) > 1 else 0.0)
     return fig
 
@@ -540,7 +549,7 @@ def gain_figure(matched: list[dict], common: dict | None = None, compared: list[
         panels.append(Panel(rows + combined, [("", SKY, "o", False)], "Change in r² with SVs (%)",
                             starred={(name, 0) for name, _ in rows if name in gained}, notes=gain_notes))
     stars = any(panel.starred for panel in panels)
-    fig = forest(panels, least=HEIGHT)
+    fig = forest(panels)
     return fig, [("Held-out partial r² in percent of LDpred2-auto and SV-PGS for each trait on a log axis; " if measured
                   else "")
                  + ("SV-PGS's pooled change in r² over LDpred2-auto, overall and by ancestry group, with one-sided p; "
@@ -553,7 +562,8 @@ def gain_figure(matched: list[dict], common: dict | None = None, compared: list[
 
 def main() -> None:
     numbers = json.loads(NUMBERS.read_text())
-    with plt.rc_context({**POSTER_STYLE, "axes.labelsize": POSTER_LABEL}):
+    # shorter ticks and pads than the simulation figures', so the stacked panels fit the column
+    with plt.rc_context({**POSTER_STYLE, "axes.labelsize": POSTER_LABEL, "xtick.major.size": 10.0, "xtick.major.pad": 6.0}):
         drawn = []
         if numbers.get("matched", {}).get("rows"):
             compared = json.loads(COMPARED.read_text()) if COMPARED.is_file() else {}
