@@ -1,4 +1,4 @@
-SV gain in All of Us: pre-specified analysis, amendment 7
+SV gain in All of Us: pre-specified analysis, amendment 8
 Written 2026-10-22 17:58 PDT and committed before any matched pairing run other than aou-wl15 had been scored.
 
 What had been seen when this was written
@@ -304,6 +304,24 @@ final results now; no CAD or hyperlipidemia value had been read, and no primary 
   the Holm-adjusted primary p is reported as lying between the primary's own p and twice it, until Q8 runs.
 - Each trait's descriptive row is that pair analysed alone with the same code, as before.
 
+Converged pairs only (amendment 8, written 2026-10-23 at 06:35 PDT, post hoc: after the primary's result below was
+seen, by the user's decision "remake all figures but obviously dont use non-converged sv pgs, and meta analyses")
+- From now on, every reported SV-PGS meta-analysis and figure uses only pairs whose two arms both converged. An arm
+  converged when its pairing run's score step lists it as certified (run/score/_COMPLETE.json, summary.uncertified
+  empty for the trait). The exclusion rests on these fit diagnostics alone. The primary above stays the pre-specified
+  result, and this analysis is labelled post hoc.
+- A trait whose original pair has an uncertified arm takes its c4 continuation when both of the continuation's arms
+  are certified. Otherwise the trait is out.
+- Read at 06:33 PDT from the score steps' flags:
+  - In (4 traits): LDL (aou-x3-l2 and aou-c4-l1, merged; aou-c4-l1 replaces aou-wl15, whose with_sv arm was uncertified
+    for budget_unresolved and outer_criterion_met), hypothyroidism (aou-x3-o1), atrial fibrillation (aou-x3-a1) and
+    eGFR (aou-m3f-e1).
+  - Out: gout (with_sv uncertified in aou-x3-g2 and again in aou-c4-g2), hypertension (with_sv uncertified in
+    aou-m3f-h2 and again in aou-c4-h2), T2D (both arms uncertified in aou-m3f-t2) and CKD (with_sv uncertified in
+    aou-m3g-k2). CAD and hyperlipidemia are out because they had not finished, and asthma because its seed was null.
+- The analysis is the primary's (amendment 5: g, 95% CI, one-sided swap p from 1,000 family arm swaps, one-sided
+  bootstrap p, one-sided 95% upper bound, long-read people excluded), on these 4 traits, plus each pair alone.
+
 Results seen (log; no test definition changes because of them)
 - Before 2bf5cb24: aou-wl15 (LDL), as listed at the top.
 - About 19:55 PDT on 2026-10-22, after 2bf5cb24 and cd542c9b (the coordinator's time): runwatch read the run reports of aou-x3-o1
@@ -409,6 +427,15 @@ Results seen (log; no test definition changes because of them)
   lists it this way beside the 4 traits it tests. cardio restarted ~/xw/q8_watch.sh at 02:06 PDT to wait for the 4
   pairs aou-q8a-b, -s, -a and -l. On the app it loops over "b s a l" and runs at a count of 4. holm_watch.sh is
   unchanged. No Q8 pair's report or accuracy has been read.
+- 06:30 PDT on 2026-10-23, read: the PRIMARY (amendment 7), on 8 traits: LDL (aou-wl15 + aou-x3-l2), hypothyroidism,
+  atrial fibrillation, eGFR, gout, hypertension, T2D and CKD; run 06:18 to 06:30 PDT with 1,000 swaps and the long-read
+  people excluded. g = +0.00% of the arms' mean partial r^2, 95% CI [-0.00, 0.01]. The one-sided swap p is 0.131 and
+  the one-sided bootstrap p 0.107 (z 1.244). The one-sided 95% upper bound is below 0.005%. T2D takes all of g's weight
+  (share 1.00). Neither p is below 0.05, so under amendment 5 the pre-specified result is that no gain from SVs is
+  detected. Holm over the two families waits for Q8, and the primary's Holm-adjusted p lies between 0.131 and 0.262.
+  Each trait's gain relative to the SNV-and-indel r^2, from the same report: LDL -0.22%, hypothyroidism +1.42%, atrial
+  fibrillation -0.62%, eGFR +0.26%, gout +4.64%, hypertension -42.34%, T2D +0.00% and CKD -65.89%. The without-T2D and
+  c4 sensitivity analyses were stopped at 06:32 PDT to give the app's CPUs to amendment 8, and run after it.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
