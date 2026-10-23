@@ -845,10 +845,9 @@ POSTER_X_TITLES = ("Training size (thousands)", "LDpred2-auto test AUC")
 POSTER_SHARES = (("null", "0%", GREEN), ("sv_5pct", "5%", VIOLET), ("sv_20pct", "20%", WINE))
 """The accuracy figure's architectures by the share of causal variants that are SVs, as its key writes each, and the
 colour of their simulations' dots."""
-POSTER_METHODS = (("with_sv_auc", "SV-PGS\n(all variants)", SV_PGS, "o", -1),
-                  ("ldpred2_auc", "LDpred2-auto²\n(common SNVs)", LDPRED2, "s", 1))
-"""Each method's AUC column, its name over its variant set as the figure labels it, colour, marker, and the side of its
-training size its simulations' dots take. SV-PGS fits every SNV, indel and SV with no frequency or r² floor
+POSTER_METHODS = (("with_sv_auc", "SV-PGS", SV_PGS, "o", -1), ("ldpred2_auc", "LDpred2-auto²", LDPRED2, "s", 1))
+"""Each method's AUC column, its name as the figure labels it, colour, marker, and the side of its training size its
+simulations' dots take. SV-PGS fits every SNV, indel and SV with no frequency or r² floor
 (stage2_wiring.fit_models); LDpred2-auto, first named here and so cited with the poster's second reference (Privé 2020,
 build_pptx.py's REFERENCES), SNVs of training MAF >= 1% thinned to HapMap3's chr22 count, at most 16,000
 (benchmarks/bench_sim/submissions/ldpred2_auto.py)."""
@@ -871,9 +870,11 @@ def poster_accuracy_figure(grids, summary):
     """Figure 1a for the poster: test AUC against training size for SV-PGS (circles) and LDpred2-auto (squares), pooled
     over the architectures with 0%, 5% and 20% causal SVs. Each mean has its 95% interval as an error bar, over every
     simulation's own AUC as a faint dot in its architecture's colour, left of its size for SV-PGS and right for
-    LDpred2-auto. Each method is named beside its marks, under the AUC of the true genetic value. The colours' key,
-    "0%, 5% or 20% causal SVs", is one line over the plot, ending at its right edge: at tick size it is wider than the
-    plot. The y axis spans every mark with room for the names, measured from their type."""
+    LDpred2-auto. Each method is named beside its marks, under the AUC of the true genetic value: SV-PGS over the marks
+    its name spans from the left, or, when its name cannot fit there, flush right under the marks it spans and over
+    LDpred2-auto's, which stands under the marks it spans to the right end. The colours' key, "0%, 5% or 20% causal
+    SVs", is one line over the plot, ending at its right edge: at tick size it is wider than the plot. The y axis spans
+    every mark with room for the names, measured from their type."""
     grouped = cells(grids["grid"])
     fig = plt.figure(figsize=(POSTER_HALF, POSTER_HEIGHT))
     # the left margin holds the ticks and the axis title
@@ -916,29 +917,51 @@ def poster_accuracy_figure(grids, summary):
         marks.extend([*zip(SIZES, low), *zip(SIZES, high)])
     marks = np.asarray(marks)
     ceiling = summary["points"]["null"]["true_value_auc"]
-    names = {method: (widest(fig, [method], fontsize=POSTER_NAME, fontweight="bold"),
-                      tallest(fig, [method], fontsize=POSTER_NAME, fontweight="bold"))
-             for _, method, *_ in POSTER_METHODS}
+    style = {"fontsize": POSTER_NAME, "fontweight": "bold"}
     ours, theirs = (method for _, method, *_ in POSTER_METHODS)
-    # SV-PGS's name over the marks it spans from the left, LDpred2-auto's under the marks it spans to the right end
+    tall = {method: tallest(fig, [method], **style) for method in (ours, theirs)}
+    # a name keeps POSTER_PAD from the edge of every mark, the means' marks reaching furthest from their centres, and
+    # counts the marks within ``aside`` inches of its ends as under it, so that none stands at its side like a bullet
+    reach = POSTER_MARK * 0.7 / 2 / 72
+    clear, aside = POSTER_PAD + reach, 0.5
     start = SIZES[0] / 1.2
-    spans = {ours: (start, start * 2.0 ** (names[ours][0] / doubling)),
-             theirs: (last / 2.0 ** (names[theirs][0] / doubling), last)}
-    beside = {method: marks[(marks[:, 0] >= low) & (marks[:, 0] <= high), 1] for method, (low, high) in spans.items()}
-    # inches over the best possible AUC: its label and the pad; under LDpred2-auto's marks: its name
+
+    def spanned(method, flush_right):
+        """The AUCs of the marks a name spans, set flush left from ``start`` or flush right at the axis's end."""
+        wide = 2.0 ** ((widest(fig, [method], **style) + aside) / doubling)
+        low, high = (last / wide, last) if flush_right else (start / 2.0 ** (aside / doubling), start * wide)
+        return marks[(marks[:, 0] >= low) & (marks[:, 0] <= high), 1]
+
+    def scale(*limits):
+        """The least AUC per inch at which each (AUC, inches) limit has that many inches of type and pads under its
+        AUC, over the x axis, with ``above`` inches over the best possible AUC."""
+        return max((ceiling - value) / (height - above - inches) for value, inches in limits)
+
+    # inches over the best possible AUC: its label and the pads
     above = POSTER_PAD + line + POSTER_PAD
-    under = POSTER_PAD + names[theirs][1] + POSTER_PAD
-    span = max((ceiling - beside[theirs].min()) / (1 - (above + under) / height),
-               (ceiling - marks[:, 1].min()) / (1 - (above + POSTER_PAD) / height))
-    per_inch = span / height
+    # SV-PGS's name over the marks it spans from the left and under the best possible AUC, LDpred2-auto's under the
+    # marks it spans to the right end
+    lowest, everything = spanned(theirs, True).min(), (marks[:, 1].min(), clear)
+    per_inch = scale((lowest, clear + tall[theirs] + POSTER_PAD), everything)
+    over = spanned(ours, False).max() + clear * per_inch
+    stacked = over + (tall[ours] + POSTER_PAD) * per_inch > ceiling
+    if stacked:
+        # when SV-PGS's name cannot fit there, it stands flush right under the marks it spans, LDpred2-auto's under it
+        mine = spanned(ours, True).min()
+        per_inch = scale((mine, clear + tall[ours] + POSTER_PAD + tall[theirs] + POSTER_PAD),
+                         (lowest, clear + tall[theirs] + POSTER_PAD), everything)
+        first = mine - clear * per_inch
+        ax.text(1, first, ours, transform=shifted(ax, 0.0), color=SV_PGS, ha="right", va="top", **style)
+        second = min(first - (tall[ours] + POSTER_PAD) * per_inch, lowest - clear * per_inch)
+    else:
+        ax.text(start, over, ours, color=SV_PGS, ha="left", va="bottom", **style)
+        second = lowest - clear * per_inch
+    ax.text(1, second, theirs, transform=shifted(ax, 0.0), color=LDPRED2, ha="right", va="top", **style)
+    span = height * per_inch
     upper = ceiling + above * per_inch
     ax.set_ylim(upper - span, upper)
     ax.axhline(ceiling, color=INK, linestyle=(0, (1, 1.2)), linewidth=4.0, zorder=1)
     ax.text(SIZES[0] / 1.25, ceiling + POSTER_PAD * per_inch, "Best possible", color=INK, va="bottom", ha="left")
-    ax.text(start, beside[ours].max() + POSTER_PAD * per_inch, ours, color=SV_PGS, fontsize=POSTER_NAME,
-            fontweight="bold", ha="left", va="bottom")
-    ax.text(1, beside[theirs].min() - POSTER_PAD * per_inch, theirs, transform=shifted(ax, 0.0),
-            color=LDPRED2, fontsize=POSTER_NAME, fontweight="bold", ha="right", va="top")
     levels = np.arange(math.ceil((upper - span) / 0.05) * 0.05, ceiling, 0.05)
     ax.set_yticks(levels, [f"{level:.2f}" for level in levels])
     # the title runs longer than the axis, so it ends at the axis's top and runs on into the margin under it
@@ -1025,15 +1048,15 @@ def poster_wins_figure(grids):
 WELL_IMPUTED = ("tagged_sv", "tagged_sv_fold3")
 """The architectures whose causal SVs are drawn only from SVs that Beagle imputed with realized r² ≥ 0.8 (grid.py's
 sv_min_realized_r2)."""
-POSTER_GAIN, POSTER_GENOTYPES = 21.92, 11.4
-POSTER_GENOTYPES_HEIGHT = 7.2
-"""Inches: the imputation figure's height, which fills the left column under the Methods bullets."""
-"""Inches: the widths of the SV gain forest (the poster's middle column, build_pptx.py's MIDDLE) and the imputation
-figure (the left column, LEFT), each placed at its column's full width."""
-POSTER_GAIN_HEIGHT = 11.6
-"""Inches: the SV gain forest's height, which fills the middle column from the training-size figures to the band of
-Discussion, code and references at its foot (build_pptx.py's layout)."""
-GAIN_WEIGHT, GAIN_OFFSET = 2.0, 0.24
+POSTER_GAIN, POSTER_GENOTYPES = POSTER_HALF, POSTER_HALF
+"""Inches: the widths of the SV gain forest and the imputation figure, side by side in the lower row of the poster's
+middle column (build_pptx.py's layout), each placed at that width so its type prints at its own size."""
+POSTER_GAIN_HEIGHT = 11.66
+"""Inches: the SV gain forest's height. Its rows share what the key and the x axis leave, and the build stops when that
+is less than the rows need."""
+POSTER_GENOTYPES_HEIGHT = POSTER_GAIN_HEIGHT
+"""Inches: the imputation figure's height, the SV gain forest's, so the two sit flush side by side."""
+GAIN_WEIGHT, GAIN_OFFSET = 1.0, 0.24
 """The SV gain forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR), and the rows each
 source's interval sits above (true genotypes) or below (imputed SVs) its set's row."""
 FOREST_SIZES = SIZES[:3]
@@ -1053,8 +1076,8 @@ def gain_sets(grids) -> dict[str, dict]:
     sets = {}
     for key, label, points in (
         ("all", "With causal SVs", causal),
-        ("well_imputed", "Causal SVs with r² ≥ 0.8", [point for point in causal if point in WELL_IMPUTED]),
-        ("null", "No causal SVs (control)", ["null"]),
+        ("well_imputed", "Causal SVs with\nr² ≥ 0.8", [point for point in causal if point in WELL_IMPUTED]),
+        ("null", "No causal SVs\n(control)", ["null"]),
     ):
         true = [gain for point in points for _, gain, _ in gains.get(point, [])]
         imputed = [gain for point in points for _, _, gain in gains.get(point, [])]
@@ -1063,34 +1086,44 @@ def gain_sets(grids) -> dict[str, dict]:
     return sets
 
 
-def gain_forest(rows: list[dict], bold: dict, band: bool):
-    """The SV gain forest of ``poster_sv_gain_figure`` at POSTER_GAIN_HEIGHT, its rows sharing the height over the
-    measured x axis, ``bold``'s label in bold. The two genotype sources are named after marks like their own, on one
-    line in a band over the plot with ``band``, else stacked in the plot's lower right, which returns None when the
-    names would overlap an interval there."""
+def gain_forest(rows: list[dict], bold: dict):
+    """The SV gain forest of ``poster_sv_gain_figure``, POSTER_GAIN wide and POSTER_GAIN_HEIGHT tall, its rows sharing
+    the height between the key and the measured x axis, ``bold``'s label in bold. The key names the two genotype sources
+    after marks like their own, stacked over the plot and ending at its right edge. A row needs the height at which its
+    two marks clear each other by POSTER_PAD and its label clears the next; a shorter POSTER_GAIN_HEIGHT stops the
+    build."""
     top, right, height = POSTER_PAD, 0.5, POSTER_GAIN_HEIGHT
     mark, bar, ring = POSTER_MARK * GAIN_WEIGHT, POSTER_BAR * GAIN_WEIGHT, 6.0 * GAIN_WEIGHT
     fig = plt.figure(figsize=(POSTER_GAIN, height))
     style = dict(fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0)
-    gap = 0.5
-    key = tallest(fig, [label for label, _, _ in SOURCES], **style) + 2 * POSTER_PAD if band else 0.0
-    bottom = under_axes(fig, ["Test AUC gain from adding SVs"])
-    left = widest(fig, [row["label"] for row in rows], fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0) + 0.75
-    ax = frame(fig, left, bottom, POSTER_GAIN - left - right, height - key - top - bottom)
+    # inches from a key mark's centre to its name: the mark's reach and a pad
+    gap = (mark + ring) / 2 / 72 + 2 * POSTER_PAD
+    # the key's names, wrapped after "and", each over a pad
+    names = [label.replace(" and ", " and\n") for label, _, _ in SOURCES]
+    heights = [tallest(fig, [name], **style) for name in names]
+    key = sum(heights) + len(names) * POSTER_PAD
+    # the x axis's title is wider than the plot on one line
+    title = "Test AUC gain\nfrom adding SVs"
+    bottom = under_axes(fig, [title])
+    labels = [row["label"] for row in rows]
+    left = widest(fig, labels, **style) + 0.75
+    # a row's two marks stand GAIN_OFFSET rows either side of it
+    pitch = max(((mark + ring) / 72 + POSTER_PAD) / (2 * GAIN_OFFSET), tallest(fig, labels, **style) + POSTER_PAD)
+    need = top + key + len(rows) * pitch + bottom
+    if height < need - 0.005:
+        raise SystemExit(f"poster_sv_gain: POSTER_GAIN_HEIGHT is {height} in, under the {need:.2f} in its rows need")
+    width = POSTER_GAIN - left - right
+    ax = frame(fig, left, bottom, width, height - key - top - bottom)
     ends = [row[source][end] for row in rows for source in ("true", "imputed") for end in ("lower", "upper")
             if math.isfinite(row[source][end])]
     low, high = min(0.0, *ends), max(ends)
     limits = (low - 0.05 * (high - low), high + 0.05 * (high - low))
-    drawn = []
     for y, row in enumerate(rows):
         for offset, source, (_, color, filled) in ((-GAIN_OFFSET, "true", SOURCES[0]), (GAIN_OFFSET, "imputed", SOURCES[1])):
             test = row[source]
             if math.isfinite(test["lower"]):
                 ax.hlines(y + offset, test["lower"], test["upper"], color=color, linewidth=bar, zorder=3,
                           capstyle="round")
-                drawn.append((y + offset, test["upper"], bar / 2 / 72))
-            # a mean's mark reaches its radius and half its ring past its centre
-            drawn.append((y + offset, test["mean"], (mark + ring) / 2 / 72))
             ax.plot([test["mean"]], [y + offset], "o", markersize=mark, color=color,
                     markerfacecolor=color if filled else "white", markeredgecolor=color,
                     markeredgewidth=0 if filled else ring, zorder=4)
@@ -1101,43 +1134,22 @@ def gain_forest(rows: list[dict], bold: dict, band: bool):
     ax.spines["left"].set_visible(False)
     ax.set_ylim(len(rows) - 0.5, -0.5)
     ax.set_xlim(*limits)
-    step = 0.002
+    # the finest tick step whose labels stand 0.3 in apart
+    wide = widest(fig, ["0.000"], fontsize=POSTER_TYPE) + 0.3
+    step = next(step for step in (0.001, 0.002, 0.004, 0.005, 0.01, 0.02)
+                if step * width / (limits[1] - limits[0]) >= wide)
     ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
     ax.set_xticks(ticks, [plain(tick, 3) for tick in ticks])
-    ax.set_xlabel("Test AUC gain from adding SVs")
-    if band:
-        # on one line in the band over the plot, ending at its right edge, each name 0.5 in after its mark and 1 in
-        # after the name before it
-        widths = [widest(fig, [label], **style) for label, _, _ in SOURCES]
-        across, up = POSTER_GAIN - right - sum(widths) - 2 * gap - 1.0, height - key / 2
-        for (label, color, filled), width in zip(SOURCES, widths):
-            ax.plot([across], [up], "o", transform=fig.dpi_scale_trans, markersize=mark, color=color,
-                    markerfacecolor=color if filled else "white", markeredgecolor=color,
-                    markeredgewidth=0 if filled else ring, clip_on=False, zorder=4)
-            fig.text(across + gap, up, label, transform=fig.dpi_scale_trans, color=color, va="center", ha="left",
-                     **style)
-            across += gap + width + 1.0
-        return fig
-    # stacked in the plot's lower right: the names, wrapped after "and", end at the plot's right edge and the column's
-    # foot stands a pad over the x axis, each mark 0.5 in before its name and level with its first line
-    names = [label.replace(" and ", " and\n") for label, _, _ in SOURCES]
-    heights = [tallest(fig, [name], **style) for name in names]
+    ax.set_xlabel(title, loc="right")
+    # the key over the plot, the names ending at its right edge, each mark before its name and level with its first
+    # line
     line = tallest(fig, ["Called"], **style)
-    across = POSTER_GAIN - right - widest(fig, names, **style) - gap
-    foot, head = bottom + POSTER_PAD, bottom + POSTER_PAD + sum(heights) + POSTER_PAD
-    # the column, marks included, must clear every interval's right end and every mean's mark by a pad
-    inches = fig.dpi_scale_trans.inverted()
-    for y, x, reach in drawn:
-        x_at, y_at = inches.transform(ax.transData.transform((x, y)))
-        if foot - reach - POSTER_PAD <= y_at <= head + reach + POSTER_PAD and x_at + reach > across - mark / 2 / 72 - POSTER_PAD:
-            plt.close(fig)
-            return None
-    up = head
+    across, up = POSTER_GAIN - right - widest(fig, names, **style), height - top
     for (label, color, filled), name, tall in zip(SOURCES, names, heights):
-        ax.plot([across], [up - line / 2], "o", transform=fig.dpi_scale_trans, markersize=mark, color=color,
+        ax.plot([across - gap], [up - line / 2], "o", transform=fig.dpi_scale_trans, markersize=mark, color=color,
                 markerfacecolor=color if filled else "white", markeredgecolor=color,
                 markeredgewidth=0 if filled else ring, clip_on=False, zorder=4)
-        fig.text(across + gap, up, name, transform=fig.dpi_scale_trans, color=color, va="top", ha="left", **style)
+        fig.text(across, up, name, transform=fig.dpi_scale_trans, color=color, va="top", ha="left", **style)
         up -= tall + POSTER_PAD
     return fig
 
@@ -1159,9 +1171,7 @@ def poster_sv_gain_figure(grids):
                  for key, row in sets.items()},
     }
     rows = list(sets.values())
-    # the sources' names stand in the plot's empty lower right when they clear every interval there, else on one line
-    # in a band over the plot
-    fig = gain_forest(rows, sets["well_imputed"], band=False) or gain_forest(rows, sets["well_imputed"], band=True)
+    fig = gain_forest(rows, sets["well_imputed"])
     description = (
         "Test AUC gain from adding SVs to SV-PGS with true genotypes (filled) and with SNVs called from simulated reads "
         "and SVs imputed by Beagle (open), mean and 95% interval over simulations at training N 5,000 to 20,000, for "
@@ -1172,7 +1182,7 @@ def poster_sv_gain_figure(grids):
 
 
 def poster_imputation_figure(summary):
-    """The genotype accuracy figure at the foot of the poster's left column: each frequency bin's mean r² of the
+    """The genotype accuracy figure beside the SV gain forest in the lower row of the poster's middle column: each frequency bin's mean r² of the
     measured genotype with the true genotype, for SNVs called from simulated reads and SVs imputed by Beagle, with a
     conservative 95% interval of the mean, ±1.96 √(mean (1 − mean) / n): an r² lies in [0, 1], so its variance is at
     most mean (1 − mean), and the summary keeps each bin's mean and count, not its values. The names stand in a column

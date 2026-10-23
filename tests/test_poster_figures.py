@@ -68,6 +68,24 @@ def poster_figures():
         # the final forest, with the converged traits' common g
         common = {"relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1, "traits": 4}
         yield "aou_1_gain_final", aou_gallery.gain_figure(rows, common)[0]
+        # and over it each trait's held-out r² for LDpred2-auto and SV-PGS
+        yield "aou_1_gain_compared", aou_gallery.gain_figure(rows, common, compared_rows())[0]
+        # with asterisks past the intervals whose q is below 0.05, gout's at the end of its arrowhead
+        yield "aou_1_gain_starred", aou_gallery.gain_figure(rows, common, compared_rows(0.01))[0]
+
+
+def compared_rows(q: float = 0.3) -> list[dict]:
+    """aou_vs_ldpred2.json's rows: each trait's held-out r² as a fraction with its 95% interval, per arm, in r² ranges
+    like the real traits', and the Benjamini-Hochberg q of SV-PGS against LDpred2-auto and of the SV gain, ``q`` for
+    LDL cholesterol's comparison and gout's gain and 0.3 for the rest."""
+    rows = []
+    for trait, r2 in (("egfr", 0.012), ("ldl_cholesterol", 0.05), ("gout", 0.003), ("hypothyroidism", 0.0008)):
+        rows.append({"trait": trait, "r2": {arm: {"r2": r2 * scale, "lower": r2 * scale / 3, "upper": r2 * scale * 1.6}
+                                            for arm, scale in (("ldpred2_auto", 0.9), ("with_sv", 1.0),
+                                                               ("snv_indel", 1.0))},
+                     "with_sv": {"q": q if trait == "ldl_cholesterol" else 0.3},
+                     "sv_gain": {"q": q if trait == "gout" else 0.3}})
+    return rows
 
 
 def drawn_texts(fig):
@@ -115,22 +133,99 @@ def test_the_poster_places_each_figure_whole(tmp_path):
         assert "srcRect" not in shape and "<a:fillRect/>" in shape
 
 
-def test_the_all_of_us_forest_refuses_an_unconverged_fit_and_draws_the_common_gain():
+def row_names(ax) -> list[str]:
+    """An All of Us panel's row names, top to bottom, a two-line name as one line."""
+    return [text.get_text().replace("\n", " ") for text in ax.texts if text.get_text() != aou_gallery.STAR]
+
+
+def test_the_all_of_us_forest_skips_an_unconverged_fit_and_draws_the_common_gain():
     rows = [{"trait": "gout", "relative": 4.5, "relative_lower": -24.6, "relative_upper": 33.6},
             {"trait": "egfr", "relative": 0.3, "relative_lower": -1.1, "relative_upper": 1.7}]
     common = {"relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1, "traits": 2}
     with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
         fig, lines = aou_gallery.gain_figure(rows, common)
-    shown = [text.get_text() for text in drawn_texts(fig)]
-    assert "Gout" in shown and aou_gallery.COMBINED in shown
+    assert row_names(fig.axes[-1]) == ["Gout", "eGFR", aou_gallery.COMBINED]
     assert "common change" in lines[0]
     plt.close(fig)
     with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
         fig, _ = aou_gallery.gain_figure(rows[1:])
-    assert aou_gallery.COMBINED not in [text.get_text() for text in drawn_texts(fig)]
+    assert row_names(fig.axes[-1]) == ["eGFR"]
     plt.close(fig)
-    with pytest.raises(SystemExit, match="gout"):
-        aou_gallery.gain_figure([{**rows[0], "unconverged": True}, rows[1]], common)
+    # a trait whose fit did not converge is in neither panel
+    with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
+        fig, _ = aou_gallery.gain_figure([{**rows[0], "unconverged": True}, rows[1]], common, compared_rows())
+    assert [row_names(ax) for ax in fig.axes] == [["eGFR", "LDL cholesterol", "Hypothyroidism"],
+                                                  ["eGFR", aou_gallery.COMBINED]]
+    plt.close(fig)
+
+
+def test_both_all_of_us_panels_keep_the_compared_order_and_give_r2_in_percent():
+    rows = [{"trait": trait, "relative": 0.5, "relative_lower": -1.0, "relative_upper": 2.0}
+            for trait in ("hypothyroidism", "stroke", "ldl_cholesterol", "gout", "egfr")]
+    common = {"relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1, "traits": 5}
+    with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
+        fig, lines = aou_gallery.gain_figure(rows, common, compared_rows())
+    fig.canvas.draw()
+    top, gain = fig.axes
+    # the compared rows' order, then the trait they lack, then the common row
+    assert row_names(top) == ["eGFR", "LDL cholesterol", "Gout", "Hypothyroidism"]
+    assert row_names(gain) == ["eGFR", "LDL cholesterol", "Gout", "Hypothyroidism", "Stroke", aou_gallery.COMBINED]
+    # r² is drawn in percent: the fractions times 100, ticked at the decades inside the axis without a % sign
+    assert top.get_xlabel() == "Held-out r² (%)" and "percent" in lines[0]
+    low, high = top.get_xlim()
+    assert low <= 0.08 * 0.9 and high >= 5.0
+    labels = [label.get_text() for label in top.get_xticklabels()]
+    assert labels and set(labels) <= {"0.01", "0.1", "1", "10"}
+    assert all(low <= tick <= high for tick in top.get_xticks())
+    # the forest takes the panels as Panel lists, top to bottom
+    panel = aou_gallery.Panel([("eGFR", [(0.5, 0.1, 0.9)])], [("", sim_gallery.SKY, "o", False)], "Change (%)")
+    with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
+        alone = aou_gallery.forest([panel])
+    assert len(alone.axes) == 1 and max(sim_gallery.overhang(alone)) <= 0
+    plt.close(alone)
+    plt.close(fig)
+
+
+def test_a_q_below_005_stars_its_interval_and_the_key_and_none_draws_neither():
+    rows = [{"trait": trait, "relative": 0.5, "relative_lower": -1.0, "relative_upper": 2.0}
+            for trait in ("ldl_cholesterol", "gout", "egfr")]
+    for q, starred in ((0.01, True), (0.05, False), (0.3, False)):
+        with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
+            fig, lines = aou_gallery.gain_figure(rows, None, compared_rows(q))
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        top, gain = fig.axes
+        notes = [text.get_text() for text in fig.texts]
+        assert (aou_gallery.STAR_NOTE in notes) is starred and ("asterisk" in lines[0]) is starred
+        for ax, name, index in ((top, "LDL cholesterol", 1), (gain, "Gout", 0)):
+            stars = [text for text in ax.texts if text.get_text() == aou_gallery.STAR]
+            assert len(stars) == (1 if starred else 0)
+            if starred:
+                # just past the starred trait's SV-PGS interval, on its line
+                box = stars[0].get_window_extent(renderer)
+                # each row's intervals, one an hlines collection, in the order of its series
+                names = row_names(ax)
+                segments = [segment for collection in ax.collections for segment in collection.get_segments()]
+                (_, y), (x1, _) = segments[names.index(name) * (len(segments) // len(names)) + index]
+                end = ax.transData.transform((x1, y))
+                assert end[0] < box.x0 < end[0] + 0.5 * fig.dpi and box.y0 < end[1] < box.y1
+        texts = [text.get_text() for text in drawn_texts(fig)]
+        assert not any(word in text for text in texts for word in ("converged", "uncertified", "†"))
+        assert max(sim_gallery.overhang(fig)) <= 0
+        plt.close(fig)
+
+
+def test_the_two_marks_in_an_all_of_us_r2_row_stack_without_touching():
+    with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
+        fig, _ = aou_gallery.gain_figure([], None, compared_rows())
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    boxes = sorted((line.get_window_extent(renderer) for line in fig.axes[0].lines if line.get_marker() in ("s", "o")),
+                   key=lambda box: -box.y1)
+    assert len(boxes) == 8
+    for upper, lower in zip(boxes, boxes[1:]):
+        assert lower.y1 < upper.y0
+    plt.close(fig)
 
 
 def test_the_forest_gives_each_traits_change_relative_to_the_r2_without_svs():

@@ -43,6 +43,7 @@ TEMPLATE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "Downloads"
 OUTPUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.home() / "Downloads" / "ASHG SV-PGS poster.pptx"
 FIGURES = Path(sys.argv[3]) if len(sys.argv) > 3 else HERE / "figures"
 GALLERY = FIGURES / "gallery"
+IMPUTATION = FIGURES / "imputation"
 SKILL = Path.home() / ".claude/skills/synced/cf317dd8-fe6e-4d5f-8d52-41758c24f59e_65ab35e1-5c99-4c20-a531-f6c547fa9553/pptx"
 EMU = 914400
 
@@ -179,24 +180,6 @@ def aou_result() -> list[str]:
         return []
     return [f"In All of Us, imputed SVs raised r² by at most {signed(common['relative_bound'] / 100)} over "
             f"{common['traits']} traits, so these traits have few SVs with large effects or poorly imputed causal SVs."]
-
-
-def aou_compared() -> list[str]:
-    """What the All of Us comparison with LDpred2-auto found, as a results bullet, when aou_vs_ldpred2.json holds it:
-    over the traits where SV-PGS converged, the common change in held-out r² of SV-PGS with SVs over LDpred2-auto's,
-    with its 95% interval, and the number of traits left out because an SV-PGS fit did not converge."""
-    path = HERE / "aou_vs_ldpred2.json"
-    if not path.is_file():
-        return []
-    found = json.loads(path.read_text())
-    common = found["combined"]["with_sv"]
-    low, high = (f"{common[key]:.0f}".replace("-", "−") for key in ("relative_lower", "relative_upper"))
-    interval = f"{low}–{high}%" if common["relative_lower"] >= 0 else f"{low}% to {high}%"
-    sentence = (f"On the {len(found['rows'])} traits where SV-PGS converged, its r² was {abs(common['relative']):.0f}% "
-                f"{'higher' if common['relative'] >= 0 else 'lower'} than LDpred2-auto's (95% CI {interval}).")
-    if "not_converged" in found:
-        sentence += f" It did not converge on {len(found['not_converged'])} others."
-    return [sentence]
 
 
 # ------------------------------------------------------------------ DrawingML
@@ -456,17 +439,16 @@ def width_of(runs: list[tuple[str, str]], size_pt: float) -> float:
                for text, flags in runs)
 
 
-def references(beside: bool) -> tuple[list[Block], float]:
-    """The References section: its bar, then the QR code to the repository with the references in small type under it,
-    or ``beside`` it, one to a line; and the least width that sets each reference on its line."""
+def references() -> list[Block]:
+    """The References section at the foot of the right column: its bar, then the QR code to the repository with the
+    references in small type beside it, one to a line."""
     lines = [marked(f"{SUPERSCRIPT[index]}{reference}") for index, reference in enumerate(REFERENCES, start=1)]
     words = Block("text", [Para(runs, REFERENCE, bullet=False, after=0) for runs in lines])
     type_width = max(width_of(runs, REFERENCE) for runs in lines) + 2 * INSET + 0.05
-    if not beside:
-        return [bar(96, "References"), Block("qr", None), words], max(type_width, QR + 2 * INSET)
-    width = INSET + QR + GUTTER + type_width
-    share = (INSET + QR) / (width - GUTTER)
-    return [bar(96, "References"), row([Block("qr", None)], [words], shares=(share, 1 - share))], width
+    share = QR / (RIGHT - GUTTER)
+    if QR + GUTTER + type_width > RIGHT:
+        raise SystemExit("the references do not fit beside the QR code")
+    return [bar(96, "References"), row([Block("qr", None)], [words], shares=(share, 1 - share))]
 
 
 def row(*children: list, shares: tuple = ()) -> Block:
@@ -577,7 +559,7 @@ class Poster:
         elif block.kind == "placeholder":
             self.shapes.append(placeholder(self.fresh(), x, y, width, height, *block.content))
         elif block.kind == "qr":
-            self.shapes.append(image(self.fresh(), "Repository QR code", self.image(self.qr), x + INSET,
+            self.shapes.append(image(self.fresh(), "Repository QR code", self.image(self.qr), x,
                                      y + QR_GAP - GAPS["bar"], QR, QR,
                                      "QR code to github.com/SauersML/SV-PGS"))
         elif block.kind == "row":
@@ -660,33 +642,28 @@ def build() -> None:
         "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy",
         "poster_model")}
     discussion = [bar(95, "Discussion"), text(bullets([*words["discussion"], *aou_result()]))]
-    # the poster reads Introduction and Methods, the simulation's results and All of Us, then the Discussion in a band
-    # across the foot of the middle and right columns, the QR code, the repository's address and the references at its
-    # right end. The All of Us result (its common gain) adds two Discussion bullets and every trait's row.
+    # the poster reads Introduction and Methods, the simulation's results, All of Us with the QR code to the repository
+    # and the references at its foot, then the Discussion in a band across the foot of the middle and right columns.
+    # The All of Us result (its common gain) adds a Discussion bullet.
     columns = [
         [
             bar(97, "Introduction"), text(bullets(words["introduction"])),
-            bar(91, "Methods"), figure(gallery["poster_model"]), text(bullets([*words["methods"], *words["design"]])),
-            figure(gallery["poster_imputation_accuracy"], flex=True, legend=GALLERY / "fig5_simulated_svs.txt"),
+            bar(91, "Methods"), figure(gallery["poster_model"]), text(bullets(words["methods"])),
+            figure(IMPUTATION / "sv_imputation_by_context.png", flex=True), text(bullets(words["design"])),
         ],
         [
             bar(118, "Simulation results"),
             row([figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
-            figure(gallery["poster_sv_gain"], flex=True),
+            row([figure(gallery["poster_sv_gain"])],
+                [figure(gallery["poster_imputation_accuracy"], legend=GALLERY / "fig5_simulated_svs.txt")]),
         ],
-        [bar(119, "All of Us cohort results"), text(bullets([*words["aou"], *aou_compared()])), *aou_blocks()],
+        [bar(119, "All of Us cohort results"), text(bullets(words["aou"])), *aou_blocks(), *references()],
     ]
     poster = Poster(xml, rels, work / "ppt/media")
     across = COLUMNS[2][0] + RIGHT - COLUMNS[1][0]
-    # the Discussion and the References side by side, the references under the QR code or beside it, whichever makes
-    # the shorter band
-    bands = []
-    for beside in (False, True):
-        ending, width = references(beside)
-        share = width / (across - GUTTER)
-        bands.append([row(discussion, ending, shares=(1 - share, share))])
-    band = min(bands, key=lambda band: poster.stack_height(band, across))
+    # the Discussion alone in the band, so its bullets run the band's width
+    band = discussion
     top = BOTTOM - poster.stack_height(band, across)
     poster.stack(band, COLUMNS[1][0], top, across, None)
     for index, ((x, width), blocks) in enumerate(zip(COLUMNS, columns)):

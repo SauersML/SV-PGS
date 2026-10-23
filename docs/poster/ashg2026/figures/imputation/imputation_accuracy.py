@@ -72,7 +72,7 @@ def context_panel(ax) -> None:
     ax.set_ylim(-len(rows) + 0.4 - 0.5, 0.5)
     ax.set_xlim(0, 1)
     ax.set_xticks([0, 0.5, 1], ["0", "0.5", "1"])
-    ax.set_xlabel("r² per SV allele")
+    ax.set_xlabel("Imputation r²")
 
 
 def fit(fig, axes, heights, gaps, width, pad=POSTER_PAD) -> float:
