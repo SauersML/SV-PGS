@@ -107,3 +107,15 @@ Amendment 3 (2026-10-23, 01:20 PDT, before any screen value is read; no screen r
   staged source and traits.
 - The family is now at most 83 traits: the 11 of the earlier battery, aou-scr-d1 .. d7 (67 diseases) and aou-scr-q1
   (5 quantitative traits), less those below the power threshold. Nothing else changes.
+
+Amendment 4 (2026-10-23, 01:30 PDT, before any screen value is read; no screen run has fitted any trait)
+- aou-scr-q1 is stopped (coordinator: speed matters more than its five traits), and heart_rate,
+  mean_corpuscular_volume, platelet_count, white_blood_cell_count and total_bilirubin leave the family. The family is
+  now at most 78 traits: the 11 of the earlier battery and the 67 diseases of aou-scr-d1 .. d7, less those below the
+  power threshold.
+- The analysis runs on its own, on the app, as soon as the last of aou-scr-d1 .. d7 has ended (2026-10-23 14:00 PDT at
+  the latest): fastpgs_meta.py --screen ldpred2_auto --exclude <the long-read panel's research ids>. A screen run that
+  did not succeed is listed as missing, and its traits leave the family.
+- A secondary line is added that decides no hit: the admitted traits' gains pooled by generalized least squares under
+  their joint-resample covariance (fixed and random effects), each with its own SE, 95% interval and one-sided p
+  (gain > 0). The hits are still the traits with BH q < 0.05 from their one-sided per-trait p.

@@ -95,6 +95,8 @@ def test_the_screen_tests_each_admitted_trait_one_sided_and_names_the_rest(tmp_p
     lines = [line for line in printed.splitlines() if line.startswith("  ") and "one-sided p=" in line]
     assert sorted(line.split("\t")[0].strip() for line in lines) == ["gout", "ldl"]
     assert "n=1198" in printed and "traits with a with_sv gain at BH q < 0.05" in printed
+    pooled_line = next(line for line in printed.splitlines() if "pooled by GLS" in line)
+    assert "the 2 traits' gains" in pooled_line and pooled_line.count("one-sided p (gain > 0) = ") == 2
 
 
 def test_a_screen_or_primary_report_needs_the_long_read_exclusion(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -110,8 +112,9 @@ def test_a_screen_or_primary_report_needs_the_long_read_exclusion(tmp_path: Path
 
 
 def test_a_pooled_gain_carries_its_own_gls_inference_one_sided() -> None:
-    from benchmarks.bench_real import sv_gain_meta
     from scipy import stats
+
+    from benchmarks.bench_real import sv_gain_meta
 
     text = sv_gain_meta.normal(sv_gain_meta.PairedComparison(0.002, 0.001, 2.0), 1e4, "")
     assert "20.000 (SE 10.000)" in text and f"one-sided p (gain > 0) = {stats.norm.sf(2.0):.4g}" in text

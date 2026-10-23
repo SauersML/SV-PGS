@@ -34,7 +34,8 @@ import numpy as np
 from scipy import stats
 
 from benchmarks.bench_real.sv_gain_meta import (
-    MINIMUM_GROUP_PEOPLE, OPS, PERMUTATIONS, PRELIMINARY, RESAMPLES, UPPER, PairedTrait, analyse, gains, report, shown, union,
+    MINIMUM_GROUP_PEOPLE, OPS, PERMUTATIONS, PRELIMINARY, RESAMPLES, UPPER, PairedTrait, analyse, gains, normal, pooled, report, shown,
+    union,
 )
 from sv_pgs.held_out_comparison import auc_components, cluster_bootstrap_counts, paired_delta_auc
 from sv_pgs.workspace_pipeline import _residualized
@@ -174,7 +175,9 @@ def screen_admits(pair: PairedTrait) -> bool:
 def screen_report(method: str, traits: Sequence[dict[str, object]], people: Sequence[np.ndarray], weights: np.ndarray) -> list[str]:
     """The screen: per trait passing ``screen_admits``, the with_sv gain in held-out partial r^2 with its family bootstrap
     95% interval and SE, the one-sided normal p of gain / SE (H1: gain > 0) and the Benjamini-Hochberg q over those
-    traits. Traits below the threshold, or with no score in an arm, are named without their counts."""
+    traits. Traits below the threshold, or with no score in an arm, are named without their counts. A secondary line,
+    which decides no hit, pools the traits' gains by generalized least squares under their joint-resample covariance
+    (sv_gain_meta.pooled), with that pooled gain's own SE, interval and one-sided p."""
     pairs = [(trait["name"], paired(trait, people[index], method)) for index, trait in enumerate(traits)]
     missing = [name for name, pair in pairs if pair is None]
     below = [name for name, pair in pairs if pair is not None and not screen_admits(pair)]
@@ -192,7 +195,7 @@ def screen_report(method: str, traits: Sequence[dict[str, object]], people: Sequ
         error = float(np.nanstd(draws, ddof=1))
         z = gain / error if error > 0 else math.nan
         rows.append({"pair": pair, "gain": gain, "base": base, "low": float(np.nanquantile(draws, 0.025)), "high": float(np.nanquantile(draws, 0.975)),
-                     "p": float(stats.norm.sf(z)) if math.isfinite(z) else 1.0})
+                     "p": float(stats.norm.sf(z)) if math.isfinite(z) else 1.0, "draws": draws})
     q = benjamini_hochberg([row["p"] for row in rows])
     for row, value in sorted(zip(rows, q), key=lambda item: item[0]["p"]):
         pair = row["pair"]
@@ -202,6 +205,9 @@ def screen_report(method: str, traits: Sequence[dict[str, object]], people: Sequ
                      f"\tone-sided p={row['p']:.3g} q={value:.3g}" + ("\tSV GAIN at q < 0.05" if value < SCREEN_Q else ""))
     hits = int(np.sum(q < SCREEN_Q))
     lines.append(f"  {hits} of {len(rows)} traits with a with_sv gain at BH q < {SCREEN_Q}")
+    gls = pooled(np.array([row["gain"] for row in rows]), np.column_stack([row["draws"] for row in rows]))
+    lines.append(f"  secondary (decides no hit): the {len(rows)} traits' gains pooled by GLS under their joint-resample covariance "
+                 f"(x1e-4), fixed: {normal(gls['fixed'], 1e4, '')}; random: {normal(gls['random'], 1e4, '')}")
     return lines
 
 
