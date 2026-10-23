@@ -8,8 +8,7 @@ below with the reason it is not a choice:
   a formatted string (display, never results);
 - registered: a specification or file format, a mathematical constant, a
   definition, a derivation, the configuration of an external run whose output
-  we must match, a unit, or (in the simulator only) a scenario's parameter,
-  each with its citation;
+  we must match, or a unit, each with its citation;
 - pending: a known arbitrary constant with the lane that owns its removal. Each
   one still in the code is debt, listed by the strict xfail below until the
   last is gone.
@@ -32,9 +31,7 @@ EXEMPT_VALUES = frozenset({0, 1, -1, 2, 0.5, -0.5})
 EXEMPT_EXPONENTS = frozenset({2, 3, -1, -2, 0.5, -0.5, 1.5, -1.5})
 EXEMPT_KEYWORDS = frozenset({"axis", "ndim", "ord", "stacklevel", "maxsplit", "indent"})
 
-CLASSES = frozenset({"spec", "math", "definitional", "derived", "external-config", "unit", "scenario"})
-# A scenario parameter defines a simulated truth, never a method's choice, so only the simulator may register one.
-SCENARIO_MODULES = frozenset({"synthetic_store.py"})
+CLASSES = frozenset({"spec", "math", "definitional", "derived", "external-config", "unit"})
 
 # (module path relative to sv_pgs/, symbol) -> (class, allowed values, citation)
 REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
@@ -234,34 +231,6 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('sv_fusion.py', 'MAXIMUM_BREAKPOINT_DISTANCE'): ('spec', frozenset({100}), 'GATK-SV re-clustering rule'),
     ('sv_fusion.py', 'MINIMUM_CALIBRATION_SAMPLES'): ('math', frozenset({4}), 'Fisher z has standard error 1/sqrt(n - 3), so n > 3'),
     ('sv_fusion.py', '_fisher_z'): ('math', frozenset({3}), 'Fisher z has standard error 1/sqrt(n - 3), so n > 3'),
-    ('synthetic_store.py', 'HG38_AUTOSOME_MEGABASES'): ('scenario', frozenset({248.96, 242.19, 198.3, 190.21, 181.54, 170.81, 159.35, 145.14, 138.39, 133.8, 135.09, 133.28, 114.36, 107.04, 101.99, 90.34, 83.26, 80.37, 58.62, 64.44, 46.71, 50.82}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'COHORT_GROUPS'): ('scenario', frozenset({0.8, 0.2, 0.35, 0.15}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'ANCESTRY_DIRICHLET_CONCENTRATION'): ('scenario', frozenset({15.0}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'ADMIXTURE_GENERATIONS'): ('scenario', frozenset({8}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'TILE_GAP_BP'): ('scenario', frozenset({1000000}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'TILE_GAP_CM'): ('scenario', frozenset({50.0}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'ERR_IMP'): ('scenario', frozenset({0.001}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'POP_CLAMP'): ('scenario', frozenset({1e-05}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'POP_KEPT_PATHS'): ('scenario', frozenset({10}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'NESTED_RECORD_PROBABILITY'): ('scenario', frozenset({0.3}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'MAXIMUM_NESTED_PATHS'): ('scenario', frozenset({5}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'SOFT_POSTERIOR_FRACTION'): ('scenario', frozenset({0.1}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'SOFT_DELTA_LOG10_RANGE'): ('scenario', frozenset({-5.0, -2.0}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'SINGLE_PATH_R2'): ('scenario', frozenset({0.8329993319973283, 0.9543537402545237, 0.9917454154040785, 0.9979868123448445, 0.726935085825916, 0.9306600470124883, 0.9865243070521974, 0.9967590549910882, 0.0022485654501617743, 0.1738066716577618, 0.6865351451998423, 0.868419151645502, 0.06496154204265829, 0.30317890563719757, 0.6548260520832868, 0.9006202645418034}), 'bench-sim v7 Beagle 5.5 arm median single-record dosage r2 on public 1kGP haplotypes (v7/results_calibration_beagle_5000.json)'),
-    ('synthetic_store.py', 'MAF_BIN_EDGES'): ('scenario', frozenset({0.001, 0.01, 0.05}), 'the MAF bin edges of bench-sim v7 Beagle 5.5 arm median single-record dosage r2 on public 1kGP haplotypes (v7/results_calibration_beagle_5000.json)'),
-    ('synthetic_store.py', 'PIPELINE_R2_LOSS'): ('scenario', frozenset({0.01}), 'stated design input: half B\'s r2 target sits 0.01 below half A\'s for every class; no measured or AoU source (synthetic_store module comment)'),
-    ('synthetic_store.py', 'R2_BETA_CONCENTRATION'): ('scenario', frozenset({20.0}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'COMPLEXITY_BIN_PATHS'): ('scenario', frozenset({5, 6, 10, 11, 20, 21, 60}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', '_tile_units'): ('scenario', frozenset({3}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', '_popcount'): ('scenario', frozenset({8}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', '_SOFT_DELTA_MEAN'): ('scenario', frozenset({10}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', '_SOFT_DELTA_SECOND_MOMENT'): ('scenario', frozenset({10}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'noise_parameters'): ('scenario', frozenset({10}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'draw_tile_mosaic'): ('scenario', frozenset({100.0}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'haplotype_posteriors'): ('scenario', frozenset({10.0}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'half_statistics'): ('scenario', frozenset({1000.0, 256, 1000000.0, 500}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', 'plan_store'): ('scenario', frozenset({3}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
-    ('synthetic_store.py', '_write_variant_table'): ('scenario', frozenset({31}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
     ('eb_monitor.py', 'MONITOR_SHARE'): ('spec', frozenset({0.05}), "the EB monitor's time bound, at most 5% of the fit's: the lead's specification of a log-only monitor that no result reads"),
     ('variant_typing.py', 'COMMUNITY_SV_MINIMUM_LENGTH'): ('spec', frozenset({50}), 'community SV definition, >= 50 bp; reporting label and external-record matching only'),
     ('variant_typing.py', '_core_kind_and_length'): ('external-config', frozenset({10.0, 0.1}), 'imputation strata near-pure rule max(10, 10%) (lrma-strata scripts/finalqc/strata_build.py classify)'),
@@ -457,7 +426,6 @@ def test_every_registered_entry_is_classified_and_still_occurs() -> None:
     present = _present()
     for key, (category, values, citation) in REGISTRY.items():
         assert category in CLASSES, f"{key}: unknown class {category!r}"
-        assert category != "scenario" or key[0] in SCENARIO_MODULES, f"{key}: only the simulator has scenario parameters"
         assert citation, f"{key}: a registered constant needs its citation"
         assert key not in PENDING, f"{key}: registered and pending at once"
         missing = set(values) - present.get(key, set())

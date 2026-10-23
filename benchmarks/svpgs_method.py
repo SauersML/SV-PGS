@@ -71,7 +71,7 @@ _CLASS_CODES = {variant_class: index for index, variant_class in enumerate(Varia
 
 
 def _length_class(reference_length: np.ndarray, alternate_length: np.ndarray) -> np.ndarray:
-    """A small variant's class from its allele lengths, as synthetic_store types 1kGP indels."""
+    """A small variant's class from its allele lengths."""
     classes = np.full(reference_length.shape[0], _CLASS_CODES[VariantClass.OTHER_COMPLEX_SV], dtype=np.uint8)
     classes[reference_length > alternate_length] = _CLASS_CODES[VariantClass.DELETION]
     classes[reference_length < alternate_length] = _CLASS_CODES[VariantClass.INSERTION]
