@@ -16,6 +16,7 @@ docs/poster/ashg2026/figures/fig_aou_*
 docs/poster/ashg2026/figures/aou_*
 docs/poster/ashg2026/aou_numbers.json
 docs/poster/ashg2026/aou_vs_ldpred2.json
+docs/poster/ashg2026/aou_ancestry.json
 docs/poster/ashg2026/figures/imputation/*.json
 docs/poster/ashg2026/figures/imputation/*.pdf
 docs/poster/ashg2026/figures/imputation/*.png
