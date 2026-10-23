@@ -92,9 +92,12 @@ never a value of the data.
 from __future__ import annotations
 
 import argparse
+import array
+import ast
 import contextlib
 import datetime
 import hashlib
+import io
 import json
 import math
 import os
@@ -104,6 +107,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 try:
@@ -141,6 +145,16 @@ fills {arm} and {trait}): its completed fit's and its partial's (a FIT_ARMS run'
 its own."""
 MEAN_FIELD = "product_mixture"
 """The draw law of a saved mean-field model, the only kind ``_warm_seeds`` starts a fit from (model.json's draw_laws)."""
+NULL_EFFECT = 1e-12
+"""A saved model whose coefficients' mean |b| (``effect_scale``) is below this is a collapsed null: EB fitted no genetic
+signal. The asthma and CKD seeds aou-ws6 and aou-wk7 had 2.8e-21 and 5.4e-18, and both arms warm-started from them
+stayed at the null; the eGFR and hyperlipidemia seeds aou-we6s and aou-wy5, real fits, had 9e-4 and 8e-7."""
+NULL_COLLAPSE = "run/NULL_COLLAPSE.json"
+"""In a run whose trait's fitted arm is a collapsed null (``Follower.signal``): each arm's model and mean |b|. The pair
+is no SV test, and its report is no gain."""
+READ_AHEAD = 1 << 16
+"""The least a byte-range read of a model's arrays.npz fetches (``_Ranged``): the zip's end records and central
+directory in one read, a member's local header in another."""
 ARM_VMS_CONFIG = {"cross_fit": False, "compact_fit_store": True, "arm_pass": True}
 """An arm_vms run's config apart from its traits' bases: one fold split for every trait, the fit on the compact fit
 store and every trait's groups in one pass (arm_pass). A key the commit's driver does not name is left out, with a
@@ -501,11 +515,11 @@ class Gcloud:
     def url(self, path: str) -> str:
         return f"gs://{self.bucket}/svpgs/{path}"
 
-    def _run(self, arguments: list, change: bool = False) -> subprocess.CompletedProcess:
+    def _run(self, arguments: list, change: bool = False, text: bool = True) -> subprocess.CompletedProcess:
         if change and not self.execute:
             raise RuntimeError("a change to the cloud outside --execute")
         try:
-            done = subprocess.run(["gcloud", *arguments], capture_output=True, text=True, check=False, timeout=COMMAND_SECONDS)
+            done = subprocess.run(["gcloud", *arguments], capture_output=True, text=text, check=False, timeout=COMMAND_SECONDS)
         except subprocess.TimeoutExpired:
             raise (RoundError if change else Unavailable)(f"gcloud {' '.join(arguments[:3])} did not finish in {COMMAND_SECONDS} s") from None
         if change and done.returncode != 0:
@@ -514,18 +528,24 @@ class Gcloud:
             raise RoundError(f"gcloud {' '.join(arguments[:2])} failed: {done.stderr.strip()[-500:]}")
         return done
 
-    def _read(self, arguments: list):
-        """A read's output, or None where what it reads is absent; Unavailable where it failed otherwise."""
-        done = self._run(arguments)
+    def _read(self, arguments: list, text: bool = True):
+        """A read's output (bytes where not ``text``), or None where what it reads is absent; Unavailable where it failed
+        otherwise."""
+        done = self._run(arguments, text=text)
         if done.returncode == 0:
             return done.stdout
-        if ABSENT.search(done.stderr):
+        error = done.stderr if text else done.stderr.decode("utf-8", "replace")
+        if ABSENT.search(error):
             return None
-        raise Unavailable(f"gcloud {' '.join(arguments[:3])} failed: {done.stderr.strip()[-300:]}")
+        raise Unavailable(f"gcloud {' '.join(arguments[:3])} failed: {error.strip()[-300:]}")
 
     def read(self, path: str):
         """An object's text, or None where there is none."""
         return self._read(["storage", "cat", self.url(path)])
+
+    def read_range(self, path: str, start: int, end: int):
+        """An object's bytes ``start`` to ``end``, both included, or None where there is none."""
+        return self._read(["storage", "cat", "-r", f"{start}-{end}", self.url(path)], text=False)
 
     def generation(self, path: str):
         """An object's generation, or None where there is none."""
@@ -778,16 +798,96 @@ def record_key(cloud: Gcloud, run, step: str = "store"):
         return None
 
 
-def warm_start(cloud: Gcloud, trait: dict, arm: str, store, saved: dict, keys: dict, metadata: dict, model_format=None) -> tuple:
+class _Ranged(io.RawIOBase):
+    """A bucket object read by byte ranges, for zipfile: a read fetches at least READ_AHEAD bytes (the last READ_AHEAD
+    near the end) and keeps the last span fetched, so one member of a model's arrays.npz takes three reads, not the
+    whole archive."""
+
+    def __init__(self, cloud: Gcloud, path: str, size: int) -> None:
+        super().__init__()
+        self.cloud, self.path, self.size, self.position, self.span = cloud, path, size, 0, (0, b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.position
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        self.position = {io.SEEK_SET: 0, io.SEEK_CUR: self.position, io.SEEK_END: self.size}[whence] + offset
+        return self.position
+
+    def readinto(self, buffer) -> int:
+        count = max(0, min(len(buffer), self.size - self.position))
+        if count == 0:
+            return 0
+        start, kept = self.span
+        if not start <= self.position <= self.position + count <= start + len(kept):
+            start = max(0, min(self.position, self.size - READ_AHEAD))
+            end = min(self.size, max(self.position + count, start + READ_AHEAD)) - 1
+            kept = self.cloud.read_range(self.path, start, end)
+            if kept is None or len(kept) != end - start + 1:
+                raise Unavailable(f"{self.path}: bytes {start}-{end} were not read whole")
+            self.span = (start, kept)
+        offset = self.position - start
+        buffer[:count] = kept[offset:offset + count]
+        self.position += count
+        return count
+
+
+def _mean_absolute(data: bytes) -> float:
+    """The mean |value| of a .npy array of float64 or float32 (the format's versions 1 to 3), without numpy."""
+    if data[:6] != b"\x93NUMPY":
+        raise ValueError("not a .npy array")
+    width = 2 if data[6] == 1 else 4
+    length = int.from_bytes(data[8:8 + width], "little")
+    header = ast.literal_eval(data[8 + width:8 + width + length].decode("latin1"))
+    kinds = {"<f8": "d", "<f4": "f"}
+    if header.get("descr") not in kinds:
+        raise ValueError(f"a .npy array of {header.get('descr')!r}, not float64 or float32")
+    values = array.array(kinds[header["descr"]])
+    values.frombytes(data[8 + width + length:])
+    if sys.byteorder != "little":
+        values.byteswap()
+    if len(values) != math.prod(header["shape"]):
+        raise ValueError(f"a .npy array of {len(values)} values for its shape {header['shape']}")
+    return math.fsum(map(abs, values)) / len(values) if len(values) else 0.0
+
+
+def effect_scale(cloud: Gcloud, folder: str) -> float:
+    """The mean |b| of a saved model's coefficients (arrays.npz's scoring/<i>/coefficients, the largest over its
+    models), one aggregate of the model's parameters. Only those members are read (``_Ranged``), and zipfile checks
+    each one's CRC. Unavailable or ValueError where it cannot be read."""
+    path = f"{folder}/arrays.npz"
+    size = cloud.size(path)
+    if size is None:
+        raise ValueError(f"{path} is absent")
+    try:
+        with zipfile.ZipFile(_Ranged(cloud, path, size)) as archive:
+            names = [name for name in archive.namelist() if re.fullmatch(r"scoring/\d+/coefficients\.npy", name)]
+            if not names:
+                raise ValueError(f"{path} holds no scoring coefficients")
+            return max(_mean_absolute(archive.read(name)) for name in names)
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"{path}: {error}") from None
+
+
+def warm_start(cloud: Gcloud, trait: dict, arm: str, store, saved: dict, keys: dict, metadata: dict, model_format=None, scales=None) -> tuple:
     """Where ``arm``'s fit of ``trait`` starts: ("warm", the first of its warm_from runs' saved models that
     ``workspace_pipeline._warm_seeds`` can take, and how many there are) or ("cold", why each run gives none). A model
     qualifies in a run whose store record has the key of the store this run keeps (``store``: the same store has the
     same sites, which _warm_seeds requires) where its model.json lists a mean-field draw law and is of the commit's
     ``model_format`` (artifact.MODEL_FORMAT, the only one load_model reads; unchecked where None). The job ranks every model
     that qualifies (``_seed_rank``: the same arm's reliabilities, the same problem, an accepted fit, the newer), so with
-    several it may take another than the one named. ``saved``, ``keys`` and ``metadata`` keep the bucket's reads for the
-    other arms and runs."""
-    found, reasons = [], []
+    several it may take another than the one named. ("refused", why) where any model that qualifies is a collapsed null
+    (mean |b| under NULL_EFFECT, ``effect_scale``) or its coefficients cannot be read: the job would rank it with the
+    others, and a fit started from it stays at the null. ``saved``, ``keys``, ``metadata`` and ``scales`` keep the
+    bucket's reads for the other arms and runs."""
+    scales = {} if scales is None else scales
+    found, reasons, refused = [], [], []
     for run in trait["warm_from"]:
         if run not in saved:
             saved[run] = cloud.models(run)
@@ -815,7 +915,20 @@ def warm_start(cloud: Gcloud, trait: dict, arm: str, store, saved: dict, keys: d
             elif MEAN_FIELD not in shown.get("draw_laws", ()):
                 reasons.append(f"{folder} holds no mean-field model")
             else:
-                found.append((folder, bool((shown.get("acceptance") or {}).get("accepted", False))))
+                if folder not in scales:
+                    try:
+                        scales[folder] = effect_scale(cloud, folder)
+                    except (Unavailable, ValueError) as error:
+                        scales[folder] = str(error)
+                scale = scales[folder]
+                if isinstance(scale, str):
+                    refused.append(f"svpgs/{folder}: its coefficients were not read ({scale[-200:]})")
+                elif scale < NULL_EFFECT:
+                    refused.append(f"svpgs/{folder} is a collapsed null model (mean |b| {scale:.1e}, under {NULL_EFFECT:g})")
+                else:
+                    found.append((folder, bool((shown.get("acceptance") or {}).get("accepted", False))))
+    if refused:
+        return "refused", "; ".join(refused) + ": the job would rank it among its seeds"
     if not found:
         return "cold", "; ".join(reasons) or "no warm_from run named"
     folder, accepted = found[0]
@@ -971,6 +1084,7 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
     saved: dict = {}
     keys: dict = {}
     metadata: dict = {}
+    scales: dict = {}
     records: dict = {}
     artifact = commit / "sv_pgs/artifact.py"
     model_format = re.search(r'^MODEL_FORMAT = "([^"]+)"', artifact.read_text(encoding="utf-8"), re.M) if artifact.is_file() else None
@@ -1102,7 +1216,7 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
         starts = None
         if warm and cloud is not None:
             kept = kept_store(held["store"]) if "store" in taken else None
-            starts = {(trait["name"], arm): warm_start(cloud, trait, arm, kept, saved, keys, metadata, model_format) for trait in traits for arm in arms}
+            starts = {(trait["name"], arm): warm_start(cloud, trait, arm, kept, saved, keys, metadata, model_format, scales) for trait in traits for arm in arms}
         plan.runs.append({"run_id": run_id, "traits": [trait["name"] for trait in traits], "arms": arms, "base": base, "reuse": taken,
                           "made": {step: why for step, why in made.items() if why != "not asked"}, "config": config, "shape": shape,
                           "holders": {step: held[step] for step in taken}, "starts": starts})
@@ -1118,10 +1232,15 @@ def build(spec: dict, timeline_label: str, timeline: dict, cloud, repository: Pa
         plan.jobs.append(_job(run_id, spec["fit_slot"], "fit", job_environment(spec, run_id, spec["fit_slot"], shape, plan.staging, reuse_base, **own)))
     if warm and cloud is not None:
         # The study's rule (_warm_seeds): a trait's two arms start alike, both cold or each from its own arm's model.
+        refused = [f"{run['run_id']} {arm} {trait}: {where}" for run in plan.runs for (trait, arm), (state, where) in (run["starts"] or {}).items()
+                   if state == "refused"]
+        plan.check(not refused, f"warm starts: no seed is a collapsed null model (mean |b| under {NULL_EFFECT:g})" + (
+            f", but {'; '.join(refused)}. Drop that run from the trait's warm_from, or set warm_start false" if refused else ""))
         states: dict = {}
         for run in plan.runs:
             for (trait, _arm), (state, _where) in (run["starts"] or {}).items():
-                states.setdefault(trait, set()).add(state)
+                if state != "refused":
+                    states.setdefault(trait, set()).add(state)
         unlike = [trait for trait, found in states.items() if len(found) > 1]
         plan.check(not unlike, "warm starts: each trait's arms start alike" + (
             f", but not {', '.join(unlike)}: name the run holding the cold arm's model in its warm_from, or [] for both cold" if unlike else ""))
@@ -1401,8 +1520,9 @@ def execute(plan: Plan, cloud: Gcloud, launcher: Path) -> None:
 # ---------------------------------------------------------------------------
 FOLLOW = "follow"
 """Under the round's staging, --follow's own objects: chains/<job>.json (each job it submitted for a planned job, with
-why), lease.json (the follower that holds the round), follow.log (every action), and STOP, which a person writes to
-stop every follower of the round."""
+why), lease.json (the follower that holds the round), follow.log (every action), signal/<trait>.json (whether EB fitted
+the trait's arms any genetic signal, ``Follower.signal``), and STOP, which a person writes to stop every follower of the
+round."""
 KILLED = ("exit-137", "exit-139")
 """run_step.sh's markers of a driver the kernel killed (out of host memory) or that crashed: the same code fails the same
 way on the same data, like an error the driver names."""
@@ -1497,6 +1617,8 @@ class Follower:
         self.lease = None
         # The planned jobs this follower's own submission of failed, by name (``send``).
         self.unsent: set = set()
+        # Each trait's verdict on its fitted arms (``signal``), None where they left no model to read.
+        self.signals: dict = {}
         self.cap = plan.spec["spend_cap_usd"] or spend_cap(plan)
         budget = Path(os.environ.get("STUDY_BUDGET") or HERE / "study_budget.template.json")
         self.slots = json.loads(budget.read_text(encoding="utf-8"))["slots"]
@@ -1661,6 +1783,62 @@ class Follower:
         self.send(planned, {"name": f"svpgs-{run}-{slot}", "run_id": run, "slot": slot, "environment": dict(entry["environment"], BUDGET_SLOT=slot),
                             "reason": "planned"})
 
+    def signal(self) -> None:
+        """Each trait whose fit jobs have all ended, read once: each arm's saved model's mean |b| (``effect_scale``). A
+        trait any of whose arms is under NULL_EFFECT is a collapsed null, where EB fitted no genetic signal. Its pair is
+        no SV test: each of its runs gets NULL_COLLAPSE, and its merge job, which would report a gain of 0 by
+        construction, is ended unsubmitted. Each verdict is kept in FOLLOW/signal/<trait>.json, so a follower started
+        again reads no model twice."""
+        jobs = {entry["run_id"]: entry for entry in self.plan.jobs}
+        for trait in self.plan.spec["traits"]:
+            name = trait["name"]
+            runs = [run for run in self.plan.runs if name in run["traits"] and run["run_id"] in jobs]
+            if name in self.signals or not runs or any(self.state(jobs[run["run_id"]]) not in ("SUCCEEDED", "FAILED", "DELETED") for run in runs):
+                continue
+            path = f"{self.root}/signal/{name}.json"
+            text = self.cloud.read(path)
+            if text is not None:
+                self.signals[name] = json.loads(text)
+            else:
+                found: dict = {}
+                for run in runs:
+                    for (arm, held), folders in self.cloud.models(run["run_id"]).items():
+                        if held == name:
+                            found.setdefault(arm, []).extend(folders)
+                arms = sorted({arm for run in runs for arm in run["arms"]})
+                if any(arm not in found for arm in arms):
+                    # An arm whose fit left no model (its chain ended failed): nothing to read.
+                    self.signals[name] = None
+                    continue
+                # A completed fit's model, else its partial's.
+                models = {arm: min(found[arm], key=lambda folder: "/run/fit/" not in folder) for arm in arms}
+                try:
+                    scales = {arm: effect_scale(self.cloud, folder) for arm, folder in models.items()}
+                except ValueError as error:
+                    self.signals[name] = None
+                    self.say("signal not read", trait=name, why=str(error)[-300:])
+                    continue
+                null = [arm for arm in arms if scales[arm] < NULL_EFFECT]
+                why = ("EB fitted no genetic signal: " + ", ".join(f"the {arm} arm's mean |b| is {scales[arm]:.1e}" for arm in null)
+                       + f", under {NULL_EFFECT:g}; the pair is no SV test") if null else None
+                verdict = {"trait": name, "runs": [run["run_id"] for run in runs], "null_collapse": bool(null), "why": why,
+                           "arms": {arm: {"model": f"svpgs/{models[arm]}", "mean_abs_effect": scales[arm]} for arm in arms}}
+                shown = json.dumps(verdict, indent=2) + "\n"
+                if null:
+                    for run in runs:
+                        self.cloud.write(f"{run['run_id']}/{NULL_COLLAPSE}", shown)
+                    self.say("null collapse", trait=name, runs=verdict["runs"], why=why)
+                else:
+                    self.say("signal", trait=name, mean_abs_effect={arm: f"{scale:.1e}" for arm, scale in scales.items()})
+                self.cloud.write(path, shown)
+                self.signals[name] = verdict
+            verdict = self.signals[name]
+            if verdict and verdict["null_collapse"]:
+                for entry in self.plan.merges + self.plan.finishes:
+                    if entry.get("trait") == name and not self.chain(entry) and entry["name"] not in self.ended:
+                        self.ended[entry["name"]] = ("FAILED", verdict["why"])
+                        self.say("ended", job=entry["name"], why=verdict["why"])
+
     def resubmit(self) -> None:
         """Each chain whose latest job FAILED: resubmitted on a free slot of its run where its reason allows (RESUBMITTED)
         and the chain has resubmissions left, else ended, with why."""
@@ -1720,10 +1898,13 @@ def follow(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str,
       Its RUN_ID is the run that got further: one whose fit is complete or that holds both arms'
       handoffs pushed its adoption, so the merge finishes in it, its partner's models being gone from a completed fit's
       partial; otherwise the plan's order.
+    None for a trait whose arms EB fitted no genetic signal in (``Follower.signal``, with --execute).
     A job it waits for is its chain (``Follower``): ended where it SUCCEEDED, or FAILED with no resubmission left.
     Returns what still waits, with why; a job that can no longer run (a fit it needs ended failed) is the follower's
     ``ended``, not waiting."""
     follower = follower or Follower(plan, cloud, launcher, project, region, resubmitting=False)
+    if cloud.execute:
+        follower.signal()
     by_name = {entry["name"]: entry for entry in follower.entries()}
 
     def state(name: str):
@@ -1930,7 +2111,9 @@ def watch(plan: Plan, cloud: Gcloud, launcher: Path, project: str, region: str, 
                 if not waiting and not active:
                     failed = {name: follower.ended.get(name, ("FAILED", state or "never submitted (round.py --execute submits it)"))[1]
                               for name, state in states.items() if state != "SUCCEEDED"}
-                    follower.say("follow ended", succeeded=sum(state == "SUCCEEDED" for state in states.values()), failed=failed)
+                    null = {name: verdict["why"] for name, verdict in follower.signals.items() if verdict and verdict["null_collapse"]}
+                    follower.say("follow ended", succeeded=sum(state == "SUCCEEDED" for state in states.values()), failed=failed,
+                                 **({"no_genetic_signal": null} if null else {}))
                     if cloud.execute:
                         recorded.unlink(missing_ok=True)
                     return 1 if failed else 0

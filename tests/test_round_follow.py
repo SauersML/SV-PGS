@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from launcher.workspace import round as planner
-from tests.test_round import BUCKET, LAUNCHER, _bucket, _repository, _spec, cloud  # noqa: F401 - cloud is a fixture
+from tests.test_round import BUCKET, LAUNCHER, _arrays, _bucket, _repository, _spec, cloud  # noqa: F401 - cloud is a fixture
 
 MARK = "20261022T120000Z"
 """A marker time after every fixture job's creation (CREATED)."""
@@ -365,6 +365,53 @@ def test_a_root_job_execute_did_not_submit_is_submitted_and_a_deleted_one_is_not
     follower.forget()
     planner.follow(plan, gcloud, cloud, "p", "r", follower)
     assert [(entry["RUN_ID"], entry["BUDGET_SLOT"]) for entry in _submitted(fake)][1:] == [("aou-r7-l2", "train-3")]
+
+
+def test_a_pair_eb_fitted_no_genetic_signal_in_is_marked_and_not_merged(tmp_path, cloud) -> None:  # noqa: F811
+    plan, fake = _round(tmp_path)
+    gcloud = planner.Gcloud(BUCKET, True)
+    svpgs = fake / "gcs" / BUCKET / "svpgs"
+    trait, merge = plan.finishes[0]["trait"], plan.finishes[0]["name"]
+
+    def model(run: str, arm: str, scale: float) -> None:
+        folder = svpgs / run / "run/fit.partial/models" / arm / trait
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "model.json").write_text("{}")
+        _arrays(folder / "arrays.npz", scale)
+
+    # Both arms' jobs ended, neither finished the run, and each pushed its handoff: the CPU merge would run. The
+    # snv_indel arm stayed at the null, as aou-m3-s1/s2 did from the collapsed seed aou-ws6.
+    model("aou-r7-l1", "snv_indel", 2.8e-21)
+    model("aou-r7-l2", "with_sv", 4e-3)
+    for run in ("aou-r7-l1", "aou-r7-l2"):
+        (svpgs / run / "run/effects.partial/batches/a").mkdir(parents=True)
+        (svpgs / run / "run/effects.partial/batches/a/handoff.json").write_text("{}")
+    _set(fake, "svpgs-aou-r7-l1-train-1", "SUCCEEDED")
+    _set(fake, "svpgs-aou-r7-l2-train-1", "SUCCEEDED")
+    follower = planner.Follower(plan, gcloud, cloud, "p", "r", log=tmp_path / "follow.log")
+    assert planner.follow(plan, gcloud, cloud, "p", "r", follower) == [] and not _submitted(fake)
+    why = "EB fitted no genetic signal: the snv_indel arm's mean |b| is 2.8e-21, under 1e-12; the pair is no SV test"
+    assert follower.ended[merge] == ("FAILED", why)
+    for run in ("aou-r7-l1", "aou-r7-l2"):
+        marked = json.loads((svpgs / run / planner.NULL_COLLAPSE).read_text())
+        assert marked["null_collapse"] and marked["why"] == why and marked["runs"] == ["aou-r7-l1", "aou-r7-l2"]
+        assert marked["arms"]["with_sv"]["mean_abs_effect"] == pytest.approx(4e-3)
+    assert json.loads((svpgs / f"_rounds/r7/follow/signal/{trait}.json").read_text()) == marked
+    assert [json.loads(line)["action"] for line in (tmp_path / "follow.log").read_text().splitlines()] == ["null collapse", "ended"]
+    # A follower started again takes the verdict from the bucket and reads no model again.
+    (fake / "calls.log").write_text("")
+    follower = planner.Follower(plan, gcloud, cloud, "p", "r")
+    assert planner.follow(plan, gcloud, cloud, "p", "r", follower) == [] and follower.ended[merge] == ("FAILED", why) and not _submitted(fake)
+    assert not [line for line in (fake / "calls.log").read_text().splitlines() if "arrays.npz" in line]
+    # Both arms fitted a signal: no mark, and the merge is submitted.
+    (svpgs / f"_rounds/r7/follow/signal/{trait}.json").unlink()
+    for run in ("aou-r7-l1", "aou-r7-l2"):
+        (svpgs / run / planner.NULL_COLLAPSE).unlink()
+    model("aou-r7-l1", "snv_indel", 9e-4)
+    follower = planner.Follower(plan, gcloud, cloud, "p", "r")
+    assert planner.follow(plan, gcloud, cloud, "p", "r", follower) == []
+    assert [entry["PARTNER_RUN"] for entry in _submitted(fake)] == ["aou-r7-l2"] and not (svpgs / "aou-r7-l1" / planner.NULL_COLLAPSE).exists()
+    assert not json.loads((svpgs / f"_rounds/r7/follow/signal/{trait}.json").read_text())["null_collapse"]
 
 
 def test_a_gpu_job_s_attempt_is_capped_and_the_cap_is_within_the_slot(tmp_path) -> None:

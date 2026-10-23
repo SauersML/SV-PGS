@@ -17,6 +17,8 @@ import sys
 import tarfile
 from pathlib import Path
 
+import numpy as np
+
 import pytest
 
 from launcher.workspace import round as planner
@@ -58,10 +60,14 @@ def matches(path):
 if os.environ.get("FAKE_GCLOUD_DOWN"):
     sys.exit("ERROR: (gcloud) There was a problem refreshing your current auth tokens: connection reset")
 if args[:2] == ["storage", "cat"]:
-    path = local(args[2])
+    path = local(args[-1])
     if not path.is_file():
         absent()
-    sys.stdout.write(path.read_text())
+    if "-r" in args:
+        first, last = args[args.index("-r") + 1].split("-")
+        sys.stdout.buffer.write(path.read_bytes()[int(first):int(last) + 1])
+    else:
+        sys.stdout.write(path.read_text())
 elif args[:3] == ["storage", "objects", "describe"]:
     path = local(args[3])
     if not path.is_file():
@@ -480,6 +486,13 @@ def test_a_dry_run_takes_every_step_from_the_base_and_changes_nothing(tmp_path, 
         planner.Gcloud(BUCKET, False).copy("a", "b")
 
 
+def _arrays(path: Path, scale: float, count: int = 100_000) -> None:
+    """A saved model's arrays.npz as artifact.save_model writes it, its coefficients of mean |b| ``scale``."""
+    signs = np.where(np.arange(count) % 2 == 0, 1.0, -1.0)
+    np.savez(path, **{"noise_variance": np.ones(count), "scoring/0/store_rows": np.arange(count), "scoring/0/coefficients": scale * signs,
+                      "scoring/0/alpha": np.zeros(count)})
+
+
 def test_each_arm_starts_from_its_own_earlier_model_and_the_plan_names_each_start(tmp_path, cloud) -> None:
     """warm_start_models by default: a run's config names its trait's warm_from runs' saved models, the same patterns
     for both arms so their fit keys agree, and the plan reads the bucket for each arm's start: warm from a mean-field
@@ -492,11 +505,12 @@ def test_each_arm_starts_from_its_own_earlier_model_and_the_plan_names_each_star
     # of the same store.
     shutil.copytree(svpgs / "aou-wl5/run/store", svpgs / "aou-wl1/run/store")
 
-    def save(run: str, directory: str, arm: str, laws=("product_mixture",), accepted: bool = True, model_format: str = "svpgs-model v3") -> Path:
+    def save(run: str, directory: str, arm: str, laws=("product_mixture",), accepted: bool = True, model_format: str = "svpgs-model v3",
+             scale: float = 1e-3) -> Path:
         folder = svpgs / run / "run" / directory / "models" / arm / "ldl_cholesterol"
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "model.json").write_text(json.dumps({"format": model_format, "draw_laws": list(laws), "acceptance": {"accepted": accepted}, "provenance": {}}))
-        (folder / "arrays.npz").write_bytes(b"a")
+        _arrays(folder / "arrays.npz", scale)
         return folder
 
     save("aou-wl5", "fit.partial", "with_sv")
@@ -536,6 +550,26 @@ def test_each_arm_starts_from_its_own_earlier_model_and_the_plan_names_each_star
     save("aou-wl5", "fit", "snv_indel")
     assert plan_of().runs[0]["starts"][("ldl_cholesterol", "snv_indel")] == (
         "warm", "svpgs/aou-wl5/run/fit/models/snv_indel/ldl_cholesterol (an accepted fit; 2 models, the job takes the best)")
+    # A seed whose coefficients collapsed to the null (as aou-ws6's, mean |b| 2.8e-21) is refused, though the arm has
+    # another: the job would rank it among its seeds, and a fit started from it stays at the null. Its coefficients
+    # are read by byte ranges, a few reads of a small part of the archive.
+    folder = save("aou-wl1", "fit.partial", "snv_indel", scale=1e-20)
+    calls = fake / "calls.log"
+    calls.write_text("")
+    plan = plan_of()
+    why = (f"svpgs/aou-wl1/run/fit.partial/models/snv_indel/ldl_cholesterol is a collapsed null model (mean |b| 1.0e-20, under 1e-12): "
+           "the job would rank it among its seeds")
+    assert plan.runs[0]["starts"][("ldl_cholesterol", "snv_indel")] == ("refused", why)
+    assert [text for state, text in plan.checks if state == "FAIL"] == [
+        f"warm starts: no seed is a collapsed null model (mean |b| under 1e-12), but {plan.runs[0]['run_id']} snv_indel ldl_cholesterol: {why}. "
+        "Drop that run from the trait's warm_from, or set warm_start false"]
+    ranges = [line.split() for line in calls.read_text().splitlines() if line.startswith("storage cat -r") and "aou-wl1" in line]
+    fetched = sum(int(last) - int(first) + 1 for first, last in (line[3].split("-") for line in ranges))
+    assert len(ranges) <= 3 and fetched < (folder / "arrays.npz").stat().st_size / 2
+    assert planner.effect_scale(planner.Gcloud(BUCKET, False), "aou-wl1/run/fit.partial/models/snv_indel/ldl_cholesterol") == pytest.approx(1e-20)
+    (folder / "arrays.npz").write_bytes(b"a")
+    assert plan_of().runs[0]["starts"][("ldl_cholesterol", "snv_indel")][0] == "refused"
+    save("aou-wl1", "fit.partial", "snv_indel")
     # Offline the patterns are named and the starts unchecked.
     plan = planner.build(planner.read_spec(raw), *planner.read_timeline("budget"), None, repository)
     assert "starts unchecked (the bucket was not read): warm_start_models " + " ".join(patterns) in planner.render(plan)
