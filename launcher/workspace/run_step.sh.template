@@ -123,6 +123,9 @@ export PYTHONFAULTHANDLER=1
 # Two minutes without a progress line, the driver logs where its main thread is (sv_pgs/progress.py), so the progress
 # copy below shows what a silent stretch spends its time on: the AoU disease fits went twenty minutes between lines.
 export SVPGS_QUIET_STACK_SECONDS=120
+# Each traced GPU operation waits for its devices, and the first CUDA error logs the last 128 operations with their
+# threads (sv_pgs/gpu_guard.py): the launch fault recurred on db70b15. The arithmetic and the fit's keys are unchanged.
+export SVPGS_GPU_GUARD=sync
 # The driver's log (below) also holds, once a minute from here to the driver's end, a line of the VM's resources from
 # launcher/workspace/sample_resources.py (each GPU's utilization over nvidia-smi's samples every 5 s and its memory, the
 # CPU's busy and iowait shares, the load, the host memory in use, the run disk's and the network's MiB/s), and the store
