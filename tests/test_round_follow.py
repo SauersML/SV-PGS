@@ -5,6 +5,7 @@ spend cap; a time cap resubmitted only after progress; the round's end, its STOP
 follower started detached, stopped, and started again after a restart."""
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import shutil
@@ -25,11 +26,13 @@ CREATED = "2026-10-22T11:00:00Z"
 
 
 def _job(state: str, exits=(), hours: float = 0.0, machine: str = "a2-highgpu-2g") -> tuple:
-    """A job's record as gcloud batch jobs describe gives it, and its one task's exits as gcloud batch tasks list does."""
+    """A job's record as gcloud batch jobs describe gives it, and its one task's exits as gcloud batch tasks list does. It
+    became RUNNING a minute ago, so a running job's spend is its ``hours`` whenever the test runs."""
+    began = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     record = {
         "createTime": CREATED, "status": {
             "state": state, "runDuration": f"{hours * 3600:.0f}s",
-            "statusEvents": [{"eventTime": "2026-10-22T11:05:00Z", "description": "Job state is set from SCHEDULED to RUNNING"}],
+            "statusEvents": [{"eventTime": began, "description": "Job state is set from SCHEDULED to RUNNING"}],
         },
         "allocationPolicy": {"instances": [{"policy": {"machineType": machine, "provisioningModel": "SPOT"}}]},
     }
@@ -316,24 +319,50 @@ def test_a_refused_submission_leaves_the_chain_as_it_was_and_spend_counts_each_t
     assert one > 0 and many == pytest.approx(22 * one)
 
 
-def test_a_root_job_execute_did_not_submit_is_submitted_once_the_round_is_recorded(tmp_path, cloud) -> None:  # noqa: F811
+def test_a_root_job_execute_did_not_submit_is_submitted_and_a_deleted_one_is_not(tmp_path, cloud, monkeypatch) -> None:  # noqa: F811
     plan, fake = _round(tmp_path)
     gcloud = planner.Gcloud(BUCKET, True)
     follower = planner.Follower(plan, gcloud, cloud, "p", "r")
     # No round.json: --execute has not run, so nothing is submitted.
     planner.follow(plan, gcloud, cloud, "p", "r", follower)
     assert not _submitted(fake)
-    (fake / "gcs" / BUCKET / "svpgs" / plan.staging / "round.json").parent.mkdir(parents=True, exist_ok=True)
-    (fake / "gcs" / BUCKET / "svpgs" / plan.staging / "round.json").write_text("{}")
-    # l1's job is in Batch; l2's slot was reserved by a submission that made no job 20 minutes ago.
+    svpgs = fake / "gcs" / BUCKET / "svpgs"
+    (svpgs / plan.staging / "round.json").parent.mkdir(parents=True, exist_ok=True)
+    (svpgs / plan.staging / "round.json").write_text("{}")
+    # l1's job is in Batch. l2's slot was reserved 20 minutes ago and Batch has no job: someone deleted it, so it is
+    # ended, not submitted again.
     _set(fake, "svpgs-aou-r7-l1-train-1", "RUNNING")
-    slots = fake / "gcs" / BUCKET / "svpgs/aou-r7-l2/budget/slots"
+    slots = svpgs / "aou-r7-l2/budget/slots"
     slots.mkdir(parents=True)
     (slots / "train-1.json").write_text("{}")
     os.utime(slots / "train-1.json", (time.time() - 1200, time.time() - 1200))
     follower.forget()
     planner.follow(plan, gcloud, cloud, "p", "r", follower)
-    assert [(entry["RUN_ID"], entry["BUDGET_SLOT"]) for entry in _submitted(fake)] == [("aou-r7-l2", "train-3")]
+    assert not _submitted(fake) and "reserved" in follower.ended["svpgs-aou-r7-l2-train-1"][1]
+    # With no reservation, --execute stopped before it: submitted on its own slot.
+    (slots / "train-1.json").unlink()
+    follower = planner.Follower(plan, gcloud, cloud, "p", "r")
+    planner.follow(plan, gcloud, cloud, "p", "r", follower)
+    assert [(entry["RUN_ID"], entry["BUDGET_SLOT"]) for entry in _submitted(fake)] == [("aou-r7-l2", "train-1")]
+    # This follower's own submission reserved the slot and failed: once the reservation is old, another slot.
+    (svpgs / "_rounds/r7/follow/chains/svpgs-aou-r7-l2-train-1.json").unlink()
+    follower = planner.Follower(plan, gcloud, cloud, "p", "r")
+
+    def refused(entry, launcher):
+        (slots / f"{entry['environment']['BUDGET_SLOT']}.json").write_text("{}")
+        raise planner.RoundError(f"{entry['name']} was not submitted: quota")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(planner, "submit", refused)
+        with pytest.raises(planner.RoundError, match="quota"):
+            planner.follow(plan, gcloud, cloud, "p", "r", follower)
+    follower.forget()
+    waiting = planner.follow(plan, gcloud, cloud, "p", "r", follower)
+    assert "svpgs-aou-r7-l2-train-1" in dict(waiting) and len(_submitted(fake)) == 1
+    os.utime(slots / "train-1.json", (time.time() - 1200, time.time() - 1200))
+    follower.forget()
+    planner.follow(plan, gcloud, cloud, "p", "r", follower)
+    assert [(entry["RUN_ID"], entry["BUDGET_SLOT"]) for entry in _submitted(fake)][1:] == [("aou-r7-l2", "train-3")]
 
 
 def test_a_gpu_job_s_attempt_is_capped_and_the_cap_is_within_the_slot(tmp_path) -> None:

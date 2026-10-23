@@ -1495,6 +1495,8 @@ class Follower:
         self.chains: dict = {}
         self.ended: dict = {}
         self.lease = None
+        # The planned jobs this follower's own submission of failed, by name (``send``).
+        self.unsent: set = set()
         self.cap = plan.spec["spend_cap_usd"] or spend_cap(plan)
         budget = Path(os.environ.get("STUDY_BUDGET") or HERE / "study_budget.template.json")
         self.slots = json.loads(budget.read_text(encoding="utf-8"))["slots"]
@@ -1624,6 +1626,7 @@ class Follower:
             # Not submitted: the chain is as it was, and the next pass tries again (a planned job on a free slot where
             # submit.sh reserved its own, ``follow``).
             self.say("not submitted", job=job["name"], reason=job["reason"], why=str(error)[-300:])
+            self.unsent.add(entry["name"])
             if before:
                 self.cloud.write(path, json.dumps({"jobs": before}, indent=2) + "\n")
             else:
@@ -1635,14 +1638,20 @@ class Follower:
 
     def send_planned(self, planned: dict, entry: dict, waiting: list) -> None:
         """The planned job ``entry`` (``planned``'s, or its CPU merge in the run that got further) submitted on its own
-        slot. Where a submission reserved that slot and made no job (it failed, or its follower died during it), on
-        another slot like it once the reservation is SUBMITTING_SECONDS old (a submission still running has its job by
-        then); before that it waits."""
+        slot where nothing reserved it. A slot reserved with no job in Batch and no chain is a job someone deleted, or
+        one whose submission did not make it: it is ended, not submitted again, unless this follower's own submission
+        of it failed (``unsent``), which goes on another slot like it once the reservation is SUBMITTING_SECONDS old (a
+        submission still running has its job by then). Before that it waits."""
         run, slot = entry["run_id"], entry["environment"]["BUDGET_SLOT"]
         reserved = self.cloud.stamped(f"{run}/budget/slots").get(f"{slot}.json")
         if reserved is not None:
             if self.clock() - reserved < SUBMITTING_SECONDS:
                 waiting.append((planned["name"], {slot: "reserved just now, its job not yet in Batch"}))
+                return
+            if planned["name"] not in self.unsent:
+                why = f"its slot {slot} of {run} is reserved and Batch has no job for it (deleted, or its submission failed): not submitted again"
+                self.ended[planned["name"]] = ("FAILED", why)
+                self.say("ended", job=planned["name"], why=why)
                 return
             slot = self.free_slot(run, slot)
             if slot is None:
