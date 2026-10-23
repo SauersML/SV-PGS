@@ -149,7 +149,7 @@ def copy(numbers: dict) -> dict:
                          "Polygenic scores rarely use SVs",
                          "We test if imputed SVs improve accuracy"],
         "methods": ["Priors depend on imputation r², frequency, SV length"],
-        "code": ["Code:", "github.com/", "SauersML/SV-PGS"],
+        "code": ["Code:", "github.com/SauersML/SV-PGS"],
         "design": [
             f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22",
             # each setting's values over the grid's points (DESIGN_SETTINGS), listed rather than as a range
@@ -459,11 +459,16 @@ def text(paragraphs: list[Para]) -> Block:
 
 QR = 2.6
 """Inches: the side of the QR code to the repository."""
+ENDING = 9.3
+"""Inches: the width of the QR code and the small type beside it at the right end of the Discussion band, the least that
+sets the repository's address on one line."""
 
 
 def code(lines: list[str]) -> Block:
-    """A QR code to the repository with its address beside it."""
-    return Block("qr", [Para([(line, "b" if index else "")], BODY, bullet=False, after=0) for index, line in enumerate(lines)])
+    """A QR code to the repository with ``lines`` beside it in small type: "Code:", the address in bold, then the
+    references."""
+    return Block("qr", [Para([(line, "b" if index == 1 else "")], REFERENCE, bullet=False, after=0)
+                        for index, line in enumerate(lines)])
 
 
 def row(*children: list, shares: tuple = ()) -> Block:
@@ -657,14 +662,10 @@ def build() -> None:
     gallery = {name: GALLERY / f"{name}.png" for name in (
         "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy",
         "poster_model")}
-    # the four references in small type under the repository's QR code, one to a line
-    references = Block("text", [Para([(f"{SUPERSCRIPT[index]}{reference}", "")], REFERENCE, bullet=False, after=0)
-                                for index, reference in enumerate(REFERENCES, start=1)])
     discussion = [bar(95, "Discussion"), text(bullets([*words["discussion"], *aou_result()]))]
-    ending = [code(words["code"]), references]
-    # the poster reads Introduction and Methods, the simulation's results, All of Us, then Discussion at the foot of the
-    # middle column, and the code and the references at the foot of the right one, the references in the poster's
-    # bottom right corner. The All of Us result (its common gain) adds two Discussion bullets and every trait's row.
+    # the poster reads Introduction and Methods, the simulation's results and All of Us, then the Discussion in a band
+    # across the foot of the middle and right columns, the QR code, the repository's address and the references at its
+    # right end. The All of Us result (its common gain) adds two Discussion bullets and every trait's row.
     columns = [
         [
             bar(97, "Introduction"), text(bullets(words["introduction"])),
@@ -683,13 +684,14 @@ def build() -> None:
         [bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks()],
     ]
     poster = Poster(xml, rels, work / "ppt/media")
-    floors = [BOTTOM]
-    for (x, width), blocks in zip(COLUMNS[1:], (discussion, ending)):
-        top = BOTTOM - poster.stack_height(blocks, width)
-        poster.stack(blocks, x, top, width, None)
-        floors.append(top - GAPS["section"])
-    for (x, width), blocks, floor in zip(COLUMNS, columns, floors):
-        poster.stack(blocks, x, TOP, width, floor)
+    across = COLUMNS[2][0] + RIGHT - COLUMNS[1][0]
+    references = [f"{SUPERSCRIPT[index]}{reference}" for index, reference in enumerate(REFERENCES, start=1)]
+    band = [discussion[0], row(discussion[1:], [code([*words["code"], *references])],
+                               shares=(1 - ENDING / (across - GUTTER), ENDING / (across - GUTTER)))]
+    top = BOTTOM - poster.stack_height(band, across)
+    poster.stack(band, COLUMNS[1][0], top, across, None)
+    for index, ((x, width), blocks) in enumerate(zip(COLUMNS, columns)):
+        poster.stack(blocks, x, TOP, width, top - GAPS["section"] if index else BOTTOM)
     xml = poster.xml.replace("</p:spTree>", "".join(poster.shapes) + "</p:spTree>")
     rels = poster.rels
 
