@@ -85,6 +85,10 @@ LABEL_GAP = 0.3
 MARK = 1.5
 """The forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR) when its rows are a line of type
 apart."""
+HEIGHT = 19.90
+"""Inches: the room the poster's right column gives the All of Us figure (build_pptx.py's layout), which no other
+block fits beside. What it has beyond the figure's natural height goes equally between the panels; the rows stay a
+line of type apart."""
 TRAITS = {
     "ldl_cholesterol": "LDL cholesterol", "egfr": "eGFR", "hypertension": "Hypertension",
     "type_2_diabetes": "Type 2 diabetes", "coronary_artery_disease": "Coronary disease",
@@ -549,7 +553,7 @@ def gain_figure(matched: list[dict], common: dict | None = None, compared: list[
         panels.append(Panel(rows + combined, [("", SKY, "o", False)], "Change in r² with SVs (%)",
                             starred={(name, 0) for name, _ in rows if name in gained}, notes=gain_notes))
     stars = any(panel.starred for panel in panels)
-    fig = forest(panels)
+    fig = forest(panels, least=HEIGHT)
     return fig, [("Held-out partial r² in percent of LDpred2-auto and SV-PGS for each trait on a log axis; " if measured
                   else "")
                  + ("SV-PGS's pooled change in r² over LDpred2-auto, overall and by ancestry group, with one-sided p; "
