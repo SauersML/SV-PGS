@@ -687,7 +687,7 @@ def _fit_group(
     restart = restart if restart is not None else RestartStore(work_dir / "restart")
     store_key = store_key if store_key is not None else uuid.uuid4().hex
     request_key = request_key if request_key is not None else uuid.uuid4().hex
-    # SPEC 1fca1cf: no variant is filtered by rarity or any threshold (only a derived bound may leave one out).
+    # No variant is filtered by rarity or any threshold. Only a derived bound may leave one out.
     config = ModelConfig(minimum_minor_allele_frequency=0.0)
     binary = trait_type == TraitType.BINARY
     labels = targets
@@ -759,7 +759,7 @@ def _fit_group(
                 codes.release()
         return without_genetic_column("every candidate record is monomorphic on these training rows")
     kept_rows = np.asarray(statistics.active_rows, dtype=np.int64)[np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)]
-    # The prior is over every active row: tie members keep their own class and offset (tie_members; review-mathbugs T1).
+    # The prior is over every active row: tie members keep their own class and offset (tie_members).
     member_rows = np.asarray(statistics.active_rows, dtype=np.int64)
     monitor = None if evaluation is None else EbMonitor.start(
         evaluation_codes, member_rows, np.asarray(statistics.means), np.asarray(statistics.scales), evaluation,
@@ -1010,7 +1010,7 @@ def _fit_group(
 
         # ``inference``'s fixed points: the mean-field route by default until the EP route (with its double loop, which
         # passes the wiring store EP refused 59 of 65 calls on) is measured on bench-sim.
-        # The quadrature at the fitted state (review F17, ``scale_mixture_ep.lattice_check``): the start lattice is
+        # The quadrature at the fitted state (``scale_mixture_ep.lattice_check``): the start lattice is
         # derived from the start's single-variant likelihoods only. Each model whose check passes is finished from the fit
         # as it stands; where any model's fitted normalizers or moments move on the refined or the extended lattice, the
         # models are fitted again on the lattice moved for them, and those are checked there.

@@ -2653,7 +2653,7 @@ def build_all_of_us_measurement_targets(
     certifies the level/noise split (OccasionModelFit.split_identified).
     Otherwise it is the mean of the person's Box-Cox-transformed readings
     (marginal_transform) with reliability 1, logged, and the summary's
-    measurement_model says which (the lead's ruling on replicates).
+    measurement_model says which.
     """
     people = person_occasions(rows)
     # Each kept person with the mask of their occasions kept, those occasions' readings and the readings' derivatives
@@ -2698,7 +2698,7 @@ def build_all_of_us_measurement_targets(
         recorded=np.concatenate([person.values[selected] for person, selected, *_rest in kept]),
         slopes=np.concatenate([slopes for _person, _selected, _readings, slopes, _source in kept]),
     )
-    # The lead's ruling on replicates: the level and the noise are separable only through within-person replicates
+    # The level and the noise are separable only through within-person replicates
     # and only when the data certify it; otherwise the target is the transformed reading, with reliability 1.
     fit, reason = None, "no person has a repeated occasion"
     if np.any(counts > 1):

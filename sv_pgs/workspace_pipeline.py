@@ -194,7 +194,7 @@ structural variation of the abstract's definition (>= 50 bp, and copy number), w
 ARM_KEEPS_STRUCTURAL = {"snv_indel": False, "with_sv": True}
 ALL_ROWS_MODEL = "all"
 """The model of a trait trained on every person who has the trait: the released score and the effects step's source.
-SPEC: the fit itself never holds rows out; the folds' models exist only to measure held-out accuracy."""
+The fit itself never holds rows out; the folds' models exist only to measure held-out accuracy."""
 STRUCTURAL_PART = "structural"
 """The name suffix of an all-rows model's structural part (``artifact.model_part`` on ``structural_records``), whose
 genetic score the score step writes beside the model's own for the effects step's variance decomposition."""

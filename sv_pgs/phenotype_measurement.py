@@ -5,25 +5,23 @@ Occasion j of person i is a positive reading y_ij in the trait's canonical unit,
     z_ij = h(y_ij) = d_ij' gamma + T_i + e_ij,   T_i ~ N(0, tau^2),   e_ij ~ sum_k pi_k N(0, s_k).
 
 - h is the Box-Cox transform (y^lambda - 1) / lambda (log y at lambda = 0), whose log Jacobian
-  (lambda - 1) log y is part of the likelihood; lambda maximizes the profile evidence (the null space of
-  §3.1's smooth transform, whose smooth deviation comes later).
+  (lambda - 1) log y is part of the likelihood; lambda maximizes the profile evidence.
 - T_i is the person's long-run level. The target is E[T_i | occasions], with reliability
-  1 - Var(T_i | occasions) / tau^2 (§1, the Tweedie identities).
-- pi is the lattice form of the noise's continuous mixing density g over t = log s (SPEC 131b205): log g is
+  1 - Var(T_i | occasions) / tau^2 (the Tweedie identities).
+- pi is the lattice form of the noise's continuous mixing density g over t = log s: log g is
   a smooth function of t whose third-difference roughness is penalized with a learned weight, on the
   engine's own one-class prior (``scale_mixture_ep``). A gross error (a typo, a unit confusion) is
   downweighted by the density, not cut at a hand-set range.
 
 The lattice starts at the recording resolution's variance. Recorded values are rounded to a resolution delta (the
-smallest gap between distinct recorded values, §3.2), so the rounded-data likelihood convolves the noise with the
+smallest gap between distinct recorded values), so the rounded-data likelihood convolves the noise with the
 rounding error, of variance (y^(lambda - 1) c delta)^2 / 12 on the transformed scale, c the reading's derivative in its
 recorded value (1 for a reading that is one; an eGFR is computed from recorded creatinine): no smaller noise variance
 is resolvable. The lattice reaches the largest squared within-person deviation, past it by its own width,
-and its spacing is halved until its quadrature in t meets the evidence tolerance. PENDING (lead ruling): the
-extent past the largest deviation is generous, not derived; math-density's R2 rule (the fitted mass beyond the
-last node) replaces it.
+and its spacing is halved until its quadrature in t meets the evidence tolerance. The extent past the largest
+deviation is generous, not derived.
 
-Inference is exact in T_i, which is one-dimensional (the lead's ruling): EM over the complete data
+Inference is exact in T_i, which is one-dimensional: EM over the complete data
 (T_i, each occasion's lattice component), with the density's step on the exact likelihood.
 - E-step: p(T_i | z_i) by the trapezoid rule in T. Each person's step is certified by the Trefethen-Weideman
   bound with the mass-weighted strip modulus, bounded in closed form (its strip width searched per person),
@@ -153,7 +151,7 @@ class Occasions:
 
     @property
     def resolution(self) -> float:
-        """The recording resolution: the smallest gap between distinct recorded values (§3.2), two values within
+        """The recording resolution: the smallest gap between distinct recorded values, two values within
         float64's rounding of each other counting as one (``_resolvable_gaps``). A reading's own is its slope times it."""
         distinct = np.unique(self.recorded)
         return float(np.min(np.diff(distinct)[_resolvable_gaps(distinct)]))
@@ -184,8 +182,8 @@ class OccasionModelFit:
 
     @property
     def split_identified(self) -> bool:
-        """Whether the data separate the level variance from the noise (the lead's ruling on traits with few
-        within-person replicates): the observed information for (log tau^2, a) is positive definite beyond its
+        """Whether the data separate the level variance from the noise, which traits with few within-person
+        replicates can fail: the observed information for (log tau^2, a) is positive definite beyond its
         rounding. Each entry, a sum of m rounded terms, errs by at most gamma_m times the sum of their magnitudes
         (Higham 2002, section 4.2), so by Weyl's inequality the matrix is certified positive definite when its
         smallest eigenvalue exceeds the Frobenius norm of those bounds. Without replicates only the sum
@@ -716,9 +714,10 @@ def laplace_evidence(
 
     The inner problem (the penalized marginal likelihood in x) is not concave in general: the observed
     information of a scale mixture can be indefinite. So a strict maximum is required, and the Laplace V is not
-    corrected toward the exact integral here (the engine's Tierney-Kadane certification is not applied). PENDING:
-    the engine's rounding test (Demmel's componentwise bound, computed on its profiled factor in the [N, C]
-    basis) once that factor is public; the same bound on the full -H here is too conservative to use.
+    corrected toward the exact integral here (the engine's Tierney-Kadane certification is not applied). The
+    engine's rounding test (Demmel's componentwise bound, computed on its profiled factor in the [N, C] basis) is
+    not applied either, since that factor is private to the engine, and the same bound on the full -H here is too
+    conservative to use.
     """
     if not np.all(np.isfinite(log_smoothing)):
         return log_likelihood
@@ -1273,7 +1272,7 @@ class SplitNotIdentified(ValueError):
 def marginal_transform(values: F64Array, design: F64Array) -> tuple[float, F64Array]:
     """The Box-Cox exponent learned from the readings' marginal, and the transformed readings: the target of a
     trait whose level and noise are not separable (no within-person replicates, or a split the data do not
-    certify; the lead's ruling), with reliability 1. The noise then stays in the genetic model's residual, where
+    certify), with reliability 1. The noise then stays in the genetic model's residual, where
     it belongs when it cannot be separated.
 
     The exponent maximizes the Gaussian marginal profile log-likelihood of the readings given the design,
