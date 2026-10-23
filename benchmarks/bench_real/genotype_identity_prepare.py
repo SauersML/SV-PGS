@@ -15,7 +15,6 @@ import os
 import re
 from pathlib import Path
 import subprocess
-import time
 
 import numpy as np
 

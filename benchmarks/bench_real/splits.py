@@ -18,11 +18,9 @@ import sys
 import numpy as np
 import pandas as pd
 
+from benchmarks.seeds import seed_from_name
+
 RANDOM_FOLD_COUNT = 5
-
-
-def seed_from_name(name: str) -> int:
-    return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "little")
 
 
 def random_folds(samples: pd.DataFrame) -> list:

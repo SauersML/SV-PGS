@@ -3,8 +3,7 @@
 top_variant   the single variant with the largest training |correlation|, fitted by OLS (the "lead eQTL" predictor).
 gblup_reml    GBLUP on the standardized cis genotypes, with h^2 chosen by REML (spectral form: Kang et al. 2008,
               Genetics 178:1709) and the GLS fixed effects, both under the harness's fixed-effect design [1, covariates].
-mr.ash        is not ported here: the published R package (mr.ash.alpha) is run as itself for the comparison; a Python
-              port gave identical SNV and SNV+SV predictions on bench-real chr22 (lead, 2026-09-21) and was deleted.
+mr.ash        is not ported here: the published R package (mr.ash.alpha) is run as itself for the comparison.
 """
 import numpy as np
 from scipy import linalg, optimize

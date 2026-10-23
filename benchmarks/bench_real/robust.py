@@ -35,7 +35,6 @@ one method, design and feature set.
 """
 import argparse
 import dataclasses
-import hashlib
 import json
 import pathlib
 
@@ -43,15 +42,13 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from benchmarks.seeds import seed_from_name
+
 GROUPS = ("AFR", "AMR", "EAS", "EUR", "SAS")
 METRICS = ("r2", "r2_floor", "oos_r2", "oos_r2_centred")
 MASKED = "/masked"
 BASELINE_SET = "snv"
 LEVEL = 0.95  # the conventional two-sided interval level; it also sets the conventional q <= 1 - LEVEL count
-
-
-def seed_from_name(name: str) -> int:
-    return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "little")
 
 
 @dataclasses.dataclass
