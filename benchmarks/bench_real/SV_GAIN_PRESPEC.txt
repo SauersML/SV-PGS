@@ -487,7 +487,15 @@ Results seen (log; no test definition changes because of them)
     4-trait run read with 9f83b6f: relative gains +1.43% and -0.60%, against +1.42% and -0.62%.
   - Without T2D (post hoc sensitivity analysis, 7 traits; amendment 7's run, finished 06:52 PDT): g = +0.21% [-0.63,
     1.04], one-sided swap p 0.238, bootstrap p 0.312, one-sided 95% upper bound 0.91%.
-  - aou_numbers.json keeps the 4-trait converged rows, which the coordinator made final for the poster at 06:55 PDT.
+  - aou_numbers.json kept the 4-trait converged rows until 07:02 PDT. The coordinator then had the 5-trait set swapped
+    in: 5 rows with HDL, each with its Benjamini-Hochberg q over the 5 pairs' one-sided swap p (hypothyroidism 0.260,
+    HDL 0.272, eGFR 0.609, LDL 0.688, atrial fibrillation 0.688), and the All converged traits row.
+- 07:06 PDT on 2026-10-23, read: the amendment-5 c4 sensitivity analysis (8 traits; aou-c4-l1, aou-c4-g2 and aou-c4-h2
+  in place of aou-wl15, aou-x3-g2 and aou-m3f-h2; T2D's original fits, flagged). g = +0.00% [-0.00, 0.01], one-sided
+  swap p 0.132, bootstrap p 0.107, one-sided 95% upper bound below 0.005%. T2D takes all of g's weight, as in the
+  primary. Gout's gain relative to the SNV-and-indel r^2 moves from +4.64% to +1.54%, and its with_sv arm is still
+  uncertified. Hypertension's continuation gives its original gain exactly (-42.34%) and is still uncertified. LDL
+  with aou-c4-l1 is -0.02%.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
