@@ -55,8 +55,8 @@ def trait_name(trait: str) -> str:
 def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list[float], tick_text, log: bool,
            reference: float | None = None):
     """A forest at the column's width in the imputed SVs' sky blue: a row per (label, estimate, low, high), its label at
-    the left, the estimate filled where its interval excludes the reference (0, or 1 on a log axis, unless given), with
-    the reference drawn."""
+    the left, each estimate an open mark as imputed SVs' are in the simulation figures (every All of Us SV is imputed),
+    with the reference drawn (0, or 1 on a log axis, unless given)."""
     reference = (1.0 if log else 0.0) if reference is None else reference
     # the bottom holds the ticks and the axis title's descenders; the right, half of the last tick's label
     top, bottom, right = 0.35, 2.3, 0.95
@@ -68,15 +68,14 @@ def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list
         ax.set_xscale("log")
     low_limit, high_limit = ticks[0], ticks[-1]
     for y, (label, value, low, high) in enumerate(rows):
-        clear = low > reference or high < reference
         ax.hlines(y, max(low, low_limit), min(high, high_limit), color=SKY, linewidth=POSTER_BAR, zorder=3,
                   capstyle="round")
         for end, edge, marker in ((low, low_limit, "<"), (high, high_limit, ">")):
             if (end < edge) if marker == "<" else (end > edge):
                 ax.plot([edge], [y], marker=marker, markersize=POSTER_MARK * 0.7, color=SKY, markeredgewidth=0,
                         zorder=3, clip_on=False)
-        ax.plot([value], [y], "o", markersize=POSTER_MARK, color=SKY, markerfacecolor=SKY if clear else "white",
-                markeredgecolor=SKY, markeredgewidth=0 if clear else 6.0, zorder=4)
+        ax.plot([value], [y], "o", markersize=POSTER_MARK, color=SKY, markerfacecolor="white", markeredgecolor=SKY,
+                markeredgewidth=6.0, zorder=4)
         ax.text(0, y, label, transform=shifted(ax, -0.3), ha="right", va="center")
     ax.axvline(reference, color=INK, linewidth=4.0, zorder=2)
     ax.set_yticks([])
@@ -106,7 +105,7 @@ def span(values: list[float]) -> list[float]:
 
 def gain_figure(matched: list[dict]) -> tuple:
     """Each trait's change in held-out partial r² from adding SVs, as a share of the partial r² without them, with its
-    95% interval: over all held-out people, then in each genetic ancestry group; filled where the interval excludes 0.
+    95% interval: over all held-out people, then in each genetic ancestry group.
     With one trait its rows are named "All" and by group, the trait named in the text beside the figure."""
     rows = []
     for row in matched:
