@@ -231,8 +231,8 @@ def test_a_sharded_read_hands_over_each_block_once_every_device_has_run_its_queu
 
 def test_stage2_shards_its_reads_over_the_devices_as_one_streamed_source_reads(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Stage 2's reads are sharded over a budget's CUDA devices by LD block (``stage2_wiring.stage2_source``), on a model's
-    training samples. Checked on the host: numpy stands in for CuPy (``compute_budget._cupy_device_context`` needs no
-    device there) and each device's shard is a host source, so the plan, the sample selection, the peer tiles and the
+    training samples. Checked on the host: numpy stands in for CuPy and each device's shard is a host source,
+    so the plan, the sample selection, the peer tiles and the
     threads of ``map_reduce`` run as on two devices. Every block's products are the streamed source's bit for bit, a
     read summed over the devices is within the reassociation bound of the streamed one, and a mean-field fit is the
     streamed source's to its tolerance."""

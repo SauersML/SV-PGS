@@ -25,7 +25,7 @@ class VariantClass(str, Enum):
 
 @dataclass(slots=True)
 class ModelConfig:
-    """The settings the kept stages read."""
+    """Trait likelihood and variant filters used during fitting."""
 
     trait_type: TraitType = TraitType.BINARY
     minimum_scale: float = 1e-6                    # variants with std < this are treated as monomorphic

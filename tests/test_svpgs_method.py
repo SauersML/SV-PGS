@@ -6,7 +6,6 @@ The engine driver is the stub of tests/test_fit_model.py, so these tests pin the
 from __future__ import annotations
 
 import dataclasses
-import os
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +18,7 @@ from benchmarks.bench_sim import harness as bench_sim
 from sv_pgs import fit_model
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType, VariantClass
-from sv_pgs.dosage_store import CODES_PER_DOSAGE, DosageStore
+from sv_pgs.dosage_store import CODES_PER_DOSAGE
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from tests.test_fit_model import _StubDriver
 

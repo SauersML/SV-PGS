@@ -16,7 +16,6 @@ import pytest
 from scipy.integrate import quad
 from scipy.special import logsumexp
 
-from sv_pgs import scale_mixture_ep
 from sv_pgs.scale_mixture_ep import (
     _HALF_PRECISION,
     AnnotationGroup,
@@ -262,7 +261,6 @@ def _smooth_log_density(nodes: np.ndarray, floor: float, top: float, bump_width:
 
 def _lattice_sum(cavity: Cavity, offset: np.ndarray, spacing: float, floor: float, top: float, bump_width: float) -> tuple[float, float]:
     """sum_j log Z_j on the lattice of ``spacing`` over the density's support, and sum_j M_j / Z_j there."""
-    width = max(top - floor, 1.0)
     # Beyond sqrt(2 ln(1/eps)) bump widths from either end of the range the density is below eps of its peak.
     reach = np.sqrt(2.0 * np.log(1.0 / _EPSILON)) * bump_width
     start, stop = floor - reach, top + reach

@@ -14,7 +14,6 @@ it, published and mirrored the same way, and removed once the batch is committed
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import logging
 import os
@@ -38,11 +37,8 @@ READS = ".read-"
 
 
 def _digest(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(io.DEFAULT_BUFFER_SIZE), b""):
-            digest.update(block)
-    return digest.hexdigest()
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 class BatchCheckpoint:

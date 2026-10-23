@@ -1861,7 +1861,6 @@ def test_report_cells_hide_the_levels_from_which_a_small_count_would_follow() ->
 
     # (ancestry, rows, cases) and (half, rows): every level's rows and cases are its first ones.
     ancestry = (("eur", 300, 40), ("afr", 100, 25), ("amr", 30, 10), ("eas", 25, 0))
-    halves = (("A", 440), ("B", 15))
     total = sum(rows for _level, rows, _cases in ancestry)
     targets = np.zeros(total)
     starts = np.cumsum([0] + [rows for _level, rows, _cases in ancestry])

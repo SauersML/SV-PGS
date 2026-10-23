@@ -72,7 +72,7 @@ from numpy.polynomial import chebyshev, legendre
 from scipy import integrate
 from scipy.linalg import cho_factor, cho_solve
 from scipy.optimize import minimize_scalar
-from scipy.special import log_ndtr, logsumexp
+from scipy.special import logsumexp
 from threadpoolctl import threadpool_limits
 
 SITE_TOLERANCE = 1e-12

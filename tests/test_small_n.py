@@ -759,7 +759,6 @@ def test_the_double_loop_never_evaluates_an_improper_cavity(monkeypatch):
     raised on it, uncaught. Here a doubleton column (x2 = x0 + x1) with negative sites on its singletons starts with an
     improper q-cavity; the double loop reseeds its inner problem instead, never calls the tilted moments on an improper
     cavity, and returns sites whose every q-cavity is proper and which pass the EP check."""
-    from sv_pgs import small_n
     from sv_pgs.scale_mixture_ep import Cavity, derived_lattice, initial_hyperparameters, log_scale, scale_mixture_prior, tilted_cumulants, tilted_moments
     from sv_pgs.small_n import double_loop_sites
 

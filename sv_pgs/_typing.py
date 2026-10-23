@@ -1,18 +1,6 @@
-"""Shared type aliases for numpy arrays.
+"""NumPy array aliases by dtype; dimensions are specified by each caller.
 
-Centralizes the parameterized array types we use across the package. With
-mypy --strict, every bare ``np.ndarray`` is flagged as missing generic
-parameters; importing these aliases gives a single principled source of
-truth instead of sprinkling ``ndarray[Any, np.dtype[...]]`` everywhere.
-
-Conventions:
-- ``F32Array``, ``F64Array``, ``I32Array``, ``I64Array``, ``U8Array``,
-  ``U16Array``, ``BoolArray`` are 1-D-or-N-D ``np.ndarray`` with the named dtype.
-- ``NDArray`` (= ``np.typing.NDArray[np.generic]``) is the broadest
-  "some numpy array" alias; reach for it only when a function genuinely
-  accepts any dtype.
-
-Keep this module dependency-light: just ``np.typing`` and ``typing``.
+``NDArray`` accepts any dtype. The other aliases name a specific NumPy dtype.
 """
 
 from __future__ import annotations
@@ -21,8 +9,6 @@ from typing import Any, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
-
-# Generic numpy arrays --------------------------------------------------------
 
 NDArray: TypeAlias = npt.NDArray[Any]
 """Any numpy array (dtype unconstrained)."""

@@ -69,8 +69,6 @@ from sv_pgs.phenotype_measurement import Occasions, box_cox, marginal_transform
 from tests.oracles import fit_at_exponent
 from tests.phenotype_bounds import (
     rounding_gamma,
-    sampling_bound,
-    variance_component_standard_errors,
     within_rounding,
 )
 

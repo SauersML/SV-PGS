@@ -82,6 +82,7 @@ it approximates (``draws``): each member's node from its responsibilities, then 
 from __future__ import annotations
 
 import time
+from functools import cache
 from typing import Sequence
 
 import numba
@@ -929,24 +930,22 @@ class MeanFieldFixedPoints:
         variance_by_shift = np.where(live, third, 0.0)
         variance_by_omega = np.where(live, -0.5 * (fourth - variance * variance) - mean * third, 0.0)
         residual_dimension = float(self.residual_dimension)
-        noise_solve: dict[str, object] = {}
         binary = self.sites is not None
 
         def off_diagonal_gram(columns: F64Array) -> F64Array:
             return design.back(design.image(columns)) - squares[:, None] * columns
 
-        def noise_terms() -> tuple[F64Array, F64Array, float]:
+        @cache
+        def noise_terms() -> tuple[F64Array, float]:
             # dm_1 = R^-1 c, dh_1 and the scalar on dsigma^2 (module docstring): once per fixed point.
-            if not noise_solve:
-                coupling = np.where(live, shift + mean_by_omega * omega / np.where(live, variance, 1.0), 0.0)
-                mean_one = noise * response.solve(coupling[:, None])
-                shift_one = off_diagonal_gram(mean_one) / noise - shift[:, None]
-                scalar = residual_dimension - (
-                    2.0 * float(residual @ design.image(mean_one)[:, 0])
-                    + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
-                ) / noise
-                noise_solve.update(mean_one=mean_one, shift_one=shift_one, scalar=scalar)
-            return noise_solve["mean_one"], noise_solve["shift_one"], noise_solve["scalar"]  # type: ignore[return-value]
+            coupling = np.where(live, shift + mean_by_omega * omega / np.where(live, variance, 1.0), 0.0)
+            mean_one = noise * response.solve(coupling[:, None])
+            shift_one = off_diagonal_gram(mean_one) / noise - shift[:, None]
+            scalar = residual_dimension - (
+                2.0 * float(residual @ design.image(mean_one)[:, 0])
+                + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
+            ) / noise
+            return shift_one, scalar
 
         def cavity_response(mean_by_z: F64Array, variance_by_z: F64Array, _relative_tolerance: float = 0.0) -> tuple[F64Array, F64Array]:
             # (The tolerance is the streamed route's, whose solves are iterative; this factor is exact.)
@@ -964,7 +963,7 @@ class MeanFieldFixedPoints:
                 self.profile["response_seconds"] += time.perf_counter() - started
                 self.profile["responses"] += 1
                 return shift_step, np.zeros_like(shift_step)
-            _mean_one, shift_one, scalar = noise_terms()
+            shift_one, scalar = noise_terms()
             right = -2.0 * (residual @ design.image(mean_step)) + squares @ (
                 np.where(live[:, None], variance_by_z, 0.0) + variance_by_shift[:, None] * shift_step
             )

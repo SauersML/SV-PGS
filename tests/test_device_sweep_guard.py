@@ -176,7 +176,7 @@ def test_a_later_layout_s_check_reaches_a_block_after_one_it_skipped(monkeypatch
             batched_sweep(np, _Faulty(fault, launch=1, after=after), problem, layout, range(3), state, problem["residuals"].copy(), sweep.PanelGrams())
         assert all(not values.any() for values in state.values())
     assert [message.split(")")[0].split("(")[1] for message in messages[:4]] == [
-        "whole sweep", *(f"3 of 4 blocks of a new member order",) * 3,
+        "whole sweep", *("3 of 4 blocks of a new member order",) * 3,
     ]
     assert messages[4].startswith("batched sweep disabled (check failed: shift of model 0, member ")
     member = int(messages[4].split("member ")[1].split(":")[0])

@@ -84,11 +84,6 @@ def _informative_annotations(annotations: Mapping[str, np.ndarray]) -> dict[str,
     return {name: values for name, values in annotations.items() if np.unique(values).shape[0] > 1}
 
 
-def _categorical(values: np.ndarray) -> tuple[np.ndarray, tuple[str, ...]]:
-    legend, codes = np.unique(np.asarray(values, dtype=str), return_inverse=True)
-    return codes.astype(np.int32), tuple(str(level) for level in legend)
-
-
 def write_store(
     root: Path,
     *,
@@ -345,9 +340,6 @@ def bench_real_classes_for_arm(variants: Any, arm: str) -> np.ndarray:
         classes[typed & (bench_real_signed_change(variants) == 0)] = _CLASS_CODES[VariantClass.OTHER_COMPLEX_SV]
         return classes
     return np.full(np.asarray(variants.position).shape[0], _CLASS_CODES[VariantClass.SNV], dtype=np.uint8)
-
-
-CENTERINGS = ("training", "target")
 
 
 @dataclass(frozen=True)

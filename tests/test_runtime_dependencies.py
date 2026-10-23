@@ -10,16 +10,8 @@ import ast
 import pathlib
 import re
 import sys
+import tomllib
 from importlib import metadata
-
-import pytest
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10 has no tomllib
-    tomllib = None
-
-pytestmark = pytest.mark.skipif(tomllib is None, reason="tomllib is in the standard library from Python 3.11")
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 # Modules no runtime dependency provides: the package itself, and the GPU backend, which every caller loads behind a

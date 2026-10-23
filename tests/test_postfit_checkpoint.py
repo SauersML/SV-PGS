@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from sv_pgs.postfit_checkpoint import BatchCheckpoint, RECORD
-from sv_pgs.run_mirror import push, restore
+from sv_pgs.run_mirror import PushIncomplete, push, restore
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE
 from tests.directory_remote import DirectoryRemote
 
@@ -108,8 +108,11 @@ def test_an_interrupted_upload_never_leaves_a_completion_record(tmp_path: Path, 
     if replacement:
         push(run, DirectoryRemote(mirror))
         _commit(batch)
-    with pytest.raises(ConnectionError, match="preempted upload"):
+    with pytest.raises(PushIncomplete, match="preempted upload") as failed:
         push(run, _InterruptedUpload(mirror))
+    assert len(failed.value.failures) == 1
+    step, error = failed.value.failures[0]
+    assert step == "effects" and isinstance(error, ConnectionError)
     restored = tmp_path / "restored"
     restore(restored, DirectoryRemote(mirror))
     assert _batch(restored / "effects.partial").read() is None

@@ -557,7 +557,7 @@ def test_each_arm_starts_from_its_own_earlier_model_and_the_plan_names_each_star
     calls = fake / "calls.log"
     calls.write_text("")
     plan = plan_of()
-    why = (f"svpgs/aou-wl1/run/fit.partial/models/snv_indel/ldl_cholesterol is a collapsed null model (mean |b| 1.0e-20, under 1e-12): "
+    why = ("svpgs/aou-wl1/run/fit.partial/models/snv_indel/ldl_cholesterol is a collapsed null model (mean |b| 1.0e-20, under 1e-12): "
            "the job would rank it among its seeds")
     assert plan.runs[0]["starts"][("ldl_cholesterol", "snv_indel")] == ("refused", why)
     assert [text for state, text in plan.checks if state == "FAIL"] == [

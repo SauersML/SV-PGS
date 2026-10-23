@@ -24,14 +24,6 @@ def within_rounding(expected: float, operations: int, condition: float = 1.0):
     return pytest.approx(expected, rel=2.0 * rounding_gamma(operations) * condition)
 
 
-def variance_condition(values) -> float:
-    """Relative condition number of the population variance, |d var| / var over
-    max |d x_i| / |x_i|: 2 mean(|x_i - m| |x_i|) / var."""
-    values_array = np.asarray(values, dtype=np.float64)
-    deviations = values_array - values_array.mean()
-    return float(2.0 * np.mean(np.abs(deviations * values_array)) / values_array.var())
-
-
 def sampling_bound(standard_error: float) -> float:
     """Two-sided bound on an estimate's error that a correct estimator exceeds
     with probability FALSE_FAILURE_PROBABILITY (normal sampling distribution)."""
