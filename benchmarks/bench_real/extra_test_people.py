@@ -451,6 +451,8 @@ def check(args: argparse.Namespace) -> int:
     for model_index, (trait_index, arm) in enumerate(entries):
         reference = stored.genetic_mean[ARMS.index(arm), rows, cohort.all_rows_model(trait_index)]
         difference = np.abs(scores["x"][model_index, columns] - reference)
+        if not np.all(np.isfinite(difference)) or difference.max() > max(1e-6, 1e-4 * reference.std()):
+            raise ValueError("Independent score-path validation failed; new-callset scoring prohibited")
         print(f"check {cohort.trait_names[trait_index]}/{arm}: people {shown(len(rows))}, largest |difference| {difference.max():.3g}, "
               f"score SD {reference.std():.3g}")
     return 0
