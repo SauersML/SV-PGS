@@ -87,14 +87,89 @@ def test_no_gain_is_found_where_none_was_planted_and_a_planted_gain_is_found_and
     traits, families, ancestry = _synthetic(np.random.default_rng(4), 0.6)
     planted = sv_gain_meta.analyse(traits, families, ancestry, 5, resamples=100, permutations=20, permutation_resamples=40)
     assert planted["p_stouffer_one_sided"] < 0.01 and np.all(planted["estimate"] > 0)
+    assert planted["common"]["p_one_sided"] < 0.01 and planted["common"]["upper_95"] > planted["common"]["estimate"] > 0
+    assert calibration_ok(planted["calibration"])
     assert np.all(planted["upper_95"] > planted["estimate"]) and np.all(planted["relative_upper_95"] > planted["relative"])
     calibration = planted["calibration"]
     # swapped arms are exchangeable, so the observed Z lies above every swapped one
     assert calibration["permutations"] == 20 and calibration["p_permutation_Z_upper"] == 1 / 21
     assert abs(calibration["Z_mean"]) < 1.0 and np.all(np.isfinite(calibration["z_sd"]))
     lines = sv_gain_meta.report(planted, traits)
-    assert any(line.startswith("PRIMARY Stouffer") for line in lines) and any("at most" in line for line in lines)
+    assert any(line.startswith("PRIMARY common relative gain") for line in lines) and any("at most" in line for line in lines)
+    assert any(line.startswith("original primary, now secondary: Stouffer") for line in lines)
     assert sv_gain_meta.report(planted, traits, "ablation")[0] == sv_gain_meta.ABLATION_LABEL and lines[0] != sv_gain_meta.ABLATION_LABEL
+
+
+def calibration_ok(calibration: dict[str, object]) -> bool:
+    # swapped arms are exchangeable, so the observed primary z lies above every swapped one
+    return calibration["p_permutation_common_upper"] == 1 / 21 and abs(calibration["common_z_mean"]) < 1.0
+
+
+def test_the_common_relative_gain_holds_its_level_and_its_interval_covers_0_without_a_gain() -> None:
+    # 1,500 people per trait: at 450 every statistic here, the Stouffer Z too, spreads about 15% wider than its bootstrap
+    # SE says, while the All of Us traits hold 4,000 to 8,000 held-out people each
+    generator = np.random.default_rng(11)
+    statistics, covered = [], []
+    for _ in range(50):
+        traits, families, ancestry = _synthetic(generator, 0.0, people=1500)
+        result = sv_gain_meta.analyse(traits, families, ancestry, int(generator.integers(1 << 30)), resamples=100, permutations=0)
+        statistics.append(result["common"]["z"])
+        covered.append(result["common"]["upper_95"] >= 0.0)
+    assert abs(np.mean(statistics)) < 0.4 and 0.7 < np.std(statistics) < 1.4
+    assert np.mean(np.array(statistics) > stats.norm.isf(0.05)) <= 0.12 and np.mean(covered) >= 0.88
+
+
+def test_the_common_relative_gain_weights_traits_by_r2_over_the_gain_variance() -> None:
+    estimates, bases = np.array([0.002, -0.001]), np.array([0.05, 0.005])
+    draws = np.random.default_rng(12).normal(estimates, [0.001, 0.0005], size=(4000, 2))
+    found = sv_gain_meta.common_relative(estimates, bases, draws, np.tile(bases, (4000, 1)))
+    levels = bases + estimates / 2.0
+    weights = levels / np.var(draws, axis=0, ddof=1)
+    assert np.isclose(found["estimate"], weights @ estimates / (weights @ levels))
+    assert np.isclose(found["weight_share"].sum(), 1.0) and found["weight_share"][0] > found["weight_share"][1]
+    # a trait whose arms are the same score (no variance) gets no weight
+    flat = sv_gain_meta.common_relative(estimates, bases, np.column_stack([draws[:, 0], np.full(4000, -0.001)]), np.tile(bases, (4000, 1)))
+    assert flat["weight_share"][1] == 0.0 and np.isclose(flat["estimate"], estimates[0] / levels[0])
+
+
+def _run(name: str, ids: list[str], target: np.ndarray, baseline: np.ndarray, candidate: np.ndarray) -> dict[str, object]:
+    count = len(ids)
+    return {"name": name, "binary": False, "seed": 1, "ids": np.array(ids, dtype=object), "families": np.arange(count),
+            "ancestry": np.array(["eur"] * count, dtype=object), "target": target, "covariates": np.ones((count, 1)),
+            "baseline": baseline, "candidate": candidate}
+
+
+def test_pairs_of_one_trait_are_averaged_per_arm_on_their_common_people() -> None:
+    generator = np.random.default_rng(13)
+    target = generator.normal(size=6)
+    first = _run("ldl", ["a", "b", "c", "d", "e", "f"], target, generator.normal(size=6), generator.normal(size=6))
+    second = _run("ldl", ["f", "e", "d", "c", "b", "x"], np.r_[target[::-1][:5], 9.0], 3.0 * generator.normal(size=6), generator.normal(size=6) + 5.0)
+    merged = sv_gain_meta.merge_pairs([first, second])
+    assert merged["ids"].tolist() == ["b", "c", "d", "e", "f"] and merged["pairs"] == 2
+    rows_second = [4, 3, 2, 1, 0]
+
+    def standardized(values: np.ndarray) -> np.ndarray:
+        return (values - values.mean()) / values.std()
+
+    for arm in ("baseline", "candidate"):
+        expected = (standardized(first[arm][1:]) + standardized(second[arm][rows_second])) / 2.0
+        assert np.allclose(merged[arm], expected)
+    assert np.allclose(merged["target"], target[1:])
+    broken = _run("ldl", ["b", "c"], np.array([0.0, 0.0]), np.zeros(2), np.ones(2))
+    try:
+        sv_gain_meta.merge_pairs([first, broken])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("runs whose outcomes disagree were merged")
+
+
+def test_excluded_people_leave_every_per_person_array() -> None:
+    run = _run("gout", ["a", "b", "c"], np.array([1.0, 2.0, 3.0]), np.zeros(3), np.ones(3))
+    kept, lost = sv_gain_meta.excluded(run, {"b", "z"})
+    assert lost == 1 and kept["ids"].tolist() == ["a", "c"] and kept["target"].tolist() == [1.0, 3.0] and kept["covariates"].shape == (2, 1)
+    only, dropped = sv_gain_meta.excluded(run, {"b", "z"}, keep=True)
+    assert dropped == 2 and only["ids"].tolist() == ["b"] and only["baseline"].tolist() == [0.0]
 
 
 def test_one_family_coin_swaps_all_its_members_in_every_trait() -> None:

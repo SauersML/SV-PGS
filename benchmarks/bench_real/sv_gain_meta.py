@@ -19,9 +19,17 @@ any run puts them in one family (``union_clusters``). Every trait's gain is read
 correlation R of the traits' gains (shared people, correlated outcomes) is read from them too.
 
 The analysis was fixed before any combined value was computed (~/svpgs-watch/JOURNAL.txt, 2026-10-22). The unit is one
-test per trait on all its held-out people.
-- Primary: the two-sided Stouffer combination of the per-trait z = gain / bootstrap SE, equal weights,
-  Z = sum(z) / sqrt(1'R1).
+test per trait on all its held-out people. It was amended at 17:40 PDT that day (benchmarks/bench_real/SV_GAIN_PRESPEC.txt),
+when only aou-wl15 (LDL) had been scored, to the primary below. It weights LDL, the one result seen, the most.
+- Primary (amended): the common relative gain g, the gains regressed on the arms' mean partial r^2 through the origin
+  with weights 1 / var(gain): g = sum(a gain) / sum(a r^2), a = r^2 / var(gain) (``common_relative``). Where
+  every trait gains the same fraction of its accuracy, this is the most precise estimate of that fraction, and it
+  needs no per-trait ratio, whose denominator can resample near 0. Its standard error comes from the joint resamples
+  with the weights a fixed. Test: one-sided, g > 0, at 0.05. A run's traits each enter once: several matched pairing
+  runs of one trait are averaged per arm first (``merge_pairs``), and people in an excluded list (the long-read panel)
+  are dropped before anything is computed (``main``).
+- Original primary, now secondary: the two-sided Stouffer combination of the per-trait z = gain / bootstrap SE,
+  equal weights, Z = sum(z) / sqrt(1'R1).
 - Secondary:
   - the Cauchy combination (ACAT; Liu and Xie 2020) of the per-trait two-sided p, calibrated under arbitrary
     dependence at small levels and powerful when one trait carries the signal;
@@ -41,7 +49,7 @@ that family has the two arms' scores exchanged. Every trait reads the same coins
 Where the arms are equally accurate the swapped data have the observed data's distribution, so the replicates give
 the null of every statistic. Each replicate repeats the analysis (PERMUTATION_RESAMPLES bootstrap resamples per trait),
 which yields:
-- the null mean and SD of every z and of Z (near 0 and 1 when the bootstrap SE is right);
+- the null mean and SD of every z, of Z and of the primary's z (near 0 and 1 when the bootstrap SE is right);
 - the share of replicates below 0.05 for each p;
 - the permutation p of the observed statistics.
 
@@ -49,7 +57,7 @@ Inputs: the per-person arrays of ``PairedTrait`` (``analyse``). ``main`` reads t
 each named pairing run's cohort and score steps; only aggregates are printed, and every count of 1 to 20 is shown as
 <=20.
 
-    python sv_gain_meta.py RUN [RUN ...] [--permutations N] [--resamples N]
+    python sv_gain_meta.py RUN [RUN ...] [--exclude IDS] [--permutations N] [--resamples N]
 """
 
 from __future__ import annotations
@@ -69,7 +77,8 @@ GROUPS = ("eur", "afr", "amr")
 """The ancestry groups pooled across traits (the three largest in the held-out sets)."""
 RESAMPLES = 2000
 """Joint bootstrap resamples behind the observed statistics (the report's BOOTSTRAP_RESAMPLES)."""
-PERMUTATIONS = 200
+PERMUTATIONS = 1000
+"""Family arm swaps behind the primary's permutation p (SV_GAIN_PRESPEC.txt)."""
 PERMUTATION_RESAMPLES = 200
 """Bootstrap resamples behind each permutation replicate's standard errors and R (the observed resamples' first ones)."""
 CHUNK = 250
@@ -188,6 +197,28 @@ def reml_hksj(estimates: np.ndarray, variances: np.ndarray) -> dict[str, float]:
             "p_value": float(2.0 * stats.t.sf(abs(statistic), k - 1)) if math.isfinite(statistic) else math.nan, "tau_squared": tau2}
 
 
+def common_relative(estimates: np.ndarray, bases: np.ndarray, draws: np.ndarray, base_draws: np.ndarray) -> dict[str, object]:
+    """The primary (module docstring): the common relative gain g = sum(a gain) / sum(a r^2), a = r^2 / var(gain), its
+    standard error over the joint resamples (resamples x traits) with a fixed, z, one- and two-sided p, 95% interval
+    and one-sided upper 95% bound, and each trait's share of the weight. r^2 is the two arms' mean partial r^2
+    (``bases``, the snv_indel arm's, plus half the gain): it is the same with the arms exchanged, so where they are
+    equally accurate it carries no information on the gain's sign. The snv_indel arm's own r^2 would: it is high
+    exactly where the gain is low, which weights the traits that lost and biases g down. A trait whose gain has no
+    variance (both arms the same score) gets no weight."""
+    levels, level_draws = bases + estimates / 2.0, base_draws + draws / 2.0
+    variances = np.nanvar(draws, axis=0, ddof=1)
+    varies = (np.nanmax(draws, axis=0) > np.nanmin(draws, axis=0)) & (variances > 0.0)
+    weights = np.where(varies, levels / np.where(varies, variances, 1.0), 0.0)
+    estimate = float(weights @ estimates / (weights @ levels))
+    finite = np.all(np.isfinite(draws), axis=1) & np.all(np.isfinite(level_draws), axis=1)
+    error = float(np.std((draws[finite] @ weights) / (level_draws[finite] @ weights), ddof=1))
+    z = estimate / error if error > 0.0 else math.nan
+    half = float(stats.norm.ppf(0.975)) * error
+    return {"estimate": estimate, "standard_error": error, "z": z, "p_one_sided": float(stats.norm.sf(z)),
+            "p_two_sided": float(2.0 * stats.norm.sf(abs(z))), "ci_low": estimate - half, "ci_high": estimate + half,
+            "upper_95": estimate + UPPER * error, "weight_share": weights / weights.sum()}
+
+
 def correlation_of(draws: np.ndarray) -> np.ndarray:
     """The correlation of the traits' resampled gains (resamples x traits), over the resamples where all are finite."""
     if draws.shape[1] == 1:
@@ -246,11 +277,13 @@ def analyse(traits: Sequence[PairedTrait], clusters: np.ndarray, ancestry: np.nd
         base_draws.append(base_draw)
     estimates_array, draws_array = np.array(estimates), np.column_stack(draws)
     observed = combined(estimates_array, draws_array)
+    observed["common"] = common_relative(estimates_array, np.array(bases), draws_array, np.column_stack(base_draws))
     relative = estimates_array / np.array(bases)
     relative_draws = draws_array / np.column_stack(base_draws)
     relative_error = np.nanstd(relative_draws, axis=0, ddof=1)
     result: dict[str, object] = {
         "traits": [trait.name for trait in traits], "estimate": estimates_array, "baseline_r2": np.array(bases),
+        "arm_correlation": np.array([float(np.corrcoef(trait.candidate, trait.baseline)[0, 1]) for trait in traits]),
         "ci_low": np.nanquantile(draws_array, 0.025, axis=0), "ci_high": np.nanquantile(draws_array, 0.975, axis=0), **observed,
         "upper_95": estimates_array + UPPER * observed["standard_error"],
         "relative": relative, "relative_standard_error": relative_error, "relative_upper_95": relative + UPPER * relative_error,
@@ -259,7 +292,7 @@ def analyse(traits: Sequence[PairedTrait], clusters: np.ndarray, ancestry: np.nd
     }
     groups = {}
     for group in GROUPS:
-        cells, used, used_draws, used_relative, used_relative_draws = [], [], [], [], []
+        cells, used, used_draws, used_relative, used_relative_draws, used_bases, used_base_draws = [], [], [], [], [], [], []
         for trait in traits:
             rows = group_rows(trait, ancestry, group)
             cases = int(np.sum(trait.target[rows])) if trait.binary else None
@@ -270,12 +303,16 @@ def analyse(traits: Sequence[PairedTrait], clusters: np.ndarray, ancestry: np.nd
                 used_draws.append(gain_draws)
                 used_relative.append(gain[0] / base[0])
                 used_relative_draws.append(gain_draws / base_draw)
+                used_bases.append(base[0])
+                used_base_draws.append(base_draw)
                 cells.append((trait.name, rows.shape[0], cases, gain[0]))
             else:
                 cells.append((trait.name, rows.shape[0], cases, math.nan))
         groups[group] = {"cells": cells,
                          "absolute": pooled(np.array(used), np.column_stack(used_draws)) if used else None,
-                         "relative": pooled(np.array(used_relative), np.column_stack(used_relative_draws)) if used else None}
+                         "relative": pooled(np.array(used_relative), np.column_stack(used_relative_draws)) if used else None,
+                         "common": common_relative(np.array(used), np.array(used_bases), np.column_stack(used_draws),
+                                                   np.column_stack(used_base_draws)) if used else None}
     result["groups"] = groups
     if permutations:
         result["calibration"] = calibrate(traits, clusters, weights[:permutation_resamples], generator, permutations, observed)
@@ -286,28 +323,37 @@ def calibrate(traits: Sequence[PairedTrait], clusters: np.ndarray, weights: np.n
               permutations: int, observed: dict[str, object]) -> dict[str, object]:
     """The analysis repeated on family arm swaps (module docstring)."""
     unit = np.ones((1, clusters.shape[0]))
-    z_null, total_null, trait_p_null = [], [], []
-    p_null: dict[str, list[float]] = {"p_stouffer": [], "p_acat": [], "p_omnibus": [], "p_stouffer_one_sided": []}
+    z_null, total_null, trait_p_null, common_null = [], [], [], []
+    p_null: dict[str, list[float]] = {"p_stouffer": [], "p_acat": [], "p_omnibus": [], "p_stouffer_one_sided": [], "p_common_one_sided": []}
     for _ in range(permutations):
         coins = generator.random(int(clusters.max()) + 1) < 0.5
-        estimates, draws = [], []
+        estimates, bases, draws, base_draws = [], [], [], []
         for trait in traits:
             swap = family_swaps(trait, clusters, coins)
-            estimates.append(gains(unit, trait, swap)[0][0])
-            draws.append(gains(weights, trait, swap)[0])
+            gain, base = gains(unit, trait, swap)
+            gain_draws, base_draw = gains(weights, trait, swap)
+            estimates.append(gain[0])
+            bases.append(base[0])
+            draws.append(gain_draws)
+            base_draws.append(base_draw)
         found = combined(np.array(estimates), np.column_stack(draws))
+        common = common_relative(np.array(estimates), np.array(bases), np.column_stack(draws), np.column_stack(base_draws))
+        found["p_common_one_sided"] = common["p_one_sided"]
         z_null.append(found["z"])
         trait_p_null.append(found["p"])
         total_null.append(found["Z"])
+        common_null.append(common["z"])
         for name in p_null:
             p_null[name].append(found[name])
-    z_null_array, total_array = np.vstack(z_null), np.array(total_null)
+    z_null_array, total_array, common_array = np.vstack(z_null), np.array(total_null), np.array(common_null)
     count = total_array.shape[0]
     return {
         "permutations": count,
         "z_mean": np.mean(z_null_array, axis=0), "z_sd": np.std(z_null_array, axis=0, ddof=1),
         "trait_type_one": np.mean(np.vstack(trait_p_null) < LEVEL, axis=0),
         "Z_mean": float(np.mean(total_array)), "Z_sd": float(np.std(total_array, ddof=1)),
+        "common_z_mean": float(np.mean(common_array)), "common_z_sd": float(np.std(common_array, ddof=1)),
+        "p_permutation_common_upper": float((1 + np.sum(common_array >= observed["common"]["z"])) / (1 + count)),
         "type_one": {name: float(np.mean(np.array(values) < LEVEL)) for name, values in p_null.items()},
         "p_permutation_Z_upper": float((1 + np.sum(total_array >= observed["Z"])) / (1 + count)),
         "p_permutation_Z_two_sided": float((1 + np.sum(np.abs(total_array) >= abs(observed["Z"]))) / (1 + count)),
@@ -343,8 +389,16 @@ def report(result: dict[str, object], traits: Sequence[PairedTrait], contrast: s
             f"{result['z'][index]:.3f}", f"{result['p'][index]:.4g}", f"{result['p_one_sided'][index]:.4g}", f"{result['upper_95'][index] * 1e4:.3f}",
             f"{result['relative'][index] * 100:.2f}", f"{result['relative_standard_error'][index] * 100:.2f}",
             f"{result['relative_upper_95'][index] * 100:.2f}")))
+    lines.append("arm agreement (held-out correlation of the two arms' scores, outcome-free): "
+                 + ", ".join(f"{name} {value:.4f}" for name, value in zip(names, result["arm_correlation"])))
     lines.append("R (joint family bootstrap correlation of the gains): " + np.array2string(result["R"], precision=3).replace("\n", " "))
-    lines.append(f"PRIMARY Stouffer Z = {result['Z']:.3f}, two-sided p = {result['p_stouffer']:.4g} (one-sided gain > 0: {result['p_stouffer_one_sided']:.4g})")
+    common = result["common"]
+    lines.append(f"PRIMARY common relative gain g = {common['estimate'] * 100:.2f}% of snv_indel r^2 [{common['ci_low'] * 100:.2f}, "
+                 f"{common['ci_high'] * 100:.2f}], z = {common['z']:.3f}, one-sided p (g > 0) = {common['p_one_sided']:.4g} "
+                 f"(two-sided {common['p_two_sided']:.4g}), at most {common['upper_95'] * 100:.2f}%; weight shares "
+                 + ", ".join(f"{name} {share:.2f}" for name, share in zip(names, common["weight_share"])))
+    lines.append(f"original primary, now secondary: Stouffer Z = {result['Z']:.3f}, two-sided p = {result['p_stouffer']:.4g} "
+                 f"(one-sided gain > 0: {result['p_stouffer_one_sided']:.4g})")
     lines.append(f"ACAT p = {result['p_acat']:.4g} (from one-sided p: {result['p_acat_one_sided']:.4g}); omnibus Cauchy(Stouffer, ACAT) p = {result['p_omnibus']:.4g}")
     random = result["relative_random"]
     lines.append(f"relative gain, REML + HKSJ: {random['estimate'] * 100:.2f}% [{random['ci_low'] * 100:.2f}, {random['ci_high'] * 100:.2f}], "
@@ -355,12 +409,18 @@ def report(result: dict[str, object], traits: Sequence[PairedTrait], contrast: s
                           + (f" gain={gain * 1e4:.3f}e-4" if math.isfinite(gain) else " (not pooled)") for name, people, cases, gain in entry["cells"])
         lines.append(f"{group.upper()} cells: {cells}")
         if entry["absolute"] is not None:
+            common = entry["common"]
+            lines.append(f"{group.upper()} common relative gain (secondary): {common['estimate'] * 100:.2f}% [{common['ci_low'] * 100:.2f}, "
+                         f"{common['ci_high'] * 100:.2f}], one-sided p = {common['p_one_sided']:.4g}, at most {common['upper_95'] * 100:.2f}%")
             lines.extend(pooled_lines(f"{group.upper()}:", entry["absolute"], entry["relative"]))
     calibration = result.get("calibration")
     if calibration:
         lines.append(f"calibration ({calibration['permutations']} family arm swaps): per-trait null z mean "
                      + np.array2string(calibration["z_mean"], precision=2) + ", SD " + np.array2string(calibration["z_sd"], precision=2)
                      + ", type-I at 0.05 " + np.array2string(calibration["trait_type_one"], precision=3))
+        lines.append(f"  PRIMARY p (one-sided permutation p, g > 0): {calibration['p_permutation_common_upper']:.4g}; its z null mean "
+                     f"{calibration['common_z_mean']:.2f}, SD {calibration['common_z_sd']:.2f}, normal one-sided type-I at 0.05 "
+                     f"{calibration['type_one']['p_common_one_sided']:.3f}")
         lines.append(f"  Stouffer Z null mean {calibration['Z_mean']:.2f}, SD {calibration['Z_sd']:.2f}; type-I at 0.05: "
                      + ", ".join(f"{name} {value:.3f}" for name, value in calibration["type_one"].items()))
         lines.append(f"  permutation p: Stouffer Z upper {calibration['p_permutation_Z_upper']:.4g}, two-sided {calibration['p_permutation_Z_two_sided']:.4g}; "
@@ -398,6 +458,47 @@ def read_run(name: str, contrast: str = "arms") -> dict[str, object]:
             "candidate": scores.held_out_genetic[ARMS.index("with_sv"), rows, trait], "seed": run.config.seed}
 
 
+PER_PERSON = ("ids", "families", "ancestry", "target", "covariates", "baseline", "candidate")
+
+
+def excluded(run: dict[str, object], ids: set[str], keep: bool = False) -> tuple[dict[str, object], int]:
+    """The run without its held-out people whose research id is in ``ids`` (with ``keep``, without those whose id is
+    not), and how many it lost."""
+    keep = np.array([(str(value) in ids) == keep for value in run["ids"]], dtype=bool)
+    return {**run, **{key: np.asarray(run[key])[keep] for key in PER_PERSON}}, int(np.sum(~keep))
+
+
+def merge_pairs(runs: Sequence[dict[str, object]]) -> dict[str, object]:
+    """One trait's matched pairing runs as one: on the held-out people every run has, each run's two scores
+    standardized over those people, then each arm averaged over the runs. Averaging fits of one arm cuts the fit-to-fit
+    noise both arms carry; both arms are averaged over the same runs. The outcome must agree between runs."""
+    first = runs[0]
+    common = set(map(str, first["ids"]))
+    for run in runs[1:]:
+        common &= set(map(str, run["ids"]))
+    order = [str(value) for value in first["ids"] if str(value) in common]
+    merged = {**first}
+    rows_of = []
+    for run in runs:
+        position = {str(value): row for row, value in enumerate(run["ids"])}
+        rows_of.append(np.array([position[value] for value in order], dtype=np.int64))
+    for key in ("ids", "families", "ancestry", "target", "covariates"):
+        merged[key] = np.asarray(first[key])[rows_of[0]]
+    for run, rows in zip(runs[1:], rows_of[1:]):
+        if run["name"] != first["name"] or not np.allclose(np.asarray(run["target"], dtype=np.float64)[rows], merged["target"]):
+            raise ValueError(f"{run['name']}: runs merged as one trait disagree on the trait or its outcome")
+
+    def standardized(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        spread = float(np.std(values))
+        return (values - values.mean()) / spread if spread > 0.0 else values - values.mean()
+
+    for arm in ("baseline", "candidate"):
+        merged[arm] = np.mean([standardized(np.asarray(run[arm])[rows]) for run, rows in zip(runs, rows_of)], axis=0)
+    merged["pairs"] = len(runs)
+    return merged
+
+
 def union(runs: Sequence[dict[str, object]]) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, int]:
     """The union of the traits' held-out people, matched by research id (each run's "ids", "families" and "ancestry"):
     each trait's people as indices into it, the union clusters (``union_clusters``), each union person's ancestry label
@@ -421,10 +522,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("runs", nargs="+", help="Matched pairing runs (both arms fitted by identical code), one trait each.")
     parser.add_argument("--contrast", choices=("arms", "ablation"), default="arms",
                         help="arms (primary): with_sv vs snv_indel; ablation (secondary, descriptive): SV terms zeroed in one fit.")
+    parser.add_argument("--exclude", help="A file of research ids to drop from every trait's held-out people (one per line, or "
+                                              "a tab-separated table with a research_id column): the long-read panel's members.")
+    parser.add_argument("--only", action="store_true", help="Keep only the people in --exclude's file instead of dropping them "
+                                                            "(the descriptive long-read stratum, SV_GAIN_PRESPEC.txt secondary 4).")
     parser.add_argument("--permutations", type=int, default=PERMUTATIONS)
     parser.add_argument("--resamples", type=int, default=RESAMPLES)
     args = parser.parse_args(argv)
     runs = [read_run(name, args.contrast) for name in args.runs]
+    if args.exclude:
+        with open(args.exclude, encoding="utf-8") as handle:
+            rows = [line.rstrip("\n").split("\t") for line in handle if line.strip()]
+        column = rows[0].index("research_id") if "research_id" in rows[0] else None
+        ids = {row[column] for row in rows[1:]} if column is not None else {row[0] for row in rows}
+        for index, run in enumerate(runs):
+            runs[index], lost = excluded(run, ids, keep=args.only)
+            print(f"{args.runs[index]}: {shown(lost)} held-out people {'outside' if args.only else 'in'} {args.exclude} "
+                  f"({shown(len(ids))} ids) {'dropped' if not args.only else 'dropped, the rest kept'}")
+    by_trait: dict[str, list[dict[str, object]]] = {}
+    for name, run in zip(args.runs, runs):
+        by_trait.setdefault(str(run["name"]), []).append({**run, "run": name})
+    runs = [merge_pairs(group) for group in by_trait.values()]
+    for run in runs:
+        print(f"{run['name']}: {run['pairs']} matched pairing run(s) averaged per arm, {shown(np.asarray(run['ids']).shape[0])} held-out people in all of them")
     people, clusters, labels, disagreements = union(runs)
     traits = [PairedTrait(run["name"], run["binary"], people[i], np.asarray(run["target"], dtype=np.float64), np.asarray(run["covariates"], dtype=np.float64),
                           np.asarray(run["baseline"], dtype=np.float64), np.asarray(run["candidate"], dtype=np.float64)) for i, run in enumerate(runs)]

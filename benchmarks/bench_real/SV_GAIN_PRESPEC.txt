@@ -1,0 +1,109 @@
+SV gain in All of Us: pre-specified analysis, amendment 1
+Written 2026-10-22 17:58 PDT and committed before any matched pairing run other than aou-wl15 had been scored.
+
+What had been seen when this was written
+- aou-wl15 (LDL; wl14 with_sv vs wl13 snv_indel, identical code): gain -0.0011 partial r^2 (95% CI -0.0040 to 0.0021),
+  relative -1.9%. This is the only matched-pair result anyone had seen.
+- The within-model SV deletion of four old-round models (aou-wl5, wo7, wa5, wg8). It is not a test of SV gain and
+  is not used below.
+- Training-only summaries of four old with_sv fits (aou_numbers.json "enrichment"): the share of the posterior second
+  moment on SVs is 0.35% (LDL), 2.1% (hypothyroidism), 2.1% (AF) and 38% (gout). Gout's share is prior mass: its fitted
+  effects put 6.2% on SVs, which are 5.7% of the variants, and no SV has |posterior mean| / sd above 0.87 (gout1 check).
+  No trait shows SV signal in training, so no trait is weighted or selected by it.
+- No fast-baseline (aou_fastpgs) result had been read.
+
+Unit and inputs
+- One test per trait, on all of the trait's held-out people (fold 0), from matched pairing runs only: a with_sv model
+  and a separately fitted snv_indel model, fitted by identical code on the same training people.
+- Every matched pairing run of a trait that finishes both arms counts. Several runs of one trait are merged
+  (sv_gain_meta.merge_pairs): on the held-out people all of them share, each run's two scores are standardized, and
+  each arm is averaged over the runs. Both arms are averaged over the same runs.
+  - LDL: aou-wl15 and the cross-seeded pair aou-x3-l1/l2 (or its successor).
+  - Hypothyroidism, AF and gout: the cross-seeded pairs aou-x3-o, -a and -g. Their old-round arms (wo7, wa5, wg8) were
+    fitted by different code and are excluded.
+  - Asthma, eGFR, CKD, hyperlipidemia, hypertension, CAD and T2D: their round-m3 pairs (m3-s; m3f-e, -k, -y; the
+    h/c/t pairs that follow m3fs). Where a trait's pair is rerun on a fixed code hash, the round's rule already
+    journalled at 16:38 PDT decides which pair counts. That rule depends only on faults, never on results.
+  - A pair whose arms fail, or whose scores were never written, is left out and listed.
+- Excluded people: held-out people who are in the long-read set (the research ids of
+  v9/wgs/long_read/manifest.tsv in the CDR) are dropped from every trait before anything is computed
+  (sv_gain_meta --exclude). Their imputed SVs come from a panel holding their own assemblies, so they are near their
+  true genotypes, and keeping them would raise the SV gain above what imputed SVs give anyone else. Only the count is
+  printed.
+
+Primary (one test)
+- The common relative gain g. Each trait's gain (with_sv partial r^2 less snv_indel) is regressed on the two arms'
+  mean partial r^2 through the origin, with weights 1 / var(gain): g = sum(a gain) / sum(a r^2), a = r^2 / var(gain)
+  (sv_gain_meta.common_relative).
+  - The variances come from the joint family bootstrap of all traits' held-out people, 2,000 resamples.
+  - Its standard error comes from the same resamples, with a held fixed.
+- H1: g > 0. The test is one-sided at 0.05.
+- The p-value is the one-sided permutation p from 1,000 family arm swaps (the analysis repeated on each, 200
+  resamples apiece). It is exact where the arms are exchangeable, so it does not rely on the bootstrap standard error.
+  The normal p is printed beside it.
+- Also reported:
+  - g's 95% interval;
+  - its one-sided upper 95% bound ("SVs add at most X% of the SNV-and-indel model's partial r^2"), whatever the test
+    finds;
+  - each trait's share of the weight.
+- Why this statistic:
+  - It is the most precise estimate of a gain that is a common fraction of each trait's accuracy, and it has no
+    per-trait ratio whose denominator can resample near 0.
+  - Analytic power (below) puts it above the original equal-weight Stouffer for every gain size.
+  - It gives LDL, the one result seen, the largest weight, so seeing LDL did not pull the choice toward a positive
+    result.
+  - The arms' mean r^2 is used, not the snv_indel arm's own r^2: the latter is high exactly where the gain is low, and
+    in synthetic data with no gain it biased z down by 0.4.
+
+Secondary, all reported, none confirmatory
+1. The original primary (journal 15:17 and 15:31 PDT): the two-sided equal-weight Stouffer Z. Also ACAT, the omnibus,
+   REML+HKSJ relative gain, and GLS pooled gains, with every trait's own gain, interval, p and upper bound.
+2. Ancestry: g within AFR, then EUR, then AMR, each one-sided. Only traits with at least 100 held-out people of the
+   group, and for a disease more than 20 cases, enter. AFR comes first because SVs are less well tagged by SNVs there.
+   These are reported with their own p, uncorrected, and labelled secondary.
+3. Fast baselines (benchmarks/bench_real/fastpgs_meta.py): for C+T, lassosum2 and LDpred2-auto, the same primary
+   statistic over the traits whose two arms differ, with Holm correction across the 3 methods.
+4. The long-read people excluded above: their count is reported. If at least 500 held-out people are in the long-read
+   set, the same statistic is run on them alone as a descriptive near-true-genotype stratum. It is labelled as such and
+   is no test of imputed SVs.
+
+Calibration
+- Every statistic's null mean and SD, its type-I rate at 0.05 and its permutation p come from the family arm swaps.
+- If the primary z's null SD is outside 0.8 to 1.25, its normal p is not used and only the permutation p stands.
+
+Considered and not used
+- Selecting or weighting traits by training-estimated SV share. Training shows no SV signal in any trait (above), so
+  the weights would be noise, and gout's prior mass would take nearly all of them.
+- Local tests restricted to windows around high-posterior SVs. They gain power only if the SV benefit sits in a few
+  pre-specified windows. Gout's check found no SV with a clear effect, so the benefit, if any, is spread out. The test
+  would also need new per-window scoring of both arms, and it answers a narrower question.
+- More seeds or replicate pairs per trait: the user ruled them out on cost.
+- Cross-fitting the other four folds (about $76 per trait for both arms on Spot).
+  - Test n rises about 5x and the SE falls about 2.2x.
+  - With the $100 budget only one trait could be done, which is too little for the pooled test.
+  - It also takes hours past the poster.
+- The extra 50k samples: there is no official map from their sequencing ids to person ids.
+- The within-model SV deletion: not a measure of SV gain.
+
+Power (analytic, one-sided 0.05)
+- Model: SE of a trait's gain is about 2 r sqrt(2 (1 - rho) / n), where:
+  - r^2 is the snv_indel partial r^2;
+  - n is the held-out people;
+  - rho is the correlation of the two arms' scores on the held-out people.
+- aou-wl15 gives 1 - rho = 0.022 (SE 0.00155 at r^2 0.058, n 4,186).
+- r^2 for the other traits is from the old rounds where known (hypothyroidism 0.0048, AF 0.0009, gout 0.0047). It is
+  assumed for the rest: eGFR 0.03, hyperlipidemia 0.015, hypertension and T2D 0.010, CAD 0.005, CKD 0.004, asthma 0.003.
+- A realistic gain is 1-3% of r^2. Simulations with imputed SVs give about 2-3% in r^2 terms. With no causal SV, the
+  tagging gain is about 1.4%.
+
+  1 - rho                              pooled relative SE   power at g = 1%   2%     3%     5%
+  0.022 (as aou-wl15)                  1.44%                0.17              0.40   0.67   0.97
+  0.005 (cross-seeded arms)            0.68%                0.43              0.90   1.00   1.00
+  0.002                                0.43%                0.75              1.00   1.00   1.00
+
+- The original equal-weight Stouffer has 0.35, 0.84 and 0.99 power at g = 2% for the three rows, and LDL alone has
+  0.18, 0.47 and 0.79.
+- The arms' agreement rho decides the power. Seeding both arms' mode search from both arms' saved modes (crossseed's
+  design) is the lever. The trait weights matter far less.
+- rho is outcome-free, so it is printed for every trait (held-out correlation of the two arms' scores) before the
+  test.

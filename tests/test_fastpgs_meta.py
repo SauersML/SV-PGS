@@ -34,7 +34,7 @@ def test_every_method_is_tested_on_both_traits_and_a_failed_arm_is_named(tmp_pat
     for method in aou_fastpgs.METHODS:
         assert f"=== {method}" in printed
     assert "=== lassosum2: 1 traits; no score in an arm for gout" in printed
-    assert "AUC" in printed and "PRIMARY Stouffer" in printed
+    assert "AUC" in printed and "PRIMARY common relative gain" in printed
     assert "\tAFR\t" in printed and "\tEUR\t" in printed
 
 
@@ -52,7 +52,7 @@ def test_a_trait_whose_arms_chose_the_same_model_is_listed_and_not_combined(tmp_
     printed = capsys.readouterr().out
     ct = printed[printed.index("=== ct"):]
     assert "the same model in both arms (gain 0, not combined) for gout" in ct
-    assert "Z = nan" not in ct and "PRIMARY Stouffer" in ct
+    assert "Z = nan" not in ct and "PRIMARY common relative gain" in ct
 
 
 def test_a_cell_reads_the_arms_partial_r2_on_its_rows() -> None:
