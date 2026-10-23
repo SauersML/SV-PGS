@@ -326,6 +326,12 @@ Results seen (log; no test definition changes because of them)
   g's weight. That is a design weakness of the primary: its inverse-variance weights a = r^2 / var(gain) let a
   near-degenerate pair, whose two arms give almost the same score, dominate g. The null threshold of 1e-12 does not
   catch a pair this close to the null. On the interim inputs the analysis without T2D is the six-pair result above.
+- 00:31 PDT on 2026-10-23: a watcher on the workspace app (~/xw/svgain_watch.sh, sv_gain_meta at main c1f5570, 1,000
+  swaps, long-read people excluded) runs the primary as soon as the CKD (aou-m3g-k), CAD (aou-m3f-c) and
+  hyperlipidemia (aou-m3h-y) pairs have their reports, or at 08:00 PDT with whichever have. Then it runs the same
+  analysis without T2D. When the three c4 pairs have their reports, or at 12:00 PDT, it runs the amendment-5
+  sensitivity analysis, with each c4 pair in place of its original fits. Its logs are ~/xw/svgain_PRIMARY.log,
+  svgain_PRIMARY_noT2D.log and svgain_SENSITIVITY_c4.log, with times in ~/xw/svgain_watch.status.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
