@@ -140,17 +140,18 @@ def test_poster_design_lists_each_setting_value_the_grid_simulates(monkeypatch, 
         "sv_causal_fraction": {point["sv_causal_fraction"] for point in grid.POINTS.values()},
     }
     assert {name: set(values) for name, values in poster.DESIGN_SETTINGS.items()} == simulated
-    line = poster_copy(poster)["design"][1]
+    line = " ".join(poster_copy(poster)["design"][1:3])
     # each value is named and none is given as a range
     assert "–" not in line
     assert "h² 0.01 or 0.1" in line and "prevalence 1% or 10%" in line
-    assert "50, 200 or 2,000 causal variants" in line and "0%, 5% or 20% SVs" in line
+    assert "50, 200 or 2,000 causal variants" in line and "0%, 5% or 20% are SVs" in line
 
 
 def test_poster_cites_every_reference_in_order(monkeypatch, tmp_path):
     poster = poster_module(monkeypatch, tmp_path)
     words = poster_copy(poster)
-    text = " ".join(line for key in ("introduction", "methods", "design", "aou", "discussion") for line in words[key])
+    text = " ".join(line for key in ("introduction", "methods", "design", "compared", "aou", "discussion")
+                    for line in words[key])
     # h² and r² are exponents, not citations
     text = re.sub(r"[hr]²", "", text)
     marks = [poster.SUPERSCRIPT[index] for index in range(1, len(poster.REFERENCES) + 1)]

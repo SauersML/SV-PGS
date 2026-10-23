@@ -141,22 +141,23 @@ def copy(numbers: dict) -> dict:
     return {
         # Byrska-Bishop 2022: "On average, ~9,679 SVs were discovered in each genome"
         "introduction": [f"Each genome has ~9,700 structural variants (SVs){cite('Byrska-Bishop 2022 Cell')}",
-                         "Polygenic scores rarely use SVs, so we test if imputed SVs improve accuracy"],
+                         "Polygenic scores rarely use SVs",
+                         "We test if imputed SVs improve accuracy"],
         "methods": ["Priors depend on imputation r², frequency, SV length"],
         "code": ["Code:", "github.com/", "SauersML/SV-PGS"],
         "design": [
             f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22",
             # each setting's values over the grid's points (DESIGN_SETTINGS), listed rather than as a range
             f"{gain['shown']} architectures: h² {listed([f'{h2:g}' for h2 in DESIGN_SETTINGS['h2']])}, prevalence "
-            f"{listed([f'{share:.0%}' for share in DESIGN_SETTINGS['prevalence']])}, "
-            f"{listed([f'{count:,}' for count in DESIGN_SETTINGS['causal_variants']])} causal variants, "
-            f"{listed([f'{share:.0%}' for share in DESIGN_SETTINGS['sv_causal_fraction']])} SVs",
-            # SV-PGS fits every measured record with no frequency or r² floor (stage2_wiring.fit_models); LDpred2-auto
-            # takes SNVs of training MAF >= 1% thinned evenly in genetic distance to HapMap3's chr22 count, so at most
-            # 16,000 (benchmarks/bench_sim/submissions/ldpred2_auto.py)
-            f"SV-PGS: all SNVs, indels and SVs. LDpred2-auto{cite('Privé 2020 Bioinformatics')}: up to 16,000 SNVs "
-            "with MAF ≥ 1%",
+            f"{listed([f'{share:.0%}' for share in DESIGN_SETTINGS['prevalence']])}",
+            f"{listed([f'{count:,}' for count in DESIGN_SETTINGS['causal_variants']])} causal variants, of which "
+            f"{listed([f'{share:.0%}' for share in DESIGN_SETTINGS['sv_causal_fraction']])} are SVs",
         ],
+        # what each plotted method fits, over the simulation's figures: SV-PGS every measured record with no
+        # frequency or r² floor (stage2_wiring.fit_models), LDpred2-auto SNVs of training MAF >= 1% thinned evenly in
+        # genetic distance to HapMap3's chr22 count, so at most 16,000 (benchmarks/bench_sim/submissions/ldpred2_auto.py)
+        "compared": ["SV-PGS: all SNVs, indels and SVs",
+                     f"LDpred2-auto{cite('Privé 2020 Bioinformatics')}: up to 16,000 SNVs with MAF ≥ 1%"],
         "whole_note": f"Simulations on whole chr22 with test N = {people(accuracy['test_people'])}",
         "gain_note": f"Mean and 95% CI over {simulations} simulations in 3 Mb of chr22",
         # GLIMPSE2 is Rubinacci 2023; the assemblies are the accepted abstract's 12,212 phased genome assemblies
@@ -638,7 +639,7 @@ def build() -> None:
         ],
         [
             bar(118, "Simulation results"),
-            Block("text", [Para([(words["whole_note"], "")], bullet=False, after=0)]),
+            Block("text", [Para([(line, "")], bullet=False, after=0) for line in [words["whole_note"], *words["compared"]]]),
             row([figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
             Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)], gap="section"),

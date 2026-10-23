@@ -828,7 +828,7 @@ POSTER_PAD = 0.1
 """Inches between a poster figure's outermost type and its canvas's edge, and between a name and the marks beside it."""
 POSTER_X_TITLES = ("Training size (thousands)", "LDpred2-auto test AUC")
 """The x axes' titles of the two figures side by side at the top of the poster's middle column."""
-POSTER_SHARES = (("null", "0", GREEN), ("sv_5pct", "5", VIOLET), ("sv_20pct", "20%", WINE))
+POSTER_SHARES = (("null", "0%", GREEN), ("sv_5pct", "5%", VIOLET), ("sv_20pct", "20%", WINE))
 """The accuracy figure's architectures by the share of causal variants that are SVs, as its key writes each, and the
 colour of their simulations' dots."""
 POSTER_METHODS = (("with_sv_auc", "SV-PGS", SV_PGS, "o", -1), ("ldpred2_auc", "LDpred2-auto", LDPRED2, "s", 1))
@@ -852,17 +852,30 @@ def poster_accuracy_figure(grids, summary):
     """Figure 1a for the poster: test AUC against training size for SV-PGS (circles) and LDpred2-auto (squares), pooled
     over the architectures with 0%, 5% and 20% causal SVs. Each mean has its 95% interval as an error bar, over every
     simulation's own AUC as a faint dot in its architecture's colour, left of its size for SV-PGS and right for
-    LDpred2-auto. Each method is named beside its marks, under the AUC of the true genetic value and the colours' key.
-    The y axis spans every mark with room for the names and the key, measured from their type."""
+    LDpred2-auto. Each method is named beside its marks, under the AUC of the true genetic value. The colours' key,
+    "0%, 5% or 20% causal SVs", is one line over the plot, ending at its right edge: at tick size it is wider than the
+    plot. The y axis spans every mark with room for the names, measured from their type."""
     grouped = cells(grids["grid"])
     fig = plt.figure(figsize=(POSTER_HALF, POSTER_HEIGHT))
     # the left margin holds the ticks and the axis title
-    top, bottom, left, right = 0.25, under_axes(fig), widest(fig, ["0.00"], fontsize=POSTER_TYPE) + 1.45, 0.3
+    # the key's words, each share in its dots' colour: "0%, 5% or 20% causal SVs"
+    shares = [(label, share) for _, label, share in POSTER_SHARES]
+    key = [shares[0], *((part, tint) for index, (label, share) in enumerate(shares[1:], 1)
+                        for part, tint in ((", " if index < len(shares) - 1 else " or ", INK), (label, share))),
+           (" causal SVs", INK)]
+    line = tallest(fig, ["Best possible"], fontsize=POSTER_TYPE)
+    # the top margin holds the key over the plot
+    top, bottom, left, right = 0.25 + line + POSTER_PAD, under_axes(fig), widest(fig, ["0.00"], fontsize=POSTER_TYPE) + 1.45, 0.3
     width, height = POSTER_HALF - left - right, POSTER_HEIGHT - top - bottom
     ax = frame(fig, left, bottom, width, height)
     log_size_axis(ax)
     # the title runs longer than the axis, so it ends at the axis's far end
     ax.set_xlabel(POSTER_X_TITLES[0], loc="right")
+    across = (left + width - widest(fig, ["".join(words for words, _ in key)], fontsize=POSTER_TYPE)) / POSTER_HALF
+    piece = fig.text(across, 1 - 0.25 / POSTER_HEIGHT, key[0][0], color=key[0][1], va="top", ha="left")
+    for words, color in key[1:]:
+        piece = ax.annotate(words, xy=(1, 0), xycoords=piece, va="bottom", ha="left", color=color,
+                            annotation_clip=False)
     first, last = ax.get_xlim()
     doubling = width / math.log2(last / first)
     random = np.random.default_rng(0)
@@ -887,14 +900,13 @@ def poster_accuracy_figure(grids, summary):
     names = {method: (widest(fig, [method], fontsize=POSTER_NAME, fontweight="bold"),
                       tallest(fig, [method], fontsize=POSTER_NAME, fontweight="bold"))
              for _, method, *_ in POSTER_METHODS}
-    line = tallest(fig, ["Best possible"], fontsize=POSTER_TYPE)
     # SV-PGS's name over the marks it spans from the left, LDpred2-auto's under the marks it spans to the right end
     start = SIZES[0] / 1.2
     spans = {"SV-PGS": (start, start * 2.0 ** (names["SV-PGS"][0] / doubling)),
              "LDpred2-auto": (last / 2.0 ** (names["LDpred2-auto"][0] / doubling), last)}
     beside = {method: marks[(marks[:, 0] >= low) & (marks[:, 0] <= high), 1] for method, (low, high) in spans.items()}
-    # inches over the best possible AUC: its label, then the key, then the pad; under LDpred2-auto's marks: its name
-    above = POSTER_PAD + 2 * line + POSTER_PAD
+    # inches over the best possible AUC: its label and the pad; under LDpred2-auto's marks: its name
+    above = POSTER_PAD + line + POSTER_PAD
     under = POSTER_PAD + names["LDpred2-auto"][1] + POSTER_PAD
     span = max((ceiling - beside["LDpred2-auto"].min()) / (1 - (above + under) / height),
                (ceiling - marks[:, 1].min()) / (1 - (above + POSTER_PAD) / height))
@@ -903,12 +915,6 @@ def poster_accuracy_figure(grids, summary):
     ax.set_ylim(upper - span, upper)
     ax.axhline(ceiling, color=INK, linestyle=(0, (1, 1.2)), linewidth=4.0, zorder=1)
     ax.text(SIZES[0] / 1.25, ceiling + POSTER_PAD * per_inch, "Best possible", color=INK, va="bottom", ha="left")
-    # the key: each share of causal variants that are SVs in its dots' colour
-    piece = ax.text(SIZES[0] / 1.25, ceiling + (POSTER_PAD + line) * per_inch, POSTER_SHARES[0][1],
-                    color=POSTER_SHARES[0][2], va="bottom", ha="left")
-    for words, color in (*((part, tint) for _, label, share in POSTER_SHARES[1:] for part, tint in ((", ", INK), (label, share))),
-                         (" causal SVs", INK)):
-        piece = ax.annotate(words, xy=(1, 0), xycoords=piece, va="bottom", ha="left", color=color)
     ax.text(start, beside["SV-PGS"].max() + POSTER_PAD * per_inch, "SV-PGS", color=SV_PGS, fontsize=POSTER_NAME,
             fontweight="bold", ha="left", va="bottom")
     ax.text(1, beside["LDpred2-auto"].min() - POSTER_PAD * per_inch, "LDpred2-auto", transform=shifted(ax, 0.0),
