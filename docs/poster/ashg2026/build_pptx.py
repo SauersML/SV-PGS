@@ -174,8 +174,8 @@ def copy(numbers: dict) -> dict:
 
 
 def aou_matched() -> list[str]:
-    """What the All of Us figure compares, when aou_numbers.json holds its "matched" rows (aggregates, every count >
-    20): for each trait, SV-PGS fitted with SVs and without them, tested in the same held-out people."""
+    """What the All of Us figure compares, when aou_numbers.json holds its "matched" rows (aggregates, every count
+    below 40 masked): for each trait, SV-PGS fitted with SVs and without them, tested in the same held-out people."""
     path = HERE / "aou_numbers.json"
     rows = json.loads(path.read_text()).get("matched", {}).get("rows", []) if path.is_file() else []
     # every matched run's run_config.json: fit_minimum_minor_allele_frequency 0.01, fit_minimum_r2 0.3 and
