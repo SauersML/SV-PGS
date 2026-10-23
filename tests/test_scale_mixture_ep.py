@@ -1868,8 +1868,8 @@ def test_the_fused_variant_derivatives_are_the_dense_components_moments():
 def test_the_trust_radius_follows_the_models_measured_agreement():
     """``_next_radius``: a step that reached the radius goes to L / (2 e), e the model's measured relative error along
     it, where that is past doubling. An error >= 1/2 (measured, or the realized gain's resolution over the prediction)
-    supports no longer step; a step short of the radius keeps it; an unmeasured gain, or a deviation within the gain's
-    resolution, doubles it."""
+    supports no longer step; a step short of the radius keeps it; a deviation within the gain's resolution doubles it;
+    an undefined ratio (an unmeasured gain, or a prediction of no gain) keeps it."""
     from types import SimpleNamespace
 
     from sv_pgs.scale_mixture_ep import _next_radius
@@ -1886,7 +1886,10 @@ def test_the_trust_radius_follows_the_models_measured_agreement():
     assert _next_radius(newton, proposal, 1.0, 1.0, predicted * (1.0 - 1e-12), 1e-15) == pytest.approx(1.0 / (2.0 * 1e-12), rel=1e-3)
     assert _next_radius(newton, proposal, 1.0, 1.0, predicted * (1.0 - 1e-15), 1e-12) == 2.0
     assert _next_radius(newton, proposal, 4.0, 1.0, predicted, 1e-6) == 4.0
-    assert _next_radius(newton, proposal, 1.0, 1.0, np.nan, np.nan) == 2.0
+    assert _next_radius(newton, proposal, 1.0, 1.0, np.nan, np.nan) == 1.0
+    assert _next_radius(newton, proposal, 1.0, 1.0, predicted, np.inf) == 1.0
+    # B + S curves the step down by more than g rises along it: the model predicts no gain, so the ratio is undefined.
+    assert _next_radius(SimpleNamespace(gradient=np.array([1.0, 0.0]), total=np.diag([3.0, 1.0])), proposal, 1.0, 1.0, 0.5, 1e-6) == 1.0
 
 
 def test_the_moving_rows_kernel_is_the_log_sum_exp_of_the_kernel_terms():
@@ -2487,4 +2490,80 @@ def test_a_polish_that_cannot_reenter_a_basin_returns_the_state_it_left(monkeypa
     assert len(solved) == (4 if ending == "unmoved" else 3)
     assert {"unmoved": "fixed point unmoved outside every basin", "quadratic": "the departed quadratic failed", "budget": "no certified rise"}[ending] in fit.refusal
     np.testing.assert_array_equal(fit.hyperparameters.coefficients, start.coefficients)
+    np.testing.assert_array_equal(solved[-1], start.coefficients)
+
+
+def test_an_indefinite_step_with_no_certified_value_at_either_end_is_refused_and_shortened(monkeypatch):
+    """aou-m3f-y1 [real]: a release stood at a fixed point with no certified value, and its polish accepted six steps
+    of "decrement inf indefinite, gain nan, state error inf" on the mode objective's own ratio while the radius grew
+    from 0.332 to 130, until a trial's dual solve did not fit. Here a polished state's plan frees block 0, V has no
+    certified value anywhere with it free, and B + S is indefinite there: every step of the release's polish is
+    refused, its radius shrinks at every refusal, and the fit ends at the state the release left."""
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    initial = initial_hyperparameters(prior)
+    blocks = len(prior.smoothing_blocks)
+    start = replace(initial, log_smoothing=np.where(np.arange(blocks) == 0, np.inf, np.full(blocks, 2.0)))
+    size = start.coefficients.size
+    solved, lines = [], []
+    state = engine._State(
+        value=0.0, rest=0.0, gradient=np.ones(size), fixed_curvature=np.eye(size), correction=INDEPENDENT_EFFECTS,
+        error=1e-6, decrement=0.0, polished=True,
+    )
+
+    def free(log_smoothing) -> bool:
+        return bool(np.isfinite(log_smoothing[0]))
+
+    def fixed_points(hyperparameters):
+        solved.append(hyperparameters[0].coefficients.copy())
+        assert len(solved) <= engine.EB_STALL_TRIALS + 4
+        return [FixedPoint(
+            cavity=cavity, posterior=diagonal_posterior(np.ones(prior.variant_count)), mean=np.zeros(prior.variant_count),
+            precision_norm=lambda direction: np.inf, effective_effects=0.0,
+        )]
+
+    def outer_state(view, hyperparameters, *arguments):
+        return None if free(hyperparameters.log_smoothing) else state
+
+    def step(view, hyperparameters, *arguments, held_edges=frozenset(), **keywords):
+        # The release of block 0, until it is held (``refused_releases``); then the state itself.
+        released = 0 not in held_edges and not free(hyperparameters.log_smoothing)
+        weights = np.where(np.arange(blocks) == 0, 2.0, hyperparameters.log_smoothing) if released else hyperparameters.log_smoothing
+        return engine.HyperStep(
+            hyperparameters=MixtureHyperparameters(coefficients=hyperparameters.coefficients, log_smoothing=weights),
+            evidence=1.0 if released else 0.0, evidence_error=0.0, smoothing_gradient=0.0,
+            stationarity_steps=np.zeros(0), stationarity_errors=np.zeros(0), stationarity_gain=0.0,
+        )
+
+    def newton(view, weights, coefficients, *arguments):
+        if not free(weights):
+            return engine._NewtonB(
+                view=view, allowed=np.eye(size), log_smoothing=weights, origin=coefficients, gradient=np.zeros(size),
+                total=np.eye(size), eigenvectors=np.eye(size), eigenvalues=np.ones(size), definite=True, decrement=0.0,
+            )
+        # At the freed weights B + S has a negative eigenvalue: the Newton decrement is infinite, the trust step's
+        # predicted gain finite and positive, and the mode objective rises along it.
+        eigenvalues = np.ones(size)
+        eigenvalues[0] = -1.0
+        return engine._NewtonB(
+            view=view, allowed=np.eye(size), log_smoothing=weights, origin=coefficients, gradient=np.ones(size),
+            total=np.diag(eigenvalues), eigenvectors=np.eye(size), eigenvalues=eigenvalues, definite=False, decrement=np.inf,
+        )
+
+    monkeypatch.setattr(engine, "curvature_correction", lambda *arguments: INDEPENDENT_EFFECTS)
+    monkeypatch.setattr(engine, "_outer_state", outer_state)
+    monkeypatch.setattr(engine, "hyper_step", step)
+    monkeypatch.setattr(engine, "_newton_b", newton)
+    monkeypatch.setattr(engine, "_penalized_gradient", lambda *arguments: np.ones(size))
+    monkeypatch.setattr(engine, "log", lines.append)
+    (fit,) = fit_hyperparameters(prior, [start], fixed_points, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert any("(a release of blocks [0])" in line for line in lines), "\n".join(lines)
+    accepted = [line for line in lines if "inner step accepted" in line]
+    refused = [line for line in lines if "inner step refused" in line]
+    assert not accepted, "\n".join(accepted)
+    assert len(refused) >= 2 and all("decrement inf," in line and line.endswith("no certified value") for line in refused), "\n".join(refused)
+    radii = [float(line.split("(radius ")[1].split(")")[0]) for line in refused]
+    assert all(later < earlier for earlier, later in zip(radii, radii[1:])), radii
+    # The release is undone: the fit stands at the state it left, block 0 at its edge.
+    np.testing.assert_array_equal(fit.hyperparameters.coefficients, start.coefficients)
+    np.testing.assert_array_equal(fit.hyperparameters.log_smoothing, start.log_smoothing)
     np.testing.assert_array_equal(solved[-1], start.coefficients)

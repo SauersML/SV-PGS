@@ -4843,6 +4843,13 @@ def _proposal(newton: _NewtonB, radius: float) -> F64Array:
     return _trust_region_step(newton.total, newton.gradient, radius, spectrum=(newton.eigenvalues, newton.eigenvectors))
 
 
+def _predicted_gain(newton: _NewtonB, proposal: F64Array) -> float:
+    """The quadratic model's gain along ``proposal``, g's - s'(B + S)s / 2: the trust-region ratio's denominator. It is
+    finite where B + S is indefinite, as the Newton decrement there is not (a trust step on |B + S| predicts a positive
+    gain wherever g is not zero)."""
+    return float(newton.gradient @ proposal) - 0.5 * float(proposal @ newton.total @ proposal)
+
+
 def _next_radius(newton: _NewtonB, proposal: F64Array, radius: float, length: float, realized: float, resolution: float) -> float:
     """The trust radius after an accepted inner step of ``length`` inside ``radius``, from the model's measured
     agreement along it (the trust-region update; Nocedal and Wright, Numerical Optimization, 2nd ed., Section 4.1, its
@@ -4856,18 +4863,21 @@ def _next_radius(newton: _NewtonB, proposal: F64Array, radius: float, length: fl
     before Newton's step fitted), and doubles otherwise, as an accepted step always did: shrinking the radius after an
     accepted step left three certificate tests uncertified. A measured error of one half or more (the model
     mispredicted the step by half, or the realized gain fell) supports no longer step, L / (2 e) <= L, so the radius
-    holds. Without a measured gain (a state with no certified value at either end) the radius doubles: such a walk
-    stops where the density collapses or the fixed point stops moving, and doubling reaches either in logarithmically
-    many fixed points. The extrapolation needs the error measured: where the model's deviation from the realized gain is
-    within the gain's resolution, the cubic term is unseen and L / (2 e) at e = resolution / m is no bound (the mode
-    objective's gain is resolved to rounding, so that radius was some 1e13 L, and the next Newton step on the weak
-    directions ran thousands of units to where the EP double loop has no fixed point: tests/test_small_n.py's recoding
-    test, which had taken 3 s, never ended), so the radius doubles."""
+    holds. Where the ratio of the realized gain to the predicted one is undefined (either gain not finite, or a
+    prediction of no gain) the radius holds too: it grows only after a step whose ratio is finite and good (the caller
+    refuses such a step before it gets here, and keeps the radius after a step that measured no gain of V,
+    ``fit_hyperparameters``). Doubling there let a walk with no certified value at either end take its radius from
+    0.332 to 130 in six accepted steps of "decrement inf indefinite, gain nan", and the next trial's dual solve needed
+    25,018 columns, which no device held [real, aou-m3f-y1 hyperlipidemia]. The extrapolation needs the error measured:
+    where the model's deviation from the realized gain is within the gain's resolution, the cubic term is unseen and
+    L / (2 e) at e = resolution / m is no bound (the mode objective's gain is resolved to rounding, so that radius was
+    some 1e13 L, and the next Newton step on the weak directions ran thousands of units to where the EP double loop has
+    no fixed point: tests/test_small_n.py's recoding test, which had taken 3 s, never ended), so the radius doubles."""
     if length < radius * (1.0 - _HALF_PRECISION):
         return radius
-    predicted = float(newton.gradient @ proposal) - 0.5 * float(proposal @ newton.total @ proposal)
-    if not (np.isfinite(realized) and np.isfinite(resolution) and predicted > 0.0):
-        return 2.0 * radius
+    predicted = _predicted_gain(newton, proposal)
+    if not (np.isfinite(realized) and np.isfinite(resolution) and np.isfinite(predicted) and predicted > 0.0):
+        return radius
     deviation = abs(1.0 - realized / predicted)
     error = max(deviation, resolution / predicted)
     if not error < 0.5:
@@ -5869,8 +5879,14 @@ def fit_hyperparameters(
                 # than Newton's thousand units lowers, so the loop halved to x's resolution and read a maximum where
                 # the state's own error was 9.6 nats.
                 mode_gain = 0.5 * float((newton.gradient + gradient) @ proposal)
-                accepted = np.isfinite(mode_gain) and mode_gain > 0.0
+                # The trust-region test (Nocedal and Wright, Algorithm 4.1): a step whose ratio of realized to predicted
+                # gain is undefined (either gain not finite, or a prediction of no gain) is refused and shortened.
+                predicted = _predicted_gain(newton, proposal)
+                accepted = np.isfinite(mode_gain) and mode_gain > 0.0 and np.isfinite(predicted) and predicted > 0.0
             left = False
+            # A walk from a state with no certified value and none to return to (no release in flight, no departed
+            # state): the model has never held a certified state, and the walk is the search for a first one.
+            searching = states[model] is None and anchors[model] is None and departures[model] is None
             if accepted:
                 trial_correction, trial_state = solve_state(trial, trial_point)
                 previous_state = states[model]
@@ -5925,6 +5941,18 @@ def fit_hyperparameters(
                         iterations[model] += 1
                         uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement, "fixed point unmoved outside every basin")
                         continue
+                if previous_state is None and trial_state is None and anchors[model] is not None:
+                    # A release's polish judges the release by x's certified V at the freed weights (``settle_release``),
+                    # and a step with no certified value at either end measures none: it is refused and shortened, as
+                    # a step that leaves a basin is, so the polish reaches a basin by shorter steps or the release is
+                    # settled against the state it left. On hyperlipidemia's whole-genome fit [real, aou-m3f-y1] a
+                    # release of blocks [4, 5, 7] stood at a fixed point with no certified value (x moved 472 units),
+                    # and its polish accepted six steps of "decrement inf indefinite, gain nan, state error inf" on the
+                    # mode objective's own ratio while the radius grew from 0.332 to 130, until a trial's dual solve
+                    # did not fit. A walk from a departed state, or the search for a first certified state, has no
+                    # release to judge: its steps stand on the mode objective's ratio (refused, the mean-field test
+                    # problem's walk from weights 2.0 departed a state of error 282 and ended outside every basin).
+                    accepted, left = False, True
             if accepted:
                 if departs:
                     departures[model] = (
@@ -5945,8 +5973,14 @@ def fit_hyperparameters(
                 if trial_state is not None:
                     # An ascent of x into a certified state: a certified rise of V's integrand at these weights.
                     progressed(model)
+                # The radius grows only after a step whose ratio is finite and good, and that measured a finite gain of
+                # V (a certified value at both ends) or searched for a first certified state (where the mode objective's
+                # is the only gain to measure: held there, the walk from weights 2.0 on the mean-field test problem
+                # moved its fixed point too little to tell from unmoved, and ended outside every basin). Every other
+                # step without a measured gain of V (a departure, a walk from one, a step into a basin) keeps it.
                 mode_gain, mode_rounding = _inner_step_agreement(newton.gradient, gradient, proposal)
-                radii[model] = _next_radius(newton, proposal, entry.radius, length, mode_gain, mode_rounding)
+                grows = np.isfinite(inner_gain) or searching
+                radii[model] = _next_radius(newton, proposal, entry.radius, length, mode_gain, mode_rounding) if grows else entry.radius
                 # A polishing step continues at the same weights; one that left a saddle leads to a new plan.
                 pending[model] = inner(model, entry.step, entry.remaining, True) if entry.polishes else None
                 continue
