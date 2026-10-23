@@ -1,4 +1,4 @@
-SV gain in All of Us: pre-specified analysis, amendment 5
+SV gain in All of Us: pre-specified analysis, amendment 6
 Written 2026-10-22 17:58 PDT and committed before any matched pairing run other than aou-wl15 had been scored.
 
 What had been seen when this was written
@@ -244,6 +244,16 @@ analysis and after the interim combination; the primary has not run)
   - REML + HKSJ treats the traits as independent although they share people. It is reported as an independence-based
     sensitivity analysis.
 
+When, revised (amendment 6, written 2026-10-23 about 00:35 PDT, after the interim combinations logged below; it
+changes only the time)
+- Asthma will have no valid pair: its cold seed aou-m3gs-s1 collapsed to the null, and no pair was submitted. So "all 11
+  traits' pairs finished" can never happen, and asthma is reported as excluded, null seed.
+- The primary runs as soon as every trait that has a pair in flight has finished: CKD (aou-m3g-k), CAD (the m3f-c pair
+  after its seed aou-m3fs-c1) and hyperlipidemia (aou-m3h-y). 2026-10-23 08:00 PDT stays the fallback, and a pair not
+  finished by then is left out and listed.
+- The post-amendment sensitivity analysis (amendment 5) runs as soon as the c4 continuations finish.
+- Family Q8 (amendment 3) is cut by cardio to the 5 traits of its Pair A. Q8's test runs when Pair A finishes.
+
 Results seen (log; no test definition changes because of them)
 - Before 2bf5cb24: aou-wl15 (LDL), as listed at the top.
 - About 19:55 PDT on 2026-10-22, after 2bf5cb24 and cd542c9b (the coordinator's time): runwatch read the run reports of aou-x3-o1
@@ -295,6 +305,21 @@ Results seen (log; no test definition changes because of them)
   - Asthma: the cold seed aou-m3gs-s1 finished at 23:04 PDT collapsed to the null (snv_indel mean |b| 2.9e-16), so no
     asthma pair was submitted. Asthma has no valid pair and is listed as such.
   - CKD: aou-m3g-k1 finished at 22:45 PDT and k2 was running.
+- About 00:15 to 00:30 PDT on 2026-10-23, labelled interim (main 28680564: the same resamples for the observed and
+  swapped statistics, LDL's families joined; long-read people excluded; 200 swaps; all one-sided):
+  - Six pairs on their original fits (LDL merged, hypothyroidism, AF, eGFR, gout, hypertension): g = +0.21% of the
+    arms' mean r^2 [-0.62, 1.05], sharp-null permutation p 0.22, weak-null bootstrap p 0.31, upper bound 0.92%.
+  - The four pairs no continuation touches (LDL aou-x3-l2, hypothyroidism, AF, eGFR): g = -0.00% [-0.16, 0.15],
+    sharp p 0.53, weak p 0.53, upper bound 0.12%. Shares of g: LDL 0.97.
+  - T2D, aou-m3f-t2 (arms t2 and t1; db70b15; it counts under ops's 00:12 rule, since t2 finished at 00:17 PDT with
+    no fault): valid under amendment 2. Held-out score variance is 8.66e-10 (snv_indel) and 1.28e-11 (with_sv), above
+    the 1e-12 threshold, with no NULL_COLLAPSE marker and the fit key and seed shared. Both arms are uncertified
+    (outer_criterion_met, prediction_move, quadrature_unresolved, remaining_gain: no certified rise of V in 8 trials),
+    and each fit log has 9 gain-nan lines. Arm agreement 1.0000. Alone: gain +0.001e-4, sharp p 0.10, weak p 0.11.
+  - Seven pairs, the six above and T2D: g = 0.00% [-0.00, 0.01], sharp p 0.15, weak p 0.11. T2D takes 1.00 of g's
+    weight, since its two near-null arms give the same score and its gain has almost no variance.
+  - Fast baseline, kept apart and never pooled (fastpgs_meta, LDpred2-auto, 11 runs, long-read people excluded): GLS
+    absolute gain -0.033e-4 [-0.85, 0.79], one-sided p about 0.53. g = -0.67% [-2.08, 0.75], weak p 0.82, sharp p 0.86.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
