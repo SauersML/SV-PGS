@@ -454,30 +454,36 @@ def width_of(runs: list[tuple[str, str]], size_pt: float) -> float:
                for text, flags in runs)
 
 
-QR_MOST, REFERENCE_AFTER = 5.0, 8
+QR_MOST, REFERENCE_AFTER = 5.5, 8
 """The largest QR side (inches) the References section grows its code to, and the points between two references."""
 
 
 def references(height: float) -> list[Block]:
     """The References section in ``height`` inches (the Discussion's beside it): its bar, then the references (first
-    author, journal, year) beside the QR code to the repository. The type is as large as fits, from REFERENCE up
-    to below the body size, and then the code as large as fits, from QR up to QR_MOST, so the section is as tall as the
-    Discussion and leaves no white under it."""
+    author, journal, year) beside the QR code to the repository. Each QR side from QR to QR_MOST (in quarter inches)
+    takes the largest type that fits beside it, from REFERENCE up to below the body size; the section keeps the pair
+    that leaves the least white under the references and the code, the larger type on a tie."""
     room = height - BAR - GAPS["bar"]
     entries = [marked(f"{SUPERSCRIPT[index]}{REFERENCE_TEXT[key]}") for index, key in enumerate(REFERENCES, start=1)]
     largest = min(QR_MOST, room - QR_GAP + GAPS["bar"])
-    sides = [largest - 0.25 * step for step in range(int((largest - QR) / 0.25) + 1)]
-    for size in range(BODY - 6, REFERENCE - 1, -1):
-        for side in sides:
-            width = RIGHT - GUTTER - side
+    best = None
+    for side in (largest - 0.25 * step for step in range(int((largest - QR) / 0.25) + 1)):
+        width = RIGHT - GUTTER - side
+        for size in range(BODY - 6, REFERENCE - 1, -1):
             paragraphs = [Para(runs, size, bullet=False, after=REFERENCE_AFTER) for runs in entries]
             paragraphs[-1].after = 0
             used = sum(para.height(width - 2 * INSET) for para in paragraphs) + REFERENCE_AFTER * (len(entries) - 1) / 72
             if used <= room:
-                return [bar(96, "References"),
-                        row([Block("text", paragraphs)], [Block("qr", float(side))],
-                            shares=(width / (RIGHT - GUTTER), side / (RIGHT - GUTTER)))]
-    raise SystemExit(f"the references do not fit beside a {QR} in QR code in {room:.2f} in")
+                white = (room - used) * width + (room - side - QR_GAP + GAPS["bar"]) * side
+                if best is None or (white, -size) < best[0]:
+                    best = ((white, -size), paragraphs, side, width)
+                break
+    if best is None:
+        raise SystemExit(f"the references do not fit beside a {QR} in QR code in {room:.2f} in")
+    _, paragraphs, side, width = best
+    return [bar(96, "References"),
+            row([Block("text", paragraphs)], [Block("qr", float(side))],
+                shares=(width / (RIGHT - GUTTER), side / (RIGHT - GUTTER)))]
 
 
 def row(*children: list, shares: tuple = ()) -> Block:
