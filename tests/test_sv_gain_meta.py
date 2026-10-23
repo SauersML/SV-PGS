@@ -201,3 +201,19 @@ def test_one_trait_alone_gives_its_own_test() -> None:
     result = sv_gain_meta.analyse(traits, families, ancestry, 9, resamples=100, permutations=0)
     assert np.isclose(result["Z"], result["z"][0]) and np.isclose(result["p_acat"], result["p"][0], rtol=1e-6)
     assert np.isfinite(result["absolute_pooled"]["fixed"].estimate)
+
+
+def test_a_null_arm_or_an_arm_fitted_under_another_key_or_seed_excludes_a_pair_and_uncertified_is_flagged(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(sv_gain_meta, "OPS", str(tmp_path))
+    for name, key, seed in (("aou-p1", "k", 1), ("aou-p2", "k", 1), ("aou-q1", "k", 1), ("aou-q2", "other", 2)):
+        (tmp_path / name / "run" / ("fit" if name.endswith("1") else "fit.partial")).mkdir(parents=True)
+        (tmp_path / name / "run" / ("fit" if name.endswith("1") else "fit.partial") / "_KEY").write_text(key + "\n", encoding="utf-8")
+        (tmp_path / name / "run_config.json").write_text(f'{{"seed": {seed}}}', encoding="utf-8")
+    summary = {"quarantined": {}, "uncertified": {"gout": ["with_sv (outer_criterion_met)"]}}
+    assert sv_gain_meta.partners_of("aou-p1") == ["aou-p2"] and sv_gain_meta.partners_of("aou-wl15") == []
+    reasons, uncertified = sv_gain_meta.validity("aou-p1", ["aou-p2"], "gout", {"snv_indel": 1e-4, "with_sv": 2e-4}, summary)
+    assert reasons == [] and uncertified == ["with_sv (outer_criterion_met)"]
+    reasons, _ = sv_gain_meta.validity("aou-p1", ["aou-p2"], "gout", {"snv_indel": 1.6e-35, "with_sv": float("nan")}, summary)
+    assert len(reasons) == 2 and all("null" in reason for reason in reasons)
+    reasons, _ = sv_gain_meta.validity("aou-q1", ["aou-q2"], "ldl", {"snv_indel": 1.0, "with_sv": 1.0}, {"quarantined": {"ldl": ["with_sv (nonfinite)"]}})
+    assert len(reasons) == 3 and "cannot be scored" in reasons[0] and "fit step key" in reasons[1] and "seed" in reasons[2]

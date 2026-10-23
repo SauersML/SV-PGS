@@ -1,1 +1,0 @@
-A table of the variants each method is given: SV-PGS all SNVs, indels and SVs; LDpred2-auto SNVs of MAF ≥ 1% thinned to HapMap3 density, and no indels or SVs.

@@ -433,10 +433,47 @@ def report(result: dict[str, object], traits: Sequence[PairedTrait], contrast: s
 OPS = "/home/jupyter/workspace/svpgs_ops/svpgs"
 
 
-def read_run(name: str, contrast: str = "arms") -> dict[str, object]:
+NULL_VARIANCE = 1e-12
+"""A pair counts only if each arm's genetic score varies over the trait's held-out people by more than this (in the
+trait's units squared; SV_GAIN_PRESPEC.txt, validity). An EB fit that collapsed to the null scores everyone alike: round
+m3's warm-started asthma and CKD pairs had total genetic variances of 1.6e-35 and 1.4e-28. Standardizing such a score
+turns its rounding error into a full-size score, so its "gain" is noise, and it is no null result either."""
+
+
+def partners_of(name: str) -> list[str]:
+    """The run that fitted the other arm of a pairing run named ...1 or ...2 (round x3's and m3's layout): the same name
+    ending in the other digit, where that run exists; none otherwise."""
+    if name[-1:] not in ("1", "2"):
+        return []
+    other = name[:-1] + ("2" if name[-1] == "1" else "1")
+    return [other] if Path(f"{OPS}/{other}/run_config.json").exists() else []
+
+
+def validity(name: str, partners: Sequence[str], cohort_trait: str, variances: dict[str, float], summary: dict[str, object]) -> tuple[list[str], list[str]]:
+    """Why a pairing run is not a valid test of SV gain (SV_GAIN_PRESPEC.txt, validity), and its uncertified arms:
+    - an arm whose fit is unscorable (the score step's quarantined) or null (held-out score variance at most NULL_VARIANCE);
+    - a run that fitted an arm (``partners``) under another fit step key, which holds the fit's code and inputs, or
+      another seed.
+    An uncertified arm (the score step's uncertified) is counted and flagged."""
+    reasons = [f"its {cohort_trait} fit cannot be scored ({'; '.join(summary['quarantined'][cohort_trait])})"] if cohort_trait in summary.get("quarantined", {}) else []
+    reasons += [f"its {arm} fit is null (held-out genetic score variance {variance:.2g}, at most {NULL_VARIANCE:g})"
+                for arm, variance in variances.items() if not variance > NULL_VARIANCE]
+    key = Path(f"{OPS}/{name}/run/fit/_KEY").read_text(encoding="utf-8").strip()
+    seed = json.load(open(f"{OPS}/{name}/run_config.json", encoding="utf-8"))["seed"]
+    for partner in partners:
+        keys = {path.read_text(encoding="utf-8").strip() for path in (Path(f"{OPS}/{partner}/run/fit.partial/_KEY"), Path(f"{OPS}/{partner}/run/fit/_KEY")) if path.exists()}
+        if key not in keys:
+            reasons.append(f"{partner}, which fitted an arm, has another fit step key (code or inputs)")
+        if json.load(open(f"{OPS}/{partner}/run_config.json", encoding="utf-8"))["seed"] != seed:
+            reasons.append(f"{partner}, which fitted an arm, has another seed")
+    return reasons, list(summary.get("uncertified", {}).get(cohort_trait, []))
+
+
+def read_run(name: str, contrast: str = "arms", partners: Sequence[str] | None = None) -> dict[str, object]:
     """One run's trait as the test reads it, from its cohort and score steps inside the workspace: per held-out person
     the research id, family, ancestry, outcome, covariates and the two scores compared (both arms, or for the ablation
-    the with_sv model's score and the same score less its SV terms)."""
+    the with_sv model's score and the same score less its SV terms), with its validity (``validity``; ``partners`` are
+    the runs that fitted its arms, by default ``partners_of``)."""
     from sv_pgs.compute_budget import detect_compute_budget
     from sv_pgs.config import TraitType
     from sv_pgs.workspace_pipeline import ARMS, WorkspaceConfig, _fit_cohort, _held_out_rows, _read_scores, _Run, workspace_bindings
@@ -472,7 +509,11 @@ def read_run(name: str, contrast: str = "arms") -> dict[str, object]:
     if len(cohort.evaluated_folds(trait, run.config.fold_count)) != 1:
         raise ValueError(f"{name}: the test reads one held-out fold")
     rows = np.flatnonzero(_held_out_rows(cohort, trait))
+    variances = {arm: float(np.var(scores.held_out_genetic[ARMS.index(arm), rows, trait])) for arm in ARMS}
+    partners = partners_of(name) if partners is None else list(partners)
+    invalid, uncertified = validity(name, partners, cohort.trait_names[trait], variances, run.summary("score"))
     return {"name": cohort.trait_names[trait], "binary": cohort.trait_types[trait] == TraitType.BINARY,
+            "invalid": invalid, "uncertified": uncertified, "variances": variances, "partners": partners,
             "ids": np.asarray(cohort.research_ids, dtype=object)[rows], "families": cohort.families[rows],
             "ancestry": np.asarray(cohort.ancestry, dtype=object)[rows], "target": cohort.targets[rows, trait],
             "covariates": cohort.covariates[np.ix_(rows, np.flatnonzero(cohort.covariate_columns[trait]))],
@@ -542,7 +583,8 @@ def union(runs: Sequence[dict[str, object]]) -> tuple[list[np.ndarray], np.ndarr
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("runs", nargs="+", help="Matched pairing runs (both arms fitted by identical code), one trait each.")
+    parser.add_argument("runs", nargs="+", help="Matched pairing runs (both arms fitted by identical code), one trait each; "
+                                                "RUN:PARTNER[,PARTNER] names the runs that fitted its arms (default: RUN with its last digit 1 and 2 swapped).")
     parser.add_argument("--contrast", choices=("arms", "ablation"), default="arms",
                         help="arms (primary): with_sv vs snv_indel; ablation (secondary, descriptive): SV terms zeroed in one fit.")
     parser.add_argument("--exclude", help="A file of research ids to drop from every trait's held-out people (one per line, or "
@@ -552,7 +594,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--permutations", type=int, default=PERMUTATIONS)
     parser.add_argument("--resamples", type=int, default=RESAMPLES)
     args = parser.parse_args(argv)
-    runs = [read_run(name, args.contrast) for name in args.runs]
+    named = [(spec.split(":")[0], spec.split(":")[1].split(",") if ":" in spec else None) for spec in args.runs]
+    runs, names = [], []
+    for name, partners in named:
+        run = read_run(name, args.contrast, partners)
+        checked = f"arms fitted by {', '.join([name, *run['partners']])}" if run["partners"] else "both arms fitted in this run"
+        print(f"{name}: {run['name']}; {checked}; held-out genetic score variance "
+              + ", ".join(f"{arm} {variance:.3g}" for arm, variance in run["variances"].items())
+              + (f"; uncertified, counted and flagged: {'; '.join(run['uncertified'])}" if run["uncertified"] else "; both arms certified"))
+        if run["invalid"]:
+            print(f"{name}: EXCLUDED by the validity rule, not counted and not a null result: {'; '.join(run['invalid'])}")
+            continue
+        runs.append(run)
+        names.append(name)
+    if not runs:
+        print("no valid matched pairing run")
+        return 1
+    args.runs = names
     if args.exclude:
         with open(args.exclude, encoding="utf-8") as handle:
             rows = [line.rstrip("\n").split("\t") for line in handle if line.strip()]
