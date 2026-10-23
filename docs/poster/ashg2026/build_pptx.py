@@ -131,7 +131,8 @@ def copy(numbers: dict) -> dict:
         "design": [
             f"{people(svs['people'])} genomes from 1000 Genomes chr22, one cohort",
             f"Baseline: liability h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}, "
-            f"{accuracy['causal']} causal variants; {gain['shown']} architectures vary one setting",
+            f"{accuracy['causal']} causal variants, {accuracy['baseline_sv_share']:.0%} SVs; "
+            f"{gain['shown'] - 1} other architectures vary settings",
         ],
         "whole_note": f"Simulations on whole chr22, tested on {people(accuracy['test_people'])} people",
         "gain_note": f"Mean and 95% CI over {simulations} simulations in 3 Mb of chr22",
