@@ -37,7 +37,8 @@ with their store codes:
 
 Fill statistics run over every store sample. They use genotypes only, never a
 phenotype, and SPEC trains on all samples, so they are the training statistics.
-Codes follow the store encoding: an ALT count x is round(127 x), and a copy-number row's copy
+``observed_fractions`` keeps the share of each row that was called. Codes follow
+the store encoding: an ALT count x is round(127 x), and a copy-number row's copy
 number c is round(c k) with k = floor(254 / its maximum called copy number), its
 value c - its modal called copy number (``copy_number``); each row carries its
 ``codes_per_unit`` and ``value_origin``. A predicted call outside the stored range
@@ -115,6 +116,7 @@ class GatksvRows:
     codes: U8Array
     codes_per_unit: U8Array
     value_origin: I64Array
+    observed_fractions: F64Array
     filled_from_imputed: BoolArray
     clipped_counts: I64Array
     unobserved_records: I64Array
@@ -267,6 +269,7 @@ def gatksv_block_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[G
         codes=row_codes,
         codes_per_unit=row_codes_per_unit,
         value_origin=row_origins,
+        observed_fractions=observed_counts[kept_records] / float(sample_count),
         filled_from_imputed=filled_from_imputed,
         clipped_counts=row_clipped,
         unobserved_records=np.flatnonzero(observed_counts == 0).astype(np.int64),

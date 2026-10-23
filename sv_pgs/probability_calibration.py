@@ -94,11 +94,13 @@ def calibration_mask(training, families, fraction, seed):
     families = np.asarray(families)
     if families.shape != training.shape or not 0 <= fraction < 1:
         raise ValueError("Calibration needs aligned families and a fraction in [0, 1)")
+    result = np.zeros_like(training)
     if not fraction:
-        return np.zeros_like(training)
+        return result
     groups = np.unique(families[training])
     count = max(1, int(round(fraction * len(groups))))
     if count >= len(groups):
         raise ValueError("Not enough independent families for training and calibration")
     chosen = np.random.default_rng(seed).permutation(groups)[:count]
-    return training & np.isin(families, chosen)
+    result = training & np.isin(families, chosen)
+    return result

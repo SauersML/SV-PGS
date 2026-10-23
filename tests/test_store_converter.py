@@ -150,14 +150,16 @@ def test_linear_recalibration_keeps_group_means_and_scales_deviations() -> None:
 
     recalibrated = linear_recalibration(dosage_milli, groups, np.array([[0.5, 1.0]]))
 
-    np.testing.assert_array_equal(recalibrated, [[500, 1000, 1500, 0, 1000, 2000]])
+    np.testing.assert_array_equal(recalibrated.dosage_milli, [[500, 1000, 1500, 0, 1000, 2000]])
+    assert recalibrated.clipped.tolist() == [0]
 
 
-def test_linear_recalibration_clips_and_needs_every_kappa() -> None:
+def test_linear_recalibration_clips_and_counts_and_needs_every_kappa() -> None:
     dosage_milli = np.array([[0, 0, 0, 2000]], dtype=np.uint16)
     recalibrated = linear_recalibration(dosage_milli, np.zeros(4, dtype=np.int64), np.array([[1.5]]))
     # Mean 500; 500 + 1.5 (2000 - 500) = 2750 clips to 2000; 500 + 1.5 (0 - 500) = -250 clips to 0.
-    np.testing.assert_array_equal(recalibrated, [[0, 0, 0, 2000]])
+    np.testing.assert_array_equal(recalibrated.dosage_milli, [[0, 0, 0, 2000]])
+    assert recalibrated.clipped.tolist() == [4]
     with pytest.raises(ValueError, match="finite nonnegative kappa"):
         linear_recalibration(dosage_milli, np.zeros(4, dtype=np.int64), np.array([[np.nan]]))
     with pytest.raises(ValueError, match="finite nonnegative kappa"):
@@ -169,7 +171,7 @@ def test_a_zero_kappa_writes_the_group_mean() -> None:
     dosage_milli = np.array([[0, 1000, 2000, 400, 600, 800]], dtype=np.uint16)
     groups = np.array([0, 0, 0, 1, 1, 1], dtype=np.int64)
     recalibrated = linear_recalibration(dosage_milli, groups, np.array([[0.0, 1.0]]))
-    np.testing.assert_array_equal(recalibrated, [[1000, 1000, 1000, 400, 600, 800]])
+    np.testing.assert_array_equal(recalibrated.dosage_milli, [[1000, 1000, 1000, 400, 600, 800]])
 
 
 def test_overlap_group_first_joins_overlapping_spans_and_extra_groups() -> None:
@@ -354,7 +356,7 @@ def test_assemble_half_applies_the_linear_recalibration(tmp_path) -> None:
     assemble_half(tmp_path / "store", 0, "chr22", [batch.codes], np.array([0, 0, 1]), scales, _fill_of([batch]), codec="raw", budget=_BUDGET)
 
     dosage_milli = ((batch.codes.astype(np.int64) * 2000 + 127) // 254).astype(np.uint16)
-    recalibrated = encode_dosage_milli(linear_recalibration(dosage_milli, np.array([0, 0, 1]), scales))
+    recalibrated = encode_dosage_milli(linear_recalibration(dosage_milli, np.array([0, 0, 1]), scales).dosage_milli)
     array = CodeArray(dosage_array_directory(tmp_path / "store", 0, "chr22"))
     target = np.empty((3, 3), dtype=np.uint8)
     array.read_rows_into(0, 3, target)

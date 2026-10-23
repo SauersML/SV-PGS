@@ -1259,20 +1259,21 @@ def _ensure_open_file_capacity(required_descriptors: int) -> None:
 
 @dataclass(frozen=True, slots=True)
 class _SampleSelection:
-    """Store columns a read returns: all of them, or a sorted gather."""
+    """Store columns a read returns: all of them, one contiguous range, or a sorted gather."""
 
     indices: I64Array
+    contiguous: bool
     complete: bool
 
     @classmethod
     def build(cls, sample_indices: NDArray | None, sample_count: int) -> _SampleSelection:
         if sample_indices is None:
-            return cls(indices=np.arange(sample_count, dtype=np.int64), complete=True)
+            return cls(indices=np.arange(sample_count, dtype=np.int64), contiguous=True, complete=True)
         indices = np.asarray(sample_indices, dtype=np.int64)
         if indices.ndim != 1 or indices.size == 0 or np.any(np.diff(indices) <= 0) or indices[0] < 0 or indices[-1] >= sample_count:
             raise ValueError("sample_indices must be sorted, distinct store columns.")
-        # Sorted, distinct columns below sample_count are all of them exactly when there are sample_count of them.
-        return cls(indices=indices, complete=indices.size == sample_count)
+        contiguous = bool(indices[-1] - indices[0] + 1 == indices.size)
+        return cls(indices=indices, contiguous=contiguous, complete=contiguous and indices.size == sample_count)
 
 
 class DosageStore:
