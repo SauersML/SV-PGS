@@ -443,9 +443,10 @@ def text(paragraphs: list[Para]) -> Block:
     return Block("text", paragraphs)
 
 
-QR, QR_GAP = 3.5, 0.5
+QR, QR_GAP = 3.5, 0.65
 """Inches: the side of the QR code to the repository (its one-module border included), and the white between it and the
-References bar over it, which with that border clears the code's four-module quiet zone."""
+References bar over it, which with that border gives a 5 in code about five modules of white above, one more than the
+four-module quiet zone."""
 
 
 def width_of(runs: list[tuple[str, str]], size_pt: float) -> float:
