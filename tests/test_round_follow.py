@@ -5,6 +5,7 @@ spend cap; a time cap resubmitted only after progress; the round's end, its STOP
 follower started detached, stopped, and started again after a restart."""
 from __future__ import annotations
 
+import ctypes
 import datetime
 import json
 import os
@@ -23,6 +24,7 @@ from tests.test_round import BUCKET, LAUNCHER, _bucket, _repository, _spec, clou
 MARK = "20261022T120000Z"
 """A marker time after every fixture job's creation (CREATED)."""
 CREATED = "2026-10-22T11:00:00Z"
+PR_SET_CHILD_SUBREAPER = 36
 
 
 def _job(state: str, exits=(), hours: float = 0.0, machine: str = "a2-highgpu-2g") -> tuple:
@@ -409,13 +411,23 @@ def test_follow_sh_starts_one_detached_follower_stops_it_and_starts_recorded_rou
     def follow(*arguments: str) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", str(launcher / "follow.sh"), *arguments], env=environment, capture_output=True, text=True, timeout=120)
 
+    def gone(pid) -> bool:
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+        except FileNotFoundError:
+            return True
+
     def started_pid() -> int:
         for _ in range(100):
-            if (state / "r7.pid").is_file() and Path(f"/proc/{(state / 'r7.pid').read_text().strip()}").exists():
+            if (state / "r7.pid").is_file() and not gone((state / "r7.pid").read_text().strip()):
                 return int((state / "r7.pid").read_text())
             time.sleep(0.1)
         raise AssertionError("no follower started")
 
+    # As on the app, where PID 1 (the Jupyter server) reaps no orphan: the supervisor, orphaned when "start" exits, is
+    # this test's child and stays a zombie once it exits, which kill -0 still finds.
+    libc = ctypes.CDLL(None, use_errno=True)
+    assert libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
     started = follow("start", str(spec), "5")
     assert started.returncode == 0 and "follower started" in started.stdout, started.stderr
     pid, supervisor = started_pid(), int((state / "r7.supervisor").read_text())
@@ -426,16 +438,17 @@ def test_follow_sh_starts_one_detached_follower_stops_it_and_starts_recorded_rou
         assert "export OPS_BUCKET=ops-bucket" in (state / "r7.env").read_text()
         assert "already runs" in follow("start", str(spec)).stdout
         assert "running (pid" in follow("status").stdout
+        began = time.monotonic()
         stopped = follow("stop", "r7")
-        assert stopped.returncode == 0 and "stopped" in stopped.stdout
-        assert not Path(f"/proc/{pid}").exists() and not Path(f"/proc/{supervisor}").exists() and not (state / "rounds/r7").exists()
+        assert stopped.returncode == 0 and "stopped" in stopped.stdout and time.monotonic() - began < 30
+        assert gone(pid) and gone(supervisor) and Path(f"/proc/{supervisor}").exists() and not (state / "rounds/r7").exists()
         assert (state / "r7.log").read_text() == "stopped\n"
         # A follower that dies while its round is recorded is started again by its supervisor.
         assert follow("start", str(spec), "5").returncode == 0
         pid = started_pid()
         os.kill(pid, signal.SIGKILL)
         for _ in range(100):
-            if (state / "r7.pid").read_text().strip() != str(pid) and Path(f"/proc/{(state / 'r7.pid').read_text().strip()}").exists():
+            if (state / "r7.pid").read_text().strip() != str(pid) and not gone((state / "r7.pid").read_text().strip()):
                 break
             time.sleep(0.1)
         assert int((state / "r7.pid").read_text()) != pid and "started again" in (state / "r7.out").read_text()
@@ -446,13 +459,37 @@ def test_follow_sh_starts_one_detached_follower_stops_it_and_starts_recorded_rou
         time.sleep(0.5)
         assert "not running" in follow("status").stdout
         assert follow("ensure").returncode == 0
-        assert Path(f"/proc/{started_pid()}").exists()
+        assert not gone(started_pid())
         follow("stop", "r7")
-        assert follow("ensure").returncode == 0 and not Path(f"/proc/{int((state / 'r7.pid').read_text())}").exists()
+        assert follow("ensure").returncode == 0 and gone(int((state / "r7.pid").read_text()))
+        assert f"export PATH={os.environ['PATH']}" in (state / "r7.env").read_text()
     finally:
         follow("stop", "r7")
+        libc.prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0)
+        while True:
+            try:
+                if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                    break
+            except ChildProcessError:
+                break
     # install-boot adds a hook to the Jupyter server's config once, and the hook compiles.
     assert "installed" in follow("install-boot").stdout and "already installed" in follow("install-boot").stdout
     config = (tmp_path / "home/.jupyter/jupyter_server_config.py").read_text()
     compile(config, "jupyter_server_config.py", "exec")
-    assert config.count("svpgs-follow") == 1 and f"{launcher}/follow.sh" in config
+    assert config.count("svpgs-follow") == 1 and f"{launcher}/follow.sh" in config and f"{state}/boot.log" in config
+    # On the app, ~/.jupyter's file is root's: the hook goes in the next config directory under HOME that jupyter --paths
+    # names, and none outside HOME.
+    home = tmp_path / "app"
+    (home / ".jupyter").mkdir(parents=True)
+    (home / ".jupyter/jupyter_server_config.py").write_text("c = get_config()\n")
+    (home / ".jupyter/jupyter_server_config.py").chmod(0o444)
+    tools = tmp_path / "jupyter-bin"
+    tools.mkdir()
+    (tools / "jupyter").write_text(f"#!/bin/sh\nprintf 'config:\\n    {home}/.jupyter\\n    {tmp_path}/etc/jupyter\\n    {home}/.local/etc/jupyter\\n"
+                                   f"data:\\n    {home}/.local/share/jupyter\\n'\n")
+    (tools / "jupyter").chmod(0o755)
+    environment.update(HOME=str(home), PATH=f"{tools}:{os.environ['PATH']}")
+    assert f"installed in {home}/.local/etc/jupyter/jupyter_server_config.py" in follow("install-boot").stdout
+    assert "already installed" in follow("install-boot").stdout and not (tmp_path / "etc").exists()
+    assert (home / ".jupyter/jupyter_server_config.py").read_text() == "c = get_config()\n"
+    compile((home / ".local/etc/jupyter/jupyter_server_config.py").read_text(), "jupyter_server_config.py", "exec")

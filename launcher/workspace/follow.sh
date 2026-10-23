@@ -27,8 +27,12 @@ CONTENDED=4
 mkdir -p "$STATE/rounds"
 
 alive() {
-  # Process $1 runs and its command line holds $2 (a pid reused by another process is not it).
-  kill -0 "$1" 2>/dev/null && tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -qF -- "$2"
+  # Process $1 runs and its command line holds $2 (a pid reused by another process is not it). A zombie has exited: on the
+  # app, PID 1 is the Jupyter server, which reaps no orphan, so a supervisor that exited stays a zombie, and kill -0
+  # still succeeds on it.
+  local state
+  state="$(sed -n 's/^.*) \([A-Za-z]\).*$/\1/p' "/proc/$1/stat" 2>/dev/null)" || return 1
+  [ -n "$state" ] && [ "$state" != Z ] && tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -qF -- "$2"
 }
 
 running() {
@@ -87,7 +91,8 @@ start() {
     return 0
   fi
   : > "$STATE/$round.env"
-  for name in $(cd "$here" && python3 -c 'import round; print(" ".join(round.WORKSPACE_ENVIRONMENT))') PROJECT_ID REGION STUDY_BUDGET; do
+  # PATH too: "ensure" from the Jupyter server's hook finds python3 and gcloud where this terminal does.
+  for name in $(cd "$here" && python3 -c 'import round; print(" ".join(round.WORKSPACE_ENVIRONMENT))') PROJECT_ID REGION STUDY_BUDGET PATH; do
     [ -z "${!name:-}" ] || printf 'export %s=%q\n' "$name" "${!name}" >> "$STATE/$round.env"
   done
   printf '%s\n%s\n' "$spec" "$minutes" > "$STATE/rounds/$round"
@@ -151,22 +156,36 @@ case "${1:-}" in
       (set -a && . "$STATE/$round.env" && set +a && start "$spec" "$minutes") || echo "round $round: not started" >&2
     done ;;
   install-boot)
-    config="$HOME/.jupyter/jupyter_server_config.py"
-    if grep -q "svpgs-follow" "$config" 2>/dev/null; then
-      echo "already installed in $config"
-    else
-      mkdir -p "$(dirname "$config")"
-      cat >> "$config" <<PY
+    # The hook goes in a jupyter_server_config.py this user can write, in one of the Jupyter server's config directories
+    # (jupyter --paths) under HOME, the disk the app keeps across restarts. On the app, ~/.jupyter's file is root's, and
+    # the server also reads ~/.local/etc/jupyter. "ensure"'s output goes to STATE/boot.log.
+    dirs="$( (jupyter --paths 2>/dev/null || true) | awk '/^[a-z]+:$/ {section = $1; next} section == "config:" {print $1}')"
+    [ -n "$dirs" ] || dirs="$HOME/.jupyter"
+    config=""
+    for dir in $dirs; do
+      case "$dir" in "$HOME"/*) ;; *) continue ;; esac
+      if grep -q "svpgs-follow" "$dir/jupyter_server_config.py" 2>/dev/null; then
+        echo "already installed in $dir/jupyter_server_config.py"
+        exit 0
+      fi
+      if [ -z "$config" ] && { [ -w "$dir/jupyter_server_config.py" ] || { [ ! -e "$dir/jupyter_server_config.py" ] && mkdir -p "$dir" 2>/dev/null && [ -w "$dir" ]; }; }; then
+        config="$dir/jupyter_server_config.py"
+      fi
+    done
+    if [ -z "$config" ]; then
+      echo "not installed: no Jupyter config directory under $HOME takes the hook (jupyter --paths: $(echo $dirs))" >&2
+      exit 1
+    fi
+    cat >> "$config" <<PY
 
 # svpgs-follow: start the study's recorded round followers when this server starts (launcher/workspace/follow.sh ensure).
 try:
-    import subprocess as _svpgs_follow
-    _svpgs_follow.Popen(["bash", "$here/follow.sh", "ensure"], start_new_session=True, stdin=_svpgs_follow.DEVNULL,
-                        stdout=_svpgs_follow.DEVNULL, stderr=_svpgs_follow.DEVNULL)
+    import os as _svpgs_os, subprocess as _svpgs_follow
+    _svpgs_follow.Popen(["bash", "-c", 'exec bash "\$0" ensure >> "\$1" 2>&1', "$here/follow.sh", "$STATE/boot.log"],
+                        start_new_session=True, stdin=_svpgs_follow.DEVNULL, env=dict(_svpgs_os.environ, SVPGS_FOLLOW_STATE="$STATE"))
 except Exception:
     pass
 PY
-      echo "installed in $config"
-    fi ;;
+    echo "installed in $config" ;;
   *) echo "usage: follow.sh start ROUND.json [MINUTES] | stop ROUND | status | ensure | install-boot" >&2; exit 2 ;;
 esac
