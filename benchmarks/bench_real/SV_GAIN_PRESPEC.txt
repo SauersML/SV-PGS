@@ -283,6 +283,21 @@ changes only the time)
   - Power over the 4 traits (sum r^2 n 579): at 1 - rho = 0.022 the SE is 1.74% and power at g = 2% is 0.31. At
     1 - rho = 0.005 the SE is 0.83% and power at g = 2% is 0.78. At 1 - rho = 0.0004 the SE is 0.24%, and power is
     0.68 at g = 0.5% and 1.00 at g = 1%.
+  - Three more pairs failed (logged 2026-10-23 about 06:50 PDT by cardio, before the Q8 test ran). Each failure is
+    technical, and amendment 3 leaves a failed pair out and lists it:
+    - SBP: aou-q8a-s2 (with_sv) ran out of GPU memory in the fit at 05:34 PDT on its third attempt. The follower does not
+      resubmit a driver OOM, and the round was over its $105 resubmission cap.
+    - HbA1c: both arms spent 6 h 20 min in the measurement step (_group_code_moments, CPU only) and never reached the
+      fit. ops stopped them at 06:33 PDT, logs saved first.
+    - BMI: aou-q8a-b2 (with_sv) logged no completed EB iteration after round 21 at 02:33 PDT, with host memory at 158 of
+      167 GiB and its 8 h attempt cap at 08:03 PDT. cardio stopped it at about 06:45 PDT, logs saved first.
+  - Q8's test therefore runs now over HDL (aou-q8a-l1/l2), its one finished pair, under amendment 3's rule that the test
+    runs once every pair has finished or failed. The app's ~/xw/q8_watch.sh was restarted for HDL alone. With one trait,
+    g is HDL's own relative gain.
+  - Blinding note: while checking whether aou-q8a-b2 had stalled, cardio printed its log tail, which held two EB
+    monitor lines for the with_sv arm's held-out fold (pgs_partial_r2 about 0.006 at iterations 20 and 21). No
+    snv_indel value for BMI was seen, so no BMI gain was computed. BMI was stopped for the stall alone, and BMI has no
+    finished pair, so the value enters no test. No HDL value had been read.
 
 Primary now (amendment 7, written 2026-10-23 at 06:20 PDT at the coordinator's request, because the user needs the
 final results now; no CAD or hyperlipidemia value had been read, and no primary had run)
