@@ -632,7 +632,7 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     with DosageStore.open(run / "store" / "store", half_indices=[0]) as before, DosageStore.open(run / "measurement" / "store", half_indices=[0]) as after:
         groups = np.load(run / "samples" / "groups_half0.npy")
         stored_milli = ((before.read_codes(0, before.n_variants).astype(np.int64) * 2000 + 127) // 254).astype(np.uint16)
-        expected = linear_recalibration(stored_milli, groups, measurement["scales"][:, : groups.max() + 1]).dosage_milli
+        expected = linear_recalibration(stored_milli, groups, measurement["scales"][:, : groups.max() + 1])
         np.testing.assert_array_equal(after.read_codes(0, after.n_variants), encode_dosage_milli(expected))
         assert after.manifest_attributes["recalibrated"] is True
     # direct_sv is null here: the step adds no row, and the fit reads the measurement step's store and model.

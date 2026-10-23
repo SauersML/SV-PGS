@@ -167,21 +167,13 @@ def value_matched_background(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class Recalibration:
-    """A block's recalibrated dosages and how many entries the [0, 2] range clipped."""
-
-    dosage_milli: NDArray
-    clipped: I64Array
-
-
-def linear_recalibration(dosage_milli: NDArray, sample_groups: NDArray, scales: NDArray) -> Recalibration:
+def linear_recalibration(dosage_milli: NDArray, sample_groups: NDArray, scales: NDArray) -> NDArray:
     """D* = mu_g + kappa (DS - mu_g) per record and ancestry group, on thousandths of a dosage.
 
     ``sample_groups[s]`` is sample s's ancestry group (0..G-1) and ``scales[r, g]`` the kappa of
     record r's stratum in group g. mu_g is the record's mean over the
     group's samples, so the group means are unchanged. Results are rounded half up and clipped
-    to [0, 2000]; ``clipped`` counts the entries the clip changed.
+    to [0, 2000].
 
     kappa = 0 is a calibration, not a missing one: ``measurement_model`` projects a negative
     Cov(G, D) to 0 (the column carries no signal in that group, and its log reliability there is
@@ -203,12 +195,7 @@ def linear_recalibration(dosage_milli: NDArray, sample_groups: NDArray, scales: 
         members = groups == group
         centre = values[:, members].mean(axis=1, keepdims=True)
         recalibrated[:, members] = centre + kappa[:, group : group + 1] * (values[:, members] - centre)
-    rounded = np.floor(recalibrated + 0.5)
-    clipped = (rounded < 0) | (rounded > MAXIMUM_DOSAGE_MILLI)
-    return Recalibration(
-        dosage_milli=np.clip(rounded, 0, MAXIMUM_DOSAGE_MILLI).astype(milli.dtype),
-        clipped=clipped.sum(axis=1).astype(np.int64),
-    )
+    return np.clip(np.floor(recalibrated + 0.5), 0, MAXIMUM_DOSAGE_MILLI).astype(milli.dtype)
 
 
 @dataclass(frozen=True, slots=True)
@@ -829,7 +816,7 @@ def _half_code_blocks(
         if scales is not None:
             # D* from the codes: DS = code / 127 to the nearest thousandth (rounded half up), recalibrated, re-encoded.
             dosage_milli = ((codes.astype(np.int64) * MAXIMUM_DOSAGE_MILLI + CODES_PER_DOSAGE) // MAXIMUM_CODE).astype(np.uint16)
-            codes = encode_dosage_milli(linear_recalibration(dosage_milli, sample_groups, scales[start:stop]).dosage_milli)
+            codes = encode_dosage_milli(linear_recalibration(dosage_milli, sample_groups, scales[start:stop]))
         yield codes
 
 
