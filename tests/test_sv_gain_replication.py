@@ -80,4 +80,4 @@ def test_people_and_family_counts_come_from_the_rows_and_small_cells_are_masked(
     assert found["people"] == people
     assert found["families"] == people // 3
     text = "\n".join(report({**found, "cases": 7}, "trait"))
-    assert "<=20" in text and " 7" not in text
+    assert "<40" in text and " 7" not in text

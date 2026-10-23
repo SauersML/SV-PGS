@@ -49,8 +49,14 @@ CHUNK_ROWS = 4000
 """Records per extraction task: one ``bcftools view -R`` over their positions in one batch file."""
 
 
+MINIMUM_SHOWN = 40
+"""No count below this is printed or read from All of Us: anything smaller is masked at the source (the user's rule of
+2026-10-22, which tightens the program's own small-cell rule of 20)."""
+
+
 def shown(count: int) -> str:
-    return "<=20" if 1 <= count <= 20 else str(count)
+    """A count as it may be printed: below MINIMUM_SHOWN, only that it is below it."""
+    return f"<{MINIMUM_SHOWN}" if 1 <= count < MINIMUM_SHOWN else str(count)
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,32 @@ def model_weights(folder: str | Path) -> ModelWeights:
         beta = np.asarray(arrays[f"scoring/{index}/coefficients"], dtype=np.float64)
     weights = beta / scales
     return ModelWeights(rows, weights, weights * means, str(metadata["provenance"]["sites_digest"]))
+
+
+def fast_method_weights(units_path: str | Path, records: np.ndarray, label: str) -> ModelWeights:
+    """One standard-method arm's fitted effects as a ``ModelWeights`` (``benchmarks.bench_real.aou_fastpgs.Units``).
+
+    ``records`` are the store rows its ``effects`` rows index, in the order that job built them, and ``label`` the
+    column, such as ``"with_sv|ldpred2_auto|auto"``. That job's score is
+    sum_j effect_j (code_j / 127 - mean_j), so in signed codes s = code - 127 the weight is effect_j / 127 and the
+    centre effect_j (mean_j - 1); a record the callset lacks then adds neither term, which leaves it at the training
+    mean, as it does for a fitted SV-PGS model. The means are the ones the effects were fitted with and are never
+    re-estimated on the new people. Rows with a zero effect carry no score and are dropped, which is what makes the
+    snv_indel arm's records a subset of the with_sv arm's."""
+    with np.load(Path(units_path), allow_pickle=False) as arrays:
+        labels = [str(value) for value in arrays["labels"]]
+        if label not in labels:
+            raise ValueError(f"{units_path} has no column {label!r}; it holds {len(labels)} columns.")
+        effects = np.asarray(arrays["effects"][:, labels.index(label)], dtype=np.float64)
+        means = np.asarray(arrays["means"], dtype=np.float64)
+    rows = np.asarray(records, dtype=np.int64)
+    if effects.shape[0] != rows.shape[0] or means.shape[0] != rows.shape[0]:
+        raise ValueError(f"{units_path}: {effects.shape[0]} effects and {means.shape[0]} means for {rows.shape[0]} records.")
+    used = np.flatnonzero(effects != 0.0)
+    order = used[np.argsort(rows[used], kind="stable")]
+    if order.shape[0] > 1 and np.any(np.diff(rows[order]) <= 0):
+        raise ValueError(f"{units_path}: its records repeat a store row.")
+    return ModelWeights(rows[order], effects[order] / 127.0, effects[order] * (means[order] - 1.0), "fast-method weights")
 
 
 @dataclass(frozen=True)

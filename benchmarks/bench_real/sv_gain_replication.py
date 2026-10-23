@@ -1,7 +1,20 @@
-"""The pre-specified replication of one trait's matched SV gain in held-out people of a later imputed callset.
+"""The pre-specified replications of a trait's SV gain in held-out people of a later imputed callset.
 
 Fixed before any replication value was computed (~/svpgs-watch/JOURNAL.txt, 2026-10-22). Nothing below is chosen
-after seeing a replication number.
+after seeing a replication number. ``REPLICATIONS`` holds one entry per pre-registered trait, each with the discovery
+result it replicates. Every entry shares the statistic, the one-sided level, the calibration and the batch-drift
+limitation below.
+
+chronic_kidney_disease, the standard-method pair of run aou-m1p-k. Here the two arms are LDpred2-auto fitted on the
+with_sv records and LDpred2-auto fitted on the snv_indel records, in one process on the same training rows with the
+same settings, from one GWAS pass whose snv_indel LD band is the restriction of the with_sv band, and scored on the
+same held-out people. Its saved effects are applied to the new people unchanged, centred on the training means they
+were fitted with (``extra_test_people.fast_method_weights``); nothing is refitted and no mean is re-estimated on the
+new people. Its discovery result is a gain of +3.98e-4 (95% CI +0.83 to +7.93e-4, two-sided p 0.027, so one-sided
+0.013, +10.3% relative) over 7,185 held-out people, from the same partial-r^2 statistic. That cell is the strongest of
+three methods by eleven traits and carries no multiplicity correction, and the pooled LDpred2-auto test over the
+eleven traits is null (permutation p 0.55), which is exactly why it needs an independent test rather than a louder
+claim. The secondary DeLong AUC difference there was +0.0042 (0.0012 to 0.0072).
 
 Trait and models. hypothyroidism, the matched pair of pairing run x3: the with_sv arm against the separately fitted
 snv_indel arm, both fitted by identical code (digest 7a0580a9) on the same training people, over the same store layout
@@ -53,6 +66,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from dataclasses import dataclass
 
 import numpy as np
 from scipy import stats
@@ -62,6 +76,39 @@ from sv_pgs.held_out_comparison import cluster_bootstrap_counts, weighted_partia
 TRAIT = "hypothyroidism"
 PAIR = "x3"
 """The pairing run whose two arms are replicated (``aou-x3-o1`` holds both arms' models and the discovery report)."""
+
+
+@dataclass(frozen=True)
+class PreSpecified:
+    """One trait's pre-registered replication: what is compared, where its weights are, and the discovery result it
+    replicates. Written before any replication value for that trait was computed."""
+
+    trait: str
+    run: str
+    arms: str
+    statistic: str
+    discovery_gain: float
+    discovery_ci: tuple[float, float]
+    discovery_p_one_sided: float
+    discovery_relative: float
+    fixed_on: str
+
+
+REPLICATIONS = {
+    "hypothyroidism": PreSpecified(
+        trait="hypothyroidism", run="aou-x3-o1", arms="SV-PGS with_sv against the separately fitted snv_indel arm, identical code 7a0580a9",
+        statistic="paired held-out partial r^2 difference, family-bootstrap SE, one-sided",
+        discovery_gain=0.71e-4, discovery_ci=(-0.09e-4, 1.58e-4), discovery_p_one_sided=0.043, discovery_relative=0.015,
+        fixed_on="2026-10-22"),
+    "chronic_kidney_disease": PreSpecified(
+        trait="chronic_kidney_disease", run="aou-m1p-k",
+        arms="LDpred2-auto fitted on the with_sv records against LDpred2-auto fitted on the snv_indel records, one process, same code and training rows",
+        statistic="paired held-out partial r^2 difference, family-bootstrap SE, one-sided",
+        discovery_gain=3.98e-4, discovery_ci=(0.83e-4, 7.93e-4), discovery_p_one_sided=0.013, discovery_relative=0.103,
+        fixed_on="2026-10-22"),
+}
+"""Every trait pre-registered for the new people, each entry fixed before that trait was scored there."""
+
 ALPHA = 0.05
 """The replication's one-sided level."""
 SCREENING_LEVEL = 0.10
@@ -76,8 +123,14 @@ CHUNK = 250
 """Resamples per ``weighted_partial_r2`` call (``sv_gain_meta.CHUNK``)."""
 
 
+MINIMUM_SHOWN = 40
+"""No count below this is printed or read from All of Us: anything smaller is masked at the source (the user's rule of
+2026-10-22, which tightens the program's own small-cell rule of 20)."""
+
+
 def shown(count: int) -> str:
-    return "<=20" if 1 <= count <= 20 else str(count)
+    """A count as it may be printed: below MINIMUM_SHOWN, only that it is below it."""
+    return f"<{MINIMUM_SHOWN}" if 1 <= count < MINIMUM_SHOWN else str(count)
 
 
 def promising(p_one_sided: float, matched_arms: bool, identical_code: bool) -> bool:

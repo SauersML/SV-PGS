@@ -1,13 +1,44 @@
 import numpy as np
+import pytest
 
 from benchmarks.bench_real.extra_test_people import (
     ModelWeights,
     aligned_covariates,
+    fast_method_weights,
     finished_scores,
     joined_families,
     partial_scores,
+    shown,
     weight_table,
 )
+
+
+def test_fast_method_weights_reproduce_the_jobs_own_score_and_drop_unused_rows(tmp_path):
+    rng = np.random.default_rng(2)
+    records = np.array([9, 2, 15, 4, 11])
+    means = rng.uniform(0.0, 2.0, size=5)
+    effects = np.array([0.3, -0.2, 0.0, 0.5, 0.1])
+    other = rng.normal(size=5)
+    path = tmp_path / "units.npz"
+    np.savez(path, means=means, effects=np.column_stack([effects, other]),
+             labels=np.array(["with_sv|ldpred2_auto|auto", "snv_indel|ldpred2_auto|auto"]))
+    found = fast_method_weights(path, records, "with_sv|ldpred2_auto|auto")
+    # The zero-effect record is dropped and the rest are in ascending store-row order.
+    np.testing.assert_array_equal(found.rows, [2, 4, 9, 11])
+    codes = rng.integers(0, 255, size=(5, 6)).astype(np.uint8)
+    used = np.array([1, 3, 0, 4])
+    table = weight_table([found])
+    scores = finished_scores(partial_scores(codes[used], table.weights), table, np.ones(4, dtype=bool))
+    expected = (effects[used, None] * (codes[used].astype(float) / 127.0 - means[used, None])).sum(axis=0)
+    np.testing.assert_allclose(scores[0], expected, rtol=1e-12, atol=1e-12)
+    with pytest.raises(ValueError, match="no column"):
+        fast_method_weights(path, records, "with_sv|lassosum2|auto")
+
+
+def test_counts_below_forty_are_masked():
+    assert shown(0) == "0"
+    assert shown(1) == "<40" and shown(39) == "<40"
+    assert shown(40) == "40" and shown(7185) == "7185"
 
 
 def test_mean_score_matches_standardized_formula_with_missing_record_at_its_mean():
