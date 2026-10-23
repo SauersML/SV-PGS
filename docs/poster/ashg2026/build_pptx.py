@@ -90,8 +90,19 @@ REFERENCES = [
     "Rubinacci 2023 Nat Genet",
     "Privé 2020 Bioinformatics",
 ]
-"""First author, year and journal, one to a line, numbered in superscript in the order the text first cites them
-(``cite``): the SVs per genome, All of Us, GLIMPSE2 and LDpred2. Figures carry no citations."""
+"""Each reference's key, numbered in superscript in the order the text first cites them (``cite``): the SVs per genome
+and the 1000 Genomes panel, All of Us, GLIMPSE2 and LDpred2. Figures carry no citations."""
+REFERENCE_TEXT = {
+    "Byrska-Bishop 2022 Cell": "Byrska-Bishop M et al. High-coverage whole-genome sequencing of the expanded 1000 Genomes "
+                               "Project cohort including 602 trios. Cell 2022.",
+    "All of Us 2019 N Engl J Med": "All of Us Research Program Investigators. The All of Us Research Program. "
+                                   "N Engl J Med 2019.",
+    "Rubinacci 2023 Nat Genet": "Rubinacci S et al. Imputation of low-coverage sequencing data from 150,119 UK Biobank "
+                                "genomes. Nat Genet 2023.",
+    "Privé 2020 Bioinformatics": "Privé F et al. LDpred2: better, faster, stronger. Bioinformatics 2020.",
+}
+"""Each reference as the References section prints it: first author, title, journal and year, each checked against
+the journal (Cell 185:3426; N Engl J Med 381:668; Nat Genet 55:1088; Bioinformatics 36:5424)."""
 SUPERSCRIPT = dict(zip(range(1, 10), "¹²³⁴⁵⁶⁷⁸⁹"))
 DESIGN_SHARES = (0.0, 0.05, 0.2)
 """The shares of causal variants that are SVs over benchmarks/power/grid.py's POINTS, which
@@ -146,7 +157,9 @@ def copy(numbers: dict) -> dict:
         "methods": ["Priors use SV type, length, frequency and imputation r²."],
         # the grid varies one or two settings at a time from its base disease: the causal SV share, the SV effects' size
         # or shape, h² 0.01, prevalence 1%, 50 or 2,000 causal variants, and which SVs are causal
-        "design": [f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22."],
+        # the simulation's haplotypes are the 1000 Genomes high-coverage phased SNV/INDEL/SV panel (Byrska-Bishop 2022)
+        "design": [f"{people(svs['people'])} genomes simulated from 1000 Genomes{cite('Byrska-Bishop 2022 Cell')} "
+                   "chr22."],
         "grid": [f"Simulated diseases vary the causal SV share ({listed([f'{share:.0%}' for share in DESIGN_SHARES])}), "
                  "SV effects, h², prevalence and causal count."],
         # GLIMPSE2 is Rubinacci 2023; the assemblies are the accepted abstract's 12,212 phased genome assemblies
@@ -443,14 +456,30 @@ def width_of(runs: list[tuple[str, str]], size_pt: float) -> float:
                for text, flags in runs)
 
 
-def references() -> list[Block]:
-    """The References section: its bar, then the QR code to the repository with the references in small type under it,
-    one to a line."""
-    lines = [marked(f"{SUPERSCRIPT[index]}{reference}") for index, reference in enumerate(REFERENCES, start=1)]
-    if max(width_of(runs, REFERENCE) for runs in lines) + 2 * INSET > RIGHT:
-        raise SystemExit("a reference runs past the right column")
-    return [bar(96, "References"), Block("qr", None),
-            Block("text", [Para(runs, REFERENCE, bullet=False, after=0) for runs in lines])]
+QR_MOST, REFERENCE_AFTER = 5.0, 8
+"""The largest QR side (inches) the References section grows its code to, and the points between two references."""
+
+
+def references(height: float) -> list[Block]:
+    """The References section in ``height`` inches (the Discussion's beside it): its bar, then the references (first
+    author, title, journal, year) beside the QR code to the repository. The type is as large as fits, from REFERENCE up
+    to below the body size, and then the code as large as fits, from QR up to QR_MOST, so the section is as tall as the
+    Discussion and leaves no white under it."""
+    room = height - BAR - GAPS["bar"]
+    entries = [marked(f"{SUPERSCRIPT[index]}{REFERENCE_TEXT[key]}") for index, key in enumerate(REFERENCES, start=1)]
+    largest = min(QR_MOST, room - QR_GAP + GAPS["bar"])
+    sides = [largest - 0.25 * step for step in range(int((largest - QR) / 0.25) + 1)]
+    for size in range(BODY - 6, REFERENCE - 1, -1):
+        for side in sides:
+            width = RIGHT - GUTTER - side
+            paragraphs = [Para(runs, size, bullet=False, after=REFERENCE_AFTER) for runs in entries]
+            paragraphs[-1].after = 0
+            used = sum(para.height(width - 2 * INSET) for para in paragraphs) + REFERENCE_AFTER * (len(entries) - 1) / 72
+            if used <= room:
+                return [bar(96, "References"),
+                        row([Block("text", paragraphs)], [Block("qr", float(side))],
+                            shares=(width / (RIGHT - GUTTER), side / (RIGHT - GUTTER)))]
+    raise SystemExit(f"the references do not fit beside a {QR} in QR code in {room:.2f} in")
 
 
 def row(*children: list, shares: tuple = ()) -> Block:
@@ -517,7 +546,7 @@ class Poster:
         if block.kind == "placeholder":
             return 0.0
         if block.kind == "qr":
-            return QR + QR_GAP - GAPS["bar"]
+            return (block.content or QR) + QR_GAP - GAPS["bar"]
         if block.kind == "row":
             return max(self.stack_height(child, part) for child, part in zip(block.children, parts(block, width)))
         raise ValueError(block.kind)
@@ -561,8 +590,9 @@ class Poster:
         elif block.kind == "placeholder":
             self.shapes.append(placeholder(self.fresh(), x, y, width, height, *block.content))
         elif block.kind == "qr":
+            side = block.content or QR
             self.shapes.append(image(self.fresh(), "Repository QR code", self.image(self.qr), x,
-                                     y + QR_GAP - GAPS["bar"], QR, QR,
+                                     y + QR_GAP - GAPS["bar"], side, side,
                                      "QR code to github.com/SauersML/SV-PGS"))
         elif block.kind == "row":
             for child, part in zip(block.children, parts(block, width)):
@@ -667,7 +697,8 @@ def build() -> None:
     # the band across the foot of the middle and right columns: the Discussion under the middle column, the References
     # under the right
     across = MIDDLE + GUTTER + RIGHT
-    band = [row(discussion, references(), shares=(MIDDLE / (across - GUTTER), RIGHT / (across - GUTTER)))]
+    band = [row(discussion, references(poster.stack_height(discussion, MIDDLE)),
+                shares=(MIDDLE / (across - GUTTER), RIGHT / (across - GUTTER)))]
     top = BOTTOM - poster.stack_height(band, across)
     poster.stack(band, COLUMNS[1][0], top, across, None)
     for index, ((x, width), blocks) in enumerate(zip(COLUMNS, columns)):

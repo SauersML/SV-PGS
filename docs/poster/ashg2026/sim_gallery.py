@@ -1101,8 +1101,9 @@ POSTER_GENOTYPES_HEIGHT = POSTER_GAIN_HEIGHT
 """Inches: the imputation figure's height, the SV gain forest's, so the two sit flush side by side."""
 GAIN_WEIGHT = 1.0
 """The SV gain forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR)."""
-GAIN_TITLE = "Test AUC gain from SVs"
-"""The SV gain forest's x axis title, short enough for one line."""
+GAIN_TITLE, GAIN_SCALE = "AUC gain from SVs (×1,000)", 1000
+"""The SV gain forest's x axis title, short enough for one line, and the factor its tick labels show the gain times,
+so three or more short labels fit along the axis."""
 FOREST_SIZES = SIZES[:3]
 """The training sizes the SV gain forest averages over, 5,000 to 20,000. Both genotype sources reached 40,000 in one
 simulation only, a control one, and the gain grows with training size: with it, the control's gain with imputed SVs
@@ -1190,12 +1191,21 @@ def gain_forest(rows: list[dict], bold: dict):
     # the y axis in inches down the plot
     ax.set_ylim(plot, 0)
     ax.set_xlim(*limits)
-    # the finest tick step whose labels stand 0.3 in apart
-    wide = widest(fig, ["0.000"], fontsize=POSTER_TYPE) + 0.3
-    step = next(step for step in (0.001, 0.002, 0.004, 0.005, 0.01, 0.02)
-                if step * width / (limits[1] - limits[0]) >= wide)
-    ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
-    ax.set_xticks(ticks, [plain(tick, 3) for tick in ticks])
+    # the finest tick step giving three or more ticks whose labels stand 0.3 in apart and end inside the figure
+    inch = width / (limits[1] - limits[0])
+
+    def label(tick):
+        return plain(tick * GAIN_SCALE, 0)
+
+    def ticked(step):
+        ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
+        sizes = [widest(fig, [label(tick)], fontsize=POSTER_TYPE) for tick in ticks]
+        apart = all(step * inch >= (first + second) / 2 + 0.3 for first, second in zip(sizes, sizes[1:]))
+        inside = len(ticks) and (limits[1] - ticks[-1]) * inch + right >= sizes[-1] / 2
+        return ticks if len(ticks) >= 3 and apart and inside else None
+
+    ticks = next(ticks for step in (0.001, 0.002, 0.004, 0.005, 0.01, 0.02) if (ticks := ticked(step)) is not None)
+    ax.set_xticks(ticks, [label(tick) for tick in ticks])
     # the title runs longer than the axis, so it ends at the axis's far end
     ax.set_xlabel(GAIN_TITLE, loc="right")
     # the key over the plot, the names ending at its right edge, each mark before its name and level with its first

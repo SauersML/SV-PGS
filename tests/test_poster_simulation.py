@@ -190,15 +190,25 @@ def test_aou_result_states_the_common_change_over_its_traits(monkeypatch, tmp_pa
     assert "changed r² by +0.03% (95% CI −0.11 to 0.17%) over 5 traits," in sentence
 
 
-def test_references_sit_under_the_qr_code_within_the_right_column(monkeypatch, tmp_path):
+def test_references_sit_beside_the_qr_code_and_fill_the_discussions_height(monkeypatch, tmp_path):
     poster = poster_module(monkeypatch, tmp_path)
-    heading, qr, words = poster.references()
+    height = 6.6
+    heading, band = poster.references(height)
     assert (heading.kind, heading.content) == ("bar", (96, "References"))
-    assert (qr.kind, words.kind) == ("qr", "text")
+    [[words], [qr]] = band.children
+    assert (band.kind, words.kind, qr.kind) == ("row", "text", "qr")
     assert ["".join(text for text, _ in para.runs) for para in words.content] == [
-        f"{poster.SUPERSCRIPT[index]}{reference}" for index, reference in enumerate(poster.REFERENCES, start=1)]
-    longest = max(poster.width_of(para.runs, poster.REFERENCE) for para in words.content)
-    assert longest + 2 * poster.INSET <= poster.RIGHT
+        f"{poster.SUPERSCRIPT[index]}{poster.REFERENCE_TEXT[key]}" for index, key in enumerate(poster.REFERENCES, start=1)]
+    # every reference keyed, the type between the old small size and the body's, the code no smaller than before
+    assert set(poster.REFERENCE_TEXT) == set(poster.REFERENCES)
+    assert poster.REFERENCE <= words.content[0].size < poster.BODY
+    assert poster.QR <= qr.content <= poster.QR_MOST
+    # the section is no taller than the Discussion beside it
+    width_text, width_qr = poster.parts(band, poster.RIGHT)
+    used = (sum(para.height(width_text - 2 * poster.INSET) for para in words.content)
+            + sum(para.after for para in words.content[:-1]) / 72)
+    assert max(used, qr.content + poster.QR_GAP - poster.GAPS["bar"]) <= height - poster.BAR - poster.GAPS["bar"] + 1e-9
+    assert width_qr >= qr.content - 1e-9
 
 
 def test_poster_copy_never_mentions_convergence_certification_or_a_dagger(monkeypatch, tmp_path):
