@@ -89,3 +89,10 @@ Amendment 1 (2026-10-23, 00:15 PDT, before any screen run's held-out value exist
 - The family is now at most 111 traits: the 11 of the earlier battery and the 100 of runs aou-scr-d1 .. d7 and
   aou-scr-q1 .. q4, less those below the power threshold. The test, BH q < 0.05 over traits, the threshold and the
   analysis time (2026-10-23 14:00 PDT at the latest) are unchanged. No further traits are added after this amendment.
+
+Amendment 2 (2026-10-23, 00:35 PDT, before any screen value is read)
+- The budget is $130 (coordinator), since a run stopped part way loses what it has spent. If d1's measured pace
+  projects more than $130, the runs with the least progress whose traits have no fit yet are stopped, and those traits
+  leave the family by a further amendment before any value is read.
+- From 0fc5b252, staged into all 11 screen runs before any after-task started, each trait's R sessions run while the
+  next trait's GWAS and bands are computed. The fits, their seeds and settings are unchanged.
