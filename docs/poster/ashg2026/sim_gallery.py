@@ -830,6 +830,9 @@ def poster_accuracy_figure(grids, summary):
             fontweight="bold", ha="left", va="bottom")
     ax.text(1, 0.496, "LDpred2-auto", transform=shifted(ax, 0.0), color=LDPRED2, fontsize=POSTER_NAME,
             fontweight="bold", ha="right", va="bottom")
+    # which simulations the means average, between SV-PGS's name and the best possible AUC
+    ax.text(SIZES[0] / 1.2, upper["SV-PGS"][-1] + 0.008, f"{SV_SHARES[0][1][:-1]}–{SV_SHARES[-1][1]} causal SVs",
+            color=INK, ha="left", va="bottom")
     ax.set_ylim(0.49, ceiling + 0.03)
     ax.set_yticks(np.arange(0.5, 0.651, 0.05), ["0.50", "0.55", "0.60", "0.65"])
     ax.set_ylabel("Test AUC")
