@@ -707,8 +707,11 @@ AOU_IMPUTATION = HERE / "figures" / "imputation" / "imputation_numbers.json"
 OPEN_LOW = 0.025
 """The lower edge (%) taken for that summary's open lowest bin, below 0.1%, so its point sits at 0.05%, as
 figures/imputation/imputation_accuracy.py places it."""
-AOU = ORANGE
-"""The All of Us SV imputation curve's colour, apart from the SNVs' black and the simulated SVs' blue."""
+AOU = IMPUTED
+"""The All of Us SV imputation curve's colour: the simulated SVs' light blue, as SVs are across the poster, told apart by
+a dashed line and open markers (AOU_STYLE), and away from LDpred2-auto's orange."""
+AOU_STYLE = dict(linestyle=(0, (3, 1.6)), markerfacecolor="white", markeredgecolor=IMPUTED)
+"""The All of Us SV imputation curve's line and marker style beside the simulated SVs' solid line and filled markers."""
 
 
 def aou_imputation():
@@ -746,7 +749,8 @@ def imputation_panel(ax, accuracy) -> None:
         ends.append((centers[-1], median[-1], label))
     real = aou_imputation()
     if real is not None:
-        ax.plot(*real, color=AOU, marker="o", markersize=MARK * 0.85, markeredgewidth=0, zorder=3, clip_on=False)
+        ax.plot(*real, color=AOU, marker="o", markersize=MARK * 0.85, markeredgewidth=3.0, zorder=3, clip_on=False,
+                **AOU_STYLE)
         ends.append((real[0][-1], real[1][-1], [("SVs, ", "normal"), ("All of Us", "italic")]))
     top = 1.12
     ax.set_xscale("log")
@@ -843,7 +847,7 @@ def genotype_figure(summary):
         f"called from simulated reads on chromosome 22, by "
         f"minor allele frequency: each bin's median (points) with an approximate 95% interval ({MEDIAN_Z:.2f} IQR/√n, "
         f"bars), SNVs black and SVs blue"
-        + (", beside the median r² of SVs imputed in All of Us per frequency bin (orange, no interval)"
+        + (", beside the median r² of SVs imputed in All of Us per frequency bin (light blue, dashed with open markers, no interval)"
            if aou_imputation() is not None else "")
         + ". b, Lengths of the "
         f"{int(records['measured'].sum()):,} measured SVs, stacked by class (records without a type are classed by the "
@@ -1197,14 +1201,16 @@ def gain_forest(rows: list[dict], bold: dict):
     def label(tick):
         return plain(tick * GAIN_SCALE, 0)
 
-    def ticked(step):
+    def ticked(step, least):
         ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
         sizes = [widest(fig, [label(tick)], fontsize=POSTER_TYPE) for tick in ticks]
         apart = all(step * inch >= (first + second) / 2 + 0.3 for first, second in zip(sizes, sizes[1:]))
         inside = len(ticks) and (limits[1] - ticks[-1]) * inch + right >= sizes[-1] / 2
-        return ticks if len(ticks) >= 3 and apart and inside else None
+        return ticks if len(ticks) >= least and apart and inside else None
 
-    ticks = next(ticks for step in (0.001, 0.002, 0.004, 0.005, 0.01, 0.02) if (ticks := ticked(step)) is not None)
+    # two ticks when no step gives three, as on an axis narrower than its labels at three
+    ticks = next(ticks for least in (3, 2) for step in (0.001, 0.002, 0.004, 0.005, 0.01, 0.02)
+                 if (ticks := ticked(step, least)) is not None)
     ax.set_xticks(ticks, [label(tick) for tick in ticks])
     # the title runs longer than the axis, so it ends at the axis's far end
     ax.set_xlabel(GAIN_TITLE, loc="right")
@@ -1274,18 +1280,27 @@ def poster_imputation_figure(summary):
         ends.append(mean[-1])
     real = aou_imputation()
     if real is not None:
-        ax.plot(*real, color=AOU, marker="o", markersize=mark, markeredgewidth=0, zorder=3, clip_on=False)
+        ax.plot(*real, color=AOU, marker="o", markersize=mark, markeredgewidth=4.0, zorder=3, clip_on=False, **AOU_STYLE)
         ends.append(real[1][-1])
     # each line named in a column after the lines' last marks: a bold name over where its genotypes come from
     after = mark / 2 / 72 + 0.15
     labels = []
-    for (name, below, slant), color, end in zip((("SNVs", None, "normal"), ("SVs", "simulated", "normal"),
-                                                  ("SVs", "All of Us", "italic")), (INK, IMPUTED, AOU), ends):
-        parts = [(ax.text(1, 1, name, color=color, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top"), 0.0)]
+    # each name after a mark like its line's, so the two light blue SV lines are told apart by their marks
+    radius = mark / 2 / 72
+    sample = 2 * radius + 0.22
+    for (name, below, slant), color, style, end in zip(
+            (("SNVs", None, "normal"), ("SVs", "simulated", "normal"), ("SVs", "All of Us", "italic")),
+            (INK, IMPUTED, AOU), ({}, {}, AOU_STYLE), ends):
         first = tallest(fig, [name], fontsize=POSTER_NAME, fontweight="bold")
+        face = {k: v for k, v in style.items() if k != "linestyle"}
+        dot, = ax.plot([1], [1], "o", color=color, markersize=mark, markeredgewidth=4.0 if face else 0, clip_on=False,
+                       **face)
+        parts = [(dot, first / 2, radius),
+                 (ax.text(1, 1, name, color=color, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top"), 0.0,
+                  sample)]
         total = first
         if below:
-            parts.append((ax.text(1, 1, below, color=color, fontstyle=slant, ha="left", va="top"), first))
+            parts.append((ax.text(1, 1, below, color=color, fontstyle=slant, ha="left", va="top"), first, sample))
             total += tallest(fig, [below], fontsize=POSTER_TYPE, fontstyle=slant)
         labels.append((end, first, total, parts))
 
@@ -1295,8 +1310,8 @@ def poster_imputation_figure(summary):
         tall, previous = ax.get_position().height * height, math.inf
         for end, first, total, parts in sorted(labels, key=lambda label: -label[0]):
             previous = min(end * tall + first / 2, previous)
-            for artist, down in parts:
-                artist.set_transform(shifted(ax, after, previous - down - tall, False))
+            for artist, down, across in parts:
+                artist.set_transform(shifted(ax, after + across, previous - down - tall, False))
             previous -= total + POSTER_PAD
 
     ax.set_xscale("log")
