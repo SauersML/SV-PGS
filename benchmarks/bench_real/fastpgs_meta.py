@@ -13,9 +13,14 @@ rule, and scored on the run's held-out people. Per method this prints:
   whose two arms differ. Where tuning chose the same model in both arms (one holding no SV), the scores are equal, the
   gain is exactly 0 with no variance, and the trait is listed as such: it has no z to combine.
 Every method reads the same bootstrap resamples. A group enters with at least MINIMUM_GROUP_PEOPLE people and, for a
-disease, more than 20 cases and controls. Aggregates only: every count of 1 to 20 is shown as <=20.
+disease, more than 20 cases and controls. Aggregates only: every count of 1 to 39 is shown as <40.
+
+``--screen`` is the wide screen's one pre-specified analysis (FASTPGS_SCREEN_PRESPEC.txt) in place of the above: per
+trait the one-sided test of a with_sv gain for one method, and the Benjamini-Hochberg q over the traits that pass the
+power threshold (``screen_report``). ``--exclude`` drops the long-read panel's members first, as sv_gain_meta does.
 
     python -m benchmarks.bench_real.fastpgs_meta RUN [RUN ...] [--methods M ...] [--resamples N] [--permutations N]
+    python -m benchmarks.bench_real.fastpgs_meta RUN [RUN ...] --screen ldpred2_auto --exclude MANIFEST
 """
 from __future__ import annotations
 
@@ -35,6 +40,11 @@ from sv_pgs.workspace_pipeline import _residualized
 
 GROUPS = ("all", "eur", "afr")
 ARMS = ("snv_indel", "with_sv")
+SCREEN_CASES = 100
+"""The screen's power threshold for a disease: at least this many held-out cases and as many held-out controls."""
+SCREEN_PEOPLE = 1000
+"""The screen's power threshold for a quantitative trait: at least this many held-out people."""
+SCREEN_Q = 0.05
 
 
 def read_run(name: str, root: str = OPS) -> list[dict[str, object]]:
@@ -141,6 +151,59 @@ def method_report(method: str, traits: Sequence[dict[str, object]], people: Sequ
     return lines
 
 
+def benjamini_hochberg(p_values: Sequence[float]) -> np.ndarray:
+    """Benjamini-Hochberg q-values: q_(i) = min over j >= i of p_(j) m / j, capped at 1, in the input order."""
+    p = np.asarray(p_values, dtype=np.float64)
+    order = np.argsort(p, kind="stable")
+    ranked = p[order] * p.shape[0] / np.arange(1, p.shape[0] + 1)
+    q = np.empty_like(p)
+    q[order] = np.minimum(np.minimum.accumulate(ranked[::-1])[::-1], 1.0)
+    return q
+
+
+def screen_admits(pair: PairedTrait) -> bool:
+    """Whether a trait passes the screen's power threshold (SCREEN_CASES, SCREEN_PEOPLE), read from counts alone."""
+    count = pair.target.shape[0]
+    if pair.binary:
+        cases = int(np.sum(pair.target))
+        return min(cases, count - cases) >= SCREEN_CASES
+    return count >= SCREEN_PEOPLE
+
+
+def screen_report(method: str, traits: Sequence[dict[str, object]], people: Sequence[np.ndarray], weights: np.ndarray) -> list[str]:
+    """The screen: per trait passing ``screen_admits``, the with_sv gain in held-out partial r^2 with its family bootstrap
+    95% interval and SE, the one-sided normal p of gain / SE (H1: gain > 0) and the Benjamini-Hochberg q over those
+    traits. Traits below the threshold, or with no score in an arm, are named without their counts."""
+    pairs = [(trait["name"], paired(trait, people[index], method)) for index, trait in enumerate(traits)]
+    missing = [name for name, pair in pairs if pair is None]
+    below = [name for name, pair in pairs if pair is not None and not screen_admits(pair)]
+    admitted = [pair for _name, pair in pairs if pair is not None and screen_admits(pair)]
+    lines = [f"=== screen, {method}: {len(admitted)} traits in the family"
+             + (f"; below the power threshold: {', '.join(below)}" if below else "")
+             + (f"; no score in an arm: {', '.join(missing)}" if missing else "")]
+    if not admitted:
+        return lines
+    unit = np.ones((1, weights.shape[1]))
+    rows = []
+    for pair in admitted:
+        gain, base = (values[0] for values in gains(unit, pair))
+        draws, _ = gains(weights, pair)
+        error = float(np.nanstd(draws, ddof=1))
+        z = gain / error if error > 0 else math.nan
+        rows.append({"pair": pair, "gain": gain, "base": base, "low": float(np.nanquantile(draws, 0.025)), "high": float(np.nanquantile(draws, 0.975)),
+                     "p": float(stats.norm.sf(z)) if math.isfinite(z) else 1.0})
+    q = benjamini_hochberg([row["p"] for row in rows])
+    for row, value in sorted(zip(rows, q), key=lambda item: item[0]["p"]):
+        pair = row["pair"]
+        cases = f" cases={shown(int(np.sum(pair.target)))}" if pair.binary else ""
+        lines.append(f"  {pair.name}\tn={shown(pair.target.shape[0])}{cases}\tr2 snv_indel {row['base']:.5f} with_sv {row['base'] + row['gain']:.5f}"
+                     f"\tgain {row['gain'] * 1e4:+.2f}e-4 [{row['low'] * 1e4:+.2f}, {row['high'] * 1e4:+.2f}] ({row['gain'] / row['base'] * 100:+.2f}%)"
+                     f"\tone-sided p={row['p']:.3g} q={value:.3g}" + ("\tSV GAIN at q < 0.05" if value < SCREEN_Q else ""))
+    hits = int(np.sum(q < SCREEN_Q))
+    lines.append(f"  {hits} of {len(rows)} traits with a with_sv gain at BH q < {SCREEN_Q}")
+    return lines
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("runs", nargs="+", help="Runs an aou_fastpgs.py job finished on.")
@@ -148,14 +211,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default=OPS, help="The ops bucket's svpgs directory as this machine mounts it.")
     parser.add_argument("--resamples", type=int, default=RESAMPLES)
     parser.add_argument("--permutations", type=int, default=PERMUTATIONS)
+    parser.add_argument("--screen", choices=("ldpred2_auto", "lassosum2", "ct"), help="Run the wide screen's analysis for this method only.")
+    parser.add_argument("--exclude", help="A file of research ids to drop from every trait's held-out people (sv_gain_meta --exclude).")
     args = parser.parse_args(argv)
     traits = [trait for name in args.runs for trait in read_run(name, args.root)]
+    if args.exclude:
+        with open(args.exclude, encoding="utf-8") as handle:
+            rows = [line.rstrip("\n").split("\t") for line in handle if line.strip()]
+        column = rows[0].index("research_id") if "research_id" in rows[0] else None
+        ids = {row[column] for row in rows[1:]} if column is not None else {row[0] for row in rows}
+        for index, trait in enumerate(traits):
+            keep = np.array([str(value) not in ids for value in trait["ids"]], dtype=bool)
+            print(f"{trait['name']}: {shown(int(np.sum(~keep)))} held-out people in {args.exclude} dropped")
+            traits[index] = {**trait, **{key: np.asarray(trait[key])[keep] for key in ("ids", "families", "ancestry", "target", "covariates")},
+                             "scores": np.asarray(trait["scores"])[:, :, keep]}
     people, clusters, labels, disagreements = union(traits)
     seed = traits[0]["seed"]
     weights = cluster_bootstrap_counts(np.zeros(int(clusters.max()) + 1, dtype=np.int64), args.resamples, np.random.default_rng(seed))[:, clusters]
     print(f"runs {' '.join(args.runs)}: traits {', '.join(trait['name'] for trait in traits)}; union of held-out people {shown(labels.shape[0])}, "
           f"clusters {shown(int(clusters.max()) + 1)}, ancestry labels differing between runs {shown(disagreements)}; "
           f"resamples {args.resamples}, permutations {args.permutations}")
+    if args.screen:
+        print("\n".join(screen_report(args.screen, traits, people, weights)), flush=True)
+        return 0
     for method in args.methods or traits[0]["methods"]:
         print("\n".join(method_report(method, traits, people, clusters, labels, weights, args.resamples, args.permutations)), flush=True)
     return 0

@@ -2,12 +2,14 @@
 # in argv[1]. The compact SFBM is built as ldpred2_auto_allvar.R builds it (bigsnpr 1.12.21). LDpred2-auto reads the
 # GWAS of every training row (sumstats.bin) at ldpred2_auto_allvar.R's settings; lassosum2 reads the GWAS of the
 # training rows outside the tuning slice (sumstats_part.bin) at snp_lassosum2's default grid. Writes beta_auto.bin (NaN
-# where no chain passes the tutorial's filter), beta_lasso.bin (variants x grid, column-major) and lasso_grid.tsv.
+# where no chain passes the tutorial's filter), beta_lasso.bin (variants x grid, column-major) and lasso_grid.tsv. A
+# sixth meta.txt field of 0 skips lassosum2 (aou_fastpgs.py --methods without it).
 suppressPackageStartupMessages({library(bigstatsr); library(bigsnpr); library(Matrix)})
 set.seed(1)
 folder <- commandArgs(trailingOnly = TRUE)[1]
 meta <- scan(file.path(folder, "meta.txt"), quiet = TRUE)
 p <- meta[1]; n <- meta[2]; n_part <- meta[3]; cores <- meta[4]; chunk <- meta[5]
+lasso_wanted <- length(meta) < 6 || meta[6] == 1
 read <- function(name, what, size) { con <- file(file.path(folder, name), "rb"); on.exit(close(con)); readBin(con, what, n = file.size(file.path(folder, name)) / size, size = size, endian = "little") }
 sumstats <- function(name, count) { values <- matrix(read(name, "double", 8), ncol = 2, byrow = TRUE); data.frame(beta = values[, 1], beta_se = values[, 2], n_eff = count) }
 write <- function(values, name) { con <- file(file.path(folder, name), "wb"); writeBin(as.double(values), con, size = 8, endian = "little"); close(con) }
@@ -42,6 +44,7 @@ cat("ldpred2: variants", p, "ldsc h2", ldsc[["h2"]], "intercept", ldsc[["int"]],
     as.numeric(difftime(Sys.time(), started, units = "mins")), "\n")
 write(if (length(keep) == 0) rep(NaN, p) else rowMeans(matrix(sapply(chains[keep], function(chain) chain$beta_est), nrow = p)), "beta_auto.bin")
 rm(chains)
+if (!lasso_wanted) quit(save = "no", status = 0)
 started <- Sys.time()
 lasso <- snp_lassosum2(corr, part, ncores = cores)
 grid <- attr(lasso, "grid_param")

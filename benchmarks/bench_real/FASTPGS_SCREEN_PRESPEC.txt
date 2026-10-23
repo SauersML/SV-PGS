@@ -1,0 +1,63 @@
+Wide screen for SV gain with a standard PGS method: pre-specification
+
+Fixed on 2026-10-22 at about 23:40 PDT, before any screen run was submitted and before any screen trait's held-out
+value existed. Amendments go below with their time, and only before the analysis runs.
+
+Question
+- For which traits do imputed SVs raise the held-out accuracy of LDpred2-auto?
+
+Method
+- LDpred2-auto alone (aou_fastpgs.py --methods ldpred2_auto, run by aou_fastpgs_screen.sh as each screen run's
+  after-script). lassosum2 and C+T are dropped (user, 2026-10-22).
+- Each trait is fitted twice on the same training people: on the snv_indel records and on every kept record
+  (with_sv). Both fits share the GWAS pass, the 3 cM band and the settings of the 11-trait battery. Scores go to the
+  run's held-out people.
+- A screen run holds several traits. Its traits share one read of the codes, the restore and the steps before the
+  fit. The fits and scores of each trait are its own.
+
+Statistic and test (fastpgs_meta.py --screen ldpred2_auto --exclude <long-read manifest>)
+- Long-read panel members (the research ids of v9/wgs/long_read/manifest.tsv in the CDR) are dropped from every
+  trait's held-out people first, as in SV_GAIN_PRESPEC.txt. Only their count is printed.
+- Per trait: gain = with_sv partial r^2 less snv_indel partial r^2, given the trait's covariates, on its held-out
+  people. SE = the SD of the gain over 2,000 family bootstrap resamples drawn once over the union of all traits'
+  held-out people. Test: one-sided, H1 gain > 0, p = 1 - Phi(gain / SE).
+- Family: every trait below that passes the power threshold. Methods never multiply the family: there is one method.
+- Multiplicity: Benjamini-Hochberg over the family. A trait with q < 0.05 is a screen hit.
+- Reported for every trait in the family: both arms' partial r^2, the gain with its bootstrap 95% interval, the gain
+  relative to the snv_indel arm, the one-sided p and the q. Hits and non-hits are both reported.
+
+Power threshold and the count rule (applied in code before any value is printed)
+- A disease enters with at least 100 held-out cases and 100 held-out controls. A quantitative trait enters with at
+  least 1,000 held-out people.
+- Traits below the threshold are named and nothing else about them is printed. This drops every trait with fewer
+  than 40 cases before anyone looks at it.
+- No count below 40 is printed or read (shown as <40). No summary of a group under 20 people is read.
+
+Traits in the family
+- The 11 traits of the earlier battery (LDpred2-auto results already read, so their inclusion is fixed now and
+  does not depend on them): atrial_fibrillation (aou-m1p-a), coronary_artery_disease (aou-m1p-c), gout (aou-m1p-g),
+  hypertension (aou-m1p-h), chronic_kidney_disease (aou-m1p-k), hypothyroidism (aou-m1p-o), asthma (aou-m1p-s),
+  type2_diabetes (aou-m1p-t), hyperlipidemia (aou-m1p-y), egfr_ckd_epi_2021 (aou-we6), ldl_cholesterol (aou-wl5).
+- Screen run aou-scr-d1: breast_cancer, copd, depression, cataract, psoriasis, prostate_cancer, alzheimers_disease.
+- Screen run aou-scr-q1: heart_rate, mean_corpuscular_volume, platelet_count, white_blood_cell_count,
+  total_bilirubin.
+- New definitions (sv_pgs/all_of_us.py, codes checked on tx.fhir.org and units from aggregate LOINC unit counts) may
+  be added in further screen runs by amendment, only before the analysis runs and only while no screen run's held-out
+  value has been read.
+- Not in the family: the eight traits of family Q8 (height, BMI, SBP, DBP, HbA1c, HDL, TG, TC). They are blind until
+  Q8's own test (SV_GAIN_PRESPEC.txt amendment 3), and their fast baselines are Q8's secondary.
+
+Blinding
+- Until the analysis runs, nobody reads a screen run's fastpgs.jsonl, the JSON lines of its after-task log, or its
+  fastpgs/*.npz. Runs are watched by job state, markers and the after-task log's timestamped progress lines only.
+
+When
+- Once, when every screen run listed above has finished or failed, or at 2026-10-23 14:00 PDT, whichever is first.
+  A run that has not finished by then is listed as missing, and its traits leave the family.
+
+Follow-up
+- A screen hit is a candidate for replication in the new 50k (SV_GAIN_PRESPEC.txt and sv_gain_replication.py), with
+  its own pre-specification before any of its new values is computed.
+
+Budget
+- $120 for all screen runs. Spot n2d-highmem-96, at most 3 retries.

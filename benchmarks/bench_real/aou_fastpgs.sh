@@ -4,6 +4,7 @@
 # environment in the ops bucket, unpacked as aou_ldpred2.sh unpacks it. Per trait, arm and method the aggregates go to
 # $OPS/fastpgs.jsonl, each held-out person's scores to $OPS/fastpgs/<trait>.npz and each trait's fitted effects to
 # $OPS/fastpgs-units. The scores are participant-level: they stay in the workspace bucket, where fastpgs_meta.py reads them.
+# Arguments pass on to aou_fastpgs.py, such as aou_fastpgs_screen.sh's --methods.
 set -euo pipefail
 rm -rf "$RUN/renv" && mkdir -p "$RUN/renv"
 tar -xzf "$OPS/../reference/renv.tar.gz" -C "$RUN/renv"
@@ -14,4 +15,4 @@ tar -xzf "$OPS/../reference/renv.tar.gz" -C "$RUN/renv"
 for file in aou_fastpgs.py aou_fastpgs.R; do cp "$OPS/source/benchmarks/bench_real/$file" "$RUN/source/benchmarks/bench_real/$file"; done
 cd "$RUN/source"
 PATH="$RUN/renv/bin:$PATH" "$RUN/venv/bin/python" -m benchmarks.bench_real.aou_fastpgs --config "$OPS/run_config.json" --out "$OPS/fastpgs.jsonl" \
-  --scores "$OPS/fastpgs" --units "$OPS/fastpgs-units"
+  --scores "$OPS/fastpgs" --units "$OPS/fastpgs-units" "$@"

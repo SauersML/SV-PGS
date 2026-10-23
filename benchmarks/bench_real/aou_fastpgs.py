@@ -32,6 +32,10 @@ Outputs, per trait:
   workspace bucket beside the run's mirror.
 - ``--units``: each trait's fitted effects, kept as they are made, so a preempted Spot task that starts again only
   reads the codes and scores (``Units``).
+
+``--methods`` fits a subset of the three: the wide screen (FASTPGS_SCREEN_PRESPEC.txt) fits LDpred2-auto alone, and
+the R script then skips lassosum2 and no clumping runs. A run's traits share one read of the codes, over every person
+any of them trains or is scored on (``read_codes``), so a run of many traits reads the store once.
 """
 from __future__ import annotations
 
@@ -236,9 +240,10 @@ def _seed(seed: int, trait: str) -> list[int]:
     return [int(seed), int.from_bytes(hashlib.sha256(trait.encode()).digest()[:4], "little")]
 
 
-def write_inputs(folder: pathlib.Path, arm: Mapping[str, np.ndarray], count: int, part_count: int, cores: int) -> None:
+def write_inputs(folder: pathlib.Path, arm: Mapping[str, np.ndarray], count: int, part_count: int, cores: int, lasso: bool = True) -> None:
     """The R script's inputs beside the arm's band (aou_fastpgs.R). A record with no variance among a GWAS's rows (none
-    at the run's frequency floor, which counts every store sample) would give R a NaN: its beta is 0 there, with se 1."""
+    at the run's frequency floor, which counts every store sample) would give R a NaN: its beta is 0 there, with se 1.
+    ``lasso`` False tells the script to skip lassosum2."""
     for beta, se, name in (("beta", "se", "sumstats.bin"), ("beta_part", "se_part", "sumstats_part.bin")):
         usable = np.isfinite(arm[beta]) & np.isfinite(arm[se]) & (arm[se] > 0)
         if not usable.all():
@@ -247,12 +252,15 @@ def write_inputs(folder: pathlib.Path, arm: Mapping[str, np.ndarray], count: int
     arm["lo"].astype("<i4").tofile(folder / "ld_lo.bin")
     arm["hi"].astype("<i4").tofile(folder / "ld_hi.bin")
     arm["ld_scores"].astype("<f8").tofile(folder / "ld_scores.bin")
-    (folder / "meta.txt").write_text(f"{arm['lo'].shape[0]} {count} {part_count} {cores} {CHUNK}\n")
+    (folder / "meta.txt").write_text(f"{arm['lo'].shape[0]} {count} {part_count} {cores} {CHUNK} {int(lasso)}\n")
 
 
 def r_outputs(folder: pathlib.Path, count: int) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """LDpred2-auto's effects (NaN where no chain passed the filter), lassosum2's [records, grid] and the grid's labels."""
+    """LDpred2-auto's effects (NaN where no chain passed the filter), lassosum2's [records, grid] and the grid's labels
+    (no columns where the script skipped lassosum2)."""
     auto = np.fromfile(folder / "beta_auto.bin", dtype="<f8")
+    if not (folder / "lasso_grid.tsv").is_file():
+        return auto, np.zeros((count, 0)), []
     lasso = np.fromfile(folder / "beta_lasso.bin", dtype="<f8")
     grid = [line.split("\t") for line in (folder / "lasso_grid.tsv").read_text().splitlines()[1:]]
     lasso = lasso.reshape(len(grid), count).T
@@ -306,9 +314,10 @@ def _digest(values: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(values)).hexdigest()
 
 
-def fit_effects(cm: np.ndarray, short: np.ndarray, train: MemoryView, part: MemoryView, cores: int) -> dict[str, np.ndarray]:
+def fit_effects(cm: np.ndarray, short: np.ndarray, train: MemoryView, part: MemoryView, cores: int,
+                methods: tuple[str, ...] = METHODS) -> dict[str, np.ndarray]:
     """Every candidate's effects over the with_sv records (0 on the SVs for the snv_indel arm), with the training means
-    and one label per candidate, "arm|method|parameter"."""
+    and one label per candidate, "arm|method|parameter", for ``methods`` only."""
     effects, labels = [], []
     with tempfile.TemporaryDirectory(prefix="fastpgs_", dir=os.environ.get("TMPDIR"), ignore_cleanup_errors=True) as directory:
         folders = {arm: pathlib.Path(directory) / arm for arm in ARMS}
@@ -320,12 +329,14 @@ def fit_effects(cm: np.ndarray, short: np.ndarray, train: MemoryView, part: Memo
         clumped = {}
         for arm in ARMS:
             found = arms[arm]
-            p = p_values(found["beta_part"], found["se_part"])
-            values = np.memmap(folders[arm] / "ld_values.bin", dtype="<f4", mode="r")
-            clumped[arm] = ct_effects(found["beta_part"], p, clump(p, found["lo"], found["hi"], values))
-            del values
-            write_inputs(folders[arm], found, train.n_samples, part.n_samples, max(1, cores // len(ARMS)))
-        _log("clumped: " + ", ".join(f"{arm} {int(np.any(clumped[arm] != 0, axis=1).sum())} index records at p <= 1" for arm in ARMS))
+            if "ct" in methods:
+                p = p_values(found["beta_part"], found["se_part"])
+                values = np.memmap(folders[arm] / "ld_values.bin", dtype="<f4", mode="r")
+                clumped[arm] = ct_effects(found["beta_part"], p, clump(p, found["lo"], found["hi"], values))
+                del values
+            write_inputs(folders[arm], found, train.n_samples, part.n_samples, max(1, cores // len(ARMS)), "lassosum2" in methods)
+        if clumped:
+            _log("clumped: " + ", ".join(f"{arm} {int(np.any(clumped[arm] != 0, axis=1).sum())} index records at p <= 1" for arm in ARMS))
         single = {name: "1" for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}
         sessions = {arm: subprocess.Popen(["Rscript", str(_SCRIPT), str(folders[arm])], env=os.environ | single) for arm in ARMS}
         failed = [arm for arm, session in sessions.items() if session.wait() != 0]
@@ -334,8 +345,10 @@ def fit_effects(cm: np.ndarray, short: np.ndarray, train: MemoryView, part: Memo
         _log("R sessions done")
         for arm in ARMS:
             auto, lasso, grid = r_outputs(folders[arm], places[arm].shape[0])
-            for method, columns, names in (("ldpred2_auto", auto[:, None], ["auto"]), ("lassosum2", lasso, grid),
-                                           ("ct", clumped[arm], [f"p<={threshold:g}" for threshold in THRESHOLDS])):
+            fitted = {"ldpred2_auto": (auto[:, None], ["auto"]), "lassosum2": (lasso, grid)}
+            if arm in clumped:
+                fitted["ct"] = (clumped[arm], [f"p<={threshold:g}" for threshold in THRESHOLDS])
+            for method, (columns, names) in ((method, fitted[method]) for method in methods):
                 wide = np.zeros((cm.shape[0], columns.shape[1]), dtype=np.float32)
                 wide[places[arm]] = columns
                 effects.append(wide)
@@ -357,7 +370,8 @@ def candidate_scores(codes: np.ndarray, columns: np.ndarray, means: np.ndarray, 
     return total
 
 
-def choose(labels: np.ndarray, tuning: np.ndarray, target: np.ndarray, covariates: np.ndarray) -> tuple[dict[tuple[str, str], int], np.ndarray]:
+def choose(labels: np.ndarray, tuning: np.ndarray, target: np.ndarray, covariates: np.ndarray,
+           methods: tuple[str, ...] = METHODS) -> tuple[dict[tuple[str, str], int], np.ndarray]:
     """Per (arm, method), the candidate with the largest partial r^2 on the tuning rows (``tuning`` [rows, candidates]),
     and every candidate's tuning partial r^2 (NaN for a constant or non-finite score). LDpred2-auto has one candidate
     and no choice: it is kept wherever its score is finite."""
@@ -365,7 +379,7 @@ def choose(labels: np.ndarray, tuning: np.ndarray, target: np.ndarray, covariate
     finite = np.all(np.isfinite(tuning), axis=0)
     chosen = {}
     for arm in ARMS:
-        for method in METHODS:
+        for method in methods:
             members = np.flatnonzero([label.startswith(f"{arm}|{method}|") for label in labels.tolist()])
             usable = members[finite[members]] if method == "ldpred2_auto" else members[np.isfinite(r2[members])]
             if usable.size:
@@ -388,34 +402,45 @@ def evaluated_model(cohort, trait: int) -> tuple[int, np.ndarray]:
     return found[0]
 
 
-def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np.ndarray, cohort, trait: int, seed: int,
-              units: Units | None, cores: int) -> tuple[list[dict[str, object]], dict[str, np.ndarray]]:
-    """Both arms' three methods for one trait: the aggregate lines and the held-out people's arrays (module docstring)."""
-    name = cohort.trait_names[trait]
-    binary = cohort.trait_types[trait] == TraitType.BINARY
+def trait_rows(cohort, trait: int) -> tuple[int, np.ndarray, np.ndarray]:
+    """The trait's evaluated model, its training rows and its held-out rows (observed targets only), each in rising
+    store column."""
     model, held = evaluated_model(cohort, trait)
     training = np.flatnonzero(cohort.training[:, model] & np.isfinite(cohort.targets[:, trait]))
     training = training[np.argsort(cohort.store_columns[training], kind="stable")]
-    held = held[np.argsort(cohort.store_columns[held], kind="stable")]
+    return model, training, held[np.argsort(cohort.store_columns[held], kind="stable")]
+
+
+def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np.ndarray, cohort, trait: int, seed: int,
+              units: Units | None, cores: int, methods: tuple[str, ...] = METHODS,
+              shared: tuple[np.ndarray, np.ndarray] | None = None) -> tuple[list[dict[str, object]], dict[str, np.ndarray]]:
+    """Both arms' ``methods`` for one trait: the aggregate lines and the held-out people's arrays (module docstring).
+    ``shared`` is codes already read with their ascending store columns, which hold every column the trait reads."""
+    name = cohort.trait_names[trait]
+    binary = cohort.trait_types[trait] == TraitType.BINARY
+    model, training, held = trait_rows(cohort, trait)
     tuning = tuning_slice(cohort.families[training], _seed(seed, name))
-    columns = np.union1d(cohort.store_columns[training], cohort.store_columns[held])
+    columns = np.union1d(cohort.store_columns[training], cohort.store_columns[held]) if shared is None else shared[1]
     where = {kind: np.searchsorted(columns, cohort.store_columns[rows]) for kind, rows in (("training", training), ("held", held))}
     own = np.flatnonzero(cohort.covariate_columns[trait])
 
     def view(rows: np.ndarray, places: np.ndarray, codes: np.ndarray) -> MemoryView:
         return MemoryView(codes, places, np.asarray(cohort.covariates[np.ix_(rows, own)], dtype=np.float64), np.asarray(cohort.targets[rows, trait], dtype=np.float64))
 
-    _log(f"{name}: reading {records.shape[0]} records over {columns.shape[0]} people")
-    codes = read_codes(store, records, columns)
-    _log(f"{name}: codes read")
+    if shared is None:
+        _log(f"{name}: reading {records.shape[0]} records over {columns.shape[0]} people")
+        codes = read_codes(store, records, columns)
+        _log(f"{name}: codes read")
+    else:
+        codes = shared[0]
     path = None if units is None else units.path(
         trait=name, model=model, records=_digest(records), cm=_digest(cm), short=_digest(short), training=_digest(cohort.store_columns[training]),
         held=_digest(cohort.store_columns[held]), tuning=_digest(tuning), target=_digest(cohort.targets[training, trait]),
-        covariates=_digest(cohort.covariates[np.ix_(training, own)]),
+        covariates=_digest(cohort.covariates[np.ix_(training, own)]), **({} if methods == METHODS else {"methods": list(methods)}),
     )
     fitted = None if path is None or units is None else units.read(path)
     if fitted is None:
-        fitted = fit_effects(cm, short, view(training, where["training"], codes), view(training[~tuning], where["training"][~tuning], codes), cores)
+        fitted = fit_effects(cm, short, view(training, where["training"], codes), view(training[~tuning], where["training"][~tuning], codes), cores, methods)
         if path is not None and units is not None:
             units.write(path, fitted)
     labels = fitted["labels"]
@@ -423,15 +448,15 @@ def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np
     found = candidate_scores(codes, scored, fitted["means"], fitted["effects"])
     del codes
     tuning_scores, held_scores = found[: tuning_rows.shape[0]], found[tuning_rows.shape[0] :]
-    chosen, tuning_r2 = choose(labels, tuning_scores, cohort.targets[tuning_rows, trait], np.asarray(cohort.covariates[np.ix_(tuning_rows, own)], dtype=np.float64))
+    chosen, tuning_r2 = choose(labels, tuning_scores, cohort.targets[tuning_rows, trait], np.asarray(cohort.covariates[np.ix_(tuning_rows, own)], dtype=np.float64), methods)
     target, covariates = np.asarray(cohort.targets[held, trait], dtype=np.float64), np.asarray(cohort.covariates[np.ix_(held, own)], dtype=np.float64)
-    scores = np.full((len(METHODS), len(ARMS), held.shape[0]), np.nan)
+    scores = np.full((len(methods), len(ARMS), held.shape[0]), np.nan)
     cases = int(target.sum()) if binary else None
     lines = []
     for (arm, method), index in sorted(chosen.items()):
-        scores[METHODS.index(method), ARMS.index(arm)] = held_scores[:, index]
+        scores[methods.index(method), ARMS.index(arm)] = held_scores[:, index]
     for arm in ARMS:
-        for method in METHODS:
+        for method in methods:
             index = chosen.get((arm, method))
             line: dict[str, object] = {
                 "trait": name, "arm": arm, "method": method, "held_out_rows": _count(held.shape[0]),
@@ -449,7 +474,7 @@ def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np
                 line["held_out_auc"] = auc_components(target, held_scores[:, index]).auc if index is not None and both else None
             lines.append(line)
     arrays = {
-        "trait": np.array(name), "binary": np.array(binary), "methods": np.array(METHODS), "arms": np.array(ARMS),
+        "trait": np.array(name), "binary": np.array(binary), "methods": np.array(methods), "arms": np.array(ARMS),
         "research_ids": np.array(cohort.research_ids)[held], "families": np.asarray(cohort.families)[held],
         "ancestry": np.array(cohort.ancestry)[held], "target": target, "covariates": covariates, "scores": scores, "seed": np.array(seed),
     }
@@ -476,7 +501,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, help="The aggregate table to write (one JSON line per trait, arm and method).")
     parser.add_argument("--scores", required=True, type=pathlib.Path, help="The directory of each trait's held-out arrays (<trait>.npz): kept in the workspace.")
     parser.add_argument("--units", type=pathlib.Path, help="Where each trait's fitted effects are kept, and found again after a restart (Units).")
+    parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS), help="The methods to fit (default all three).")
     args = parser.parse_args(argv)
+    methods = tuple(method for method in METHODS if method in args.methods)
     config = WorkspaceConfig.read(args.config)
     if getattr(config, "direct_sv", None) is not None:
         raise ValueError("the run adds direct SV calls to its store: with_sv would test them beside the imputed SVs.")
@@ -494,8 +521,14 @@ def main(argv: list[str] | None = None) -> int:
         kept = fit_filtered(*filtered, region) if region is not None else fit_filtered(*filtered)
         records, cm, short = arm_records(table, kept)
         _log(f"records: {records.shape[0]} with_sv, {int(short.sum())} snv_indel")
-        for trait in range(len(cohort.trait_names)):
-            found, arrays = fit_trait(store, records, cm, short, cohort, trait, int(config.seed), units, cores)
+        traits = range(len(cohort.trait_names))
+        rows = [trait_rows(cohort, trait) for trait in traits]
+        columns = np.unique(np.concatenate([cohort.store_columns[np.r_[training, held]] for _model, training, held in rows]))
+        _log(f"reading {records.shape[0]} records over {columns.shape[0]} people for {len(cohort.trait_names)} traits")
+        shared = (read_codes(store, records, columns), columns)
+        _log("codes read")
+        for trait in traits:
+            found, arrays = fit_trait(store, records, cm, short, cohort, trait, int(config.seed), units, cores, methods, shared)
             for line in found:
                 lines.append(json.dumps(line))
                 print(lines[-1], flush=True)

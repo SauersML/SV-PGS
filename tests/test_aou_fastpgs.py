@@ -182,3 +182,29 @@ def test_ldpred2_auto_is_kept_without_a_usable_tuning_target() -> None:
     tuning[:, 2] = np.nan
     chosen, _ = aou_fastpgs.choose(labels, tuning, np.zeros(50), np.ones((50, 1)))
     assert chosen == {("snv_indel", "ldpred2_auto"): 0}
+
+
+def test_ldpred2_auto_alone_skips_lassosum2_and_clumping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    generator = np.random.default_rng(9)
+    view = _view(generator, 90, 80)
+    short = generator.random(90) < 0.8
+    calls = []
+
+    def popen(command, env):
+        folder = Path(command[2])
+        calls.append(folder.name)
+        assert (folder / "meta.txt").read_text().split()[5] == "0"
+        count = int((folder / "meta.txt").read_text().split()[0])
+        np.full(count, 0.5).astype("<f8").tofile(folder / "beta_auto.bin")
+        return type("Done", (), {"wait": staticmethod(lambda: 0)})()
+
+    monkeypatch.setattr(aou_fastpgs.subprocess, "Popen", popen)
+    monkeypatch.setattr(aou_fastpgs, "clump", lambda *args: pytest.fail("clumping ran"))
+    fitted = aou_fastpgs.fit_effects(view.variants["cm"], short, view, view, 2, ("ldpred2_auto",))
+    assert sorted(calls) == ["snv_indel", "with_sv"]
+    assert fitted["labels"].tolist() == ["snv_indel|ldpred2_auto|auto", "with_sv|ldpred2_auto|auto"]
+    np.testing.assert_array_equal(fitted["effects"][:, 0], np.where(short, 0.5, 0.0))
+    np.testing.assert_array_equal(fitted["effects"][:, 1], np.full(90, 0.5))
+    tuning = generator.normal(size=(30, 2))
+    chosen, _ = aou_fastpgs.choose(fitted["labels"], tuning, generator.normal(size=30), np.ones((30, 1)), ("ldpred2_auto",))
+    assert chosen == {("snv_indel", "ldpred2_auto"): 0, ("with_sv", "ldpred2_auto"): 1}

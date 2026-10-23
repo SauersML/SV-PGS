@@ -69,3 +69,26 @@ def test_a_cell_reads_the_arms_partial_r2_on_its_rows() -> None:
     assert found["snv_indel"] == pytest.approx(_partial_r2(target[rows], baseline[rows], covariates[rows]))
     assert found["with_sv"] == pytest.approx(_partial_r2(target[rows], candidate[rows], covariates[rows]))
     assert found["n"] == rows.shape[0]
+
+
+def test_benjamini_hochberg_q_values() -> None:
+    q = fastpgs_meta.benjamini_hochberg([0.01, 0.04, 0.03, 0.2])
+    np.testing.assert_allclose(q, [0.04, 0.16 / 3, 0.16 / 3, 0.2])
+    assert fastpgs_meta.benjamini_hochberg([0.9, 0.95]).max() <= 1.0
+
+
+def test_the_screen_tests_each_admitted_trait_one_sided_and_names_the_rest(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    generator = np.random.default_rng(4)
+    ids = np.array([f"p{index}" for index in range(1200)])
+    _write(tmp_path, "run-a", "ldl", False, ids, generator)
+    _write(tmp_path, "run-b", "gout", True, ids, generator)
+    _write(tmp_path, "run-c", "hdl", False, ids[:500], generator)
+    (tmp_path / "lr.tsv").write_text("research_id\tother\np0\tx\np1\tx\n")
+    assert fastpgs_meta.main(["run-a", "run-b", "run-c", "--root", str(tmp_path), "--resamples", "60", "--screen", "ldpred2_auto",
+                              "--exclude", str(tmp_path / "lr.tsv")]) == 0
+    printed = capsys.readouterr().out
+    assert "ldl: <40 held-out people in" in printed
+    assert "below the power threshold: hdl" in printed
+    lines = [line for line in printed.splitlines() if line.startswith("  ") and "one-sided p=" in line]
+    assert sorted(line.split("\t")[0].strip() for line in lines) == ["gout", "ldl"]
+    assert "n=1198" in printed and "traits with a with_sv gain at BH q < 0.05" in printed
