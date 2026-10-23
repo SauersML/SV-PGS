@@ -286,6 +286,15 @@ Results seen (log; no test definition changes because of them)
     0.92%. Weight shares: AF 0.76, hypothyroidism 0.16, eGFR 0.08, LDL 0.01, gout 0.00, hypertension 0.00.
   - The four pairs no amendment-4 continuation touches (LDL aou-x3-l2 alone, hypothyroidism, AF, eGFR): g = -0.00%
     [-0.16, 0.15], permutation p 0.52, at most 0.12%. Weight shares: LDL 0.60, AF 0.31, hypothyroidism 0.06, eGFR 0.03.
+- 00:12 PDT on 2026-10-23, from ops, faults only, before any held-out number of these runs was read:
+  - Hyperlipidemia: aou-m3f-y1 failed (out of memory). The pair is redone as aou-m3h-y1/y2 on 7c4ab98, submitted
+    00:10 PDT. Under the 16:38 rule that pair counts.
+  - T2D: aou-m3f-t1 finished, and aou-m3f-t2 (db70b15) is taking the same runaway steps that broke y1. An insurance
+    pair, aou-m3h-t1/t2 on 7c4ab98, went in at 00:11 PDT. The db70b15 pair counts if t2 finishes with no fault (job
+    failure, out of memory, launch fault). Otherwise aou-m3h-t counts. The rule reads faults only.
+  - Asthma: the cold seed aou-m3gs-s1 finished at 23:04 PDT collapsed to the null (snv_indel mean |b| 2.9e-16), so no
+    asthma pair was submitted. Asthma has no valid pair and is listed as such.
+  - CKD: aou-m3g-k1 finished at 22:45 PDT and k2 was running.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
