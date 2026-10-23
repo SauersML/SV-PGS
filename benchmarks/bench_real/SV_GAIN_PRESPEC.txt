@@ -270,6 +270,19 @@ changes only the time)
   - Power, by amendment 3's model over the 5 traits (sum r^2 n 1,087 instead of 1,529): at 1 - rho = 0.022 the SE is
     1.27% and power at g = 2% is 0.47. At 1 - rho = 0.005 the SE is 0.61% and power at g = 2% is 0.95. At 1 - rho =
     0.0004 the SE is 0.17%, and power is 0.90 at g = 0.5% and 1.00 at g = 1%.
+  - Height dropped (written 2026-10-23 about 02:10 PDT at the coordinator's request, before any Q8 result was read).
+    Both height arms failed for a technical reason: GPU out-of-memory in the fit's Stage 0 on the round's a2-highgpu-2g
+    shape. aou-q8a-h1 (snv_indel) failed at 01:17 PDT with 6.5 GB more needed on device 0 and 36.0 of 41.8 GB held, and
+    aou-q8a-h2 (with_sv) failed at 01:40 PDT with 7.0 GB more needed. Height has the largest training cohort of the five.
+    A retry needs a larger shape or a memory fix and 2 h or more, so height is left out and listed as failed (GPU OOM),
+    as amendment 3 says for a failed pair. Nothing about either arm's accuracy was read.
+  - Q8 is now 4 traits: body_mass_index, systolic_blood_pressure, hemoglobin_a1c and hdl_cholesterol (aou-q8a-b, -s,
+    -a, -l). The test runs as soon as all 4 pairs have their reports, with 2026-10-24 12:00 PDT kept as the fallback.
+    The app's ~/xw/q8_watch.sh was restarted at 02:06 PDT to wait for these 4 only. holm_watch.sh waits on Q8's end
+    and reads its runs from the log, so it needs no change.
+  - Power over the 4 traits (sum r^2 n 579): at 1 - rho = 0.022 the SE is 1.74% and power at g = 2% is 0.31. At
+    1 - rho = 0.005 the SE is 0.83% and power at g = 2% is 0.78. At 1 - rho = 0.0004 the SE is 0.24%, and power is
+    0.68 at g = 0.5% and 1.00 at g = 1%.
 
 Results seen (log; no test definition changes because of them)
 - Before 2bf5cb24: aou-wl15 (LDL), as listed at the top.
