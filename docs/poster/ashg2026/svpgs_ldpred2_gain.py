@@ -17,7 +17,7 @@ from aou_gallery import HERE
 from sim_gallery import BLUE, INK, plt
 
 REVIEW = HERE / "figures" / "aou_review"
-SHORT = {"LDL cholesterol": "LDL", "Hypothyroidism": "Hypothyroidism", "Atrial fibrillation": "Atrial\nfibrillation",
+SHORT = {"LDL cholesterol": "LDL", "Hypothyroidism": "Hypo-\nthyroidism", "Atrial fibrillation": "Atrial\nfibrillation",
          "eGFR": "eGFR", "HDL cholesterol": "HDL"}
 
 
@@ -45,18 +45,23 @@ def draw(names: list[str], values: list[tuple[float, float, float]], title: str,
                          "axes.edgecolor": INK, "axes.linewidth": 1.0, "pdf.fonttype": 42})
     # the traits, then a gap of half a slot before Overall
     places = list(range(len(names) - 1)) + [len(names) - 0.5]
-    fig, ax = plt.subplots(figsize=(0.95 * len(names) + 1.6, 3.6))
+    fig, ax = plt.subplots(figsize=(1.2 * len(names) + 1.6, 3.8))
     ax.axhline(0, color=INK, linewidth=1.0)
     for place, (value, low, high) in zip(places, values):
         ax.vlines(place, low, high, color=BLUE, linewidth=2.0)
         ax.plot([place], [value], marker="o", markersize=7, color=BLUE, markeredgewidth=0, linestyle="none")
     ax.set_xticks(places, names)
     ax.set_xlim(places[0] - 0.6, places[-1] + 0.6)
+    # the y range comes from the points: an interval end farther than 3 times the largest point from 0 runs off the axis
+    reach = 3 * max(abs(value) for value, _, _ in values)
+    ends = [end for value, low, high in values for end in (value, low, high) if abs(end) <= reach]
+    span = max(ends) - min(min(ends), 0)
+    ax.set_ylim(min(min(ends), 0) - 0.05 * span, max(ends) + 0.05 * span)
     ax.set_ylabel(title)
     ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
     for suffix in (".pdf", ".png"):
-        fig.savefig(REVIEW / f"{path}{suffix}", dpi=200)
+        fig.savefig(REVIEW / f"{path}{suffix}", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
