@@ -255,3 +255,15 @@ def test_a_null_arm_or_an_arm_fitted_under_another_key_or_seed_excludes_a_pair_a
     (tmp_path / "aou-p2" / "run" / "NULL_COLLAPSE.json").write_text('{"trait": "gout", "null_collapse": true, "why": "mean |b| 1e-21"}', encoding="utf-8")
     reasons, _ = sv_gain_meta.validity("aou-p1", ["aou-p2"], "gout", {"snv_indel": 1e-4, "with_sv": 2e-4}, summary)
     assert len(reasons) == 1 and "no genetic signal" in reasons[0] and "1e-21" in reasons[0]
+
+
+def test_a_pair_launched_on_a_base_run_reads_the_base_run_s_cohort(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(sv_gain_meta, "OPS", str(tmp_path))
+    for attempt in ("train-1", "train-3"):
+        (tmp_path / "aou-q8a-l2" / "launcher" / attempt).mkdir(parents=True)
+        (tmp_path / "aou-q8a-l2" / "launcher" / attempt / "run_step.sh").write_text(
+            '[ -z "aou-q8p-l" ] || base=(--base "gs://svpgs-ops-bucket/svpgs/aou-q8p-l/run")\n', encoding="utf-8")
+    (tmp_path / "aou-x3-l2" / "launcher" / "train-1").mkdir(parents=True)
+    (tmp_path / "aou-x3-l2" / "launcher" / "train-1" / "run_step.sh").write_text('[ -z "" ] || base=(--base "")\n', encoding="utf-8")
+    assert sv_gain_meta.base_run_of("aou-q8a-l2") == "aou-q8p-l"
+    assert sv_gain_meta.base_run_of("aou-x3-l2") is None and sv_gain_meta.base_run_of("aou-wl15") is None

@@ -75,6 +75,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -510,6 +511,17 @@ def validity(name: str, partners: Sequence[str], cohort_trait: str, variances: d
     return reasons, list(summary.get("uncertified", {}).get(cohort_trait, []))
 
 
+def base_run_of(name: str) -> str | None:
+    """The run whose steps before the fit a pairing run's launcher took (run_step.sh's --base gs://.../svpgs/<run>/run),
+    if any: round q8a's pairs ran on a VM disk and pushed only their fit and later steps, so their cohort is the prep
+    run's (aou-q8p-l for aou-q8a-l1/l2), not their accept_steps_from tree's, which belongs to another trait."""
+    for script in sorted(Path(f"{OPS}/{name}/launcher").glob("*/run_step.sh"), reverse=True):
+        found = re.search(r'--base "gs://[^"]*/svpgs/([^/"]+)/run"', script.read_text(encoding="utf-8"))
+        if found:
+            return found[1]
+    return None
+
+
 def read_run(name: str, contrast: str = "arms", partners: Sequence[str] | None = None) -> dict[str, object]:
     """One run's trait as the test reads it, from its cohort and score steps inside the workspace: per held-out person
     the research id, family, ancestry, outcome, covariates and the two scores compared (both arms, or for the ablation
@@ -522,6 +534,10 @@ def read_run(name: str, contrast: str = "arms", partners: Sequence[str] | None =
     config = json.load(open(f"{OPS}/{name}/run_config.json", encoding="utf-8"))
     run_directory, source = Path(f"{OPS}/{name}/run"), config.get("accept_steps_from")
     cohort_directory = run_directory / "cohort"
+    base = base_run_of(name)
+    if not (cohort_directory / "cohort.npz").exists() and base:
+        # the base run's cohort is the one the pair's fit and score steps read
+        cohort_directory, source = Path(f"{OPS}/{base}/run/cohort"), None
     while not (cohort_directory / "cohort.npz").exists() and source:
         # a run that kept its cohort step from an earlier run's tree (accept_steps_from: .../svpgs/<run>/source) holds
         # no copy of it; the earlier run's cohort (or the one that run kept) is the one its score step indexes
