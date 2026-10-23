@@ -161,7 +161,7 @@ def forest(panels: list[Panel], least: float = 0.0):
                + tallest(fig, ["0.1"], fontsize=style["xtick.labelsize"])
                + tallest(fig, [panel.xlabel], fontsize=style["axes.labelsize"]) + POSTER_PAD for panel in panels]
     bottoms[-1] += EDGE - POSTER_PAD
-    gaps = [AXIS_GAP if panel.rows and not panel.rows[-1][1] else 0.0 for panel in panels]
+    gaps = [AXIS_GAP if panel.notes else 0.0 for panel in panels]
     natural = EDGE + sum(key + sum(rows) + gap + bottom for key, rows, gap, bottom in zip(keys, heights, gaps, bottoms))
     height = max(least, natural)
     spare = height - natural
@@ -206,8 +206,11 @@ def forest(panels: list[Panel], least: float = 0.0):
         low_limit, high_limit = limits(panel, width, clear)
         if panel.log:
             ax.set_xscale("log")
+        # the notes of rows with marks start at one x, NOTE_GAP past the farthest of those rows' ends
+        aligned = max([ends(panel, name, estimates, width, low_limit, high_limit, half, star)[1]
+                       for name, estimates in panel.rows if estimates and name in panel.notes], default=0.0) + NOTE_GAP
         for (name, estimates), centre in zip(panel.rows, centres):
-            each, past = ends(panel, name, estimates, width, low_limit, high_limit, half, star)
+            each, _ = ends(panel, name, estimates, width, low_limit, high_limit, half, star)
             for index, ((label, colour, marker, filled), (value, low, high)) in enumerate(zip(panel.series, estimates)):
                 y = centre + (index - (len(panel.series) - 1) / 2) * (mark / 72 + (0.0 if filled else ring / 72)
                                                                       + MARK_GAP)
@@ -234,7 +237,7 @@ def forest(panels: list[Panel], least: float = 0.0):
                 centre = first
             elif name in panel.notes:
                 ax.text(0, centre, " ".join(panel.notes[name]), ha="left", va="center", gid="note",
-                        transform=shifted(ax, past + NOTE_GAP if ending else column - left))
+                        transform=shifted(ax, aligned if ending else column - left))
             ax.text(0, centre, shown[name], transform=shifted(ax, EDGE - left), ha="left", va="center",
                     fontweight=weight[name], gid="name")
         if not panel.log:
@@ -321,13 +324,18 @@ def plot_width(fig, panels: list[Panel], clears: list[float], halves: list[float
                 else (lambda value: (value - low) / (high - low))
             for tick in drawn_ticks(fig, panel, width, low, high):
                 reach = max(reach, width * (place(tick) - 1) + widest(fig, [tick_text(panel)(tick)], fontsize=size) / 2)
+            # the notes start at one x past the farthest end of their rows, so the widest note counts from there
+            noted, note = 0.0, 0.0
             for name, estimates in panel.rows:
                 if not estimates:
                     continue
                 _, past = ends(panel, name, estimates, width, low, high, half, star)
-                note = (NOTE_GAP + widest(fig, [" ".join(panel.notes[name])], fontsize=matplotlib.rcParams["font.size"])
-                        if ends_noted and name in panel.notes else 0.0)
-                reach = max(reach, past + note - width)
+                reach = max(reach, past - width)
+                if ends_noted and name in panel.notes:
+                    noted = max(noted, past)
+                    note = max(note, NOTE_GAP + widest(fig, [" ".join(panel.notes[name])],
+                                                       fontsize=matplotlib.rcParams["font.size"]))
+            reach = max(reach, noted + note - width) if note else reach
         return width + reach + EDGE <= room
 
     low, high = 2 * max(clears) + 2 * POSTER_PAD, room - EDGE
@@ -470,82 +478,73 @@ def signed(percent_value: float) -> str:
     return f"{round(percent_value):+d}%".replace("-", "−")
 
 
-def pooled_note(percent_value: float, p: float) -> list[str]:
-    """The r² panel's pooled row: SV-PGS with SVs against LDpred2-auto pooled over the traits, as its change in r² over
-    LDpred2-auto's (``percent_value``) and its one-sided ``p``, in the pieces it may break between."""
-    return ["SV-PGS", f"r² {signed(percent_value)}", "vs", "LDpred2-auto,", f"p = {p_text(p)}"]
-
-
-def group_note(percent_value: float, p: float) -> list[str]:
-    """An ancestry group's row under the r² panel's pooled row, which names what its numbers are: the change and p
-    alone, so the row is one line of type."""
-    return [f"{signed(percent_value)},", f"p = {p_text(p)}"]
-
-
 GROUPS = ("EUR", "AFR", "AMR")
-"""The ancestry groups under each panel's pooled row, in this order, from ANCESTRY's "groups"."""
+"""The ancestry groups under each pooled row, in this order, from ANCESTRY's "groups"."""
+
+
+def pooled_rows(overall: dict | None, groups: dict | None, test: str) -> tuple[list, dict]:
+    """The pooled rows of a percent panel, COMBINED from ``overall`` (relative, relative_lower, relative_upper, p) and
+    then each of GROUPS that ``groups`` (aou_ancestry.json's "groups") gives for ``test`` ("sv_gain" or "vs_ldpred2":
+    percent, lower, upper, p_one), each mark a fraction for the percent ticks; and each row's one-sided p as its note."""
+    rows, notes = [], {}
+    if overall:
+        rows.append((COMBINED, [tuple(overall[key] / 100 for key in ("relative", "relative_lower", "relative_upper"))]))
+        notes[COMBINED] = [f"p = {p_text(overall['p'])}"]
+    for group in GROUPS:
+        values = ((groups or {}).get(group) or {}).get(test) or {}
+        if all(key in values for key in ("percent", "lower", "upper", "p_one")):
+            rows.append((group, [tuple(values[key] / 100 for key in ("percent", "lower", "upper"))]))
+            notes[group] = [f"p = {p_text(values['p_one'])}"]
+    return rows, notes
 
 
 def gain_figure(matched: list[dict], common: dict | None = None, compared: list[dict] | None = None,
                 pooled: dict | None = None, groups: dict | None = None) -> tuple:
-    """Each trait's change in held-out partial r² from adding SVs, relative to the r² without SVs (baseline_relative of
-    the pre-specified g), with its 95% interval, a row per trait, and when ``common`` is given a bold row for the traits'
-    common g itself, relative to the two arms' mean r². The two scales differ by about 0.1 percentage point at these
-    gains, so one axis title serves both. Over it, when ``compared`` (aou_vs_ldpred2.json's rows) gives the traits'
-    held-out r², a panel of that r² in percent for LDpred2-auto and for SV-PGS with SVs on a log axis, and its q values
-    star the SV-PGS intervals whose q is below Q in either panel (``significant``). Both panels list
-    the traits in ``compared``'s order, then any other trait, then the pooled row, COMBINED: in the gain panel the
-    common g with its one-sided swap p (p_sharp) at the row's end, and in the r² panel, when ``pooled``
-    (aou_vs_ldpred2.json's "combined") is given, a note of SV-PGS's pooled change in r² over LDpred2-auto and its p
-    (pooled_note), since a pooled change has no place on the absolute axis. Under each pooled row, for each of
-    GROUPS that ``groups`` (aou_ancestry.json's "groups") gives, a row of that group's pooled values: in the gain
-    panel its common g with its interval and its one-sided p ("sv_gain"), in the r² panel its change over LDpred2-auto
-    and its one-sided p ("vs_ldpred2", group_note). No figure on the poster uses a fit
-    that did not converge, so a trait whose SV-PGS fit did not converge is in neither panel."""
+    """Up to three panels, stacked. First, when ``compared`` (aou_vs_ldpred2.json's rows) gives the traits' held-out
+    r², that r² in percent for LDpred2-auto and for SV-PGS with SVs on a log axis, a row per trait. Second, SV-PGS's
+    pooled change in r² over LDpred2-auto's: COMBINED from ``pooled`` (aou_vs_ldpred2.json's "combined") and each of
+    GROUPS from ``groups`` (aou_ancestry.json's "groups"), each with its 95% interval and its one-sided p at the row's
+    end; pooled, so a relative axis. Third, each trait's change in held-out partial r² from adding SVs, relative to the
+    r² without SVs (baseline_relative of the pre-specified g), with its 95% interval, then COMBINED, the traits' common
+    g relative to the two arms' mean r² from ``common`` with its one-sided swap p (p_sharp), and each of GROUPS with its
+    one-sided p. The two scales differ by about 0.1 percentage point at these gains, so one axis title serves both.
+    The traits are in ``compared``'s order, then any other trait. Q values star the SV-PGS intervals whose q is below Q
+    (``significant``). No figure on the poster uses a fit that did not converge, so a trait whose SV-PGS fit did not
+    converge is in no panel."""
     keys = ("relative", "relative_lower", "relative_upper")
     dropped = {trait_name(row["trait"]) for row in matched if not converged(row)}
-    rows = order([(trait_name(row["trait"]), [tuple(baseline_relative(row[key] / 100) for key in keys)])
-                  for row in matched if converged(row)], compared)
-    if common:
-        rows.append((COMBINED, [tuple(common[key] / 100 for key in keys)]))
-    gained = {trait_name(row["trait"]) for row in compared or [] if significant(row, "sv_gain")}
-    swap = (common or {}).get("p_sharp")
-    noted = {COMBINED: [f"p = {p_text(swap)}"]} if common and swap is not None else {}
-    for group in GROUPS:
-        gain = ((groups or {}).get(group) or {}).get("sv_gain") or {}
-        if rows and all(key in gain for key in ("percent", "lower", "upper", "p_one")):
-            rows.append((group, [tuple(gain[key] / 100 for key in ("percent", "lower", "upper"))]))
-            noted[group] = [f"p = {p_text(gain['p_one'])}"]
-    panels = [Panel(rows, [("", SKY, "o", False)], "Change in r² with SVs (%)",
-                    starred={(name, 0) for name, _ in rows if name in gained}, notes=noted)] if rows else []
+    panels = []
     measured = [row for row in compared or [] if "r2" in row and trait_name(row["trait"]) not in dropped]
-    against = (pooled or {}).get("with_sv") or {}
     if measured:
         r2 = [(trait_name(row["trait"]), [tuple(100 * row["r2"][arm][key] for key in ("r2", "lower", "upper"))
                                           for arm in ("ldpred2_auto", "with_sv")]) for row in measured]
-        notes = {COMBINED: pooled_note(against["relative"], against["p_one"])} \
-            if "relative" in against and "p_one" in against else {}
-        for group in GROUPS:
-            versus = ((groups or {}).get(group) or {}).get("vs_ldpred2") or {}
-            if "percent" in versus and "p_one" in versus:
-                notes[group] = group_note(versus["percent"], versus["p_one"])
-        panels.insert(0, Panel(r2 + [(name, []) for name in notes], METHODS, "Held-out r² (%)", log=True,
-                               starred={(trait_name(row["trait"]), 1) for row in measured if significant(row, "with_sv")},
-                               notes=notes))
+        panels.append(Panel(r2, METHODS, "Held-out r² (%)", log=True,
+                            starred={(trait_name(row["trait"]), 1) for row in measured if significant(row, "with_sv")}))
+    against = (pooled or {}).get("with_sv") or {}
+    overall = ({key: against[key] for key in keys} | {"p": against["p_one"]}
+               if all(key in against for key in (*keys, "p_one")) else None)
+    versus, versus_notes = pooled_rows(overall, groups, "vs_ldpred2")
+    if versus:
+        panels.append(Panel(versus, [("", SV_PGS, "o", True)], "SV-PGS r² vs LDpred2-auto (%)", notes=versus_notes))
+    rows = order([(trait_name(row["trait"]), [tuple(baseline_relative(row[key] / 100) for key in keys)])
+                  for row in matched if converged(row)], compared)
+    common_p = ({key: common[key] for key in keys} | {"p": common["p_sharp"]}
+                if common and common.get("p_sharp") is not None else None)
+    combined, gain_notes = pooled_rows(common_p, groups, "sv_gain")
+    gained = {trait_name(row["trait"]) for row in compared or [] if significant(row, "sv_gain")}
+    if rows:
+        panels.append(Panel(rows + combined, [("", SKY, "o", False)], "Change in r² with SVs (%)",
+                            starred={(name, 0) for name, _ in rows if name in gained}, notes=gain_notes))
     stars = any(panel.starred for panel in panels)
     fig = forest(panels, least=HEIGHT)
-    return fig, [("Held-out partial r² in percent of LDpred2-auto and SV-PGS for each trait on a log axis, and under it "
-                  "the change " if measured
-                  else "The change ")
-                 + "in held-out partial r² from adding SVs to SV-PGS for each trait, relative to the r² without SVs, "
-                 "with 95% intervals, an arrowhead marking an interval that runs past the axis"
-                 + (", and in bold the traits' common change relative to the two models' mean r²" if common else "")
-                 + (" with its one-sided p" if common and swap is not None else "")
-                 + (", and in the r² panel's bold row SV-PGS's pooled change in r² over LDpred2-auto with its one-sided p"
-                    if measured and "relative" in against and "p_one" in against else "")
-                 + (", and under each pooled row the same for each ancestry group" if groups else "")
-                 + (", an asterisk marking a Benjamini-Hochberg q below 0.05 for SV-PGS against LDpred2-auto (top) or "
-                    "for the change with SVs (bottom)" if stars else "")]
+    return fig, [("Held-out partial r² in percent of LDpred2-auto and SV-PGS for each trait on a log axis; " if measured
+                  else "")
+                 + ("SV-PGS's pooled change in r² over LDpred2-auto, overall and by ancestry group, with one-sided p; "
+                    if versus else "")
+                 + "the change in held-out partial r² from adding SVs to SV-PGS for each trait, relative to the r² "
+                 "without SVs, with 95% intervals, an arrowhead marking an interval that runs past the axis"
+                 + (", and the pooled change overall and by ancestry group with one-sided p" if combined else "")
+                 + (", an asterisk marking a Benjamini-Hochberg q below 0.05" if stars else "")]
 
 
 def main() -> None:

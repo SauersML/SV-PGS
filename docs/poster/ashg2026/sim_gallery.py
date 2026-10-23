@@ -230,6 +230,16 @@ def interval(values) -> tuple[float, float, float, int]:
     return mean, mean - half, mean + half, n
 
 
+def difference(first, second) -> tuple[float, float, float]:
+    """The difference of two groups' means with Welch's 95% interval."""
+    first, second = (np.asarray(values, float) for values in (first, second))
+    parts = first.var(ddof=1) / first.size, second.var(ddof=1) / second.size
+    freedom = sum(parts) ** 2 / (parts[0] ** 2 / (first.size - 1) + parts[1] ** 2 / (second.size - 1))
+    half = float(stats.t.ppf(0.975, freedom) * math.sqrt(sum(parts)))
+    gap = float(first.mean() - second.mean())
+    return gap, gap - half, gap + half
+
+
 def median_interval(values) -> tuple[float, float, float, int]:
     """Median and its distribution-free 95% interval: the order statistics whose ranks a Binomial(n, 1/2) puts 2.5%
     beyond on each side (none below six values)."""
@@ -343,20 +353,12 @@ def zero_line(ax, vertical: bool = True) -> None:
 
 
 def load_results() -> dict[str, list[dict]]:
-    """Each grid's simulations, less any whose SV-PGS fit (with or without SVs) missed its convergence certificate
-    (benchmarks/power/grid.py's "uncertified_arms"), which no figure or mean uses. numbers.json's "uncertified" counts
-    them by grid and architecture. A result written before grid.py recorded certification lists no arm and is kept."""
+    """Each grid's simulations, every one of them, whether or not its SV-PGS fits carry a convergence certificate."""
     grids: dict[str, list[dict]] = defaultdict(list)
-    dropped: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for grid in ("grid", "grid-truth", "window", "window-truth"):
         for path in glob.glob(str(LOCAL / grid / "tasks" / "*" / "n*" / "replicate*" / "result.json")):
             with open(path) as handle:
-                row = json.load(handle)
-            if row.get("uncertified_arms"):
-                dropped[grid][row["point"]] += 1
-            else:
-                grids[grid].append(row)
-    NUMBERS["uncertified"] = {grid: dict(sorted(points.items())) for grid, points in sorted(dropped.items())}
+                grids[grid].append(json.load(handle))
     return grids
 
 
@@ -1125,6 +1127,10 @@ def gain_sets(grids) -> dict[str, dict]:
         imputed = [gain for point in points for _, _, gain in gains.get(point, [])]
         sets[key] = {"label": label, "architectures": len(points), "true": mean_test(true),
                      "imputed": mean_test(imputed), "share": fieller(imputed, true)}
+    # the imputed gain where causal SVs are well imputed less where they are not, the two sets disjoint
+    rest = [gain for point in causal if point not in WELL_IMPUTED for _, _, gain in gains.get(point, [])]
+    well = [gain for point in causal if point in WELL_IMPUTED for _, _, gain in gains.get(point, [])]
+    sets["well_imputed"]["versus_rest"] = difference(well, rest)
     return sets
 
 
@@ -1218,7 +1224,8 @@ def poster_sv_gain_figure(grids):
         "shown": len({row["point"] for row in grids["window-truth"]} & {row["point"] for row in grids["window"]}),
         "rows": {key: {"architectures": row["architectures"], "true": entry(row["true"]), "p_true": row["true"]["p"],
                        "imputed": entry(row["imputed"]), "p_imputed": row["imputed"]["p"],
-                       "share": [None if math.isinf(value) else value for value in row["share"]]}
+                       "share": [None if math.isinf(value) else value for value in row["share"]],
+                       **({"versus_rest": list(row["versus_rest"])} if "versus_rest" in row else {})}
                  for key, row in sets.items()},
     }
     rows = list(sets.values())

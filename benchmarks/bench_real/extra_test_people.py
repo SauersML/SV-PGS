@@ -199,7 +199,8 @@ def extract_task(task: tuple) -> tuple:
 
     from sv_pgs.store_converter import refalt_digest
 
-    path, chromosome, rows, keys, weights = task
+    path, chromosome, rows, keys, weights, *options = task
+    collect_info = bool(options and options[0])
     wanted = {(int(position), str(identifier)): index for index, (position, identifier) in enumerate(zip(keys["positions"], keys["identifiers"]))}
     with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False) as handle:
         for position in np.unique(keys["positions"]):
@@ -211,6 +212,8 @@ def extract_task(task: tuple) -> tuple:
     samples = tuple(reader.samples)
     dosage = np.zeros((len(wanted), len(samples)), dtype=np.float32)
     found = np.zeros(len(wanted), dtype=bool)
+    frequency = np.full(len(wanted), np.nan)
+    quality = np.full(len(wanted), np.nan)
     try:
         for record in reader:
             index = wanted.get((record.POS, str(record.INFO.get("ID"))))
@@ -219,6 +222,9 @@ def extract_task(task: tuple) -> tuple:
             if refalt_digest(record.REF, ",".join(record.ALT)) != int(keys["digests"][index]):
                 raise ValueError(f"{path}: {chromosome}:{record.POS} has the site's ID but not its REF/ALT.")
             dosage[index] = record.format("DS")[:, 0]
+            if collect_info:
+                frequency[index] = float(record.INFO.get("AF"))
+                quality[index] = float(record.INFO.get("INFO"))
             found[index] = True
     finally:
         reader.close()
@@ -227,10 +233,11 @@ def extract_task(task: tuple) -> tuple:
     if process.returncode != 0:
         raise RuntimeError(f"bcftools view failed on {path}: {error.decode(errors='replace')[-500:]}")
     codes = coded(dosage[found], keys["kept"][found], keys["carrying"][found])
-    return samples, rows[found], partial_scores(codes, weights[found])
+    result = (samples, rows[found], partial_scores(codes, weights[found]))
+    return (*result, frequency[found], quality[found]) if collect_info else result
 
 
-def score_callset(pattern: str, batches: Sequence[str], run, table: WeightTable, workers: int, chromosomes: Sequence[str] | None = None):
+def score_callset(pattern: str, batches: Sequence[str], run, table: WeightTable, workers: int, chromosomes: Sequence[str] | None = None, collect_info: bool = False):
     """Every batch's samples, each model's mean scores [models, samples] and found-record mask over ``table.rows``."""
     from sv_pgs.workspace_pipeline import strata_complexity_legend
 
@@ -249,7 +256,7 @@ def score_callset(pattern: str, batches: Sequence[str], run, table: WeightTable,
                       int(starts[store_chromosomes.index(chromosome) + 1] - starts[store_chromosomes.index(chromosome)]), sites_md5[chromosome])
                      for chromosome in wanted]
         keys = dict(zip(wanted, pool.map(chromosome_keys, key_tasks)))
-        print(f"site keys of {len(wanted)} chromosomes in {time.time() - begun:.0f} s", flush=True)
+        print(f"site keys of {shown(len(wanted))} chromosomes in {time.time() - begun:.0f} s", flush=True)
         tasks, owners = [], []
         for batch in batches:
             for chromosome in wanted:
@@ -257,12 +264,16 @@ def score_callset(pattern: str, batches: Sequence[str], run, table: WeightTable,
                 for start in range(0, members.shape[0], CHUNK_ROWS):
                     part = slice(start, start + CHUNK_ROWS)
                     tasks.append((pattern.format(batch=batch, chromosome=chromosome), chromosome, members[part],
-                                  {name: values[part] for name, values in keys[chromosome].items()}, table.weights[members[part]]))
+                                  {name: values[part] for name, values in keys[chromosome].items()}, table.weights[members[part]], collect_info))
                     owners.append(batch)
         samples: dict[str, tuple[str, ...]] = {}
         partial: dict[str, np.ndarray] = {}
         found = {batch: np.zeros(table.rows.shape[0], dtype=bool) for batch in batches}
-        for done, (owner, (names, rows, piece)) in enumerate(zip(owners, pool.map(extract_task, tasks, chunksize=1)), start=1):
+        metadata = {batch: np.full((2, table.rows.shape[0]), np.nan) for batch in batches}
+        for done, (owner, result) in enumerate(zip(owners, pool.map(extract_task, tasks, chunksize=1)), start=1):
+            names, rows, piece, *info = result
+            if collect_info:
+                metadata[owner][:, rows] = np.stack(info)
             if samples.setdefault(owner, names) != names:
                 raise ValueError(f"batch {owner}: the files list different samples.")
             partial[owner] = partial.get(owner, 0.0) + piece
@@ -270,7 +281,7 @@ def score_callset(pattern: str, batches: Sequence[str], run, table: WeightTable,
             if done % 100 == 0 or done == len(tasks):
                 print(f"extraction tasks {done}/{len(tasks)} in {time.time() - begun:.0f} s", flush=True)
     scores = {batch: finished_scores(partial[batch], table, found[batch]) for batch in batches}
-    return samples, scores, found
+    return (samples, scores, found, metadata) if collect_info else (samples, scores, found)
 
 
 def model_folder(run_name: str, arm: str, trait: str) -> Path:
@@ -384,7 +395,7 @@ def score(args: argparse.Namespace) -> int:
     if len(digests) != 1:
         raise ValueError(f"the models index {len(digests)} different store layouts; score each layout on its own.")
     table = weight_table(models)
-    print(f"{len(models)} models over {table.rows.shape[0]} store records", flush=True)
+    print(f"{shown(len(models))} models over {table.rows.shape[0]} store records", flush=True)
     samples, scores, found = score_callset(args.callset, args.batches, runs[pairs[0][0]], table, args.workers, args.chromosomes)
     report_found("records", table, found, [f"{pair}/{trait}/{arm}" for pair, trait, arm in entries])
     crosswalk = read_crosswalk(args.crosswalk)
@@ -435,6 +446,8 @@ def check(args: argparse.Namespace) -> int:
         if person in row_of:
             columns.append(column)
             rows.append(row_of[person])
+    if len(rows) < 40:
+        raise ValueError("Insufficient overlapping participants for score validation")
     for model_index, (trait_index, arm) in enumerate(entries):
         reference = stored.genetic_mean[ARMS.index(arm), rows, cohort.all_rows_model(trait_index)]
         difference = np.abs(scores["x"][model_index, columns] - reference)
