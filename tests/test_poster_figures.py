@@ -10,10 +10,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from matplotlib.transforms import Bbox
-
 matplotlib = pytest.importorskip("matplotlib")
 matplotlib.use("Agg")
+
+from matplotlib.transforms import Bbox  # noqa: E402
 
 POSTER = Path(__file__).resolve().parents[1] / "docs" / "poster" / "ashg2026"
 sys.path.insert(0, str(POSTER))  # aou_gallery imports sim_gallery by name, as it runs beside it
