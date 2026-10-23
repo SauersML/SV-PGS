@@ -38,6 +38,23 @@ def test_every_method_is_tested_on_both_traits_and_a_failed_arm_is_named(tmp_pat
     assert "\tAFR\t" in printed and "\tEUR\t" in printed
 
 
+def test_a_trait_whose_arms_chose_the_same_model_is_listed_and_not_combined(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    generator = np.random.default_rng(3)
+    _write(tmp_path, "run-a", "ldl", False, np.array([f"p{index}" for index in range(500)]), generator)
+    _write(tmp_path, "run-b", "gout", True, np.array([f"p{index}" for index in range(500)]), generator)
+    path = tmp_path / "run-b" / "fastpgs" / "gout.npz"
+    with np.load(path, allow_pickle=False) as arrays:
+        saved = {name: np.array(arrays[name]) for name in arrays.files}
+    saved["scores"][2, 1] = saved["scores"][2, 0]
+    with open(path, "wb") as handle:
+        np.savez(handle, **saved)
+    assert fastpgs_meta.main(["run-a", "run-b", "--root", str(tmp_path), "--resamples", "40", "--permutations", "2"]) == 0
+    printed = capsys.readouterr().out
+    ct = printed[printed.index("=== ct"):]
+    assert "the same model in both arms (gain 0, not combined) for gout" in ct
+    assert "Z = nan" not in ct and "PRIMARY Stouffer" in ct
+
+
 def test_a_cell_reads_the_arms_partial_r2_on_its_rows() -> None:
     generator = np.random.default_rng(2)
     people = 400
