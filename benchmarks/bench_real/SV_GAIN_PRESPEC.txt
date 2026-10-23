@@ -366,6 +366,11 @@ Results seen (log; no test definition changes because of them)
   prediction_move, remaining_gain, restored_best) and is counted and flagged. Arm agreement 0.4855. Alone, with 1,000
   swaps and the long-read people excluded: g = -98.26% [-189.16, -7.37], sharp p 0.97, weak p 0.983. As with T2D, it
   is not continued, since a continuation would land after the primary. The primary's watcher counts it.
+- 00:58 PDT on 2026-10-23, a fix to the primary's watcher, found by the coordinator: it waited for CAD as aou-m3f-c, but
+  ops submits the CAD pair on 0ce026bd as aou-m3h-c1/c2. As written, the primary would have waited for the 08:00 PDT
+  fallback and run without CAD. The watcher now takes CAD from aou-m3h-c, or from aou-m3f-c if that finishes. It was
+  restarted at 00:58 PDT, before it had run anything. The hyperlipidemia name aou-m3h-y is correct: aou-m3h-y1 and y2
+  exist and are training. No aou-m3h-c run exists yet.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
