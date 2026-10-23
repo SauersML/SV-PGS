@@ -22,12 +22,16 @@ The analysis was fixed before any combined value was computed (~/svpgs-watch/JOU
 test per trait on all its held-out people. It was amended at 17:40 PDT that day (benchmarks/bench_real/SV_GAIN_PRESPEC.txt),
 when only aou-wl15 (LDL) had been scored, to the primary below. It weights LDL, the one result seen, the most.
 - Primary (amended): the common relative gain g, the gains regressed on the arms' mean partial r^2 through the origin
-  with weights 1 / var(gain): g = sum(a gain) / sum(a r^2), a = r^2 / var(gain) (``common_relative``). Where
-  every trait gains the same fraction of its accuracy, this is the most precise estimate of that fraction, and it
-  needs no per-trait ratio, whose denominator can resample near 0. Its standard error comes from the joint resamples
-  with the weights a fixed. Test: one-sided, g > 0, at 0.05. A run's traits each enter once: several matched pairing
-  runs of one trait are averaged per arm first (``merge_pairs``), and people in an excluded list (the long-read panel)
-  are dropped before anything is computed (``main``).
+  with weights 1 / var(gain): g = sum(a gain) / sum(a r^2), a = r^2 / var(gain) (``common_relative``). g is a
+  fraction of the arms' mean partial r^2, not of the snv_indel arm's. Where every trait gains the same fraction of its
+  accuracy, this is the most precise estimate of that fraction among weightings that ignore the traits' correlation
+  (correlated traits would need GLS weights), and it needs no per-trait ratio, whose denominator can resample near 0.
+  Its standard error comes from the joint resamples with the weights a fixed. Tests (amendment 5): one-sided, g > 0,
+  at 0.05, both reported. The weak-null test of g = 0 is the family-clustered bootstrap z = g / SE, with g's one-sided
+  95% lower and upper bounds. The sharp-null test is the family arm-swap permutation p (Calibration, below). A gain is
+  claimed only if both p are below 0.05. A run's traits each enter once: several matched pairing runs of one trait are
+  averaged per arm first, with their family memberships joined (``merge_pairs``), and people in an excluded list (the
+  long-read panel) are dropped before anything is computed (``main``).
 - Original primary, now secondary: the two-sided Stouffer combination of the per-trait z = gain / bootstrap SE,
   equal weights, Z = sum(z) / sqrt(1'R1).
 - Secondary:
@@ -36,7 +40,8 @@ when only aou-wl15 (LDL) had been scored, to the primary below. It weights LDL, 
   - an omnibus Cauchy combination of the Stouffer and ACAT p;
   - one-sided p for a gain (above 0);
   - the random-effects pooled relative gain (gain / the snv_indel arm's partial r^2) by REML with the Hartung-Knapp-
-    Sidik-Jonkman interval on k - 1 degrees of freedom;
+    Sidik-Jonkman interval on k - 1 degrees of freedom, a sensitivity analysis that treats the traits as independent
+    although they share people;
   - the gain pooled by generalized least squares under the joint-resample covariance
     (``held_out_comparison.meta_analysis``), absolute and relative, over all held-out people and within the EUR, AFR
     and AMR groups.
@@ -46,9 +51,12 @@ when only aou-wl15 (LDL) had been scored, to the primary below. It weights LDL, 
 
 Calibration: a family arm-swap null. In each replicate one fair coin per union family decides whether every member of
 that family has the two arms' scores exchanged. Every trait reads the same coins, so the traits keep their dependence.
-Where the arms are equally accurate the swapped data have the observed data's distribution, so the replicates give
-the null of every statistic. Each replicate repeats the analysis (PERMUTATION_RESAMPLES bootstrap resamples per trait),
-which yields:
+Where the two arms' scores are exchangeable within families, the swapped data have the observed data's distribution,
+so the replicates give that null of every statistic. It is a sharp null, stronger than g = 0: two scores can be
+equally accurate and still differ in distribution (their covariate loadings or error distributions), and g = 0 allows
+traits whose gains have opposite signs. Each replicate repeats the analysis (PERMUTATION_RESAMPLES bootstrap resamples
+per trait), and the observed statistics the replicates are ranked against are computed from the same resamples, as
+many as each replicate uses. That yields:
 - the null mean and SD of every z, of Z and of the primary's z (near 0 and 1 when the bootstrap SE is right);
 - the share of replicates below 0.05 for each p;
 - the permutation p of the observed statistics.
@@ -202,8 +210,9 @@ def reml_hksj(estimates: np.ndarray, variances: np.ndarray) -> dict[str, float]:
 
 def common_relative(estimates: np.ndarray, bases: np.ndarray, draws: np.ndarray, base_draws: np.ndarray) -> dict[str, object]:
     """The primary (module docstring): the common relative gain g = sum(a gain) / sum(a r^2), a = r^2 / var(gain), its
-    standard error over the joint resamples (resamples x traits) with a fixed, z, one- and two-sided p, 95% interval
-    and one-sided upper 95% bound, and each trait's share of the weight. r^2 is the two arms' mean partial r^2
+    standard error over the joint resamples (resamples x traits) with a fixed, z, one- and two-sided p, 95% interval,
+    one-sided lower and upper 95% bounds, and each trait's share of g: a r^2 / sum(a r^2), the weight its own relative
+    gain gain / r^2 takes in g = sum(share gain / r^2). g is a fraction of r^2, the two arms' mean partial r^2
     (``bases``, the snv_indel arm's, plus half the gain): it is the same with the arms exchanged, so where they are
     equally accurate it carries no information on the gain's sign. The snv_indel arm's own r^2 would: it is high
     exactly where the gain is low, which weights the traits that lost and biases g down. A trait whose gain has no
@@ -219,7 +228,8 @@ def common_relative(estimates: np.ndarray, bases: np.ndarray, draws: np.ndarray,
     half = float(stats.norm.ppf(0.975)) * error
     return {"estimate": estimate, "standard_error": error, "z": z, "p_one_sided": float(stats.norm.sf(z)),
             "p_two_sided": float(2.0 * stats.norm.sf(abs(z))), "ci_low": estimate - half, "ci_high": estimate + half,
-            "upper_95": estimate + UPPER * error, "weight_share": weights / weights.sum()}
+            "lower_95": estimate - UPPER * error, "upper_95": estimate + UPPER * error,
+            "weight_share": weights * levels / (weights @ levels)}
 
 
 def correlation_of(draws: np.ndarray) -> np.ndarray:
@@ -261,6 +271,27 @@ def family_swaps(trait: PairedTrait, clusters: np.ndarray, coins: np.ndarray) ->
 
 def group_rows(trait: PairedTrait, ancestry: np.ndarray, group: str) -> np.ndarray:
     return np.flatnonzero(ancestry[trait.people] == group)
+
+
+def evaluated(traits: Sequence[PairedTrait], clusters: np.ndarray, weights: np.ndarray, coins: np.ndarray | None = None) -> dict[str, object]:
+    """The combined statistics (``combined``) and the primary's z and one-sided p over ``weights``' resamples, with the
+    arms exchanged in the families whose ``coins`` are true (none exchanged where ``coins`` is None). The observed
+    statistic a permutation p ranks against and each swapped one are this one function on the same resamples."""
+    unit = np.ones((1, clusters.shape[0]))
+    estimates, bases, draws, base_draws = [], [], [], []
+    for trait in traits:
+        swap = None if coins is None else family_swaps(trait, clusters, coins)
+        gain, base = gains(unit, trait, swap)
+        gain_draws, base_draw = gains(weights, trait, swap)
+        estimates.append(gain[0])
+        bases.append(base[0])
+        draws.append(gain_draws)
+        base_draws.append(base_draw)
+    found = combined(np.array(estimates), np.column_stack(draws))
+    common = common_relative(np.array(estimates), np.array(bases), np.column_stack(draws), np.column_stack(base_draws))
+    found["p_common_one_sided"] = common["p_one_sided"]
+    found["common_z"] = common["z"]
+    return found
 
 
 def analyse(traits: Sequence[PairedTrait], clusters: np.ndarray, ancestry: np.ndarray, seed: int, resamples: int = RESAMPLES,
@@ -318,45 +349,36 @@ def analyse(traits: Sequence[PairedTrait], clusters: np.ndarray, ancestry: np.nd
                                                    np.column_stack(used_base_draws)) if used else None}
     result["groups"] = groups
     if permutations:
-        result["calibration"] = calibrate(traits, clusters, weights[:permutation_resamples], generator, permutations, observed)
+        result["calibration"] = calibrate(traits, clusters, weights[:permutation_resamples], generator, permutations)
     return result
 
 
 def calibrate(traits: Sequence[PairedTrait], clusters: np.ndarray, weights: np.ndarray, generator: np.random.Generator,
-              permutations: int, observed: dict[str, object]) -> dict[str, object]:
-    """The analysis repeated on family arm swaps (module docstring)."""
-    unit = np.ones((1, clusters.shape[0]))
+              permutations: int) -> dict[str, object]:
+    """The analysis repeated on family arm swaps (module docstring), each permutation p ranking the observed statistic
+    computed on the same resamples (``weights``) as every swapped one (``reference``)."""
+    observed = evaluated(traits, clusters, weights)
     z_null, total_null, trait_p_null, common_null = [], [], [], []
     p_null: dict[str, list[float]] = {"p_stouffer": [], "p_acat": [], "p_omnibus": [], "p_stouffer_one_sided": [], "p_common_one_sided": []}
     for _ in range(permutations):
         coins = generator.random(int(clusters.max()) + 1) < 0.5
-        estimates, bases, draws, base_draws = [], [], [], []
-        for trait in traits:
-            swap = family_swaps(trait, clusters, coins)
-            gain, base = gains(unit, trait, swap)
-            gain_draws, base_draw = gains(weights, trait, swap)
-            estimates.append(gain[0])
-            bases.append(base[0])
-            draws.append(gain_draws)
-            base_draws.append(base_draw)
-        found = combined(np.array(estimates), np.column_stack(draws))
-        common = common_relative(np.array(estimates), np.array(bases), np.column_stack(draws), np.column_stack(base_draws))
-        found["p_common_one_sided"] = common["p_one_sided"]
+        found = evaluated(traits, clusters, weights, coins)
         z_null.append(found["z"])
         trait_p_null.append(found["p"])
         total_null.append(found["Z"])
-        common_null.append(common["z"])
+        common_null.append(found["common_z"])
         for name in p_null:
             p_null[name].append(found[name])
     z_null_array, total_array, common_array = np.vstack(z_null), np.array(total_null), np.array(common_null)
     count = total_array.shape[0]
     return {
-        "permutations": count,
+        "permutations": count, "resamples": int(weights.shape[0]),
+        "reference": {"common_z": float(observed["common_z"]), "Z": float(observed["Z"])},
         "z_mean": np.mean(z_null_array, axis=0), "z_sd": np.std(z_null_array, axis=0, ddof=1),
         "trait_type_one": np.mean(np.vstack(trait_p_null) < LEVEL, axis=0),
         "Z_mean": float(np.mean(total_array)), "Z_sd": float(np.std(total_array, ddof=1)),
         "common_z_mean": float(np.mean(common_array)), "common_z_sd": float(np.std(common_array, ddof=1)),
-        "p_permutation_common_upper": float((1 + np.sum(common_array >= observed["common"]["z"])) / (1 + count)),
+        "p_permutation_common_upper": float((1 + np.sum(common_array >= observed["common_z"])) / (1 + count)),
         "type_one": {name: float(np.mean(np.array(values) < LEVEL)) for name, values in p_null.items()},
         "p_permutation_Z_upper": float((1 + np.sum(total_array >= observed["Z"])) / (1 + count)),
         "p_permutation_Z_two_sided": float((1 + np.sum(np.abs(total_array) >= abs(observed["Z"]))) / (1 + count)),
@@ -396,15 +418,16 @@ def report(result: dict[str, object], traits: Sequence[PairedTrait], contrast: s
                  + ", ".join(f"{name} {value:.4f}" for name, value in zip(names, result["arm_correlation"])))
     lines.append("R (joint family bootstrap correlation of the gains): " + np.array2string(result["R"], precision=3).replace("\n", " "))
     common = result["common"]
-    lines.append(f"PRIMARY common relative gain g = {common['estimate'] * 100:.2f}% of snv_indel r^2 [{common['ci_low'] * 100:.2f}, "
-                 f"{common['ci_high'] * 100:.2f}], z = {common['z']:.3f}, one-sided p (g > 0) = {common['p_one_sided']:.4g} "
-                 f"(two-sided {common['p_two_sided']:.4g}), at most {common['upper_95'] * 100:.2f}%; weight shares "
+    lines.append(f"PRIMARY common relative gain g = {common['estimate'] * 100:.2f}% of the arms' mean partial r^2, 95% CI "
+                 f"[{common['ci_low'] * 100:.2f}, {common['ci_high'] * 100:.2f}]; shares of g (a r^2 / sum a r^2) "
                  + ", ".join(f"{name} {share:.2f}" for name, share in zip(names, common["weight_share"])))
+    lines.append(f"  weak null g = 0, family-clustered bootstrap test, one-sided (g > 0): z = {common['z']:.3f}, p = {common['p_one_sided']:.4g}; "
+                 f"one-sided 95% bounds: g > {common['lower_95'] * 100:.2f}%, g < {common['upper_95'] * 100:.2f}% (two-sided p {common['p_two_sided']:.4g})")
     lines.append(f"original primary, now secondary: Stouffer Z = {result['Z']:.3f}, two-sided p = {result['p_stouffer']:.4g} "
                  f"(one-sided gain > 0: {result['p_stouffer_one_sided']:.4g})")
     lines.append(f"ACAT p = {result['p_acat']:.4g} (from one-sided p: {result['p_acat_one_sided']:.4g}); omnibus Cauchy(Stouffer, ACAT) p = {result['p_omnibus']:.4g}")
     random = result["relative_random"]
-    lines.append(f"relative gain, REML + HKSJ: {random['estimate'] * 100:.2f}% [{random['ci_low'] * 100:.2f}, {random['ci_high'] * 100:.2f}], "
+    lines.append(f"relative gain (% of snv_indel r^2), REML + HKSJ, sensitivity analysis treating the traits as independent: {random['estimate'] * 100:.2f}% [{random['ci_low'] * 100:.2f}, {random['ci_high'] * 100:.2f}], "
                  f"p = {random['p_value']:.4g}, at most {random['upper_95'] * 100:.2f}%, tau^2 = {random['tau_squared']:.3g}")
     lines.extend(pooled_lines("all held-out:", result["absolute_pooled"], result["relative_pooled"]))
     for group, entry in result["groups"].items():
@@ -413,15 +436,18 @@ def report(result: dict[str, object], traits: Sequence[PairedTrait], contrast: s
         lines.append(f"{group.upper()} cells: {cells}")
         if entry["absolute"] is not None:
             common = entry["common"]
-            lines.append(f"{group.upper()} common relative gain (secondary): {common['estimate'] * 100:.2f}% [{common['ci_low'] * 100:.2f}, "
-                         f"{common['ci_high'] * 100:.2f}], one-sided p = {common['p_one_sided']:.4g}, at most {common['upper_95'] * 100:.2f}%")
+            lines.append(f"{group.upper()} common relative gain (secondary, % of the arms' mean partial r^2): {common['estimate'] * 100:.2f}% "
+                         f"[{common['ci_low'] * 100:.2f}, {common['ci_high'] * 100:.2f}], weak null one-sided p = {common['p_one_sided']:.4g}, "
+                         f"one-sided 95% bounds {common['lower_95'] * 100:.2f}% to {common['upper_95'] * 100:.2f}%")
             lines.extend(pooled_lines(f"{group.upper()}:", entry["absolute"], entry["relative"]))
     calibration = result.get("calibration")
     if calibration:
-        lines.append(f"calibration ({calibration['permutations']} family arm swaps): per-trait null z mean "
+        lines.append(f"calibration ({calibration['permutations']} family arm swaps, each and the observed statistics on the same "
+                     f"{calibration['resamples']} resamples; sharp null: the arms' scores exchangeable within families): per-trait null z mean "
                      + np.array2string(calibration["z_mean"], precision=2) + ", SD " + np.array2string(calibration["z_sd"], precision=2)
                      + ", type-I at 0.05 " + np.array2string(calibration["trait_type_one"], precision=3))
-        lines.append(f"  PRIMARY p (one-sided permutation p, g > 0): {calibration['p_permutation_common_upper']:.4g}; its z null mean "
+        lines.append(f"  PRIMARY sharp null, one-sided permutation p (g > 0): {calibration['p_permutation_common_upper']:.4g} (observed z on these "
+                     f"resamples {calibration['reference']['common_z']:.3f}); its z null mean "
                      f"{calibration['common_z_mean']:.2f}, SD {calibration['common_z_sd']:.2f}, normal one-sided type-I at 0.05 "
                      f"{calibration['type_one']['p_common_one_sided']:.3f}")
         lines.append(f"  Stouffer Z null mean {calibration['Z_mean']:.2f}, SD {calibration['Z_sd']:.2f}; type-I at 0.05: "
@@ -540,9 +566,11 @@ def excluded(run: dict[str, object], ids: set[str], keep: bool = False) -> tuple
 
 
 def merge_pairs(runs: Sequence[dict[str, object]]) -> dict[str, object]:
-    """One trait's matched pairing runs as one: on the held-out people every run has, each run's two scores
-    standardized over those people, then each arm averaged over the runs. Averaging fits of one arm cuts the fit-to-fit
-    noise both arms carry; both arms are averaged over the same runs. The outcome must agree between runs."""
+    """One trait's matched pairing runs as one ensemble comparison: on the held-out people every run has, each run's
+    two scores standardized over those people, then each arm averaged over the runs. Averaging fits of one arm cuts the
+    fit-to-fit noise both arms carry; both arms are averaged over the same runs. The outcome must agree between runs.
+    Two people share a family where any run puts them in one (``union_clusters``), so the bootstrap and the swaps keep
+    every run's family dependence."""
     first = runs[0]
     common = set(map(str, first["ids"]))
     for run in runs[1:]:
@@ -553,8 +581,9 @@ def merge_pairs(runs: Sequence[dict[str, object]]) -> dict[str, object]:
     for run in runs:
         position = {str(value): row for row, value in enumerate(run["ids"])}
         rows_of.append(np.array([position[value] for value in order], dtype=np.int64))
-    for key in ("ids", "families", "ancestry", "target", "covariates"):
+    for key in ("ids", "ancestry", "target", "covariates"):
         merged[key] = np.asarray(first[key])[rows_of[0]]
+    merged["families"] = union_clusters([(np.arange(len(order)), np.asarray(run["families"])[rows]) for run, rows in zip(runs, rows_of)], len(order))
     for run, rows in zip(runs[1:], rows_of[1:]):
         if run["name"] != first["name"] or not np.allclose(np.asarray(run["target"], dtype=np.float64)[rows], merged["target"]):
             raise ValueError(f"{run['name']}: runs merged as one trait disagree on the trait or its outcome")

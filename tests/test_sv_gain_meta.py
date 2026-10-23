@@ -164,6 +164,41 @@ def test_pairs_of_one_trait_are_averaged_per_arm_on_their_common_people() -> Non
         raise AssertionError("runs whose outcomes disagree were merged")
 
 
+def test_merged_runs_join_every_run_s_families() -> None:
+    # run A puts b and c in one family, run B puts c and d in one: merged, b, c and d share a family and e stays alone
+    first = {**_run("ldl", ["a", "b", "c", "d", "e"], np.zeros(5), np.zeros(5), np.ones(5)), "families": np.array([1, 2, 2, 3, 4])}
+    second = {**_run("ldl", ["e", "d", "c", "b", "a"], np.zeros(5), np.ones(5), np.zeros(5)), "families": np.array([9, 8, 8, 7, 6])}
+    families = sv_gain_meta.merge_pairs([first, second])["families"]
+    assert families[1] == families[2] == families[3]
+    assert len({families[0], families[1], families[4]}) == 3
+
+
+def test_the_permutation_p_ranks_the_observed_statistic_computed_on_the_swaps_resamples() -> None:
+    traits, families, ancestry = _synthetic(np.random.default_rng(14), 0.2)
+    seed, resamples, permutation_resamples = 15, 100, 30
+    result = sv_gain_meta.analyse(traits, families, ancestry, seed, resamples=resamples, permutations=5,
+                                  permutation_resamples=permutation_resamples)
+    # the same resamples analyse draws: the first permutation_resamples of its joint bootstrap
+    generator = np.random.default_rng(seed)
+    counts = sv_gain_meta.cluster_bootstrap_counts(np.zeros(int(families.max()) + 1, dtype=np.int64), resamples, generator)
+    weights = counts[:, families][:permutation_resamples]
+    reference = sv_gain_meta.evaluated(traits, families, weights)
+    calibration = result["calibration"]
+    assert calibration["resamples"] == permutation_resamples
+    assert calibration["reference"]["common_z"] == reference["common_z"] and calibration["reference"]["Z"] == reference["Z"]
+    # coins that swap no family give the observed statistic, and coins that swap every family turn its gain around
+    none = sv_gain_meta.evaluated(traits, families, weights, np.zeros(int(families.max()) + 1, dtype=bool))
+    every = sv_gain_meta.evaluated(traits, families, weights, np.ones(int(families.max()) + 1, dtype=bool))
+    assert np.isclose(none["common_z"], reference["common_z"]) and np.isclose(every["common_z"], -reference["common_z"])
+    # the report names both nulls and g's denominator
+    lines = sv_gain_meta.report(result, traits)
+    assert any("of the arms' mean partial r^2" in line for line in lines)
+    assert any(line.startswith("  weak null g = 0, family-clustered bootstrap test, one-sided") for line in lines)
+    assert any(line.startswith("  PRIMARY sharp null, one-sided permutation p") for line in lines)
+    common = result["common"]
+    assert np.isclose(common["lower_95"], common["estimate"] - sv_gain_meta.UPPER * common["standard_error"])
+
+
 def test_excluded_people_leave_every_per_person_array() -> None:
     run = _run("gout", ["a", "b", "c"], np.array([1.0, 2.0, 3.0]), np.zeros(3), np.ones(3))
     kept, lost = sv_gain_meta.excluded(run, {"b", "z"})
