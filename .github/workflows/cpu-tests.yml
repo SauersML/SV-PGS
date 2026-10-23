@@ -1,23 +1,18 @@
 name: cpu-tests
 
-# The landing gate is the MSI suite run on each tip before it reaches main. This workflow
-# is a secondary signal on main: the project has no branches other than main, so a pull_request trigger would never
-# fire, and nothing here blocks a landing.
+# Supplemental checks after main is updated; the Linux MSI suite is the landing gate.
 on:
   push:
     branches: [main]
 
-# Only main's tip matters here, so a push cancels the run it supersedes: a backlog of runs, each holding a runner,
-# queued every later push for hours.
+# Cancel superseded runs so they do not delay the current tip.
 concurrency:
   group: cpu-tests
   cancel-in-progress: true
 
 jobs:
   runtime-install:
-    # The one check the MSI venvs cannot make: that the declared runtime dependencies alone are enough. They have
-    # every dev and benchmark package installed, so a module sv_pgs imports at module scope can sit in the dev
-    # group unnoticed, as numba did. Here the package is installed without that group and every module is imported.
+    # Catch runtime imports accidentally supplied only by the development environment.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -50,8 +45,7 @@ jobs:
   cpu-fast-tests:
     # Every test file, sharded, less the slow ones (-m "not slow"); those run on MSI.
     runs-on: ubuntu-latest
-    # A shard takes about four minutes; a test that never ends (the small-n double loop, the EB polish before 69f5e72)
-    # otherwise held its runner for GitHub's six-hour default.
+    # Bound a shard containing a stalled numerical solve.
     timeout-minutes: 60
     strategy:
       fail-fast: false

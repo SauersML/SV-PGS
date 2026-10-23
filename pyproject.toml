@@ -8,10 +8,7 @@ version = "0.1.0"
 description = "Bayesian polygenic scores with structural variants, tandem repeats and SNVs in one model"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
-# The supported platform: Linux on CPython 3.12, which is what the MSI suite
-# (3.12.13) and the CI workflow run. sv_pgs reads /proc and os.sched_getaffinity (compute_budget, dosage_store,
-# progress) and has never been run below 3.12, so neither a wider Python floor nor another operating system is a
-# claim this project can make.
+# Tested on Linux with CPython 3.12; resource detection uses /proc and sched_getaffinity.
 requires-python = ">=3.12"
 classifiers = [
     "Operating System :: POSIX :: Linux",
@@ -24,24 +21,21 @@ dependencies = [
     "google-cloud-bigquery>=3.40.1",
     # crc32c checksums guard the dosage store's Zarr v3 shard indexes and zstd chunks.
     "google-crc32c>=1.5",
-    # zstd is the dosage store's bucket codec (target-format REPORT §2.3).
+    # Compression for dosage-store buckets.
     "zstandard>=0.23",
     "pandas>=1.5",
     # Stage 0's CPU backend runs single-threaded BLAS inside its own worker pool.
     "threadpoolctl>=3.1",
-    # sv_pgs/mean_field.py imports numba at module level: its kernels are the small-n route's inference, so an
-    # install without numba cannot fit anything.
+    # CPU inference kernels; required even without the GPU extra.
     "numba>=0.60",
     # The prior's annotation smooths: B-spline bases and their exact derivative roughness penalties (gamfit.basis).
     "gamfit==0.1.272",
-    # The run mirror (sv_pgs/run_mirror.py): a Batch job's disk ends with it, so the run lives in the workspace bucket.
+    # Persist runs across Batch jobs through the workspace bucket.
     "google-cloud-storage>=2.18",
 ]
 
 [project.optional-dependencies]
-# CuPy loads the CUDA 12 runtime, cuBLAS, cuSOLVER (with its cuSPARSE and nvJitLink), cuRAND (cupy.random)
-# and NVRTC from these wheels at run time; JAX's CUDA extra used to bring them in. Nothing calls cupy.fft, so
-# cuFFT is left out. tests/test_gpu_extra_cuda.py exercises each one.
+# CUDA 12 libraries used by CuPy; exercised by tests/test_gpu_extra_cuda.py.
 gpu = [
     "cupy-cuda12x>=13.0",
     "nvidia-cuda-runtime-cu12",
@@ -65,33 +59,8 @@ markers = [
     "slow: a test over 60 s on a CI runner; excluded from the CI shards (-m 'not slow') and run on MSI by bug-recent's periodic full run",
 ]
 
-[tool.mypy]
-python_version = "3.12"
-
-[[tool.mypy.overrides]]
-module = [
-    "numpy",
-    "numpy.*",
-    "pytest",
-    "pytest.*",
-    "sklearn",
-    "sklearn.*",
-    "google.cloud",
-    "google.cloud.*",
-    "cupy",
-    "cupy.*",
-    "cupyx",
-    "cupyx.*",
-    "scipy",
-    "scipy.*",
-    "cyvcf2",
-    "pandas",
-]
-ignore_missing_imports = true
-
 [dependency-groups]
 dev = [
-    "mypy>=1.20.0",
     "vulture>=2.16",
     "pytest>=8",
     # Reference metrics (roc_auc_score, r2_score) in the tests; nothing in sv_pgs imports it.
@@ -100,9 +69,4 @@ dev = [
     # on synthetic OMOP tables: sqlglot transpiles it to DuckDB.
     "duckdb>=1.1",
     "sqlglot>=30",
-]
-# Coalescent simulation for the team's accuracy and power studies on public data.
-# Never imported by sv_pgs; install with `uv sync --group sim`.
-sim = [
-    "msprime>=1.3",
 ]
