@@ -1,4 +1,4 @@
-SV gain in All of Us: pre-specified analysis, amendment 3
+SV gain in All of Us: pre-specified analysis, amendment 4
 Written 2026-10-22 17:58 PDT and committed before any matched pairing run other than aou-wl15 had been scored.
 
 What had been seen when this was written
@@ -188,6 +188,27 @@ request, before any Q8 fit was submitted)
     g = 0.5% and 1.00 at g = 1%.
   - The model predicted the finished pairs' gain SEs to within 25% (hypothyroidism 0.33 vs 0.40 x1e-4, eGFR 0.92 vs
     0.97 x1e-4).
+
+
+Continued fits (amendment 4, written 2026-10-22 about 23:20 PDT, after hypertension's held-out result was read at
+23:14 PDT)
+- Why: hypertension's with_sv arm (aou-m3f-h2) stopped uncertified, with remaining gain 0.044, and its pair's result
+  was -53.7%. An arm that stops short of its convergence criterion measures the optimizer, not the SVs. Continuing only
+  that arm after seeing its sign would be selective, so this rule covers every uncertified arm whatever the direction
+  of its pair's result. It was written after hypertension's result was seen, and that is the reason it exists.
+- Which pairs: every pair in the 11-trait family with an arm whose fit certificate is uncertified. That is hypertension
+  (aou-m3f-h2 with_sv), gout (aou-x3-g2 with_sv) and LDL (aou-wl15 with_sv) now, and any pair that ends with an
+  uncertified arm later. Which pairs qualify is read from the score step's certificates, without outcomes.
+- How: both arms of each such pair are continued, not only the uncertified one, so the pair stays matched (validity,
+  rule 2). Each arm starts from its own saved model and is refitted by one code and one set of settings, the same for
+  both arms, to its convergence criterion. A continued arm that again stops uncertified counts and is flagged, as
+  amendment 2 says. A continuation that fails or does not finish leaves its pair at its original fits, flagged.
+- Pairs whose arms are both certified are not refitted.
+- Use: the primary statistic, computed with the continued pairs in place of their original fits, is the primary
+  result. The same statistic on the original fits is reported beside it as the pre-amendment result.
+- When: if every continuation finishes before 2026-10-23 08:00 PDT, both results are reported at the time When fixes.
+  If not, the pre-amendment result is reported at that time, labelled as such, with the uncertified arms flagged. The
+  amendment-4 result follows when the continuations finish, and it is the primary result.
 
 
 Results seen (log; no test definition changes because of them)
