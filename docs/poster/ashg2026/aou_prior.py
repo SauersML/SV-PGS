@@ -13,8 +13,8 @@ posterior means, and ``posterior_variance_share`` the class's share of E[beta^2 
 Outputs, in figures/aou_review/ (each a .png and a .pdf), outside build_pptx.py's glob of figures/aou_*.png, so no
 poster build places them, and inside .gitignore's figures/aou_*:
 - prior_by_trait: a row per trait and class, the prior a black tick, the posterior a dot with its interval;
-- prior_pooled: each class pooled across traits, over every trait and without gout, whose prior alone gives SV
-  alleles larger variance than SNV alleles. A trait's estimate is its log posterior ratio with standard error
+- prior_pooled: each class pooled across the converged traits (and, were gout's fit among them, without gout, whose
+  prior alone gives SV alleles larger variance than SNV alleles). A trait's estimate is its log posterior ratio with standard error
   (log upper - log lower) / (2 x 1.96); the traits are pooled by a random-effects model, tau^2 by REML and the mean's
   interval by Hartung-Knapp-Sidik-Jonkman (t on k - 1 degrees of freedom). The prior's tick is the geometric mean of
   the traits' priors. The pooled values, Cochran's Q p, I^2 and each leave-one-trait-out value are printed.
@@ -42,6 +42,9 @@ TRAITS = {"ldl_cholesterol": "LDL cholesterol", "hypothyroidism": "Hypothyroidis
           "atrial_fibrillation": "Atrial fibrillation", "egfr_ckd_epi_2021": "eGFR", "gout": "Gout"}
 """The traits in the order drawn, each with its name on the figures."""
 GOUT = "gout"
+CONVERGED_RUNS = frozenset({"aou-wl5", "aou-wo7", "aou-wa5", "aou-m3f-e1"})
+"""The runs whose with_sv fit converged, from svgain's converged list (the fits' certification and convergence flags):
+converged fits only, so a row of any other run is left out of both figures and every pooled value."""
 INK = "#000000"
 CLASSES = {"deletion": ("Deletions", "#E69F00"), "insertion": ("Insertions", "#009E73"),
            "str_vntr_repeat": ("Tandem repeats", "#8C6D1F")}
@@ -91,7 +94,7 @@ def pooled(rows: list[dict]) -> dict[tuple[str, str], dict]:
     and the pooled ratio with each trait left out."""
     found = {}
     for name in CLASSES:
-        for subset in ("all", "without_gout"):
+        for subset in ("all", "without_gout") if any(row["trait"] == GOUT for row in rows) else ("all",):
             chosen = [row for trait in TRAITS for row in rows if row["trait"] == trait and row["class"] == name
                       and (subset == "all" or trait != GOUT)]
             y = np.array([math.log(row["posterior"]) for row in chosen])
@@ -123,49 +126,51 @@ def by_trait_figure(rows: list[dict]):
     """A row per trait and class: the learned prior and the posterior with its 95% interval."""
     traits = [trait for trait in TRAITS if any(row["trait"] == trait for row in rows)]
     width, height, left, bottom, top = 16.0, 2.0 + 1.55 * len(traits), 3.7, 1.45, 0.35
-    limits, offsets = (0.002, 100.0), (-0.26, 0.0, 0.26)
+    limits, offsets = (0.002, 20.0), (-0.26, 0.0, 0.26)
     fig = plt.figure(figsize=(width, height))
     ax = fig.add_axes((left / width, bottom / height, (width - left - 0.5) / width, (height - bottom - top) / height))
-    log_axis(ax, limits, [0.01, 0.1, 1, 10, 100])
+    log_axis(ax, limits, [0.01, 0.1, 1, 10])
     ax.set_ylim(len(traits) - 0.55, -0.45)
     for y, trait in enumerate(traits):
         ax.text(-0.03, y, TRAITS[trait], transform=ax.get_yaxis_transform(), ha="right", va="center")
         for offset, (name, (_, colour)) in zip(offsets, CLASSES.items()):
             row = next(row for row in rows if row["trait"] == trait and row["class"] == name)
             mark(ax, y + offset, row["posterior"], row["posterior_lower"], row["posterior_upper"], row["prior"], colour, limits)
-    ax.set_xlabel("Effect variance per allele, relative to SNVs")
-    # the key, in the empty left of the last row (gout's, whose intervals start above 3x): the classes' names on its
-    # three rows, then the two marks
-    last = len(traits) - 1
+    ax.set_xlabel("Effect variance per allele relative to SNVs, converged fits only")
+    # the key, in the empty left of the hypothyroidism and atrial fibrillation rows, whose intervals start above 0.1x:
+    # the classes' names on hypothyroidism's three rows, then the two marks on atrial fibrillation's
     for offset, (label, colour) in zip(offsets, CLASSES.values()):
-        ax.text(0.0024, last + offset, label, color=colour, ha="left", va="center")
-    ax.hlines(last - 0.15, 0.07, 0.13, color=INK, linewidth=BAR)
-    ax.plot([0.095], [last - 0.15], "o", color=INK, markersize=MARK, markeredgewidth=0)
-    ax.text(0.17, last - 0.15, "Posterior, 95% CI", ha="left", va="center")
-    ax.plot([0.095], [last + 0.2], "|", color=INK, markersize=TICK, markeredgewidth=4)
-    ax.text(0.17, last + 0.2, "Learned prior", ha="left", va="center")
+        ax.text(0.0024, 1 + offset, label, color=colour, ha="left", va="center")
+    ax.hlines(2 - 0.15, 0.0026, 0.0046, color=INK, linewidth=BAR)
+    ax.plot([0.0035], [2 - 0.15], "o", color=INK, markersize=MARK, markeredgewidth=0)
+    ax.text(0.006, 2 - 0.15, "Posterior, 95% CI", ha="left", va="center")
+    ax.plot([0.0035], [2 + 0.2], "|", color=INK, markersize=TICK, markeredgewidth=4)
+    ax.text(0.006, 2 + 0.2, "Learned prior", ha="left", va="center")
     return fig
 
 
 def pooled_figure(found: dict, traits: int):
-    """A pair of rows per class, over every trait and without gout: the pooled posterior with its 95% interval and the
-    traits' geometric-mean prior, with the SNVs' 1 drawn."""
-    width, height, left, bottom, top = 16.0, 7.6, 5.6, 1.45, 0.3
+    """A row per class, or with gout among the traits a pair of rows, over every trait and without gout: the pooled
+    posterior with its 95% interval and the traits' geometric-mean prior, with the SNVs' 1 drawn."""
+    subsets = [subset for subset in ("all", "without_gout") if (next(iter(CLASSES)), subset) in found]
+    width, height, left, bottom, top = 16.0, 1.75 + 1.0 * len(CLASSES) * len(subsets), 5.6 if len(subsets) > 1 else 3.2, 1.45, 0.3
     limits = (0.1, 20.0)
     fig = plt.figure(figsize=(width, height))
     ax = fig.add_axes((left / width, bottom / height, (width - left - 0.5) / width, (height - bottom - top) / height))
     log_axis(ax, limits, [0.1, 0.2, 0.5, 1, 2, 5, 10, 20])
-    ax.set_ylim(5.6, -0.6)
+    ax.set_ylim(len(CLASSES) * len(subsets) - 0.4, -0.6)
     ax.axvline(1.0, color=INK, linewidth=2.5, zorder=1)
     for index, (name, (label, colour)) in enumerate(CLASSES.items()):
-        for offset, (subset, text) in enumerate((("all", f"All {traits} traits"), ("without_gout", "Without gout"))):
+        for offset, subset in enumerate(subsets):
             entry = found[(name, subset)]
-            y = 2 * index + offset
+            y = len(subsets) * index + offset
             mark(ax, y, entry["ratio"], entry["low"], entry["high"], entry["prior"], colour, limits)
-            ax.text(-0.03, y, text, transform=ax.get_yaxis_transform(), ha="right", va="center")
-        ax.text(-(left - 0.25) / (width - left - 0.5), 2 * index + 0.5, label, transform=ax.get_yaxis_transform(),
-                ha="left", va="center")
-    ax.set_xlabel("Posterior effect variance per allele, relative to SNVs")
+            if len(subsets) > 1:
+                ax.text(-0.03, y, {"all": f"All {traits} traits", "without_gout": "Without gout"}[subset],
+                        transform=ax.get_yaxis_transform(), ha="right", va="center")
+        ax.text(-(left - 0.25) / (width - left - 0.5), len(subsets) * index + (len(subsets) - 1) / 2, label,
+                transform=ax.get_yaxis_transform(), ha="left", va="center")
+    ax.set_xlabel(f"Posterior effect variance per allele relative to SNVs, pooled over {traits} converged traits")
     # the key, in the empty right of the deletions' rows
     ax.hlines(0.5, 2.5, 3.7, color=INK, linewidth=BAR)
     ax.plot([3.05], [0.5], "o", color=INK, markersize=MARK, markeredgewidth=0)
@@ -176,7 +181,10 @@ def pooled_figure(found: dict, traits: int):
 
 
 def main() -> None:
-    rows = json.loads(NUMBERS.read_text())["prior_posterior"]["rows"]
+    every = json.loads(NUMBERS.read_text())["prior_posterior"]["rows"]
+    rows = [row for row in every if row["run"] in CONVERGED_RUNS]
+    print("converged fits only: " + ", ".join(sorted({row["run"] for row in rows})) + "; left out: "
+          + (", ".join(sorted({row["run"] for row in every} - CONVERGED_RUNS)) or "none"))
     found = pooled(rows)
     for (name, subset), entry in found.items():
         print(f"{name} {subset}: {entry['ratio']:.3g} ({entry['low']:.3g}, {entry['high']:.3g}), tau {entry['tau']:.3g}, "

@@ -1,13 +1,16 @@
 """SV-PGS against LDpred2-auto on the same All of Us held-out people: per trait, the held-out partial r^2 of SV-PGS
 (each arm of the SV-gain primary's matched pairs, benchmarks/bench_real/sv_gain_meta.py) less LDpred2-auto's fitted
 on the same run records' SNVs and indels (aou_fastpgs.py's ldpred2_auto, snv_indel arm), with 95% intervals from the
-joint family bootstrap, and the common relative difference over every trait (sv_gain_meta's primary statistic).
+joint family bootstrap, and the common relative difference over the traits (sv_gain_meta's primary statistic). Converged
+fits only: each trait enters an arm's comparison only where that arm's SV-PGS fit converged, as SPEC lists (svgain's
+converged list, one JSON entry per trait: label, the pairing runs, the run whose aou_fastpgs.py job fitted LDpred2-auto,
+and the converged arms).
 
 Runs inside the workspace (the app), where it reads each run's held-out scores; it prints aggregates only, as one JSON
 line, with any count under 40 masked. The long-read panel's members are dropped, as in the primary. svpgs_vs_ldpred2.py
 draws the figure from that line.
 
-    .venv/bin/python svpgs_vs_ldpred2_app.py SV_GAIN_META_PRIMARY.py LONGREAD_IDS > line.json
+    .venv/bin/python svpgs_vs_ldpred2_app.py SV_GAIN_META_PRIMARY.py LONGREAD_IDS SPEC.json > line.json
 """
 from __future__ import annotations
 
@@ -17,17 +20,6 @@ import sys
 
 import numpy as np
 
-# trait label, the SV-gain primary's pairing runs (LDL's two merged) and the run whose aou_fastpgs.py job fitted LDpred2-auto
-PAIRS = (
-    ("LDL cholesterol", ("aou-wl15", "aou-x3-l2"), "aou-wl5"),
-    ("eGFR", ("aou-m3f-e1",), "aou-we6"),
-    ("Hypothyroidism", ("aou-x3-o1",), "aou-m1p-o"),
-    ("Atrial fibrillation", ("aou-x3-a1",), "aou-m1p-a"),
-    ("Gout", ("aou-x3-g2",), "aou-m1p-g"),
-    ("Hypertension", ("aou-m3f-h2",), "aou-m1p-h"),
-    ("Type 2 diabetes", ("aou-m3f-t2",), "aou-m1p-t"),
-    ("Chronic kidney disease", ("aou-m3g-k2",), "aou-m1p-k"),
-)
 SHOWN = 40
 
 
@@ -41,8 +33,11 @@ def main() -> None:
     column = rows[0].index("research_id") if "research_id" in rows[0] else None
     excluded_ids = {row[column] for row in rows[1:]} if column is not None else {row[0] for row in rows}
 
+    with open(sys.argv[3], encoding="utf-8") as handle:
+        spec = json.load(handle)
     found, notes = [], []
-    for label, names, fastpgs_run in PAIRS:
+    for entry in spec:
+        label, names, fastpgs_run = entry["label"], entry["runs"], entry["fastpgs"]
         runs = [meta.excluded(meta.read_run(name), excluded_ids)[0] for name in names]
         run = meta.merge_pairs(runs) if len(runs) > 1 else runs[0]
         with np.load(f"{meta.OPS}/{fastpgs_run}/fastpgs/{run['name']}.npz", allow_pickle=False) as arrays:
@@ -58,14 +53,14 @@ def main() -> None:
         if not agree or keep.sum() < SHOWN:
             continue
         restricted = {key: np.asarray(run[key])[keep] for key in meta.PER_PERSON}
-        found.append({"label": label, "binary": run["binary"], **restricted, "ldpred2": ldpred2[other]})
+        found.append({"label": label, "binary": run["binary"], **restricted, "ldpred2": ldpred2[other], "arms": entry["arms"]})
 
     people, clusters, ancestry, _ = meta.union(found)
     result = {}
     for arm, column in (("with_sv", "candidate"), ("snv_indel", "baseline")):
         traits = [meta.PairedTrait(entry["label"], entry["binary"], people[i], np.asarray(entry["target"], dtype=np.float64),
                                    np.asarray(entry["covariates"], dtype=np.float64), entry["ldpred2"], np.asarray(entry[column], dtype=np.float64))
-                  for i, entry in enumerate(found)]
+                  for i, entry in enumerate(found) if arm in entry["arms"]]
         analysed = meta.analyse(traits, clusters, ancestry, seed=20261023, permutations=0)
         common = analysed["common"]
         result[arm] = {
