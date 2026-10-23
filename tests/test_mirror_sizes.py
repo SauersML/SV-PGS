@@ -9,6 +9,7 @@ import sys
 from launcher.workspace import mirror_sizes
 from sv_pgs import run_mirror
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, STEP_NAMES
+from tests.directory_remote import DirectoryRemote
 
 
 def _object(name: str, size: int, crc: str, date: str) -> dict:
@@ -39,7 +40,7 @@ def test_the_script_s_layout_is_the_pipeline_s_and_the_mirror_s() -> None:
     assert mirror_sizes.STEP_NAMES == STEP_NAMES and mirror_sizes.COMPLETE_FILE == COMPLETE_FILE
     assert mirror_sizes.PARTIAL == run_mirror.PARTIAL and mirror_sizes.STORE == run_mirror.STORE
     assert mirror_sizes.BASES == run_mirror.BASES and run_mirror.CARRIED == STEP_NAMES[: STEP_NAMES.index("fit")]
-    assert run_mirror.Base(run_mirror.DirectoryRemote(Path(".")), "gs://ops/svpgs/base/run").reference == f"{run_mirror.BASES}/ops/svpgs/base/run"
+    assert run_mirror.Base(DirectoryRemote(Path(".")), "gs://ops/svpgs/base/run").reference == f"{run_mirror.BASES}/ops/svpgs/base/run"
 
 
 def test_each_run_is_sized_by_part_and_a_store_several_runs_hold_is_named_once() -> None:

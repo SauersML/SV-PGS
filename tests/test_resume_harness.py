@@ -23,8 +23,9 @@ import numpy as np
 import pytest
 
 from sv_pgs import workspace_pipeline
-from sv_pgs.run_mirror import DirectoryRemote, push, restore
+from sv_pgs.run_mirror import push, restore
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, STEP_NAMES, WorkspaceConfig, run_pipeline
+from tests.directory_remote import DirectoryRemote
 from tests.test_workspace_pipeline import DIRECT_SV_NULL, BUDGET, _bindings, _Recorder, _single_model_batches, workspace  # noqa: F401 (a fixture)
 
 BOOKKEEPING = ("batches",)

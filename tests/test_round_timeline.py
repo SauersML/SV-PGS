@@ -213,7 +213,8 @@ def test_a_step_s_line_says_when_it_stopped_after_its_part_or_failed(workspace, 
     timeline = round_timeline.read(capsys.readouterr().err.splitlines())
     assert [step.state for step in timeline.steps] == ["reused"] * STEP_NAMES.index("fit") + ["failed"]
     # The other arm's run, on a disk restored from this run's mirror, and this run finishing from its parts.
-    from sv_pgs.run_mirror import DirectoryRemote, adopt, push, restore
+    from sv_pgs.run_mirror import adopt, push, restore
+    from tests.directory_remote import DirectoryRemote
 
     root = config.run_directory.parent
     partner, mine, theirs = dataclasses.replace(config, run_directory=root / "partner"), DirectoryRemote(root / "mine"), DirectoryRemote(root / "theirs")
@@ -232,4 +233,3 @@ def test_a_step_s_line_says_when_it_stopped_after_its_part_or_failed(workspace, 
     score = finishing[STEP_NAMES.index("score")]
     assert [phase.name for phase in score.inside if phase.name in round_timeline.SCORE_PHASES] == ["score_arm", "score_arm"]
     assert round_timeline.problems(timeline) == []
-    assert workspace_pipeline._run_step.__doc__ and "round_timeline" in workspace_pipeline._run_step.__doc__

@@ -23,11 +23,12 @@ def test_run_mirror_reads_the_bases_it_is_given_and_those_its_mirror_names(monke
 
     from sv_pgs import run_mirror
     from sv_pgs.workspace_pipeline import COMPLETE_FILE, WorkspaceConfig
+    from tests.directory_remote import DirectoryRemote
 
     opened = {}
 
     def remote(url):
-        opened.setdefault(url, run_mirror.DirectoryRemote(tmp_path / url.removeprefix("gs://")))
+        opened.setdefault(url, DirectoryRemote(tmp_path / url.removeprefix("gs://")))
         return opened[url]
 
     base = tmp_path / "ops/svpgs/base/run"

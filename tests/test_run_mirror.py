@@ -13,8 +13,9 @@ import pytest
 from sv_pgs import run_mirror
 from sv_pgs.content_identity import GCS_MOUNTS
 from sv_pgs.restart_store import MANIFEST, RestartStore, facts, unit_key
-from sv_pgs.run_mirror import Base, DirectoryRemote, GcsRemote, bases_of, mounted, push, restore
+from sv_pgs.run_mirror import Base, GcsRemote, bases_of, mounted, push, restore
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE
+from tests.directory_remote import DirectoryRemote
 
 
 def _write(path: Path, content: str | bytes) -> Path:

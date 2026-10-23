@@ -817,7 +817,8 @@ def test_an_uncertified_fit_is_scored_and_reported_and_named(workspace) -> None:
 def test_a_run_restored_from_its_mirror_on_a_new_disk_resumes_where_it_was_preempted(workspace) -> None:
     """Each Batch job has a new disk (run_mirror): a job preempted during the second arm's fit, whose run was pushed,
     resumes on an empty run directory restored from the mirror, fitting only that arm."""
-    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+    from sv_pgs.run_mirror import push, restore
+    from tests.directory_remote import DirectoryRemote
 
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping(synthetic.raw)
@@ -1026,7 +1027,8 @@ def test_store_shards_on_their_own_disks_meet_in_the_mirror_and_make_the_store_o
     """A fan-out store job's tasks (store_shard) start on new disks from one mirror, each converts its chromosome and
     pushes it without completing the step; the next job, restored from the mirror, writes the store a single run writes
     and converts nothing again."""
-    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+    from sv_pgs.run_mirror import push, restore
+    from tests.directory_remote import DirectoryRemote
 
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping(synthetic.raw)
@@ -1063,7 +1065,8 @@ def test_a_run_restored_from_a_base_mirror_makes_none_of_its_steps_again_and_pus
     """A new run whose mirror is empty names another run's mirror as its base (run_mirror.Base): restored from it, the
     driver finds the samples and store steps under its own keys and skips them, and its pushes send neither to its own
     mirror, which names the base instead."""
-    from sv_pgs.run_mirror import Base, DirectoryRemote, push, restore
+    from sv_pgs.run_mirror import Base, push, restore
+    from tests.directory_remote import DirectoryRemote
 
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping(synthetic.raw)
@@ -1916,7 +1919,8 @@ def test_a_run_of_regions_fits_each_window_on_the_shared_steps_mirrors_each_once
     directory on its window alone; the mirror carries each region's own steps and the shared ones once, and a fresh disk
     restored from it fits nothing again; LDpred2 and the comparison run region by region."""
     from benchmarks.bench_real import aou_compare, aou_ldpred2
-    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+    from sv_pgs.run_mirror import push, restore
+    from tests.directory_remote import DirectoryRemote
 
     synthetic, client = workspace
     windows = {"left": (21, 1, 4500), "right": (22, 2500, 9500)}
@@ -2043,7 +2047,8 @@ def _assert_postfit_outputs(directory: Path, expected) -> None:
 def test_postfit_resumes_after_a_mirrored_batch_and_keeps_every_output(workspace, monkeypatch, tmp_path, step) -> None:
     """A completed batch survives the loss of the VM; a failed batch is redone, and reassembly is exactly the same
     as an uninterrupted pass, including held-out/calibrated scores, structural parts and report tables."""
-    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+    from sv_pgs.run_mirror import push, restore
+    from tests.directory_remote import DirectoryRemote
 
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping({**synthetic.raw, "calibration_fraction": .3, "annotated_prior": False})
@@ -2149,7 +2154,8 @@ def test_a_score_read_stopped_part_way_resumes_from_its_mirrored_kept_read_to_th
     through: the restarted read starts where the mirrored kept read ends, and the scores, held-out tables and report
     are those of an uninterrupted pass. The completed step keeps no kept read."""
     from sv_pgs import fast_scoring, postfit_checkpoint
-    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+    from sv_pgs.run_mirror import push, restore
+    from tests.directory_remote import DirectoryRemote
 
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping({**synthetic.raw, "calibration_fraction": .3, "annotated_prior": False})
@@ -2237,7 +2243,8 @@ def test_two_runs_merge_their_finished_arms_and_reach_the_report_without_fitting
     then restored to a fresh disk. Real artifact loading and prediction take the result through effects and report,
     including a reordered saved fold axis, a binary and a quantitative trait, and an uncertified or refused arm."""
     from sv_pgs import artifact
-    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+    from sv_pgs.run_mirror import push, restore
+    from tests.directory_remote import DirectoryRemote
 
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping({**synthetic.raw, "disease_likelihood": likelihood, "cross_fit": cross_fit,
@@ -2386,7 +2393,8 @@ def test_arm_runs_score_their_own_arm_and_either_finishes_the_run_with_one_run_s
     steps from the fit on with no store, no fitter, no prediction and no measurement model, on a disk restored without
     the store or any restart unit. Every report, effects, score and export file is bitwise the one a run holding both arms' models makes
     today (both arms scored in one job), and the arms' parts survive a new disk without being made again."""
-    from sv_pgs.run_mirror import DirectoryRemote, adopt, push, restore
+    from sv_pgs.run_mirror import adopt, push, restore
+    from tests.directory_remote import DirectoryRemote
 
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping({**synthetic.raw, "disease_likelihood": likelihood, "cross_fit": cross_fit,

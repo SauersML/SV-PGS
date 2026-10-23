@@ -8,8 +8,9 @@ from pathlib import Path
 import pytest
 
 from sv_pgs.postfit_checkpoint import BatchCheckpoint, RECORD
-from sv_pgs.run_mirror import DirectoryRemote, push, restore
+from sv_pgs.run_mirror import push, restore
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE
+from tests.directory_remote import DirectoryRemote
 
 
 def _batch(partial: Path, key: str = "step", identity=None) -> BatchCheckpoint:

@@ -611,7 +611,8 @@ def test_a_group_preempted_mid_eb_resumes_on_a_fresh_disk_from_its_mirrored_rest
     lattice check and the certificate run as on any fit. A third run finds the completed model checkpointed, and a fit
     whose engine changed is made again with the change logged."""
     from sv_pgs import stage2_wiring
-    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+    from sv_pgs.run_mirror import push, restore
+    from tests.directory_remote import DirectoryRemote
     from tests.test_full_data_fit import _store
 
     store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
