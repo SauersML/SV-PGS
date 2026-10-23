@@ -96,3 +96,14 @@ Amendment 2 (2026-10-23, 00:35 PDT, before any screen value is read)
   leave the family by a further amendment before any value is read.
 - From 0fc5b252, staged into all 11 screen runs before any after-task started, each trait's R sessions run while the
   next trait's GWAS and bands are computed. The fits, their seeds and settings are unchanged.
+
+Amendment 3 (2026-10-23, 01:20 PDT, before any screen value is read; no screen run has fitted any trait)
+- Runs aou-scr-q2, q3 and q4 are stopped, and their 28 laboratory traits leave the family. A laboratory trait's
+  phenotype step took about 30 minutes (aou-scr-q1: heart_rate 34 minutes, mostly reading rows, then its measurement
+  model), so 9 or 10 laboratory traits would need about 5 hours of phenotypes per run before any fit. That projected the
+  screen above its $130 budget. On Spot that one step would also restart from the beginning at each preemption, and
+  four of the eleven VMs were preempted within the first hour.
+- aou-scr-q1 lost its phenotype step to a preemption and is resubmitted on a STANDARD VM (slot train-1), with the same
+  staged source and traits.
+- The family is now at most 83 traits: the 11 of the earlier battery, aou-scr-d1 .. d7 (67 diseases) and aou-scr-q1
+  (5 quantitative traits), less those below the power threshold. Nothing else changes.
