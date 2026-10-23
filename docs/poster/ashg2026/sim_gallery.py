@@ -56,8 +56,6 @@ HALF = 10.46
 """Inches: half the middle column less its gutter and INSETs, the width each of two figures side by side is placed at."""
 OUTER = 10.8
 """Inches: the poster's left column (build_pptx.py's LEFT, 11.4) less its INSETs, where Figure 5a alone goes."""
-RING = 1.2
-"""Points: the white ring round a filled mark, which parts overlapping marks without breaking a short interval's bar."""
 TYPE, LABEL, TITLE = 28, 32, 36
 """Points at print size: tick labels, legends, row labels and notes; axis titles; panel titles. The poster's body text
 is 38 pt and its glosses 30 pt (build_pptx.py)."""
@@ -79,8 +77,6 @@ SKY = "#56B4E9"
 GREEN = "#009E73"
 PURPLE = "#CC79A7"
 INK = "#000000"
-GREY = "#6E6E6E"
-RULE = "#E4E4E4"
 SV_PGS, LDPRED2, IMPUTED = BLUE, VERMILLION, SKY
 """The colours that name a method or a genotype source wherever it appears: SV-PGS (and any SV-PGS gain), LDpred2-auto,
 and imputed SV genotypes beside true ones."""
@@ -174,7 +170,7 @@ SHORT = {
     "rare_disease": "Prevalence 1%",
 }
 """Each architecture's row label in a figure, under its group's heading, in plain words and short enough to leave the
-plot half the width at poster type. The baseline is the architecture every other one changes one thing of."""
+plot half the width at poster type. The baseline is the architecture the others change settings of."""
 GROUPS = (
     ("Causal SVs", ("null", "sv_5pct", "sv_20pct")),
     ("SV effect sizes", ("sv_5pct_fold3", "sv_20pct_fold3", "sv_heavy_tail", "sv_two_point")),
@@ -186,7 +182,8 @@ NUMBERS: dict = {}
 """What each figure shows, by figure, for numbers.json: means with Student-t 95% intervals as [mean, lower, upper, n]."""
 ARCHITECTURES = (
     "The baseline architecture has liability h² = 0.1, prevalence 10%, 200 causal variants and 20% causal SVs with SV "
-    "effects drawn like small-variant effects, and every other changes one thing of it: '3×' triples the SV effect SD, "
+    "effects drawn like small-variant effects; each other architecture changes one or more of these settings or how "
+    "SV effects are drawn: '3×' triples the SV effect SD, "
     "'a few very large' draws SV effects from a Student t with 3 degrees of freedom, 'all one size' gives every causal "
     "SV the same effect size with a random sign, 'well-imputed' draws causal SVs only from those imputed with r² ≥ 0.8, "
     "and 'common' only from SVs of frequency ≥ 5%."
@@ -315,16 +312,11 @@ def estimate(ax, y: float, mean: float, low: float, high: float, color: str, fil
         low, high = max(low, limits[0]), min(high, limits[1])
     ax.hlines(y, low, high, color=color, linewidth=BAR, zorder=3)
     ax.plot([mean], [y], "o", markersize=size, color=color, markerfacecolor=color if filled else "white",
-            markeredgecolor="white" if filled else color, markeredgewidth=RING if filled else BAR, zorder=4)
+            markeredgecolor=color, markeredgewidth=0 if filled else BAR, zorder=4)
 
 
 def zero_line(ax, vertical: bool = True) -> None:
     (ax.axvline if vertical else ax.axhline)(0, color=INK, linewidth=2.4, zorder=1)
-
-
-def value_grid(ax, axis: str = "x") -> None:
-    ax.grid(axis=axis, color=RULE, linewidth=1.6, zorder=0)
-    ax.set_axisbelow(True)
 
 
 def load_results() -> dict[str, list[dict]]:
@@ -361,10 +353,10 @@ def layout(present) -> list[tuple[str, str]]:
 # ------------------------------------------------------------------ Figure 1
 
 
-SV_SHARES = (("null", "0%", INK, "o", "-"), ("sv_5pct", "5%", "#555555", "s", (0, (3, 1.5))),
-             ("sv_20pct", "20%", "#8C8C8C", "D", (0, (1, 1.2))))
-"""Figure 1b's settings: the share of causal variants that are SVs, drawn in greys darkest first, each its own marker
-and line style (solid, dashed, dotted), so no two are told apart by grey alone."""
+SV_SHARES = (("null", "0%", INK, "o", "-"), ("sv_5pct", "5%", PURPLE, "s", (0, (3, 1.5))),
+             ("sv_20pct", "20%", SV_PGS, "D", (0, (1, 1.2))))
+"""Figure 1b's settings: the share of causal variants that are SVs, none in black as in the poster's scatter, each its
+own colour, marker and line style (solid, dashed, dotted)."""
 
 
 def log_size_axis(ax) -> None:
@@ -387,28 +379,28 @@ def accuracy_figure(grids, summary, height: float = 9.6):
     log_size_axis(ax)
     ceiling = summary["points"]["null"]["true_value_auc"]
     setting = summary["points"]["null"]["setting"]
-    ax.axhline(ceiling, color=GREY, linestyle=(0, (1, 1.4)), linewidth=3.2, zorder=1)
-    ax.text(0.02, ceiling - 0.004, f"max AUC (h² = {setting['h2']:g})", transform=blended_transform_factory(ax.transAxes, ax.transData),
-            color=GREY, va="top", ha="left")
+    ax.axhline(ceiling, color=INK, linestyle=(0, (1, 1.4)), linewidth=3.2, zorder=1)
+    ax.text(0.02, ceiling - 0.004, f"Best possible (h² = {setting['h2']:g})",
+            transform=blended_transform_factory(ax.transAxes, ax.transData), color=INK, va="top", ha="left")
     counts = {}
     NUMBERS["fig1"] = {"train_counts": list(SIZES), "test_people": summary["test_people"], "h2": setting["h2"],
-                       "prevalence": setting["prevalence"], "causal": setting["causal"], "h2_auc": ceiling}
+                       "prevalence": setting["prevalence"], "causal": setting["causal"], "h2_auc": ceiling,
+                       "baseline_sv_share": summary["points"]["sv_20pct"]["setting"]["sv_causal_fraction"]}
     for key, method, color in (("with_sv_auc", "SV-PGS", SV_PGS), ("ldpred2_auc", "LDpred2-auto", LDPRED2)):
         pooled = [interval([row[key] for point, *_ in SV_SHARES for row in grouped.get((point, size), [])])
                   for size in SIZES]
         NUMBERS["fig1"][method] = [list(cell) for cell in pooled]
         mean, low, high = (np.array([cell[i] for cell in pooled]) for i in range(3))
         counts[method] = [cell[3] for cell in pooled]
-        ax.fill_between(SIZES, low, high, color=color, alpha=0.22, linewidth=0, zorder=2)
-        ax.plot(SIZES, mean, color=color, zorder=3, marker="o", markeredgecolor="white", markeredgewidth=2.0)
+        ax.errorbar(SIZES, mean, yerr=(mean - low, high - mean), color=color, elinewidth=BAR, capsize=0, marker="o",
+                    markeredgewidth=0, zorder=3)
         ax.text(1.03, mean[-1], method, transform=blended_transform_factory(ax.transAxes, ax.transData), color=color,
                 fontweight="bold", va="center", ha="left")
     ax.set_ylim(0.5, 0.69)
     ax.set_yticks(np.arange(0.5, 0.651, 0.05), ["0.50", "0.55", "0.60", "0.65"])
-    ax.text(0.98, 0.04, "0/5/20% SVs pooled\nbands: 95% CI", transform=ax.transAxes, ha="right", va="bottom", color=GREY,
-            linespacing=1.2)
+    ax.text(0.98, 0.04, "0%, 5% and 20% causal SVs pooled", transform=ax.transAxes, ha="right", va="bottom",
+            color=INK)
     ax.set_ylabel("Test AUC")
-    value_grid(ax, "y")
     heading(ax, "Test AUC by training size", "a", across=-1.75)
 
     log_size_axis(gap)
@@ -420,22 +412,20 @@ def accuracy_figure(grids, summary, height: float = 9.6):
         gap.vlines(xs, [cell[1] for cell in stats_by_size], [cell[2] for cell in stats_by_size], color=color,
                    linewidth=BAR, zorder=2)
         gap.plot(xs, [cell[0] for cell in stats_by_size], color=color, linewidth=3.4, linestyle=style, marker=marker,
-                 markersize=MARK * (0.9 if marker == "D" else 1.0), markeredgecolor="white", markeredgewidth=2.0,
-                 zorder=3, label=share)
+                 markersize=MARK * (0.9 if marker == "D" else 1.0), markeredgewidth=0, zorder=3, label=share)
     gap.set_ylim(-0.006, 0.08)
     gap.set_yticks(np.arange(0, 0.061, 0.02))
     gap.set_ylabel("ΔAUC, SV-PGS − LDpred2-auto")
-    value_grid(gap, "y")
     gap.legend(title="Causal SVs; bars: 95% CI", loc="upper left", ncol=3, handlelength=2.2, columnspacing=1.0, handletextpad=0.4,
                alignment="left", borderaxespad=0.0)
     heading(gap, "Same gain with no causal SVs", "b", across=-1.95)
     caption = (
-        "Figure 1 | SV-PGS is more accurate than LDpred2-auto at every training size, by the same margin whether 0%, "
+        "Figure 1 | SV-PGS is more accurate than LDpred2-auto at every training size, by a similar margin whether 0%, "
         "5% or 20% of the causal variants are SVs, so the gain does not come from causal SVs. "
         "A simulated binary trait on chromosome 22 (liability h² = 0.1, "
         "prevalence 10%, 200 causal variants) scored in the same 10,000 held-out people; SV-PGS fits every SNV, indel "
         "and imputed SV, LDpred2-auto HapMap3-density SNVs of the same training people. a, Test AUC, mean and "
-        "Student-t 95% interval over the three settings' replicates pooled ("
+        "Student-t 95% interval over the three settings' simulations pooled ("
         + ", ".join(f"{n}" for n in counts["SV-PGS"])
         + " at 5k-40k); dotted, the largest AUC any score can reach, that of the true genetic value at h² = 0.1 (Wray "
         "et al. 2010). b, Paired difference in AUC on the same held-out people, per setting, mean and Student-t 95% "
@@ -461,7 +451,6 @@ def ldpred2_figure(grids):
     left = labels + 0.55
     ax = frame(fig, left, bottom, HALF - left - right, height - top - bottom)
     zero_line(ax)
-    value_grid(ax)
     limits = (-0.02, 0.11)
     wins = total = 0
     for y, (kind, point) in enumerate(rows):
@@ -469,14 +458,13 @@ def ldpred2_figure(grids):
             continue
         mean, low, high, n = interval(values[point])
         estimate(ax, y, mean, low, high, SV_PGS, limits=limits)
-        # each replicate over the interval's bar and under its mean, ringed so it shows on the bar
-        ax.scatter(values[point], [y] * n, s=(DOT * 1.15) ** 2, color=GREY, edgecolors="white", linewidths=1.0,
-                   zorder=3.5)
-        ax.text(1, y, f"{n}", transform=shifted(ax, 0.2), ha="left", va="center", color=GREY)
+        # each simulation in a lighter blue under the interval's bar and its mean
+        ax.scatter(values[point], [y] * n, s=(DOT * 1.15) ** 2, color=SV_PGS, alpha=0.35, linewidths=0, zorder=2)
+        ax.text(1, y, f"{n}", transform=shifted(ax, 0.2), ha="left", va="center")
         wins += sum(value > 0 for value in values[point])
         total += n
     # the column's head on the first group heading's row, which has no count
-    ax.text(1, 0, "n", transform=shifted(ax, 0.2), ha="left", va="center", color=GREY, fontstyle="italic")
+    ax.text(1, 0, "n", transform=shifted(ax, 0.2), ha="left", va="center", fontstyle="italic")
     NUMBERS["fig2"] = {"train_count": size, "wins": wins, "replicates": total,
                        "architectures": sum(kind == "point" for kind, _ in rows)}
     row_labels(ax, rows, left - 0.15)
@@ -487,9 +475,9 @@ def ldpred2_figure(grids):
     caption = (
         f"Figure 2 | SV-PGS is more accurate than LDpred2-auto across simulated genetic architectures. Paired difference "
         f"in test AUC on the same 10,000 held-out people between SV-PGS (every SNV, indel and imputed SV) and "
-        f"LDpred2-auto (HapMap3-density SNVs), both trained on the same {size:,} people: replicates (grey), mean and "
-        f"Student-t 95% interval (blue; an arrowhead marks one that runs past {limits[1]:.2f}), n replicates at right. "
-        f"SV-PGS had the higher AUC in {wins} of {total} replicates. {ARCHITECTURES} Not yet replicated three times at "
+        f"LDpred2-auto (HapMap3-density SNVs), both trained on the same {size:,} people: each simulation (light blue), mean and "
+        f"Student-t 95% interval (blue; an arrowhead marks one that runs past {limits[1]:.2f}), n simulations at right. "
+        f"SV-PGS had the higher AUC in {wins} of {total} simulations. {ARCHITECTURES} Fewer than three simulations at "
         f"{size:,}: {'; '.join(sentence(PLAIN.get(point, LABELS[point])) for point in missing)}."
     )
     return fig, caption
@@ -504,71 +492,72 @@ SOURCES = (("True SV genotypes", SV_PGS, True), ("Imputed SV genotypes", IMPUTED
 
 def source_legend(ax, across: float, up: float) -> None:
     handles = [Line2D([0], [0], marker="o", color=color, markerfacecolor=color if filled else "white",
-                      markeredgecolor="white" if filled else color, markeredgewidth=RING if filled else BAR,
-                      markersize=PAIR_MARK, linewidth=BAR, label=label) for label, color, filled in SOURCES]
+                      markeredgecolor=color, markeredgewidth=0 if filled else BAR, markersize=PAIR_MARK, linewidth=BAR,
+                      label=label) for label, color, filled in SOURCES]
     ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0, 1), bbox_transform=shifted(ax, across, up, False),
               ncol=2, columnspacing=1.4, handlelength=1.6, handletextpad=0.5, borderaxespad=0.0)
 
 
 def sv_gain_figure(grids):
-    imputed, true = defaultdict(list), defaultdict(list)
-    for row in grids["window"]:
-        imputed[row["point"]].extend(finite([row], "delta_auc"))
-    for row in grids["window-truth"]:
-        true[row["point"]].extend(finite([row], "delta_auc"))
-    rows = layout(lambda point: len(true[point]) >= 3 and len(imputed[point]) >= 3)
-    # no title: the poster's headline names the figure; the legend over the rows, a note under them
-    top, bottom, right = 1.0, 1.75, 0.15
+    """The gain from adding SVs per architecture with true and with imputed SV genotypes, over simulations: each
+    simulation's gain is its mean over the training sizes both sources finished (benchmarks/power/truths.py), since a
+    simulation's sizes share its causal variants and test people and are not independent replicates."""
+    gains = truth_gains(grids["window-truth"], grids["window"])
+    true = {point: [gain for _, gain, _ in rows] for point, rows in gains.items()}
+    imputed = {point: [gain for _, _, gain in rows] for point, rows in gains.items()}
+    tests = {point: (mean_test(true[point]), mean_test(imputed[point])) for point in gains}
+    rows = layout(lambda point: len(true.get(point, [])) >= 3)
+    # no title: the poster's headline names the figure; the legend over the rows, and room right of the axis for half
+    # its last tick's label
+    top, bottom, right = 1.0, 1.75, 0.45
     height = top + bottom + PAIRED * (len(rows) + 0.1)
     fig = plt.figure(figsize=(HALF, height))
     labels = label_width(fig, rows)
     left = labels + 0.55
     ax = frame(fig, left, bottom, HALF - left - right, height - top - bottom)
     zero_line(ax)
-    value_grid(ax)
-    limits = (-0.015, 0.035)
-    clear = shown = 0
-    NUMBERS["fig3"] = {"architectures": {LABELS[point]: {"true": list(interval(true[point])),
-                                                         "imputed": list(interval(imputed[point]))}
-                                         for kind, point in rows if kind == "point"}}
-    counts = []
+    limits = (-0.02, 0.04)
+    shown = [point for kind, point in rows if kind == "point"]
+    clear = [point for point in shown if tests[point][0]["lower"] > 0]
+    NUMBERS["fig3"] = {"architectures": {LABELS[point]: {source: [test["mean"], test["lower"], test["upper"],
+                                                                  test["truths"]]
+                                                         for source, test in zip(("true", "imputed"), tests[point])}
+                                         for point in shown},
+                       "clear": len(clear), "shown": len(shown)}
     for y, (kind, point) in enumerate(rows):
         if kind != "point":
             continue
-        for offset, values, (_, color, filled) in ((-SPLIT, true[point], SOURCES[0]), (SPLIT, imputed[point], SOURCES[1])):
-            mean, low, high, n = interval(values)
-            estimate(ax, y + offset, mean, low, high, color, filled, limits=limits, size=PAIR_MARK)
-            counts.append(n)
-        shown += 1
-        clear += interval(true[point])[1] > 0
-    NUMBERS["fig3"].update(clear=clear, shown=shown)
+        for offset, test, (_, color, filled) in zip((-SPLIT, SPLIT), tests[point], SOURCES):
+            estimate(ax, y + offset, test["mean"], test["lower"], test["upper"], color, filled, limits=limits,
+                     size=PAIR_MARK)
     row_labels(ax, rows, left - 0.15)
     ax.set_xlim(*limits)
-    ticks = np.arange(-0.01, 0.031, 0.01)
+    ticks = np.arange(-0.02, 0.041, 0.02)
     ax.set_xticks(ticks, [plain(tick) for tick in ticks])
     ax.set_xlabel("ΔAUC, with SVs − without")
     source_legend(ax, -(left - 0.15), 0.3)
+    counts = [tests[point][0]["truths"] for point in shown]
     sizes = sorted({int(row["train_count"]) for grid in ("window", "window-truth") for row in grids[grid]})
-    fig.text(0.1 / HALF, 0.15 / height, f"Training {thousands(sizes[0])}–{thousands(sizes[-1])}k, pooled\n"
-             f"{min(counts)}–{max(counts)} replicates each", ha="left", va="bottom", color=GREY, linespacing=1.2)
-    # the widest true-genotype interval, said to be one replicate's doing when that replicate lies over 3.5 robust SDs
-    # (1.4826 median absolute deviations) from the others' median
-    widest_point = max((point for kind, point in rows if kind == "point"),
-                       key=lambda point: np.subtract(*interval(true[point])[2:0:-1]))
+    # the widest true-genotype interval, said to be one simulation's doing when that simulation lies over 3.5 robust
+    # SDs (1.4826 median absolute deviations) from the others' median
+    widest_point = max(shown, key=lambda point: tests[point][0]["upper"] - tests[point][0]["lower"])
     values = np.asarray(true[widest_point])
     farthest = values[np.argmax(np.abs(values - np.median(values)))]
     others = values[values != farthest]
     spread = 1.4826 * float(np.median(np.abs(others - np.median(others))))
-    driven = (f" The widest true-genotype interval, {SHORT[widest_point]}, comes from one replicate at "
+    driven = (f" The widest true-genotype interval, '{SHORT[widest_point]}', comes from one simulation at "
               f"{plain(float(farthest), 3)}." if spread > 0 and abs(farthest - np.median(others)) > 3.5 * spread else "")
+    named = ", ".join(f"'{SHORT[point]}'" for point in clear)
     caption = (
-        "Figure 3 | SVs add accuracy when their effects are large and they are measured well; imputation removes most of "
-        "the gain. Paired difference in test AUC on the same held-out people between SV-PGS fitted with and without SVs "
-        "on one 3 Mb chromosome 22 window (60,000 records), with every SV measured by its true genotype (filled) or "
-        "imputed by Beagle from SNV haplotypes (open): mean and Student-t 95% interval over "
-        f"{min(counts)}-{max(counts)} replicates, every training size from {sizes[0]:,} to {sizes[-1]:,} pooled (Figure 4 "
-        f"shows them apart). The true-genotype interval lies above zero for {clear} of {shown} architectures. Same "
-        f"simulated people, truth and fits; only the SV genotypes differ.{driven} {ARCHITECTURES}"
+        f"Figure 3 | Adding SVs changed test AUC little in each architecture; with true SV genotypes the gain's interval "
+        f"lies above zero for {len(clear)} of {len(shown)} architectures{': ' + named if clear else ''}. Paired "
+        "difference in test AUC on the same held-out people between SV-PGS fitted with and without SVs on one 3 Mb "
+        "chromosome 22 window (60,000 records), with every SV measured by its true genotype (filled) or imputed by "
+        "Beagle from SNV haplotypes (open). Each simulation's difference is its mean over the training sizes both "
+        f"genotype sources finished, from {sizes[0]:,} to {sizes[-1]:,} (Figure 4 shows the sizes apart); mean and "
+        f"Student-t 95% interval over {min(counts)}-{max(counts)} simulations per architecture, an arrowhead marking "
+        "an interval that runs off the axis. Same simulated people, causal variants and fits; only the SV genotypes "
+        f"differ.{driven} {ARCHITECTURES}"
     )
     return fig, caption
 
@@ -621,7 +610,7 @@ def size_figure(grids):
             zero_line(ax, vertical=False)
             low = high = 0.0
             for (_, color, filled), grid, factor in zip(SOURCES, ("window-truth", "window"), (1 / DODGE, DODGE)):
-                # a size is drawn with at least three replicates
+                # a size is drawn with at least three simulations
                 drawn = [(size * factor, *summaries[grid][(point, size)][:3]) for size in sizes
                          if summaries[grid][(point, size)][3] >= 3]
                 if not drawn:
@@ -649,7 +638,7 @@ def size_figure(grids):
                       linewidth=3.0, label=label) for label, color, filled in SOURCES]
     fig.legend(handles=handles, loc="lower right", bbox_to_anchor=((WIDE - right) / WIDE, (height - 0.95) / height),
                ncol=2, columnspacing=1.4, handlelength=1.6, handletextpad=0.5, borderaxespad=0.0)
-    # the largest size's window fits, too few per architecture to show apart; Figure 3 pools them with the rest
+    # the largest size's window fits, too few per architecture to show apart; Figure 3 averages them in
     largest = SIZES[-1]
     few = [len(finite(cells(grids[grid]).get((point, largest), []), "delta_auc")) for grid in ("window-truth", "window")
            for point in LABELS]
@@ -657,11 +646,11 @@ def size_figure(grids):
         f"Figure 4 | The gain from adding SVs at each training size from {sizes[0]:,} to {sizes[-1]:,}, for each "
         "simulated architecture. Each panel shows the paired difference in test AUC between SV-PGS fitted with and "
         "without SVs on one 3 Mb chromosome 22 window, with SVs measured by their true genotypes (filled) or imputed by "
-        "Beagle (open): the mean over replicates and its Student-t 95% interval. Each panel has its own y-axis scale. A "
-        "mean is drawn when its training size has at least three replicates. Each replicate uses the same simulated "
-        "truth and the same test people at every training size. We fitted "
-        f"{min(few)}-{max(few)} replicates per architecture and genotype source at {largest:,} training people, too few "
-        f"to show; Figure 3 pools them with the other sizes. {ARCHITECTURES}"
+        "Beagle (open): the mean over simulations and its Student-t 95% interval. Each panel has its own y-axis scale. "
+        "A mean is drawn when its training size has at least three simulations. Each simulation uses the same causal "
+        "variants and the same test people at every training size. We fitted "
+        f"{min(few)}-{max(few)} simulations per architecture and genotype source at {largest:,} training people, too "
+        f"few to show; Figure 3 averages them into each simulation's gain. {ARCHITECTURES}"
     )
     return fig, caption
 
@@ -676,20 +665,17 @@ summary keeps each frequency bin's quartiles and count, not its values."""
 
 def imputation_panel(ax, accuracy) -> None:
     """The r² of each variant's measured dosage with its true genotype (benchmarks/power/imputation_accuracy.py, not
-    Beagle's own DR2) by minor allele frequency, SNVs called from simulated reads and SVs imputed by Beagle: each frequency bin's median with its approximate 95%
-    interval (bars), over the bin's interquartile range (band) (Figure 5a)."""
+    Beagle's own DR2) by minor allele frequency, SNVs called from simulated reads and SVs imputed by Beagle: each
+    frequency bin's median with its approximate 95% interval (Figure 5a)."""
     ends = []
     for key, color, label in (("SNV", INK, "SNVs"), ("SV", IMPUTED, "SVs")):
         bins = [b for b in accuracy[key]["bins"] if b["count"]]
         centers = np.array([math.sqrt(b["low"] * b["high"]) * 100 for b in bins])
         median = np.array([b["median"] for b in bins])
         half = np.array([MEDIAN_Z * (b["q75"] - b["q25"]) / math.sqrt(b["count"]) for b in bins])
-        ax.fill_between(centers, [b["q25"] for b in bins], [b["q75"] for b in bins], color=color, alpha=0.2,
-                        linewidth=0, zorder=1)
         ax.vlines(centers, np.clip(median - half, 0, 1), np.clip(median + half, 0, 1), color=color, linewidth=BAR,
                   zorder=2)
-        ax.plot(centers, median, color=color, marker="o", markersize=MARK * 0.85, markeredgecolor="white",
-                markeredgewidth=2.0, zorder=3)
+        ax.plot(centers, median, color=color, marker="o", markersize=MARK * 0.85, markeredgewidth=0, zorder=3)
         ends.append((centers[-1] * 1.25, median[-1], label))
     top = 1.12
     ax.set_xscale("log")
@@ -706,15 +692,12 @@ def imputation_panel(ax, accuracy) -> None:
     ax.set_yticks(np.arange(0, 1.01, 0.25), ["0", "0.25", "0.50", "0.75", "1"])
     ax.set_xlabel("Minor allele frequency (%)")
     ax.set_ylabel("r² with true genotype")
-    ax.vlines(1, 0, 1, color=GREY, linewidth=2.0, linestyle=(0, (2, 2)), zorder=0)
-    # under the SVs' band at common frequencies: the share of SVs left of the 1% line, pointing at it, and the key
+    ax.vlines(1, 0, 1, color=INK, linewidth=2.0, linestyle=(0, (2, 2)), zorder=0)
+    # under the SVs' line at common frequencies: the share of SVs left of the 1% line, pointing at it
     ax.annotate(f"{accuracy['SV']['below_1pct']:.0%} of SVs\nhave MAF < 1%", xy=(1.0, 0.36), xytext=(4.2, 0.36),
                 color=INK, va="center", ha="left", linespacing=1.15,
                 arrowprops={"arrowstyle": "-|>", "color": INK, "linewidth": 2.4, "shrinkA": 4, "shrinkB": 0,
                             "mutation_scale": 28})
-    ax.text(4.2, 0.03, "bars: 95% CI\nof each median", color=GREY, va="bottom", ha="left", linespacing=1.15)
-    # the band named where it is widest, inside it, rather than in a legend
-    ax.text(0.068, 0.38, "middle 50%\nof SVs", color=INK, va="center", ha="left", linespacing=1.1)
 
 
 SV_CLASSES = (("Deletion", ORANGE), ("Insertion", GREEN), ("Duplication", PURPLE))
@@ -745,7 +728,7 @@ def genotype_figure(summary):
     for label, mask, color in groups:
         counts, _ = np.histogram(length[mask], bins=edges)
         right.bar(edges[:-1], counts, width=np.diff(edges), bottom=bottom_counts, align="edge", color=color,
-                  edgecolor="white", linewidth=1.6, label=f"{label} ({int(mask.sum()):,})")
+                  linewidth=0, label=f"{label} ({int(mask.sum()):,})")
         bottom_counts += counts
         stacked[label] = counts
     # the insertions' peak near 300 bp, where Alu elements lie, named where the data show it: a bin there holding over
@@ -759,7 +742,7 @@ def genotype_figure(summary):
     # the long tail too thin to see at this scale, said in words
     long = int((length > 1e4).sum())
     if long:
-        right.text(2e4, 0.08, f"{long} SVs > 10 kb,\nup to {length.max() / 1e3:,.0f} kb", color=GREY, va="bottom",
+        right.text(2e4, 0.08, f"{long} SVs > 10 kb,\nup to {length.max() / 1e3:,.0f} kb", color=INK, va="bottom",
                    ha="left", linespacing=1.15, transform=blended_transform_factory(right.transData, right.transAxes))
     right.set_xscale("log")
     right.set_xlim(45, 1.1e6)
@@ -767,12 +750,11 @@ def genotype_figure(summary):
     right.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
     right.set_xlabel("SV length (bp)")
     right.set_ylabel("Number of SVs")
-    value_grid(right, "y")
     right.legend(loc="upper right", handlelength=0.9, handleheight=0.9, borderaxespad=0.0)
     middle = float(np.median(length[np.any([mask for _, mask, _ in groups], axis=0)]))
-    right.axvline(middle, color=GREY, linewidth=2.0, linestyle=(0, (2, 2)), zorder=0)
+    right.axvline(middle, color=INK, linewidth=2.0, linestyle=(0, (2, 2)), zorder=0)
     right.text(middle * 1.15, 0.45, f"median\n{middle:,.0f} bp", transform=blended_transform_factory(right.transData,
-               right.transAxes), color=GREY, va="bottom", linespacing=1.15)
+               right.transAxes), color=INK, va="bottom", linespacing=1.15)
     heading(right, "Lengths of the simulated SVs", "b", across=-1.9)
     rare = {key: [b for b in accuracy[key]["bins"] if b["high"] <= 0.01 and b["count"]] for key in ("SV", "SNV")}
     NUMBERS["fig5"] = {"people": PEOPLE, "svs": accuracy["SV"]["records"], "snvs": accuracy["SNV"]["records"],
@@ -787,7 +769,7 @@ def genotype_figure(summary):
         f"for {accuracy['SV']['records']:,} SVs imputed by Beagle and {accuracy['SNV']['records']:,} sampled SNVs "
         f"called from simulated reads on chromosome 22, by "
         f"minor allele frequency: each bin's median (points) with an approximate 95% interval ({MEDIAN_Z:.2f} IQR/√n; "
-        f"bars), over the bin's middle 50% of variants (bands; SNVs grey, SVs blue). b, Lengths of the "
+        f"bars), SNVs black and SVs blue. b, Lengths of the "
         f"{int(records['measured'].sum()):,} measured SVs, stacked by class (records without a type are classed by the "
         f"sign of their length change)" + ("; the insertions' peak near 300 bp is where Alu elements lie" if alu else "")
         + ". bench-sim v7 cohort from public 1000 Genomes haplotypes."
@@ -1087,8 +1069,7 @@ def compute_figure(grids):
                         elinewidth=BAR * 0.75, capsize=7, capthick=BAR * 0.75, zorder=2)
             present.append(x), medians.append(median)
         ax.plot(present, medians, color=color, linewidth=4.0 if label else 3.0, linestyle=style, marker=marker,
-                markersize=MARK * (0.85 if marker == "s" else 1.0), markeredgecolor="white", markeredgewidth=RING,
-                zorder=3 if label else 4)
+                markersize=MARK * (0.85 if marker == "s" else 1.0), markeredgewidth=0, zorder=3 if label else 4)
         if label:
             ax.text(xs[-1] + 0.3, medians[-1], label, color=color, fontweight="bold", va="center")
     ax.set_yscale("log")
@@ -1099,15 +1080,12 @@ def compute_figure(grids):
     ax.set_xlim(xs[0] - 0.3, xs[-1] + 0.3)
     ax.set_xlabel("Training sample size (thousands)")
     ax.set_ylabel("Wall time per fit (min)")
-    value_grid(ax, "y")
-    handles = [Line2D([0], [0], marker=marker, color=SV_PGS, markeredgecolor="white", markeredgewidth=RING,
+    handles = [Line2D([0], [0], marker=marker, color=SV_PGS, markeredgewidth=0,
                       markersize=MARK * (0.85 if marker == "s" else 1.0), linewidth=3.0, linestyle=style, label=label)
                for label, marker, style in (("with SVs", "o", "-"), ("without SVs", "s", (0, (2, 1.2))))]
-    # in the band between the methods: the key to the SV-PGS marks above the note on the intervals
+    # in the band between the methods: the key to the SV-PGS marks
     ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.02, 0.62), handlelength=2.0, handletextpad=0.4,
               borderaxespad=0.0, labelspacing=0.3)
-    ax.text(0.98, 0.22, "bars: 95% CI;\nmost within the marks", transform=ax.transAxes, ha="right", va="bottom",
-            color=GREY, linespacing=1.15)
     heading(ax, "Time to fit chromosome 22", across=-1.95)
     caption = (
         "Figure 6 | SV-PGS fits take hours and LDpred2-auto's minutes; SVs add no time. Wall time of one fit on "
