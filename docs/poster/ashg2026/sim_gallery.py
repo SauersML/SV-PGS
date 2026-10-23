@@ -845,8 +845,13 @@ POSTER_X_TITLES = ("Training size (thousands)", "LDpred2-auto test AUC")
 POSTER_SHARES = (("null", "0%", GREEN), ("sv_5pct", "5%", VIOLET), ("sv_20pct", "20%", WINE))
 """The accuracy figure's architectures by the share of causal variants that are SVs, as its key writes each, and the
 colour of their simulations' dots."""
-POSTER_METHODS = (("with_sv_auc", "SV-PGS", SV_PGS, "o", -1), ("ldpred2_auc", "LDpred2-auto", LDPRED2, "s", 1))
-"""Each method's AUC column, name, colour, marker, and the side of its training size its simulations' dots take."""
+POSTER_METHODS = (("with_sv_auc", "SV-PGS\n(all variants)", SV_PGS, "o", -1),
+                  ("ldpred2_auc", "LDpred2-auto²\n(common SNVs)", LDPRED2, "s", 1))
+"""Each method's AUC column, its name over its variant set as the figure labels it, colour, marker, and the side of its
+training size its simulations' dots take. SV-PGS fits every SNV, indel and SV with no frequency or r² floor
+(stage2_wiring.fit_models); LDpred2-auto, first named here and so cited with the poster's second reference (Privé 2020,
+build_pptx.py's REFERENCES), SNVs of training MAF >= 1% thinned to HapMap3's chr22 count, at most 16,000
+(benchmarks/bench_sim/submissions/ldpred2_auto.py)."""
 DOT_OFFSET, DOT_JITTER, DOT_ALPHA = 0.12, 0.05, 0.25
 """Doublings of training size a method's simulation dots sit to its side of the size, the most a dot moves at random
 about that, and the dots' opacity."""
@@ -914,24 +919,25 @@ def poster_accuracy_figure(grids, summary):
     names = {method: (widest(fig, [method], fontsize=POSTER_NAME, fontweight="bold"),
                       tallest(fig, [method], fontsize=POSTER_NAME, fontweight="bold"))
              for _, method, *_ in POSTER_METHODS}
+    ours, theirs = (method for _, method, *_ in POSTER_METHODS)
     # SV-PGS's name over the marks it spans from the left, LDpred2-auto's under the marks it spans to the right end
     start = SIZES[0] / 1.2
-    spans = {"SV-PGS": (start, start * 2.0 ** (names["SV-PGS"][0] / doubling)),
-             "LDpred2-auto": (last / 2.0 ** (names["LDpred2-auto"][0] / doubling), last)}
+    spans = {ours: (start, start * 2.0 ** (names[ours][0] / doubling)),
+             theirs: (last / 2.0 ** (names[theirs][0] / doubling), last)}
     beside = {method: marks[(marks[:, 0] >= low) & (marks[:, 0] <= high), 1] for method, (low, high) in spans.items()}
     # inches over the best possible AUC: its label and the pad; under LDpred2-auto's marks: its name
     above = POSTER_PAD + line + POSTER_PAD
-    under = POSTER_PAD + names["LDpred2-auto"][1] + POSTER_PAD
-    span = max((ceiling - beside["LDpred2-auto"].min()) / (1 - (above + under) / height),
+    under = POSTER_PAD + names[theirs][1] + POSTER_PAD
+    span = max((ceiling - beside[theirs].min()) / (1 - (above + under) / height),
                (ceiling - marks[:, 1].min()) / (1 - (above + POSTER_PAD) / height))
     per_inch = span / height
     upper = ceiling + above * per_inch
     ax.set_ylim(upper - span, upper)
     ax.axhline(ceiling, color=INK, linestyle=(0, (1, 1.2)), linewidth=4.0, zorder=1)
     ax.text(SIZES[0] / 1.25, ceiling + POSTER_PAD * per_inch, "Best possible", color=INK, va="bottom", ha="left")
-    ax.text(start, beside["SV-PGS"].max() + POSTER_PAD * per_inch, "SV-PGS", color=SV_PGS, fontsize=POSTER_NAME,
+    ax.text(start, beside[ours].max() + POSTER_PAD * per_inch, ours, color=SV_PGS, fontsize=POSTER_NAME,
             fontweight="bold", ha="left", va="bottom")
-    ax.text(1, beside["LDpred2-auto"].min() - POSTER_PAD * per_inch, "LDpred2-auto", transform=shifted(ax, 0.0),
+    ax.text(1, beside[theirs].min() - POSTER_PAD * per_inch, theirs, transform=shifted(ax, 0.0),
             color=LDPRED2, fontsize=POSTER_NAME, fontweight="bold", ha="right", va="top")
     levels = np.arange(math.ceil((upper - span) / 0.05) * 0.05, ceiling, 0.05)
     ax.set_yticks(levels, [f"{level:.2f}" for level in levels])

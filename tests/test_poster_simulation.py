@@ -6,7 +6,6 @@ import json
 import math
 import re
 import sys
-from collections import Counter
 
 import numpy as np
 import pytest
@@ -130,37 +129,27 @@ def poster_copy(poster) -> dict:
     return poster.copy(json.loads((poster.HERE / "figures/gallery/numbers.json").read_text()))
 
 
-def test_poster_design_gives_the_grids_base_disease_and_its_other_sv_shares(monkeypatch, tmp_path):
+def test_poster_design_lists_the_causal_sv_shares_the_grid_simulates(monkeypatch, tmp_path):
     from benchmarks.power import grid
 
     poster = poster_module(monkeypatch, tmp_path)
-    shares = Counter(point["sv_causal_fraction"] for point in grid.POINTS.values())
-    base = shares.most_common(1)[0][0]
-    assert poster.DESIGN_BASE == {"h2": grid.HERITABILITY, "prevalence": grid.PREVALENCE,
-                                  "causal_variants": grid.CAUSAL_VARIANTS, "sv_causal_fraction": base}
-    assert set(poster.DESIGN_SHARES) == set(shares) - {base}
-    base_line, others = poster_copy(poster)["design"][1:3]
-    assert "h² 0.1, prevalence 10%, 200 causal variants, 20% of them SVs" in base_line
-    assert "SV share (0% or 5%)" in others
+    assert set(poster.DESIGN_SHARES) == {point["sv_causal_fraction"] for point in grid.POINTS.values()}
+    assert "causal SV share (0%, 5% or 20%)" in poster_copy(poster)["design"][1]
 
 
 def test_poster_cites_every_reference_in_order(monkeypatch, tmp_path):
+    from docs.poster.ashg2026 import sim_gallery
+
     poster = poster_module(monkeypatch, tmp_path)
     words = poster_copy(poster)
-    text = " ".join(line for key in ("introduction", "methods", "design", "compared", "aou", "discussion")
-                    for line in words[key])
+    # in reading order: the left column, the simulation figures' method names, then the All of Us column
+    lines = [*words["introduction"], *words["methods"], *words["design"],
+             *(name for _, name, *_ in sim_gallery.POSTER_METHODS), *words["aou"], *words["discussion"]]
     # h² and r² are exponents, not citations
-    text = re.sub(r"[hr]²", "", text)
+    text = re.sub(r"[hr]²", "", " ".join(lines))
     marks = [poster.SUPERSCRIPT[index] for index in range(1, len(poster.REFERENCES) + 1)]
     assert all(mark in text for mark in marks)
     assert [text.index(mark) for mark in marks] == sorted(text.index(mark) for mark in marks)
-
-
-def test_poster_gain_note_counts_the_simulations_the_forest_draws(monkeypatch, tmp_path):
-    poster = poster_module(monkeypatch, tmp_path)
-    rows = json.loads((poster.HERE / "figures/gallery/numbers.json").read_text())["poster_sv_gain"]["rows"]
-    drawn = sum(row["true"][3] for row in rows.values() if row is not rows.get("well_imputed"))
-    assert poster_copy(poster)["gain_note"].startswith(f"{drawn} simulations ")
 
 
 def test_every_poster_bullet_ends_with_a_full_stop(monkeypatch, tmp_path):
@@ -169,15 +158,3 @@ def test_every_poster_bullet_ends_with_a_full_stop(monkeypatch, tmp_path):
         for line in words[key]:
             # a citation's number follows the full stop
             assert line.rstrip("¹²³⁴⁵⁶⁷⁸⁹").endswith("."), line
-
-
-def test_the_whole_chr22_note_gives_the_prevalence_every_whole_chr22_architecture_has(monkeypatch, tmp_path):
-    from benchmarks.power import grid
-
-    poster = poster_module(monkeypatch, tmp_path)
-    assert poster.WHOLE_PREVALENCE == grid.PREVALENCE
-    # the one point at another prevalence ran in the 3 Mb window alone
-    others = {name for name, point in grid.POINTS.items()
-              if point.get("truth", {}).get("prevalence", grid.PREVALENCE) != grid.PREVALENCE}
-    assert others == {"rare_disease"}
-    assert "at 10% prevalence" in poster_copy(poster)["whole_note"]

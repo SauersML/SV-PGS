@@ -35,11 +35,12 @@ import matplotlib
 import numpy as np
 from matplotlib.lines import Line2D
 
-from sim_gallery import (INK, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_PAD, POSTER_STYLE, SKY, frame, overhang, plt,
-                         shifted, tallest, under_axes, widest)
+from sim_gallery import (INK, LDPRED2, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_PAD, POSTER_STYLE, SKY, SV_PGS, frame,
+                         overhang, plt, shifted, tallest, under_axes, widest)
 
 HERE = Path(__file__).resolve().parent
 NUMBERS = HERE / "aou_numbers.json"
+COMPARED = HERE / "aou_vs_ldpred2.json"
 OUT = HERE / "figures"
 COLUMN = 11.4
 """Inches: the poster's right column (build_pptx.py's RIGHT), each figure's width, so its type prints at its own size."""
@@ -50,7 +51,7 @@ LABEL_GAP = 0.3
 MARK = 1.5
 """The forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR) when its rows are a line of type
 apart."""
-HEIGHT = 17.22
+HEIGHT = 0.0
 """Inches: the gain forest's least height, which fills the right column from its text to the Discussion band at the
 poster's foot (build_pptx.py's layout). Rows further apart than a line of type have marks up to GROWTH times MARK."""
 GROWTH = 4 / 3
@@ -81,49 +82,62 @@ class Panel:
 
 
 def forest(panels: list[Panel], least: float = 0.0):
-    """The panels stacked at the column's width, their rows' names once at the left in a margin they share. In each row
-    the series' marks stand one above the next, each an estimate with its 95% interval, and a panel with more than one
-    series has their key over it. A log panel spans its estimates' decades; a linear one is symmetric about 0 over its
-    estimates, so that each mark clears an arrowhead at the axis's end, and an interval past the axis ends in one.
-    Every margin and the rows' pitch are measured from the type, so the figure is as short as its type allows, unless
-    ``least`` inches is taller: then its rows share that height and their marks grow with them, up to GROWTH."""
+    """The panels stacked at the column's width, their rows' names at the left in a margin they share; COMBINED, the
+    widest name, takes two lines. In each row the series' marks stand one above the next, each an estimate with its
+    95% interval, and a panel with more than one series has their key over it. A log panel spans its estimates and is
+    ticked at the decades inside; a linear one is symmetric about 0 over its estimates. Either way each mark clears an
+    arrowhead at the axis's end, and an interval past the axis ends in one. Every margin and row height is measured from
+    the type, so the figure is as short as its type allows, unless ``least`` inches is taller: then its rows share the
+    extra height and their marks grow with it, up to GROWTH."""
     fig = plt.figure(figsize=(COLUMN, 1.0))
     size = POSTER_STYLE["font.size"]
-    names = [name for panel in panels for name, _ in panel.rows]
-    weight = {name: "bold" if name == COMBINED else "normal" for name in names}
-    line = max(tallest(fig, [name], fontsize=size, fontweight=weight[name]) for name in names) + ROW_GAP
+    shown = {name: name.replace("converged ", "converged\n") if name == COMBINED else name
+             for panel in panels for name, _ in panel.rows}
+    weight = {name: "bold" if name == COMBINED else "normal" for name in shown}
     # one series' marks at MARK times the poster's, two or more at the poster's own, one above the next in a row
     marks = [POSTER_MARK * (MARK if len(panel.series) == 1 else 1.0) for panel in panels]
-    pitches = [max(line, len(panel.series) * (mark / 72 + 2 * ROW_GAP)) for panel, mark in zip(panels, marks)]
-    keys = [tallest(fig, [label for label, *_ in panel.series], fontsize=size) + POSTER_PAD if len(panel.series) > 1
-            else 0.0 for panel in panels]
+    heights = [[max(tallest(fig, [shown[name]], fontsize=size, fontweight=weight[name]),
+                    len(panel.series) * (mark / 72 + ROW_GAP)) + ROW_GAP for name, _ in panel.rows]
+               for panel, mark in zip(panels, marks)]
+    keys = [max(tallest(fig, [label for label, *_ in panel.series], fontsize=size), mark / 72) + POSTER_PAD
+            if len(panel.series) > 1 else 0.0 for panel, mark in zip(panels, marks)]
     bottoms = [under_axes(fig, [panel.xlabel]) for panel in panels]
-    natural = sum(POSTER_PAD + key + pitch * len(panel.rows) + bottom
-                  for panel, key, pitch, bottom in zip(panels, keys, pitches, bottoms))
-    rows = sum(len(panel.rows) for panel in panels)
+    natural = sum(POSTER_PAD + key + sum(rows) + bottom for key, rows, bottom in zip(keys, heights, bottoms))
     height = max(least, natural)
+    extra = (height - natural) / sum(len(rows) for rows in heights)
     # an arrowhead at the axis's start reaches half its width to the left, toward the names
     arrow = max(marks) * GROWTH * 0.7 / 2 / 72
-    left = max(widest(fig, [name], fontsize=size, fontweight=weight[name]) for name in names) + LABEL_GAP + arrow
-    right = max(widest(fig, [tick_text(panel)(tick) for tick in ticks(panel)[-1:]], fontsize=size) / 2
-                for panel in panels) + POSTER_PAD
+    left = max(widest(fig, [shown[name]], fontsize=size, fontweight=weight[name]) for name in shown) + LABEL_GAP + arrow
+    right = max(max(widest(fig, [tick_text(panel)(tick)], fontsize=size) / 2 for tick in ticks(panel))
+                for panel in panels)
+    right = max(right, arrow) + POSTER_PAD
     fig.set_size_inches(COLUMN, height)
     width = COLUMN - left - right
     top = height
-    for panel, mark, pitch, key, bottom in zip(panels, marks, pitches, keys, bottoms):
-        grown = pitch + (height - natural) / rows
-        growth = min(grown / pitch, GROWTH)
+    for panel, mark, rows, key, bottom in zip(panels, marks, heights, keys, bottoms):
+        growth = min(1 + extra / min(rows), GROWTH)
         mark, bar, ring = mark * growth, POSTER_BAR * growth, 6.0 * growth
+        span = sum(rows) + extra * len(rows)
+        if key:
+            # the key over the panel from the canvas's left edge: each series' mark, then its name
+            x, middle = POSTER_PAD, top - POSTER_PAD - key / 2
+            for label, colour, marker, filled in panel.series:
+                fig.add_artist(Line2D([x + mark / 144], [middle], transform=fig.dpi_scale_trans, marker=marker,
+                                      markersize=mark, color=colour, markerfacecolor=colour if filled else "white",
+                                      markeredgecolor=colour, markeredgewidth=0 if filled else ring))
+                x += mark / 72 + POSTER_PAD
+                fig.text(x / COLUMN, middle / height, label, ha="left", va="center")
+                x += widest(fig, [label], fontsize=size) + 4 * POSTER_PAD
         top -= POSTER_PAD + key
-        ax = frame(fig, left, top - grown * len(panel.rows), width, grown * len(panel.rows))
+        # the axes' y is inches down from its top, each row centred in its height
+        ax = frame(fig, left, top - span, width, span)
+        centres = np.cumsum([0.0, *(row + extra for row in rows)])[:-1] + (np.array(rows) + extra) / 2
         low_limit, high_limit = limits(panel, width, (mark / 2 + ring / 2) / 72 + arrow + POSTER_PAD)
         if panel.log:
             ax.set_xscale("log")
-        offsets = [(index - (len(panel.series) - 1) / 2) * (mark / 72 + 2 * ROW_GAP) / grown
-                   for index in range(len(panel.series))]
-        for row, (name, estimates) in enumerate(panel.rows):
-            for (label, colour, marker, filled), offset, (value, low, high) in zip(panel.series, offsets, estimates):
-                y = row + offset
+        for (name, estimates), centre in zip(panel.rows, centres):
+            for index, ((label, colour, marker, filled), (value, low, high)) in enumerate(zip(panel.series, estimates)):
+                y = centre + (index - (len(panel.series) - 1) / 2) * (mark / 72 + ROW_GAP)
                 ax.hlines(y, max(low, low_limit), min(high, high_limit), color=colour, linewidth=bar, zorder=3,
                           capstyle="round")
                 for end, edge, arrowhead in ((low, low_limit, "<"), (high, high_limit, ">")):
@@ -133,27 +147,21 @@ def forest(panels: list[Panel], least: float = 0.0):
                 ax.plot([value], [y], marker, markersize=mark, color=colour,
                         markerfacecolor=colour if filled else "white", markeredgecolor=colour,
                         markeredgewidth=0 if filled else ring, zorder=4)
-            ax.text(0, row, name, transform=shifted(ax, -left), ha="left", va="center", fontweight=weight[name])
+            ax.text(0, centre, shown[name], transform=shifted(ax, -left), ha="left", va="center",
+                    fontweight=weight[name])
         if not panel.log:
             ax.axvline(0.0, color=INK, linewidth=4.0, zorder=2)
         ax.set_yticks([])
         ax.spines["left"].set_visible(False)
-        ax.set_ylim(len(panel.rows) - 0.5, -0.5)
+        ax.set_ylim(span, 0)
         ax.set_xlim(low_limit, high_limit)
-        ax.set_xticks(ticks(panel), [tick_text(panel)(tick) for tick in ticks(panel)])
+        drawn = [tick for tick in ticks(panel) if low_limit <= tick <= high_limit]
+        ax.set_xticks(drawn, [tick_text(panel)(tick) for tick in drawn])
         ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
         ax.set_xlabel(panel.xlabel)
         # centred on the canvas, not on the axes, whose margins differ: a title wider than the axes then fits either side
         ax.xaxis.label.set_x((COLUMN / 2 - left) / width)
-        if key:
-            handles = [Line2D([0], [0], marker=marker, linestyle="none", markersize=mark, color=colour,
-                              markerfacecolor=colour if filled else "white", markeredgecolor=colour,
-                              markeredgewidth=0 if filled else ring, label=label)
-                       for label, colour, marker, filled in panel.series]
-            fig.legend(handles=handles, loc="lower left", ncol=len(handles), frameon=False, borderpad=0.0,
-                       borderaxespad=0.0, handletextpad=0.3, columnspacing=1.2, handlelength=1.0,
-                       bbox_to_anchor=(POSTER_PAD / COLUMN, (top + POSTER_PAD / 2) / height))
-        top -= grown * len(panel.rows) + bottom
+        top -= span + bottom
     return fig
 
 
@@ -171,13 +179,12 @@ def tick_text(panel: Panel):
 
 
 def limits(panel: Panel, width: float, clear: float) -> tuple[float, float]:
-    """The axis's ends: each estimate ``clear`` inches from them at least, over ``width`` inches, and on a linear axis
-    symmetric about 0 and wide enough for its ticks; on a log axis, its estimates' span alone."""
+    """The axis's ends: each estimate ``clear`` inches from them at least, over ``width`` inches; on a linear axis also
+    symmetric about 0 and wide enough for its ticks, on a log axis its estimates' span alone."""
     values = [value for _, estimates in panel.rows for value, _, _ in estimates]
     if panel.log:
         low, high = math.log10(min(values)), math.log10(max(values))
-        reach = (high - low) / (1 - 2 * clear / width)
-        margin = (reach - (high - low)) / 2
+        margin = (high - low) / (1 - 2 * clear / width) * clear / width
         return 10.0 ** (low - margin), 10.0 ** (high + margin)
     reach = max(abs(value) for value in values) / (1 - 2 * clear / width)
     marks = ticks(panel)
@@ -210,23 +217,38 @@ COMBINED = "All converged traits"
 """The All of Us forest's row for the traits' common g, its name in bold."""
 
 
-def gain_figure(matched: list[dict], common: dict | None = None) -> tuple:
+METHODS = [("LDpred2-auto", LDPRED2, "s", True), ("SV-PGS", SV_PGS, "o", True)]
+"""The held-out r² panel's series, each method in its colour and marker in the simulation figures."""
+
+
+def converged(row: dict) -> bool:
+    """Whether both SV-PGS fits behind a trait's row converged: neither is marked unconverged or named uncertified."""
+    return not row.get("unconverged") and "uncertified" not in row.get("flags", "")
+
+
+def gain_figure(matched: list[dict], common: dict | None = None, compared: list[dict] | None = None) -> tuple:
     """Each trait's change in held-out partial r² from adding SVs, relative to the r² without SVs (baseline_relative of
     the pre-specified g), with its 95% interval, a row per trait, and when ``common`` is given a bold row for the traits'
     common g itself, relative to the two arms' mean r². The two scales differ by about 0.1 percentage point at these
-    gains, so one axis title serves both. No figure on the poster uses a fit that did not converge."""
-    unconverged = [row["trait"] for row in matched if row.get("unconverged")]
-    if unconverged:
-        raise SystemExit(f"aou_numbers.json has fits that did not converge: {', '.join(unconverged)}")
+    gains, so one axis title serves both. Over it, when ``compared`` (aou_vs_ldpred2.json's rows) gives the traits'
+    held-out r², a panel of that r² for LDpred2-auto and for SV-PGS with SVs on a log axis. No figure on the poster uses
+    a fit that did not converge, so a trait whose SV-PGS fit did not converge is in neither panel."""
     keys = ("relative", "relative_lower", "relative_upper")
-    rows = [(trait_name(row["trait"]), *(baseline_relative(row[key] / 100) for key in keys)) for row in matched]
+    rows = [(trait_name(row["trait"]), [tuple(baseline_relative(row[key] / 100) for key in keys)])
+            for row in matched if converged(row)]
     if common:
-        rows.append((COMBINED, *(common[key] / 100 for key in keys)))
-    # the axis spans the estimates, not their intervals; an interval that runs past it ends in an arrowhead
-    fig = forest(rows, "Change in r² with SVs (%)", span([value for _, value, _, _ in rows]), percent, log=False,
-                 estimates=True, bold=frozenset({COMBINED}), least=HEIGHT)
-    return fig, ["Change in held-out partial r² from adding SVs to SV-PGS for each trait, relative to the r² without "
-                 "SVs, with 95% intervals, an arrowhead marking an interval that runs past the axis"
+        rows.append((COMBINED, [tuple(common[key] / 100 for key in keys)]))
+    panels = [Panel(rows, [("", SKY, "o", False)], "Change in r² with SVs (%)")]
+    measured = [row for row in compared or [] if "r2" in row]
+    if measured:
+        panels.insert(0, Panel([(trait_name(row["trait"]), [tuple(row["r2"][arm][key] for key in ("r2", "lower", "upper"))
+                                                             for arm in ("ldpred2_auto", "with_sv")])
+                                for row in measured], METHODS, "Held-out r²", log=True))
+    fig = forest(panels, least=HEIGHT)
+    return fig, [("Held-out partial r² of LDpred2-auto and SV-PGS for each trait, and under it the change " if measured
+                  else "The change ")
+                 + "in held-out partial r² from adding SVs to SV-PGS for each trait, relative to the r² without SVs, "
+                 "with 95% intervals, an arrowhead marking an interval that runs past the axis"
                  + (", and in bold the traits' common change relative to the two models' mean r²" if common else "")]
 
 
@@ -235,7 +257,9 @@ def main() -> None:
     with plt.rc_context({**POSTER_STYLE, "axes.labelsize": POSTER_LABEL}):
         drawn = []
         if numbers.get("matched", {}).get("rows"):
-            drawn.append(("aou_1_gain", gain_figure(numbers["matched"]["rows"], numbers["matched"].get("common"))))
+            compared = json.loads(COMPARED.read_text())["rows"] if COMPARED.is_file() else None
+            drawn.append(("aou_1_gain", gain_figure(numbers["matched"]["rows"], numbers["matched"].get("common"),
+                                                    compared)))
         for name, (fig, lines) in drawn:
             reach = overhang(fig)
             if max(reach) > 0:

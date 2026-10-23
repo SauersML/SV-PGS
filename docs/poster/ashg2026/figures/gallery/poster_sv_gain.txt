@@ -1,1 +1,0 @@
-Test AUC gain from adding SVs to SV-PGS with true genotypes (filled) and with SNVs called from simulated reads and SVs imputed by Beagle (open), mean and 95% interval over simulations at training N 5,000 to 20,000, for every architecture with causal SVs, those whose causal SVs are well imputed, and the control with no causal SVs.

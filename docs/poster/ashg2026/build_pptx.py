@@ -92,15 +92,8 @@ REFERENCES = [
 """First author, year and journal, one to a line, numbered in superscript in the order the text first cites them
 (``cite``): the SVs per genome, LDpred2, All of Us and GLIMPSE2."""
 SUPERSCRIPT = dict(zip(range(1, 10), "¹²³⁴⁵⁶⁷⁸⁹"))
-DESIGN_BASE = {"h2": 0.1, "prevalence": 0.1, "causal_variants": 200, "sv_causal_fraction": 0.2}
-"""The base disease of benchmarks/power/grid.py, from which each of its POINTS changes one or two settings: its
-HERITABILITY, PREVALENCE and CAUSAL_VARIANTS, and the SV share most points have."""
-DESIGN_SHARES = (0.0, 0.05)
-"""The other SV shares the grid's points take. tests/test_poster_simulation.py checks both against the grid."""
-
-
-WHOLE_PREVALENCE = 0.1
-"""The prevalence of every architecture simulated on whole chr22 (grid.py's PREVALENCE), which
+DESIGN_SHARES = (0.0, 0.05, 0.2)
+"""The shares of causal variants that are SVs over benchmarks/power/grid.py's POINTS, which
 tests/test_poster_simulation.py checks against the grid."""
 
 
@@ -113,7 +106,7 @@ def listed(values: list[str]) -> str:
     """"a, b or c": the values a setting takes."""
     return f"{', '.join(values[:-1])} or {values[-1]}" if len(values) > 1 else values[0]
 PLACEHOLDERS = [
-    ("Change in test r² with SVs", "All held-out people and by genetic ancestry"),
+    ("Change in test r² with SVs", "Held-out people"),
 ]
 
 
@@ -142,43 +135,29 @@ def people(count: int) -> str:
 
 def copy(numbers: dict) -> dict:
     """The poster's sentences, each number from the gallery figure that shows it."""
-    accuracy, gain, svs = numbers["fig1"], numbers["poster_sv_gain"], numbers["fig5"]
-    rows = gain["rows"]  # true and imputed: [mean, lower, upper, simulations]; share: [ratio, lower, upper]
-    simulations = rows["all"]["true"][3] + rows["null"]["true"][3]
+    svs = numbers["fig5"]
     return {
         # Byrska-Bishop 2022: "On average, ~9,679 SVs were discovered in each genome"
         "introduction": [f"Each genome has ~9,700 structural variants (SVs).{cite('Byrska-Bishop 2022 Cell')}",
                          "Polygenic scores rarely use SVs, so we test if imputed SVs improve accuracy."],
         "methods": ["Priors use SV type, length, frequency and imputation r²."],
+        # the grid varies one or two settings at a time from its base disease: the causal SV share, the SV effects' size
+        # or shape, h² 0.01, prevalence 1%, 50 or 2,000 causal variants, and which SVs are causal
         "design": [
             f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22.",
-            f"Base disease: h² {DESIGN_BASE['h2']:g}, prevalence {DESIGN_BASE['prevalence']:.0%}, "
-            f"{DESIGN_BASE['causal_variants']:,} causal variants, {DESIGN_BASE['sv_causal_fraction']:.0%} of them SVs.",
-            # the other points: SV effect size or shape (fold 3, length, deletion, heavy tail, two point), 50 or
-            # 2,000 causal variants, h² 0.01, prevalence 1%, and causal SVs only well imputed or common
-            f"Others change the SV share ({listed([f'{share:.0%}' for share in DESIGN_SHARES])}), SV effects, causal "
-            "count, h², prevalence or which SVs are causal.",
+            f"Simulated diseases vary the causal SV share ({listed([f'{share:.0%}' for share in DESIGN_SHARES])}), SV "
+            "effects, h², prevalence and causal count.",
         ],
-        # what each plotted method fits, over the simulation's figures: SV-PGS every measured record with no
-        # frequency or r² floor (stage2_wiring.fit_models), LDpred2-auto SNVs of training MAF >= 1% thinned evenly in
-        # genetic distance to HapMap3's chr22 count, so at most 16,000 (benchmarks/bench_sim/submissions/ldpred2_auto.py)
-        "compared": ["SV-PGS: all SNVs, indels and SVs",
-                     f"LDpred2-auto{cite('Privé 2020 Bioinformatics')}: up to 16,000 SNVs with MAF ≥ 1%"],
-        # every whole-chr22 architecture has the grid's PREVALENCE: rare_disease, at 1%, ran in the 3 Mb window alone
-        "whole_note": f"Whole chr22 at {WHOLE_PREVALENCE:.0%} prevalence, test N = {people(accuracy['test_people'])}",
-        "gain_note": f"{simulations} simulations in 3 Mb of chr22 (mean, 95% CI)",
         # GLIMPSE2 is Rubinacci 2023; the assemblies are the accepted abstract's 12,212 phased genome assemblies
         # the forest's matched fits: SV-PGS with and without SVs on every trait, tested in its held-out people
         "aou": ["We imputed SVs from 12,212 long-read assemblies into 100,000 All of Us"
-                f"{cite('All of Us 2019 N Engl J Med')} genomes with GLIMPSE2.{cite('Rubinacci 2023 Nat Genet')}",
-                "We compare held-out r² with and without SVs."],
+                f"{cite('All of Us 2019 N Engl J Med')} genomes with GLIMPSE2.{cite('Rubinacci 2023 Nat Genet')}"],
         # what the simulations mean. SV-PGS's AUC gain over LDpred2-auto at training N 40,000 holds without causal
         # SVs (wins' null_gain, its 95% interval above 0), so causal SVs are not its source. Imputed SVs' gain is
-        # largest where the causal SVs are well imputed, where it matches the gain with true SV genotypes (the SV-gain
-        # forest's well_imputed and all rows: imputed share of the true gain about 1 against about a third)
+        # largest where the causal SVs are well imputed (the SV-gain forest's well_imputed and all rows)
         "discussion": [
-            "SV-PGS beat LDpred2-auto with and without causal SVs, so its advantage comes from the model and variant set.",
-            "Imputed SVs helped most when causal SVs were well imputed, so the gain depends on imputation accuracy.",
+            "SV-PGS was more accurate than LDpred2-auto with and without causal SVs.",
+            "Imputed SVs helped most when causal SVs were well imputed.",
         ],
     }
 
@@ -198,6 +177,24 @@ def aou_result() -> list[str]:
         return []
     return [f"In All of Us, imputed SVs raised r² by at most {signed(common['relative_bound'] / 100)} over "
             f"{common['traits']} traits, so these traits have few SVs with large effects or poorly imputed causal SVs."]
+
+
+def aou_compared() -> list[str]:
+    """What the All of Us comparison with LDpred2-auto found, as a results bullet, when aou_vs_ldpred2.json holds it:
+    over the traits where SV-PGS converged, the common change in held-out r² of SV-PGS with SVs over LDpred2-auto's,
+    with its 95% interval, and the number of traits left out because an SV-PGS fit did not converge."""
+    path = HERE / "aou_vs_ldpred2.json"
+    if not path.is_file():
+        return []
+    found = json.loads(path.read_text())
+    common = found["combined"]["with_sv"]
+    low, high = (f"{common[key]:.0f}".replace("-", "−") for key in ("relative_lower", "relative_upper"))
+    interval = f"{low}–{high}%" if common["relative_lower"] >= 0 else f"{low}% to {high}%"
+    sentence = (f"On the {len(found['rows'])} traits where SV-PGS converged, its r² was {abs(common['relative']):.0f}% "
+                f"{'higher' if common['relative'] >= 0 else 'lower'} than LDpred2-auto's (95% CI {interval}).")
+    if "not_converged" in found:
+        sentence += f" It did not converge on {len(found['not_converged'])} others."
+    return [sentence]
 
 
 # ------------------------------------------------------------------ DrawingML
@@ -672,13 +669,11 @@ def build() -> None:
         ],
         [
             bar(118, "Simulation results"),
-            Block("text", [Para([(line, "")], bullet=False, after=0) for line in [words["whole_note"], *words["compared"]]]),
             row([figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
-            Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)]),
             figure(gallery["poster_sv_gain"]),
         ],
-        [bar(119, "All of Us cohort results"), text(bullets(words["aou"])), *aou_blocks()],
+        [bar(119, "All of Us cohort results"), text(bullets([*words["aou"], *aou_compared()])), *aou_blocks()],
     ]
     poster = Poster(xml, rels, work / "ppt/media")
     across = COLUMNS[2][0] + RIGHT - COLUMNS[1][0]
