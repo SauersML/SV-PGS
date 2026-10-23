@@ -50,12 +50,11 @@ EMU = 914400
 
 MARGIN = 0.84
 """Left and right page margins: the header band's left edge."""
-TOP, BOTTOM = 6.15, 35.3
+TOP, BOTTOM = 5.95, 35.45
 """The columns run from just under the header to the bottom margin."""
 GUTTER = 0.8
-LEFT, RIGHT = 11.4, 10.4
-"""The outer columns' widths; the middle column, the simulation's results, takes the rest of the 48 in page. The All
-of Us column is the narrowest: its figures shrink to the room it has."""
+LEFT, RIGHT = 11.4, 11.4
+"""The outer columns' widths; the middle column, the simulation's results, takes the rest of the 48 in page."""
 MIDDLE = 48 - 2 * MARGIN - 2 * GUTTER - LEFT - RIGHT
 COLUMNS = ((MARGIN, LEFT), (MARGIN + LEFT + GUTTER, MIDDLE), (48 - MARGIN - RIGHT, RIGHT))
 """Each column's left edge and width."""
@@ -177,8 +176,8 @@ def copy(numbers: dict) -> dict:
         "discussion": [
             "SV-PGS beat LDpred2-auto with and without causal SVs, so its advantage comes from the model and its "
             "larger variant set",
-            "Adding imputed SVs helped most when the causal SVs were well imputed, so the gain depends on SV "
-            "imputation accuracy",
+            "Imputed SVs helped most when the causal SVs were well imputed, so the gain depends on SV imputation "
+            "accuracy",
         ],
     }
 
@@ -191,7 +190,7 @@ def aou_matched() -> list[str]:
     # every matched run's run_config.json: fit_minimum_minor_allele_frequency 0.01, fit_minimum_r2 0.3 and
     # fit_variant_sites HapMap3, which keeps the SNVs at HapMap3 sites and every SV (workspace_pipeline.fit_filtered)
     return ["We fit SV-PGS with and without SVs and tested both in held-out people",
-            "Variants with MAF ≥ 1% and imputation r² ≥ 0.3: HapMap3 SNVs and SVs"] if rows else []
+            "HapMap3 SNVs and SVs, MAF ≥ 1%, imputation r² ≥ 0.3"] if rows else []
 
 
 def signed(share: float) -> str:
@@ -200,7 +199,7 @@ def signed(share: float) -> str:
 
 
 def aou_result() -> list[str]:
-    """What the All of Us result means, as two Discussion bullets, when aou_numbers.json's "matched" holds the traits'
+    """What the All of Us result means, as a Discussion bullet, when aou_numbers.json's "matched" holds the traits'
     "common" g: the pre-specified primary's change in r² as a fraction of the two arms' mean r², whose one-sided 95%
     upper bound ("relative_bound", in percent) caps the gain the traits could have from imputed SVs."""
     path = HERE / "aou_numbers.json"
@@ -208,9 +207,7 @@ def aou_result() -> list[str]:
     if not common:
         return []
     return [f"In All of Us, imputed SVs raised r² by at most {signed(common['relative_bound'] / 100)} across "
-            f"{common['traits']} traits, so these traits have few SVs with large effects, or their causal SVs are "
-            "poorly imputed",
-            "Long-read SV genotypes in the same people would distinguish between these two explanations"]
+            f"{common['traits']} traits, so these traits have few SVs with large effects or poorly imputed causal SVs"]
 
 
 # ------------------------------------------------------------------ DrawingML
@@ -459,16 +456,16 @@ def text(paragraphs: list[Para]) -> Block:
 
 QR = 2.6
 """Inches: the side of the QR code to the repository."""
-ENDING = 9.3
-"""Inches: the width of the QR code and the small type beside it at the right end of the Discussion band, the least that
+ENDING = 6.3
+"""Inches: the width of the QR code and the small type under it at the right end of the Discussion band, the least that
 sets the repository's address on one line."""
 
 
-def code(lines: list[str]) -> Block:
-    """A QR code to the repository with ``lines`` beside it in small type: "Code:", the address in bold, then the
-    references."""
-    return Block("qr", [Para([(line, "b" if index == 1 else "")], REFERENCE, bullet=False, after=0)
-                        for index, line in enumerate(lines)])
+def code(lines: list[str]) -> list[Block]:
+    """A QR code to the repository over ``lines`` in small type: "Code:", the address in bold, then the references."""
+    return [Block("qr", None),
+            Block("text", [Para([(line, "b" if index == 1 else "")], REFERENCE, bullet=False, after=0)
+                           for index, line in enumerate(lines)])]
 
 
 def row(*children: list, shares: tuple = ()) -> Block:
@@ -576,10 +573,6 @@ class Poster:
         elif block.kind == "qr":
             self.shapes.append(image(self.fresh(), "Repository QR code", self.image(self.qr), x + INSET, y, QR, QR,
                                      "QR code to github.com/SauersML/SV-PGS"))
-            words = sum(para.height(width - QR - 3 * INSET) for para in block.content)
-            paragraphs = "".join(para.xml() for para in block.content)
-            self.shapes.append(textbox(self.fresh(), "Repository", x + QR + INSET, y + (QR - words) / 2,
-                                       width - QR - INSET, words, paragraphs))
         elif block.kind == "row":
             for child, part in zip(block.children, parts(block, width)):
                 self.stack(child, x, y, part, None)
@@ -678,7 +671,7 @@ def build() -> None:
             Block("text", [Para([(line, "")], bullet=False, after=0) for line in [words["whole_note"], *words["compared"]]]),
             row([figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
-            Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)], gap="section"),
+            Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)]),
             figure(gallery["poster_sv_gain"]),
         ],
         [bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks()],
@@ -686,7 +679,7 @@ def build() -> None:
     poster = Poster(xml, rels, work / "ppt/media")
     across = COLUMNS[2][0] + RIGHT - COLUMNS[1][0]
     references = [f"{SUPERSCRIPT[index]}{reference}" for index, reference in enumerate(REFERENCES, start=1)]
-    band = [discussion[0], row(discussion[1:], [code([*words["code"], *references])],
+    band = [discussion[0], row(discussion[1:], code([*words["code"], *references]),
                                shares=(1 - ENDING / (across - GUTTER), ENDING / (across - GUTTER)))]
     top = BOTTOM - poster.stack_height(band, across)
     poster.stack(band, COLUMNS[1][0], top, across, None)

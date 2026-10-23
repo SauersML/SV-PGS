@@ -149,8 +149,6 @@ def test_the_discussion_bounds_the_common_all_of_us_gain_only_when_it_is_given(m
     assert build_pptx.aou_result() == []
     (tmp_path / "aou_numbers.json").write_text(json.dumps({"matched": {"rows": [], "common": {
         "relative": -2.0, "relative_lower": -4.0, "relative_upper": 0.5, "relative_bound": 0.1, "traits": 10}}}))
-    bound, follow_up = build_pptx.aou_result()
     # the primary's one-sided 95% upper bound on the common g
-    assert bound == ("In All of Us, imputed SVs raised r² by at most 0.1% across 10 traits, so these traits have few "
-                     "SVs with large effects, or their causal SVs are poorly imputed")
-    assert follow_up == "Long-read SV genotypes in the same people would distinguish between these two explanations"
+    assert build_pptx.aou_result() == ["In All of Us, imputed SVs raised r² by at most 0.1% across 10 traits, so these "
+                                       "traits have few SVs with large effects or poorly imputed causal SVs"]

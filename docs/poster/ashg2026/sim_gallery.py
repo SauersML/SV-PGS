@@ -811,10 +811,10 @@ sources written beside their marks. A poster figure carries no legend and no tit
 figure's own labels, state its message."""
 POSTER_LINE, POSTER_MARK, POSTER_BAR = 8.0, 26.0, 6.0
 """Points: a data line's width, a mean's marker and an interval's line in the poster's figures."""
-POSTER_HEIGHT = 9.62
+POSTER_HEIGHT = 8.6
 """Inches: the height of the two figures side by side at the top of the poster's middle column."""
-POSTER_HALF = 11.06
-"""Inches: the width each of those two figures is placed at (half of build_pptx.py's 22.92 in middle column less its
+POSTER_HALF = 10.56
+"""Inches: the width each of those two figures is placed at (half of build_pptx.py's 21.92 in middle column less its
 0.8 in gutter), so their type prints at its own size."""
 POSTER_STYLE = {
     "font.size": POSTER_TYPE, "axes.labelsize": POSTER_LABEL, "xtick.labelsize": POSTER_TYPE,
@@ -962,12 +962,14 @@ def poster_wins_figure(grids):
     lines = ("SV-PGS better", f"Training N = {size:,}")
     first = tallest(fig, [lines[0]], fontsize=POSTER_NAME, fontweight="bold")
     need = first + tallest(fig, [lines[1]], fontsize=POSTER_TYPE) - WINS_ABOVE + POSTER_PAD
-    # one scale on both axes, so the line of equal AUC runs at 45 degrees: up the y axis from 0.465 to at least 0.705,
+    # one scale on both axes, so the line of equal AUC runs at 45 degrees: up the y axis from 0.45 to at least 0.705,
     # and far enough that the second line clears the highest bar, and along the x axis at the same scale
-    low, reach = 0.465, (ours + half).max()
+    low, reach = 0.45, (ours + half).max()
     upper = max(0.705, (reach * height - low * need) / (height - need))
     right = low + (upper - low) / height * width
-    ax.axline((low, low), slope=1, color=INK, linewidth=4.0, zorder=1)
+    # the line of equal AUC stops under the two lines at the top left
+    end = upper - need * (upper - low) / height
+    ax.plot([low, end], [low, end], color=INK, linewidth=4.0, zorder=1)
     for chosen, color in ((~null, SV_PGS), (null, INK)):
         ax.vlines(theirs[chosen], ours[chosen] - half[chosen], ours[chosen] + half[chosen], color=color,
                   linewidth=POSTER_BAR * 0.5, zorder=2)
@@ -989,21 +991,24 @@ def poster_wins_figure(grids):
             fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top")
     ax.text(0, 1, lines[1], transform=shifted(ax, WINS_INDENT, WINS_ABOVE - first, data_rows=False), color=INK,
             ha="left", va="top")
-    # under the line, where no dot falls: what a dot and its bar are at the foot, the key to the black dots over them
-    ax.text(right - 0.003, low + 0.003, "Dot: simulation\nBar: 95% CI", color=INK, ha="right", va="bottom",
-            linespacing=1.0)
-    ax.text(right - 0.003, low + 0.058, "Black: no\ncausal SVs", color=INK, fontweight="bold", ha="right", va="bottom",
-            linespacing=1.0)
+    # under the line, where no dot falls: what a dot and its bar are at the foot, the key to the black dots just
+    # over them
+    foot = "Dot: simulation\nBar: 95% CI"
+    ax.text(1, 0, foot, transform=shifted(ax, -POSTER_PAD, POSTER_PAD, data_rows=False), color=INK, ha="right",
+            va="bottom", linespacing=1.0)
+    over = POSTER_PAD + tallest(fig, [foot], fontsize=POSTER_TYPE, linespacing=1.0) + 0.15
+    ax.text(1, 0, "Black: no\ncausal SVs", transform=shifted(ax, -POSTER_PAD, over, data_rows=False), color=INK,
+            fontweight="bold", ha="right", va="bottom", linespacing=1.0)
     return fig
 
 
 WELL_IMPUTED = ("tagged_sv", "tagged_sv_fold3")
 """The architectures whose causal SVs are drawn only from SVs that Beagle imputed with realized r² ≥ 0.8 (grid.py's
 sv_min_realized_r2)."""
-POSTER_GAIN, POSTER_GENOTYPES = 22.92, 11.4
+POSTER_GAIN, POSTER_GENOTYPES = 21.92, 11.4
 """Inches: the widths of the SV gain forest (the poster's middle column, build_pptx.py's MIDDLE) and the imputation
 figure (the left column, LEFT), each placed at its column's full width."""
-POSTER_GAIN_HEIGHT = 8.5
+POSTER_GAIN_HEIGHT = 8.22
 """Inches: the SV gain forest's height, which fills the middle column from the training-size figures to the band of
 Discussion, code and references at its foot (build_pptx.py's layout)."""
 GAIN_WEIGHT, GAIN_OFFSET = 2.0, 0.24

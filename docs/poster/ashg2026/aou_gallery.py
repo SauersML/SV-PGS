@@ -39,7 +39,7 @@ from sim_gallery import (INK, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_PAD,
 HERE = Path(__file__).resolve().parent
 NUMBERS = HERE / "aou_numbers.json"
 OUT = HERE / "figures"
-COLUMN = 10.4
+COLUMN = 11.4
 """Inches: the poster's right column (build_pptx.py's RIGHT), each figure's width, so its type prints at its own size."""
 ROW_GAP = 0.05
 """Inches between one row's name and the next row's: a row is a line of poster type and this gap."""
