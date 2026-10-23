@@ -57,6 +57,7 @@ import gc
 import hashlib
 import weakref
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Sequence
 
 import time
@@ -191,7 +192,7 @@ def block_grams(
         raise ValueError("cutting the blocks to the LD extent needs its test's level")
     # The blocks' lag profiles as Stage 0 summed them from these Grams (``LdGramStore.lag_profiles``): no Gram is read.
     extent = ld_extent(grams, statistics.sample_count, working_bytes, level, array_module, null_scale, profiles=ld.lag_profiles())
-    width = window_width(working_bytes, array_module, widest)
+    width = window_width(working_bytes, widest)
     log(f"leave-block-out windows: LD extent {extent} variants, memory width {width}, widest Stage 0 block {widest}")
     return refined_grams(grams, min(width, extent))
 
@@ -816,7 +817,7 @@ class _FullDataFixedPoints:
         # across a pooled cohort's groups puts unlinked pairs at kappa / n, 1.36 on bench-sim chr22 [sim]).
         self.grams = block_grams(statistics, working_bytes=window_budget, array_module=xp, level=certificate_level(draw_count), null_scale=null_scale)
         gaussian.windows = _WindowLayout(self.grams, gaussian.source)
-        window_bytes = window_working_bytes(self.grams, xp)
+        window_bytes = window_working_bytes(self.grams)
         log(f"ep: {len(self.grams.blocks)} leave-block-out windows of at most {max(block.shape[0] for block in self.grams.blocks)} columns, {window_bytes / 1e9:.1f} GB of {window_budget / 1e9:.1f} GB")
         if window_bytes > window_budget and max(block.shape[0] for block in self.grams.blocks) > 1:
             raise MemoryError(f"the leave-block-out windows need {window_bytes} bytes of float64 working set, over the fit's {working_bytes}")
@@ -2741,47 +2742,35 @@ class _FullDataMeanField:
         grams = replace(self.grams, scale=1.0 / noise)
         group_variance = np.bincount(self.ties.group, weights=variance, minlength=self.ties.group_count)
         dual = _member_posterior(self._reduced_posterior(model, grams, group_variance, state), self.ties, tau, group_variance, algebraic=True)
-        noise_solve: dict[str, object] = {}
+        noise_solve: tuple[F64Array, float] | None = None
 
         def solve(right: F64Array, relative_tolerance: float) -> F64Array:
             # R^-1 right: the dual solver's A = Xp'Xp / sigma^2 + diag(tau) at these sites is R itself.
             assert dual.solve is not None
             return dual.solve(right, relative_tolerance)
 
-        def coupling() -> F64Array:
-            return np.where(live, shift + mean_by_omega * omega / np.where(live, variance, 1.0), 0.0)[:, None]
-
-        def noise_terms(relative_tolerance: float, known: tuple[F64Array, F64Array, float] | None = None) -> tuple[F64Array, F64Array, float]:
-            # ``known`` is (R^-1 coupling, Xp'Xp of it, r'Xp of it) where the caller formed them with its own columns.
-            if not noise_solve:
-                if known is None:
-                    mean_one = solve(coupling(), relative_tolerance)
-                    gram_one, residual_one = self._response_products(residual, mean_one, model, metric)
-                    known = (mean_one, gram_one, float(residual_one[0]))
-                mean_one, gram_one, residual_one = known
-                shift_one = (gram_one - squares[:, None] * mean_one) / noise - shift[:, None]
-                scalar = residual_dimension - (
-                    2.0 * residual_one + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
-                ) / noise
-                noise_solve.update(mean_one=mean_one, shift_one=shift_one, scalar=scalar)
-            return noise_solve["mean_one"], noise_solve["shift_one"], noise_solve["scalar"]  # type: ignore[return-value]
-
         def cavity_response(mean_by_z: F64Array, variance_by_z: F64Array, relative_tolerance: float) -> tuple[F64Array, F64Array]:
             # The dense route's ``cavity_response`` (``mean_field``), with R^-1 by the dual solver to the relative
             # tolerance asked and Xp'Xp by tile passes.
+            nonlocal noise_solve
             scaled = np.where(live[:, None], mean_by_z / np.where(live, variance, 1.0)[:, None], 0.0)
-            known = None
-            if binary or noise_solve:
+            if binary or noise_solve is not None:
                 mean_step = solve(scaled, relative_tolerance)
                 # Xp'Xp dm and r'Xp dm (``_response_products``: on the samples from one image X dm, which both read).
                 products, residual_terms = self._response_products(residual, mean_step, model, metric)
             else:
-                # The noise response's own R^-1 solve and products (``noise_terms``) share this one's passes: one block
+                # The noise response's own R^-1 solve and products share this one's passes: one block
                 # solve of both, each column to its own relative tolerance, and one image of all their columns.
-                both = solve(np.hstack([scaled, coupling()]), relative_tolerance)
+                coupling = np.where(live, shift + mean_by_omega * omega / np.where(live, variance, 1.0), 0.0)[:, None]
+                both = solve(np.hstack([scaled, coupling]), relative_tolerance)
                 gram_both, residual_both = self._response_products(residual, both, model, metric)
                 mean_step, products, residual_terms = both[:, :-1], gram_both[:, :-1], residual_both[:-1]
-                known = (both[:, -1:], gram_both[:, -1:], float(residual_both[-1]))
+                mean_one, gram_one, residual_one = both[:, -1:], gram_both[:, -1:], float(residual_both[-1])
+                shift_one = (gram_one - squares[:, None] * mean_one) / noise - shift[:, None]
+                scalar = residual_dimension - (
+                    2.0 * residual_one + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
+                ) / noise
+                noise_solve = shift_one, scalar
             shift_step = -(products - squares[:, None] * mean_step) / noise
             if binary:
                 # Known noise: no noise response. The sites' own response is left out of the curvature, as in
@@ -2791,7 +2780,8 @@ class _FullDataMeanField:
                 # 0.05-0.2% and 1/2 log|B + S| by at most 0.02 nats at genetic scale 0.5, below the 1% by which a
                 # quantitative fixture's B, whose response is exact, differs from its own differences [sim].
                 return shift_step, np.zeros_like(shift_step)
-            _mean_one, shift_one, scalar = noise_terms(relative_tolerance, known)
+            assert noise_solve is not None
+            shift_one, scalar = noise_solve
             right = -2.0 * residual_terms + squares @ (
                 np.where(live[:, None], variance_by_z, 0.0) + variance_by_shift[:, None] * shift_step
             )

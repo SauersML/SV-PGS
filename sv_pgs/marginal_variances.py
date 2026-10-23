@@ -51,7 +51,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from functools import cached_property
 
 import numpy as np
 from numpy.typing import NDArray
@@ -439,7 +438,7 @@ def _window_quadratic(
     return _to_host(quadratic.T)
 
 
-def window_working_bytes(grams: BlockGrams, array_module: Any = np) -> int:
+def window_working_bytes(grams: BlockGrams) -> int:
     """The window algebra's peak float64 working set over the blocks, for the fit's working_bytes budget.
 
     Six |W| x |W| arrays are live at once in a window (the assembled Gram, its whitened form, the identity, the
@@ -447,7 +446,7 @@ def window_working_bytes(grams: BlockGrams, array_module: Any = np) -> int:
     formed, the scaled matrix takes the inverse's place) plus four |W| x |b| ones (the right-hand sides, their solve,
     the quadratic rows and the covariance rows), with |W| the window's and |b| the block's size. The factorizations'
     own workspaces are O(|W|) blocks. The shared Grams themselves stay where the caller keeps them (Stage 0's memory
-    map). ``array_module`` is accepted for the callers that pass their device; the count does not depend on it.
+    map).
     """
     itemsize = np.dtype(np.float64).itemsize
     peak = 0
@@ -458,9 +457,9 @@ def window_working_bytes(grams: BlockGrams, array_module: Any = np) -> int:
     return peak
 
 
-def window_width(working_bytes: int, array_module: Any = np, limit: int | None = None) -> int:
+def window_width(working_bytes: int, limit: int | None = None) -> int:
     """The widest block whose window (itself and its two neighbours at the same width) keeps the window algebra's
-    working set (``window_working_bytes`` on ``array_module``) within ``working_bytes``, by bisection on the width (the
+    working set (``window_working_bytes``) within ``working_bytes``, by bisection on the width (the
     set grows with it). At least one variant (the algebra's floor, where the budget is below it), and never wider
     than ``limit`` (the widest block there is to cut, where one is given)."""
 
@@ -469,7 +468,7 @@ def window_width(working_bytes: int, array_module: Any = np, limit: int | None =
         layout = BlockGrams(
             blocks=blocks, within=tuple(np.zeros((0, 0)) for _ in range(3)), next_cross=tuple(np.zeros((0, 0)) for _ in range(2)),
         )
-        return window_working_bytes(layout, array_module) <= working_bytes
+        return window_working_bytes(layout) <= working_bytes
 
     low, high = 1, 2
     while fits(high):
@@ -1236,37 +1235,3 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
         variance[solve.resolved] = 2.0 * np.square(resolved_scale)[:, None] * (bulk_square_total[None, :] - window_bulk_chance_square[resolved_blocks])
         window_part[solve.resolved] = resolved_bulk_near
     return JacobianProduct(values=values, standard_error=np.sqrt(variance), window_part=window_part)
-
-
-# --------------------------------------------------------------------------- the exact dual route (small n)
-
-
-@dataclass(frozen=True)
-class KernelFactor:
-    """The bulk kernel K_S = I + Xt_S D_S Xt_S' factored densely: for shapes whose n x n fits in memory.
-
-    ``lower`` is its Cholesky factor, ``resolved_solves`` Z_L = K_S^-1 Xt_L, and ``resolved_core``
-    core = Pi_L + Xt_L' Z_L. Then Q = K^-1 = K_S^-1 - Z_L core^-1 Z_L' (Woodbury, valid for any core > 0).
-    """
-
-    lower: NDArray[np.float64]
-    resolved_solves: NDArray[np.float64]
-    resolved_core: NDArray[np.float64]
-
-    @cached_property
-    def core_inverse(self) -> NDArray[np.float64]:
-        """core^-1, formed once per factor and shared by every block's call (speed-krylov)."""
-        return np.linalg.inv(self.resolved_core) if self.resolved_core.shape[0] else np.zeros((0, 0))
-
-
-def exact_block_information(factor: KernelFactor, bulk_variance: NDArray[np.float64], columns: NDArray[np.float64]) -> NDArray[np.float64]:
-    """D_j - Sigma_jj for one block's variants, exactly: D_j^2 (xt_j' K_S^-1 xt_j - c_j core^-1 c_j').
-
-    ``columns`` is the block's Xt_b (n x |b|) and ``bulk_variance`` its D_b (zero on resolved sites, whose rows
-    the caller takes from core^-1). The cost is n^2 |b| for the triangular solve plus n |b| |L|.
-    """
-    whitened = solve_triangular(factor.lower, columns, lower=True)
-    quadratic = np.sum(np.square(whitened), axis=0)
-    cross = columns.T @ factor.resolved_solves
-    spikes = np.sum((cross @ factor.core_inverse) * cross, axis=1) if cross.shape[1] else 0.0
-    return np.square(bulk_variance) * (quadratic - spikes)

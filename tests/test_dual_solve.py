@@ -222,7 +222,7 @@ def test_matheron_draws_have_the_posterior_covariance_exactly() -> None:
 
 
 def test_exact_marginals_are_the_dense_posterior_diagonal_with_negative_sites() -> None:
-    from tests.oracles import exact_bulk_diagonal
+    from tests.oracles import exact_bulk_diagonal, exact_marginals, kernel_factor
 
     genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, negative = _gaussian_problem(81)
     source = DenseDualSource(genotypes, bounds)
@@ -231,8 +231,8 @@ def test_exact_marginals_are_the_dense_posterior_diagonal_with_negative_sites() 
     assert set(negative) <= set(gaussian.bulk_solves[0].resolved)
     for model in range(MODEL_COUNT):
         posterior_precision, _mean, _alpha, _rss, design = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)
-        factor = gaussian.kernel_factor(model)
-        marginals = gaussian.exact_marginals(model, factor)
+        factor = kernel_factor(gaussian, model)
+        marginals = exact_marginals(gaussian, model, factor)
         assert np.all(marginals > 0.0)
         rounding = np.linalg.cond(posterior_precision) * genotypes.shape[0] * EPS
         np.testing.assert_allclose(marginals, np.diag(np.linalg.inv(posterior_precision)), rtol=rounding, atol=0.0)

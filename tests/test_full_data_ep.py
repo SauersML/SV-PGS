@@ -171,8 +171,8 @@ def test_factored_far_field_trace_matches_the_spectral_one() -> None:
 
 
 def test_window_width_at_a_huge_budget_stops_at_the_widest_block() -> None:
-    assert window_width(1 << 62, np, 41_984) == 41_984
-    assert window_width(1 << 62, np, 1) == 1
+    assert window_width(1 << 62, 41_984) == 41_984
+    assert window_width(1 << 62, 1) == 1
 
 
 def test_factored_far_field_trace_from_a_warm_start_reaches_the_same_root() -> None:

@@ -6,7 +6,7 @@ import pytest
 
 from sv_pgs import dual_solve
 from sv_pgs.compute_budget import _try_import_cupy
-from tests.oracles import DenseDualSource
+from tests.oracles import DenseDualSource, exact_marginals, kernel_factor
 from tests.test_dual_solve import EPS, MODEL_COUNT, _CodeTileSource, _coded_problem, _grams, _problem, _solve_bound
 
 cupy = _try_import_cupy()
@@ -66,7 +66,7 @@ def test_cuda_exact_marginals_match_the_host() -> None:
         )
         gaussian.iterate(site_precision=array_module.asarray(precision), site_shift=array_module.asarray(shift), noise_variance=noise,
                          error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
-        outputs.append(gaussian.exact_marginals(0, gaussian.kernel_factor(0)))
+        outputs.append(exact_marginals(gaussian, 0, kernel_factor(gaussian, 0)))
     np.testing.assert_allclose(outputs[1], outputs[0], rtol=genotypes.shape[0] * np.sqrt(EPS), atol=0.0)
 
 

@@ -2041,11 +2041,6 @@ class CurvatureCorrection:
         """The largest relative residual B's response has been solved to so far (0 for a correction given whole)."""
         return max(self._resolutions, default=0.0)
 
-    @property
-    def solved_directions(self) -> int:
-        """How many directions B's linear response has been solved for (lazy corrections only)."""
-        return 0 if self._basis is None else int(self._basis.shape[1])
-
     def on(self, coefficient_map: F64Array) -> F64Array:
         size = int(coefficient_map.shape[1])
         if self._columns is not None:
@@ -3196,7 +3191,7 @@ def _lines(
             totals[column] = -(penalty + steps * penalty_slopes[column] + 0.5 * np.square(steps) * penalty_curvatures[column])
         xp = _DEVICE.get()
 
-        def piece_sums(exponentials, peak, row_kernel, scaled, device_density, density_peak, start: int, stop: int) -> list:
+        def piece_sums(exponentials, peak, kernel_rows, scaled, device_density, density_peak, start: int, stop: int) -> list:
             # One piece's addends to its class's sums, in the order the pass adds them: its peaks, then its logs.
             products = exponentials[start:stop] @ scaled
             addends = [float(_host(peak[start:stop].sum()))]
@@ -3215,7 +3210,7 @@ def _lines(
                 row_index, step_index = np.nonzero(lost)
                 del lost
                 logs[row_index, step_index] = (
-                    _log_sum_exp(row_kernel[start + row_index] + device_density[step_index], axis=1)
+                    _log_sum_exp(kernel_rows[start + row_index] + device_density[step_index], axis=1)
                     - peak[start + row_index] - xp.asarray(density_peak)[step_index]
                 )
             return [*addends, _host(logs.sum(axis=0))]
@@ -3233,14 +3228,14 @@ def _lines(
                 scaled = xp.asarray(np.exp(class_density - density_peak[:, None]).T)
                 device_density = xp.asarray(class_density)
                 summed = np.zeros(class_density.shape[0])
-                for rows, peak, exponentials, row_kernel in fixed_chunks(key, fixed, class_position):
+                for rows, peak, exponentials, kernel_rows in fixed_chunks(key, fixed, class_position):
                     # The rows x steps products and their logs, in pieces of rows that fit the budget.
                     piece = max(1, budget // (3 * np.dtype(np.float64).itemsize * max(class_density.shape[0], 1)))
                     start = 0
                     while start < rows.shape[0]:
                         stop = min(start + piece, rows.shape[0])
                         try:
-                            addends = piece_sums(exponentials, peak, row_kernel, scaled, device_density, density_peak, start, stop)
+                            addends = piece_sums(exponentials, peak, kernel_rows, scaled, device_density, density_peak, start, stop)
                         except MemoryError:
                             # Refused though sized to the room (the room fell since): halved, down to one row.
                             if stop - start == 1:
@@ -3441,12 +3436,12 @@ def _laplace_corrections(
     return _repeated(
         "corrections", cavity,
         (*_prior_digest(prior), log_smoothing, evidence.coefficients, evidence.precision, evidence.responses, working_bytes, tolerance),
-        lambda: _laplace_corrections_once(prior, log_smoothing, evidence, cavity, correction, working_bytes, tolerance), held=correction,
+        lambda: _laplace_corrections_once(prior, log_smoothing, evidence, cavity, working_bytes, tolerance), held=correction,
     )
 
 
 def _laplace_corrections_once(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
+    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, working_bytes: int, tolerance: float
 ) -> tuple[F64Array, F64Array, F64Array]:
     """Per integrated direction, the correction from the Laplace term to the exact one-dimensional integral, the
     Tierney-Kadane term that decided it, and the standardized directions themselves (columns, in x).
@@ -4188,7 +4183,6 @@ def _maximize_evidence(
         first = _edge_evidence(prior, weights, infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
     if first is None:
         raise FloatingPointError("no structural start reaches a certified maximum at the starting penalty weights")
-    start = first[1]
     best_corrected = -np.inf
     # Blocks released from their edge below, once each per search: a block the ascent then returns to its edge is
     # not tried again; ``held_edges`` (``hyper_step``) are never released.

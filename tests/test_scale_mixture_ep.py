@@ -17,7 +17,6 @@ from scipy.optimize import minimize_scalar
 
 import sv_pgs.scale_mixture_ep as engine
 from sv_pgs.scale_mixture_ep import (
-    _sum_to_zero_basis,
     _sum_to_zero_rows,
     CurvatureCorrection,
     FixedPoint,
@@ -1270,9 +1269,9 @@ def test_total_curvature_matches_ep_resolved_differences_of_the_evidence_gradien
     np.testing.assert_allclose(lazy.on(view.coefficient_map), allowed.T @ whole @ allowed, rtol=1e-8, atol=1e-8 * scale)
     # One direction per independent column of the view's map (M is not injective: eta_bar and the class deviations
     # overlap in z), and only the new ones when every edge is released.
-    assert lazy.solved_directions == np.linalg.matrix_rank(view.coefficient_map) < np.linalg.matrix_rank(mapping)
+    assert lazy._basis.shape[1] == np.linalg.matrix_rank(view.coefficient_map) < np.linalg.matrix_rank(mapping)
     np.testing.assert_allclose(lazy.on(mapping), whole, rtol=1e-8, atol=1e-8 * scale)
-    assert lazy.solved_directions == np.linalg.matrix_rank(mapping)
+    assert lazy._basis.shape[1] == np.linalg.matrix_rank(mapping)
 
 
 def test_the_outer_step_never_certifies_where_the_total_curvature_is_indefinite():

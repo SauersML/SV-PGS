@@ -7,6 +7,8 @@ Test infrastructure, kept out of the package: a route that agrees with one of th
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
+from functools import cached_property
 from typing import Any
 
 import numpy as np
@@ -14,8 +16,8 @@ from numpy.typing import NDArray
 from scipy.linalg import solve_triangular
 
 from sv_pgs.code_products import DIGIT_BITS
-from sv_pgs.dual_solve import DualModels, DualTile, DualTileSource, PassCount, _checked_bounds, sequential_map_reduce
-from sv_pgs.marginal_variances import BlockCertificate, BulkSolve, KernelFactor, _certificate
+from sv_pgs.dual_solve import DualGaussian, DualModels, DualTile, DualTileSource, PassCount, _checked_bounds, _host, sequential_map_reduce
+from sv_pgs.marginal_variances import BlockCertificate, BulkSolve, _certificate
 from sv_pgs.phenotype_measurement import OccasionModelFit, Occasions, _Model, _result, _State
 from sv_pgs.scale_mixture_ep import (
     Cavity,
@@ -49,6 +51,86 @@ def far_field_trace(bulk_trace: float, bulk_square_trace: float, sample_count: i
         if not candidate > current:
             return current
         current = candidate
+
+
+@dataclass(frozen=True)
+class KernelFactor:
+    """The bulk kernel K_S = I + Xt_S D_S Xt_S' factored densely: for shapes whose n x n fits in memory.
+
+    ``lower`` is its Cholesky factor, ``resolved_solves`` Z_L = K_S^-1 Xt_L, and ``resolved_core``
+    core = Pi_L + Xt_L' Z_L. Then Q = K^-1 = K_S^-1 - Z_L core^-1 Z_L' (Woodbury, valid for any core > 0).
+    """
+
+    lower: NDArray[np.float64]
+    resolved_solves: NDArray[np.float64]
+    resolved_core: NDArray[np.float64]
+
+    @cached_property
+    def core_inverse(self) -> NDArray[np.float64]:
+        """core^-1, formed once per factor and shared by every block's call."""
+        return np.linalg.inv(self.resolved_core) if self.resolved_core.shape[0] else np.zeros((0, 0))
+
+
+def exact_block_information(factor: KernelFactor, bulk_variance: NDArray[np.float64], columns: NDArray[np.float64]) -> NDArray[np.float64]:
+    """D_j - Sigma_jj for one block's variants, exactly: D_j^2 (xt_j' K_S^-1 xt_j - c_j core^-1 c_j').
+
+    ``columns`` is the block's Xt_b (n x |b|) and ``bulk_variance`` its D_b (zero on resolved sites, whose rows
+    the caller takes from core^-1). The cost is n^2 |b| for the triangular solve plus n |b| |L|.
+    """
+    whitened = solve_triangular(factor.lower, columns, lower=True)
+    quadratic = np.sum(np.square(whitened), axis=0)
+    cross = columns.T @ factor.resolved_solves
+    spikes = np.sum((cross @ factor.core_inverse) * cross, axis=1) if cross.shape[1] else 0.0
+    return np.square(bulk_variance) * (quadratic - spikes)
+
+
+def _design_block(gaussian: DualGaussian, model: int, start: int, stop: int, tile: DualTile) -> Any:
+    """Xt_b = (I - H) W^1/2 X_b of one block for model m, dense (n x p_b)."""
+    return gaussian._state["models"].design_to_sample(tile.columns(np.arange(stop - start)), gaussian.array_module.full(stop - start, model))
+
+
+def kernel_factor(gaussian: DualGaussian, model: int) -> KernelFactor:
+    """Model m's bulk kernel K_S = I + Xt_S D_S Xt_S' factored densely at the gaussian's last iterate's sites (host).
+
+    One read forms K_S (n^2 p flops), and its Cholesky factor gives Z_L = K_S^-1 Xt_L and core = Pi_L + Xt_L'Z_L
+    (Pi_L of any sign). Raises LinAlgError when the core, hence A, is not positive definite.
+    """
+    array_module = gaussian.array_module
+    state = gaussian._state
+    variances = state["models"].variances[:, model]
+    kernel = array_module.eye(gaussian.source.sample_count)
+    for start, stop, tile in gaussian.source.blocks():
+        block = _design_block(gaussian, model, start, stop, tile)
+        kernel += (block * variances[start:stop][None, :]) @ block.T
+    kernel = _host(kernel)
+    lower = np.linalg.cholesky(0.5 * (kernel + kernel.T))
+    block = state["blocks"].get(model)
+    if block is None:
+        return KernelFactor(lower=lower, resolved_solves=np.zeros((lower.shape[0], 0)), resolved_core=np.zeros((0, 0)))
+    design = _host(block.design)
+    resolved_solves = np.linalg.solve(lower.T, np.linalg.solve(lower, design))
+    core = np.diag(_host(block.precision)) + design.T @ resolved_solves
+    core = 0.5 * (core + core.T)
+    np.linalg.cholesky(core)
+    return KernelFactor(lower=lower, resolved_solves=resolved_solves, resolved_core=core)
+
+
+def exact_marginals(gaussian: DualGaussian, model: int, factor: KernelFactor) -> NDArray[np.float64]:
+    """diag(A_m^-1) at the gaussian's last iterate's sites (host, (p,)), exactly, from ``kernel_factor``'s factor.
+
+    Bulk sites take D_j - ``exact_block_information``, resolved sites diag(core^-1) (A^-1_LL = core^-1, Schur's
+    complement of A's bulk block). The only error is float64 rounding.
+    """
+    variances = _host(gaussian._state["models"].variances[:, model])
+    marginals = np.empty(gaussian.source.variant_count)
+    for start, stop, tile in gaussian.source.blocks():
+        block_variances = variances[start:stop]
+        information = exact_block_information(factor, block_variances, _host(_design_block(gaussian, model, start, stop, tile)))
+        marginals[start:stop] = block_variances - information
+    resolved = gaussian._resolved[model]
+    if resolved.size:
+        marginals[resolved] = np.diag(np.linalg.inv(factor.resolved_core))
+    return marginals
 
 
 def exact_bulk_diagonal(factor: KernelFactor) -> NDArray[np.float64]:
