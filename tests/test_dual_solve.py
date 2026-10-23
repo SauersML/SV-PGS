@@ -314,12 +314,8 @@ def test_resolved_design_pairs_each_column_with_its_site_in_the_given_order() ->
     _projector, design, _precision, _operator = _dense(genotypes, covariates, weights, variances, 0)
     np.testing.assert_allclose(designs[0], design[:, chosen], rtol=0.0, atol=genotypes.shape[0] * EPS * np.abs(design).max())
     repeated = dual_solve.ResolvedSites({0: np.array([3, 3])}, {0: np.ones(2)}, {0: np.zeros(2)})
-    try:
+    with pytest.raises(ValueError, match="distinct"):
         dual_solve.resolved_design(source, models, repeated)
-    except ValueError as error:
-        assert "distinct" in str(error)
-    else:
-        raise AssertionError("repeated indices must be refused")
 
 class _CodeTileSource:
     """A GenotypeBlockSource over code_products.CodeBlockTile tiles, as the store source streams them."""

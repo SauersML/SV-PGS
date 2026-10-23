@@ -41,12 +41,10 @@ def test_cuda_code_tiles_with_relaxed_digits_keep_the_certificate() -> None:
     result = dual_solve.certified_block_cg(source, models, right, cupy.zeros_like(right), cupy.arange(MODEL_COUNT), bound, count, deflation=dual_solve.Deflation({}, {}, {}, {}))
     assert bool(cupy.all(result.residual_norm <= bound))
     assert any(relative_error > 0.0 for relative_error in result.relative_errors)
-    dense_models = dual_solve.DualModels(weights, variances, covariates)
     exact = host_right - np.column_stack([
         _dense_operator(standardized, covariates, weights, variances, model) @ cupy.asnumpy(result.solution[:, model]) for model in range(MODEL_COUNT)
     ])
     assert np.all(np.linalg.norm(exact, axis=0) <= cupy.asnumpy(bound) * (1.0 + standardized.shape[0] * EPS) + standardized.shape[0] * EPS * np.linalg.norm(host_right, axis=0))
-    del dense_models
 
 
 def _dense_operator(genotypes, covariates, weights, variances, model):

@@ -287,12 +287,8 @@ def test_sealed_confirmation_genes_are_never_scored_outside_the_confirmation(tmp
     assert dataset.gene_rows(["chr1"]) == [0, 2]
     assert dataset.gene_rows(["chr1"], confirmation=True) == [1]
     pd.DataFrame({"gene_id": ["g1", "g2"]}).to_csv(tmp_path / "list.tsv", sep="\t", index=False)
-    try:
+    with pytest.raises(ValueError, match="sealed"):
         dataset.gene_rows(["chr1"], gene_list=tmp_path / "list.tsv")
-    except ValueError as error:
-        assert "sealed" in str(error)
-    else:
-        raise AssertionError("a gene list naming a sealed gene must be refused")
 
 
 def test_long_read_feature_sets_select_their_source():
@@ -310,12 +306,8 @@ def test_a_derived_dataset_must_carry_its_parents_sealed_genes(tmp_path):
     (child / harness.PARENT_DATASET).write_text(str(parent) + "\n")
     dataset = harness.Dataset.__new__(harness.Dataset)
     dataset.directory = child
-    try:
+    with pytest.raises(ValueError, match="sealed"):
         dataset.sealed_genes()
-    except ValueError as error:
-        assert "sealed" in str(error)
-    else:
-        raise AssertionError("a derived dataset without the parent's sealed list must be refused")
     (child / harness.SEALED_GENES).write_bytes((parent / harness.SEALED_GENES).read_bytes())
     assert dataset.sealed_genes() == {"g2"}
 
@@ -352,12 +344,8 @@ def test_a_batch_refuses_a_sealed_gene(tmp_path):
     tiny_dataset(tmp_path)
     pd.DataFrame({"gene_id": ["g1"]}).to_csv(tmp_path / harness.SEALED_GENES, sep="\t", index=False)
     dataset = harness.Dataset(tmp_path)
-    try:
+    with pytest.raises(ValueError, match="sealed"):
         harness._LazyTrains(dataset, [0], "loso/AFR", "snv")
-    except ValueError as error:
-        assert "sealed" in str(error)
-    else:
-        raise AssertionError("a batch containing a sealed gene must be refused")
 
 
 def test_gene_ranks_take_a_slice_of_the_list_in_list_order(tmp_path):
@@ -505,19 +493,11 @@ def test_views_refuse_sealed_genes_and_missing_or_extra_views(tmp_path):
         def predict(self, genotypes):
             return np.zeros(genotypes.shape[0])
 
-    try:
+    with pytest.raises(ValueError, match="1 of 2"):
         list(harness._run_views(dataset, lambda views: {("g1", "loso/AFR", "snv"): Constant()}, [0], ["loso/AFR", "loso/EUR"], ["snv"]))
-    except ValueError as error:
-        assert "1 of 2" in str(error)
-    else:
-        raise AssertionError("a missing view must be refused")
     pd.DataFrame({"gene_id": ["g1"]}).to_csv(tmp_path / harness.SEALED_GENES, sep="\t", index=False)
-    try:
+    with pytest.raises(ValueError, match="sealed"):
         harness._LazyViews(harness.Dataset(tmp_path), [0], ["loso/AFR"], ["snv"])
-    except ValueError as error:
-        assert "sealed" in str(error)
-    else:
-        raise AssertionError("views containing a sealed gene must be refused")
 
 
 def _every_sample(values, targeted, sample_size):
@@ -620,12 +600,8 @@ def test_sample_subset_cuts_every_split_and_refuses_placeholders(tmp_path):
     dosage = np.load(tmp_path / "chr1.dosage.npy")
     dosage[:, 0] = -1
     np.save(tmp_path / "chr1.dosage.npy", dosage)
-    try:
+    with pytest.raises(ValueError, match="placeholder"):
         harness.build_gene_task(dataset, harness.load_gene_window(harness.Dataset(tmp_path, sample_subset=subset), 0), dataset.splits["loso/AFR"])
-    except ValueError as error:
-        assert "placeholder" in str(error)
-    else:
-        raise AssertionError("a negative placeholder read for a split sample must be refused")
 
 
 def test_scores_are_residualized_on_the_covariates_like_the_truth():
@@ -688,12 +664,8 @@ FAILING_METHOD = (
 def test_a_fit_failure_raises_by_default(tmp_path):
     tiny_dataset(tmp_path)
     (tmp_path / "failing.py").write_text(FAILING_METHOD)
-    try:
+    with pytest.raises(RuntimeError, match="compile"):
         harness.run(tmp_path, f"{tmp_path}/failing.py:fit", "failing", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
-    except RuntimeError as error:
-        assert "compile" in str(error)
-    else:
-        raise AssertionError("a fit that raises must stop the run, never be replaced by a stand-in predictor")
 
 
 def test_recorded_failures_are_nan_logged_and_never_scored(tmp_path):
@@ -1051,12 +1023,8 @@ def test_a_covariate_only_score_scores_zero_and_a_foreign_dataset_is_refused(tmp
     assert (scores["r2"] == 0.0).all() and (scores["oos_r2"] == 0.0).all()
     report.held_out.cache_clear()
     np.save(tmp_path / "expression.npy", expression[::-1])
-    try:
+    with pytest.raises(ValueError, match="not the dataset's expression"):
         report.per_gene_scores(tmp_path / "results", tmp_path, "m", "loso")
-    except ValueError as error:
-        assert "not the dataset's expression" in str(error)
-    else:
-        raise AssertionError("a truth that is not the dataset's expression minus a covariate fit must stop the report")
 
 
 def test_a_constant_fit_is_scored_as_no_prediction():

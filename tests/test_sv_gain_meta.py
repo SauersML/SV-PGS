@@ -4,6 +4,7 @@ finds a planted gain and bounds it, on small synthetic traits sharing people and
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from scipy import stats
 
 from benchmarks.bench_real import sv_gain_meta
@@ -156,12 +157,8 @@ def test_pairs_of_one_trait_are_averaged_per_arm_on_their_common_people() -> Non
         assert np.allclose(merged[arm], expected)
     assert np.allclose(merged["target"], target[1:])
     broken = _run("ldl", ["b", "c"], np.array([0.0, 0.0]), np.zeros(2), np.ones(2))
-    try:
+    with pytest.raises(ValueError):
         sv_gain_meta.merge_pairs([first, broken])
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("runs whose outcomes disagree were merged")
 
 
 def test_merged_runs_join_every_run_s_families() -> None:
