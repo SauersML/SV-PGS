@@ -65,8 +65,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from scipy import stats
@@ -437,23 +439,33 @@ def read_run(name: str, contrast: str = "arms") -> dict[str, object]:
     the with_sv model's score and the same score less its SV terms)."""
     from sv_pgs.compute_budget import detect_compute_budget
     from sv_pgs.config import TraitType
-    from sv_pgs.workspace_pipeline import ARMS, WorkspaceConfig, _held_out_rows, _read_cohort, _read_scores, _Run, workspace_bindings
+    from sv_pgs.workspace_pipeline import ARMS, WorkspaceConfig, _fit_cohort, _held_out_rows, _read_scores, _Run, workspace_bindings
 
     config = json.load(open(f"{OPS}/{name}/run_config.json", encoding="utf-8"))
-    config["run_directory"], config["marker_directory"] = f"{OPS}/{name}/run", f"/tmp/sv_gain_meta_markers_{name}"
-    path = f"/tmp/sv_gain_meta_{name}.json"
-    json.dump(config, open(path, "w", encoding="utf-8"))
-    run = _Run(WorkspaceConfig.read(path), workspace_bindings(), detect_compute_budget(), {})
-    cohort_run, source = run, config.get("accept_steps_from")
-    while not (cohort_run.output("cohort") / "cohort.npz").exists() and source:
+    run_directory, source = Path(f"{OPS}/{name}/run"), config.get("accept_steps_from")
+    cohort_directory = run_directory / "cohort"
+    while not (cohort_directory / "cohort.npz").exists() and source:
         # a run that kept its cohort step from an earlier run's tree (accept_steps_from: .../svpgs/<run>/source) holds
         # no copy of it; the earlier run's cohort (or the one that run kept) is the one its score step indexes
         earlier_name = source.rstrip("/").split("/")[-2]
-        earlier = dict(config, run_directory=f"{OPS}/{earlier_name}/run")
-        json.dump(earlier, open(f"/tmp/sv_gain_meta_{name}_cohort.json", "w", encoding="utf-8"))
-        cohort_run = _Run(WorkspaceConfig.read(f"/tmp/sv_gain_meta_{name}_cohort.json"), workspace_bindings(), detect_compute_budget(), {})
+        cohort_directory = Path(f"{OPS}/{earlier_name}/run/cohort")
         source = json.load(open(f"{OPS}/{earlier_name}/run_config.json", encoding="utf-8")).get("accept_steps_from")
-    cohort, scores = _read_cohort(cohort_run), _read_scores(run)
+    if cohort_directory != run_directory / "cohort":
+        # the score step checks its model names against the run's own cohort directory, so the run is read through a
+        # view of its step directories with the cohort's taken from the earlier run
+        view = Path(f"/tmp/sv_gain_meta_view_{name}")
+        shutil.rmtree(view, ignore_errors=True)
+        view.mkdir()
+        for step in run_directory.iterdir():
+            if step.name != "cohort":
+                (view / step.name).symlink_to(step)
+        (view / "cohort").symlink_to(cohort_directory)
+        run_directory = view
+    config["run_directory"], config["marker_directory"] = str(run_directory), f"/tmp/sv_gain_meta_markers_{name}"
+    path = f"/tmp/sv_gain_meta_{name}.json"
+    json.dump(config, open(path, "w", encoding="utf-8"))
+    run = _Run(WorkspaceConfig.read(path), workspace_bindings(), detect_compute_budget(), {})
+    cohort, scores = _fit_cohort(run), _read_scores(run)
     if scores.held_out_genetic.shape[1] != len(cohort.research_ids):
         raise ValueError(f"{name}: its scores hold {scores.held_out_genetic.shape[1]} people and its cohort {len(cohort.research_ids)}")
     (trait,) = range(len(cohort.trait_names))
