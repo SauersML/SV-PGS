@@ -320,6 +320,12 @@ Results seen (log; no test definition changes because of them)
     weight, since its two near-null arms give the same score and its gain has almost no variance.
   - Fast baseline, kept apart and never pooled (fastpgs_meta, LDpred2-auto, 11 runs, long-read people excluded): GLS
     absolute gain -0.033e-4 [-0.85, 0.79], one-sided p about 0.53. g = -0.67% [-2.08, 0.75], weak p 0.82, sharp p 0.86.
+- 00:29 PDT on 2026-10-23, the coordinator's decision on T2D, after the result above was seen: the rule is not amended.
+  The primary stays as pre-specified, with T2D included. Beside it, the same analysis without T2D is reported as a
+  sensitivity analysis, chosen after seeing that T2D's near-null scores (held-out variance about 1e-11) take all of
+  g's weight. That is a design weakness of the primary: its inverse-variance weights a = r^2 / var(gain) let a
+  near-degenerate pair, whose two arms give almost the same score, dominate g. The null threshold of 1e-12 does not
+  catch a pair this close to the null. On the interim inputs the analysis without T2D is the six-pair result above.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
