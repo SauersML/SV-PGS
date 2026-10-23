@@ -1067,7 +1067,7 @@ def _fit_group(
                     })
                     break
                 # An uncertified refit keeps the fit it continued, whether or not that fit certified. Rechecking
-                # both uncertified walks doubled the lattice repeatedly [real, aou-wh6: 138 -> 275 -> 549 nodes].
+                # both uncertified walks doubled the lattice repeatedly [real: 138 -> 275 -> 549 nodes].
                 kept = [model for model in moving if not refit.certificate.outer_criterion_met[model]]
                 if kept:
                     finish(fit, fit_prior, kept, {

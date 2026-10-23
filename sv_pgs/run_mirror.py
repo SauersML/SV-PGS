@@ -749,13 +749,14 @@ def _replaced_stores(names: dict[str, int]) -> set[str]:
     stores = [step for step in STEP_NAMES if step in complete and step in holding]
     return set(stores[:-1])
 
+
 def _piece_bytes(total: int, workers: int) -> int:
     """The range a restore's large files are read in (``_download_pieces``): its ``total`` bytes over ``workers``
     squared, so each worker reads about ``workers`` pieces and the last pieces, read at a worker's share of the rate,
     end within 1/``workers`` of the restore's time after its last byte could; at least the client library's chunk for
-    ranged reads at once (``transfer_manager.TM_DEFAULT_CHUNK_SIZE``). One stream read each file before: the AoU
-    store's codes are 22 files of 10-43 GB (dosage/half0/<chromosome>, 525 of the 568 GB a fit job restores [real,
-    aou-wk5's mirror]), so a restore's last minutes read its largest files on a few streams."""
+    ranged reads at once (``transfer_manager.TM_DEFAULT_CHUNK_SIZE``). The AoU store's codes are 22 files of 10-43 GB
+    (dosage/half0/<chromosome>, 525 of the 568 GB a fit job restores [real]), so with one stream per file a restore's
+    last minutes read its largest files on a few streams."""
     from google.cloud.storage import transfer_manager
 
     return max(transfer_manager.TM_DEFAULT_CHUNK_SIZE, total // max(workers, 1) ** 2)
@@ -889,7 +890,7 @@ def restore(
     no store and no fit state, only the models, the scores and the effects.
 
     Every step's objects share one pool, largest first, before any step is renamed into place. The AoU whole-genome
-    restore waited another 2m15s after the store, measurement's 21.3 GB on one or two streams [real, aou-wg6]; those
+    restore waited another 2m15s after the store, measurement's 21.3 GB on one or two streams [real]; those
     files can download beside the store's. Each completed step's marker is checked again before its rename."""
     names = remote.sizes("")
     run_directory.mkdir(parents=True, exist_ok=True)
