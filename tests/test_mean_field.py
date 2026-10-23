@@ -244,6 +244,7 @@ _INTERIOR_CERTIFICATE_REASON = (
     "first solve; the boundary model (HANDOFF, open engine work) is the open work")
 
 
+@pytest.mark.slow  # the small-n EB outer loop on 50 columns: over 15 minutes in the svpgs VM
 @pytest.mark.xfail(strict=True, reason=_INTERIOR_CERTIFICATE_REASON)
 def test_the_mean_field_fit_certifies():
     """Machinery only (own simulation): the outer loop certifies on the mean-field oracle (its remaining gain within
@@ -253,6 +254,7 @@ def test_the_mean_field_fit_certifies():
     assert fit.certificate.prediction_move[0] <= fit.certificate.prediction_tolerance[0]
 
 
+@pytest.mark.slow  # the same fit as test_the_mean_field_fit_certifies
 def test_the_mean_field_fit_scores():
     """Machinery only (own simulation): the fixed point's own certificate holds (q's mean move and the noise's gain
     within their budgets) and the scoring model carries the fit with the resolved effects on top."""
