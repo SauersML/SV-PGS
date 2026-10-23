@@ -164,3 +164,15 @@ def test_poster_gain_note_counts_the_simulations_the_forest_draws(monkeypatch, t
     rows = json.loads((poster.HERE / "figures/gallery/numbers.json").read_text())["poster_sv_gain"]["rows"]
     drawn = sum(row["true"][3] for row in rows.values() if row is not rows.get("well_imputed"))
     assert f"over {drawn} simulations" in poster_copy(poster)["gain_note"]
+
+
+def test_the_whole_chr22_note_gives_the_prevalence_every_whole_chr22_architecture_has(monkeypatch, tmp_path):
+    from benchmarks.power import grid
+
+    poster = poster_module(monkeypatch, tmp_path)
+    assert poster.WHOLE_PREVALENCE == grid.PREVALENCE
+    # the one point at another prevalence ran in the 3 Mb window alone
+    others = {name for name, point in grid.POINTS.items()
+              if point.get("truth", {}).get("prevalence", grid.PREVALENCE) != grid.PREVALENCE}
+    assert others == {"rare_disease"}
+    assert "at 10% prevalence" in poster_copy(poster)["whole_note"]

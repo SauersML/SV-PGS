@@ -5,7 +5,9 @@ count of 1 to 20 is among them, and the file, like the figures, stays out of git
 NUMBERS holds:
 - "matched": the rows of SV-PGS with SVs against SV-PGS without them, fitted by identical code and scored on the same
   held-out people, one a trait: the held-out partial r² with SVs less without as a percentage of the two models' mean
-  partial r², the pre-specified g of sv_gain_meta.py (relative, relative_lower, relative_upper: its 95% interval);
+  partial r², the pre-specified g of sv_gain_meta.py (relative, relative_lower, relative_upper: its 95% interval), and
+  "unconverged": true when the with-SV fit stopped before converging. An optional "common" holds the traits' common g
+  the same way, with "traits", the number of traits it combines;
 - "enrichment": prior_enrichment.tsv's rows of arm with_sv, one a (trait, class) and one a trait for every SV together:
   the class's mean posterior E[beta^2 | data] per record over the SNVs' (posterior_enrichment, with its jackknife
   interval), the learned prior's (prior_enrichment), and the class's share of the model's genetic variance and of the
@@ -15,8 +17,10 @@ None of the last three is drawn: their posterior moments E[beta^2 | data] are mo
 data say little about each record (gout's SVs: 98% posterior variance), so they are no measure of what the data put on
 SVs.
 
-Outputs, in figures/: aou_1_gain.png from "matched", a row per trait, drawn when NUMBERS holds its rows (transparent,
-at the width of the poster's right column), with its .txt, whose first line describes the picture.
+Outputs, in figures/: aou_1_gain.png from "matched", a row per trait and one for "common" when it is given, drawn when
+NUMBERS holds its rows (transparent, at the width of the poster's right column), with its .txt, whose first line
+describes the picture. The figure gives each g as a change relative to the r² without SVs (baseline_relative), so its
+axis title, "Change in r² with SVs (%)", reads as it says.
 
     uv run --with matplotlib --with scipy python docs/poster/ashg2026/aou_gallery.py
 """
@@ -46,6 +50,7 @@ TRAITS = {
     "type_2_diabetes": "Type 2 diabetes", "coronary_artery_disease": "Coronary disease",
     "atrial_fibrillation": "Atrial fibrillation", "hypothyroidism": "Hypothyroidism", "gout": "Gout",
     "chronic_kidney_disease": "Kidney disease", "asthma": "Asthma", "stroke": "Stroke",
+    "hyperlipidemia": "Hyperlipidemia",
 }
 """Each trait's name on the poster; a trait not here is shown as its name with spaces."""
 
@@ -56,23 +61,29 @@ def trait_name(trait: str) -> str:
 
 
 def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list[float], tick_text, log: bool,
-           reference: float | None = None, estimates: bool = False):
+           reference: float | None = None, estimates: bool = False, bold: frozenset = frozenset(),
+           note: str | None = None):
     """A forest at the column's width in the imputed SVs' sky blue: a row per (label, estimate, low, high), its label
     at the left of the canvas and its interval level with it, each estimate an open mark as imputed SVs' are in the
     simulation figures (every All of Us SV is imputed), with the reference drawn (0, or 1 on a log axis, unless given).
     The axis runs from the first tick to the last, or with ``estimates`` symmetric about the reference over the
     estimates alone, so that each estimate's mark clears an arrowhead at the axis's end. Every margin and the rows'
-    pitch are measured from the type, so the forest is as short as its type allows."""
+    pitch are measured from the type, so the forest is as short as its type allows. The labels in ``bold`` are set in
+    bold, and ``note`` is one line under the axis title."""
     reference = (1.0 if log else 0.0) if reference is None else reference
     fig = plt.figure(figsize=(COLUMN, 1.0))
     labels = [label for label, *_ in rows]
-    pitch = tallest(fig, labels, fontsize=POSTER_STYLE["font.size"]) + ROW_GAP
+    weight = {label: "bold" if label in bold else "normal" for label in labels}
+    pitch = max(tallest(fig, [label], fontsize=POSTER_STYLE["font.size"], fontweight=weight[label])
+                for label in labels) + ROW_GAP
     # an arrowhead at the axis's start reaches half its width to the left, toward the names
     arrow = POSTER_MARK * 0.7 / 2 / 72
-    left = widest(fig, labels, fontsize=POSTER_STYLE["font.size"]) + LABEL_GAP + arrow
+    left = max(widest(fig, [label], fontsize=POSTER_STYLE["font.size"], fontweight=weight[label])
+               for label in labels) + LABEL_GAP + arrow
     # the right margin holds half of the end tick's label; the bottom, the ticks and the axis title
     right = widest(fig, [tick_text(ticks[-1])], fontsize=POSTER_STYLE["font.size"]) / 2 + POSTER_PAD
-    top, bottom = POSTER_PAD, under_axes(fig, [xlabel])
+    line = tallest(fig, [note], fontsize=POSTER_STYLE["font.size"]) + POSTER_PAD if note else 0.0
+    top, bottom = POSTER_PAD, under_axes(fig, [xlabel]) + line
     height = top + bottom + pitch * len(rows)
     fig.set_size_inches(COLUMN, height)
     ax = frame(fig, left, bottom, COLUMN - left - right, height - top - bottom)
@@ -94,7 +105,7 @@ def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list
                         zorder=3, clip_on=False)
         ax.plot([value], [row], "o", markersize=POSTER_MARK, color=SKY, markerfacecolor="white", markeredgecolor=SKY,
                 markeredgewidth=6.0, zorder=4)
-        ax.text(0, row, label, transform=shifted(ax, -left), ha="left", va="center")
+        ax.text(0, row, label, transform=shifted(ax, -left), ha="left", va="center", fontweight=weight[label])
     ax.axvline(reference, color=INK, linewidth=4.0, zorder=2)
     ax.set_yticks([])
     ax.spines["left"].set_visible(False)
@@ -105,6 +116,8 @@ def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list
     ax.set_xlabel(xlabel)
     # centred on the canvas, not on the axes, whose margins differ: a title wider than the axes then fits either side
     ax.xaxis.label.set_x((COLUMN / 2 - left) / (COLUMN - left - right))
+    if note:
+        fig.text(0.5, POSTER_PAD / height, note, ha="center", va="bottom")
     return fig
 
 
@@ -121,16 +134,38 @@ def span(values: list[float]) -> list[float]:
     return list(np.arange(math.floor(low / step) * step, math.ceil(high / step) * step + step / 2, step))
 
 
-def gain_figure(matched: list[dict]) -> tuple:
-    """Each trait's change in held-out partial r² from adding SVs, as a share of the two models' mean partial r², with
-    its 95% interval, a row per trait."""
-    rows = [(trait_name(row["trait"]), row["relative"] / 100, row["relative_lower"] / 100, row["relative_upper"] / 100)
-            for row in matched]
+def baseline_relative(g: float) -> float:
+    """g, the change in r² from adding SVs as a fraction of the two models' mean r², as a fraction of the r² without SVs:
+    (c - b) / ((c + b) / 2) = g gives (c - b) / b = 2g / (2 - g). The map increases, so it takes an interval's ends to
+    the same interval's ends, and a weighted g, sum a (c - b) / sum a (c + b) / 2, to sum a (c - b) / sum a b with the
+    same weights. build_pptx.py's aou_result uses the same map."""
+    return 2 * g / (2 - g)
+
+
+UNCONVERGED = "† With-SV fit not converged"
+"""The line under the All of Us forest's axis title when a trait's with-SV fit stopped before converging; the trait's
+name then ends in the dagger."""
+COMBINED = "All traits"
+"""The All of Us forest's row for the traits' common g, its name in bold."""
+
+
+def gain_figure(matched: list[dict], common: dict | None = None) -> tuple:
+    """Each trait's change in held-out partial r² from adding SVs, relative to the r² without SVs (baseline_relative of
+    the pre-specified g), with its 95% interval, a row per trait, and a bold row for the traits' common g when
+    ``common`` is given. A trait whose with-SV fit stopped before converging has a dagger, explained under the axis."""
+    def ends(row):
+        return [baseline_relative(row[key] / 100) for key in ("relative", "relative_lower", "relative_upper")]
+
+    rows = [(trait_name(row["trait"]) + ("†" if row.get("unconverged") else ""), *ends(row)) for row in matched]
+    if common:
+        rows.append((COMBINED, *ends(common)))
+    note = UNCONVERGED if any(row.get("unconverged") for row in matched) else None
     # the axis spans the estimates, not their intervals; an interval that runs past it ends in an arrowhead
     fig = forest(rows, "Change in r² with SVs (%)", span([value for _, value, _, _ in rows]), percent, log=False,
-                 estimates=True)
-    return fig, ["Change in held-out partial r² from adding SVs to SV-PGS for each trait, as a percentage of the two "
-                 "models' mean partial r², with 95% intervals, an arrowhead marking an interval that runs past the axis"]
+                 estimates=True, bold=frozenset({COMBINED}), note=note)
+    return fig, ["Change in held-out partial r² from adding SVs to SV-PGS for each trait, relative to the r² without "
+                 "SVs, with 95% intervals, an arrowhead marking an interval that runs past the axis"
+                 + (", and the traits' common change in bold" if common else "")]
 
 
 def main() -> None:
@@ -138,7 +173,7 @@ def main() -> None:
     with plt.rc_context({**POSTER_STYLE, "axes.labelsize": POSTER_LABEL}):
         drawn = []
         if numbers.get("matched", {}).get("rows"):
-            drawn.append(("aou_1_gain", gain_figure(numbers["matched"]["rows"])))
+            drawn.append(("aou_1_gain", gain_figure(numbers["matched"]["rows"], numbers["matched"].get("common"))))
         for name, (fig, lines) in drawn:
             reach = overhang(fig)
             if max(reach) > 0:

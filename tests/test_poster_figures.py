@@ -2,6 +2,7 @@
 title, tick label, legend or note fails here, as does a picture set at another aspect ratio or cropped."""
 from __future__ import annotations
 
+import json
 import math
 import re
 import sys
@@ -64,6 +65,10 @@ def poster_figures():
                                            ("hypothyroidism", 1.4, -0.4, 3.2), ("gout", 4.5, -24.6, 33.6))]
     with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
         yield "aou_1_gain", aou_gallery.gain_figure(rows)[0]
+        # the final forest: a with-SV fit that stopped unconverged, and the traits' common g
+        flagged = [*rows[:3], {**rows[3], "unconverged": True}]
+        common = {"relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1, "traits": 4}
+        yield "aou_1_gain_final", aou_gallery.gain_figure(flagged, common)[0]
 
 
 def drawn_texts(fig):
@@ -109,3 +114,41 @@ def test_the_poster_places_each_figure_whole(tmp_path):
         assert across / up == pytest.approx(300 / 200, rel=1e-4)
         assert across <= build_pptx.emu(width) and up <= build_pptx.emu(height)
         assert "srcRect" not in shape and "<a:fillRect/>" in shape
+
+
+def test_the_all_of_us_forest_marks_an_unconverged_fit_and_draws_the_common_gain():
+    rows = [{"trait": "gout", "relative": 4.5, "relative_lower": -24.6, "relative_upper": 33.6, "unconverged": True},
+            {"trait": "egfr", "relative": 0.3, "relative_lower": -1.1, "relative_upper": 1.7}]
+    common = {"relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1, "traits": 2}
+    with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
+        fig, lines = aou_gallery.gain_figure(rows, common)
+    shown = [text.get_text() for text in drawn_texts(fig)]
+    assert "Gout†" in shown and aou_gallery.UNCONVERGED in shown and aou_gallery.COMBINED in shown
+    assert "common change" in lines[0]
+    plt.close(fig)
+    with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
+        fig, _ = aou_gallery.gain_figure(rows[1:])
+    shown = [text.get_text() for text in drawn_texts(fig)]
+    assert aou_gallery.UNCONVERGED not in shown and aou_gallery.COMBINED not in shown
+    plt.close(fig)
+
+
+def test_the_forest_and_the_discussion_give_the_change_relative_to_the_r2_without_svs():
+    # c = 0.12 against b = 0.10: g = 0.02 / 0.11, and the change relative to b is 20%
+    g = 0.02 / 0.11
+    assert aou_gallery.baseline_relative(g) == pytest.approx(0.2)
+    assert build_pptx.baseline_relative(g) == pytest.approx(0.2)
+    # a weighted g maps to the weighted change relative to b with the same weights
+    weights, before, after = np.array([2.0, 1.0]), np.array([0.10, 0.05]), np.array([0.11, 0.04])
+    weighted = (weights * (after - before)).sum() / (weights * (after + before) / 2).sum()
+    assert aou_gallery.baseline_relative(weighted) == pytest.approx((weights * (after - before)).sum()
+                                                                    / (weights * before).sum())
+
+
+def test_the_discussion_states_the_common_all_of_us_change_only_when_it_is_given(monkeypatch, tmp_path):
+    monkeypatch.setattr(build_pptx, "HERE", tmp_path)
+    assert build_pptx.aou_result() == []
+    (tmp_path / "aou_numbers.json").write_text(json.dumps({"matched": {"rows": [], "common": {
+        "relative": -2.0, "relative_lower": -4.0, "relative_upper": 0.5, "traits": 10}}}))
+    line, = build_pptx.aou_result()
+    assert line == "In All of Us, SVs changed r² by −2.0% (95% CI −3.9% to 0.5%) over 10 traits"

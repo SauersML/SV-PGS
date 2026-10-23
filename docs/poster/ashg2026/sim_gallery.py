@@ -991,10 +991,10 @@ sv_min_realized_r2)."""
 POSTER_GAIN, POSTER_GENOTYPES = 22.92, 11.4
 """Inches: the widths of the SV gain forest (the poster's middle column, build_pptx.py's MIDDLE) and the imputation
 figure (the left column, LEFT), each placed at its column's full width."""
-POSTER_GAIN_HEIGHT = 9.18
+POSTER_GAIN_HEIGHT = 9.0
 """Inches: the SV gain forest's height, which fills the middle column from the training-size figures to the References
 at its foot (build_pptx.py's layout leaves 0.02 in to spare)."""
-GAIN_WEIGHT, GAIN_OFFSET = 1.6, 0.27
+GAIN_WEIGHT, GAIN_OFFSET = 1.6, 0.24
 """The SV gain forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR), and the rows each
 source's interval sits above (true genotypes) or below (imputed SVs) its set's row."""
 FOREST_SIZES = SIZES[:3]
@@ -1049,7 +1049,9 @@ def gain_forest(rows: list[dict], bold: dict, band: bool):
             if math.isfinite(test["lower"]):
                 ax.hlines(y + offset, test["lower"], test["upper"], color=color, linewidth=bar, zorder=3,
                           capstyle="round")
-                drawn.append((y + offset, test["upper"]))
+                drawn.append((y + offset, test["upper"], bar / 2 / 72))
+            # a mean's mark reaches its radius and half its ring past its centre
+            drawn.append((y + offset, test["mean"], (mark + ring) / 2 / 72))
             ax.plot([test["mean"]], [y + offset], "o", markersize=mark, color=color,
                     markerfacecolor=color if filled else "white", markeredgecolor=color,
                     markeredgewidth=0 if filled else ring, zorder=4)
@@ -1084,12 +1086,11 @@ def gain_forest(rows: list[dict], bold: dict, band: bool):
     line = tallest(fig, ["Called"], **style)
     across = POSTER_GAIN - right - widest(fig, names, **style) - gap
     foot, head = bottom + POSTER_PAD, bottom + POSTER_PAD + sum(heights) + POSTER_PAD
-    # the column, marks included, must clear every interval level with it
+    # the column, marks included, must clear every interval's right end and every mean's mark by a pad
     inches = fig.dpi_scale_trans.inverted()
-    reach = bar / 2 / 72
-    for y, upper in drawn:
-        x_end, y_at = inches.transform(ax.transData.transform((upper, y)))
-        if foot - reach - POSTER_PAD <= y_at <= head + reach + POSTER_PAD and x_end + reach > across - mark / 2 / 72 - POSTER_PAD:
+    for y, x, reach in drawn:
+        x_at, y_at = inches.transform(ax.transData.transform((x, y)))
+        if foot - reach - POSTER_PAD <= y_at <= head + reach + POSTER_PAD and x_at + reach > across - mark / 2 / 72 - POSTER_PAD:
             plt.close(fig)
             return None
     up = head

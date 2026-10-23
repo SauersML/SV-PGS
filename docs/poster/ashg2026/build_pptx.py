@@ -99,6 +99,11 @@ DESIGN_SETTINGS = {"h2": (0.01, 0.1), "prevalence": (0.01, 0.1), "causal_variant
 PREVALENCE or CAUSAL_VARIANTS), which tests/test_poster_simulation.py checks against the grid."""
 
 
+WHOLE_PREVALENCE = 0.1
+"""The prevalence of every architecture simulated on whole chr22 (grid.py's PREVALENCE), which
+tests/test_poster_simulation.py checks against the grid."""
+
+
 def cite(reference: str) -> str:
     """The superscript number of ``reference`` in REFERENCES."""
     return SUPERSCRIPT[REFERENCES.index(reference) + 1]
@@ -158,7 +163,8 @@ def copy(numbers: dict) -> dict:
         # genetic distance to HapMap3's chr22 count, so at most 16,000 (benchmarks/bench_sim/submissions/ldpred2_auto.py)
         "compared": ["SV-PGS: all SNVs, indels and SVs",
                      f"LDpred2-auto{cite('Privé 2020 Bioinformatics')}: up to 16,000 SNVs with MAF ≥ 1%"],
-        "whole_note": f"Simulations on whole chr22 with test N = {people(accuracy['test_people'])}",
+        # every whole-chr22 architecture has the grid's PREVALENCE: rare_disease, at 1%, ran in the 3 Mb window alone
+        "whole_note": f"Whole chr22 at {WHOLE_PREVALENCE:.0%} prevalence with test N = {people(accuracy['test_people'])}",
         "gain_note": f"Mean and 95% CI over {simulations} simulations in 3 Mb of chr22",
         # GLIMPSE2 is Rubinacci 2023; the assemblies are the accepted abstract's 12,212 phased genome assemblies
         "aou": ["We imputed SVs from 12,212 long-read assemblies into 100,000 All of Us"
@@ -182,6 +188,29 @@ def aou_matched() -> list[str]:
     # fit_variant_sites HapMap3, which keeps the SNVs at HapMap3 sites and every SV (workspace_pipeline.fit_filtered)
     return ["We fit SV-PGS with and without SVs and tested both in held-out people",
             "Variants with MAF ≥ 1% and imputation r² ≥ 0.3: HapMap3 SNVs and SVs"] if rows else []
+
+
+def baseline_relative(g: float) -> float:
+    """aou_gallery.baseline_relative: g, a change in r² as a fraction of the two models' mean r², as a fraction of the
+    r² without SVs, 2g / (2 - g), so the Discussion gives the same change the All of Us forest draws."""
+    return 2 * g / (2 - g)
+
+
+def signed(share: float) -> str:
+    """A share in percent to one decimal, with a minus sign for a loss."""
+    return f"{share * 100:.1f}%".replace("-", "−")
+
+
+def aou_result() -> list[str]:
+    """The All of Us result as one Discussion bullet when aou_numbers.json's "matched" holds the traits' "common" g: its
+    change in r² relative to the r² without SVs, with its 95% interval."""
+    path = HERE / "aou_numbers.json"
+    common = json.loads(path.read_text()).get("matched", {}).get("common") if path.is_file() else None
+    if not common:
+        return []
+    value, lower, upper = (baseline_relative(common[key] / 100) for key in ("relative", "relative_lower", "relative_upper"))
+    return [f"In All of Us, SVs changed r² by {signed(value)} (95% CI {signed(lower)} to {signed(upper)}) over "
+            f"{common['traits']} traits"]
 
 
 # ------------------------------------------------------------------ DrawingML
@@ -625,7 +654,7 @@ def build() -> None:
     gallery = {name: GALLERY / f"{name}.png" for name in (
         "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy",
         "poster_model")}
-    references = [Para([(f"{SUPERSCRIPT[index]}{reference}", "")], REFERENCE, bullet=False, after=0)
+    references = [Para([(f"{SUPERSCRIPT[index]}{reference}", "")], BODY, bullet=False, after=0)
                   for index, reference in enumerate(REFERENCES, start=1)]
     half = math.ceil(len(references) / 2)
     # the poster reads Introduction and Methods, the simulation's results, All of Us, then Discussion at the foot of
@@ -649,7 +678,7 @@ def build() -> None:
         ],
         [
             bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks(),
-            bar(95, "Discussion"), text(bullets(words["discussion"])),
+            bar(95, "Discussion"), text(bullets([*aou_result(), *words["discussion"]])),
             code(words["code"]),
         ],
     ]
