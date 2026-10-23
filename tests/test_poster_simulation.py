@@ -192,7 +192,7 @@ def test_aou_result_states_the_common_change_over_its_traits(monkeypatch, tmp_pa
 
 def test_references_sit_beside_the_qr_code_and_fill_the_discussions_height(monkeypatch, tmp_path):
     poster = poster_module(monkeypatch, tmp_path)
-    height = 6.6
+    height = 7.0
     heading, band = poster.references(height)
     assert (heading.kind, heading.content) == ("bar", (96, "References"))
     [[words], [qr]] = band.children

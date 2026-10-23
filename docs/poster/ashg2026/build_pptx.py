@@ -93,16 +93,14 @@ REFERENCES = [
 """Each reference's key, numbered in superscript in the order the text first cites them (``cite``): the SVs per genome
 and the 1000 Genomes panel, All of Us, GLIMPSE2 and LDpred2. Figures carry no citations."""
 REFERENCE_TEXT = {
-    "Byrska-Bishop 2022 Cell": "Byrska-Bishop M et al. High-coverage whole-genome sequencing of the expanded 1000 Genomes "
-                               "Project cohort including 602 trios. Cell 2022.",
-    "All of Us 2019 N Engl J Med": "All of Us Research Program Investigators. The All of Us Research Program. "
-                                   "N Engl J Med 2019.",
-    "Rubinacci 2023 Nat Genet": "Rubinacci S et al. Imputation of low-coverage sequencing data from 150,119 UK Biobank "
-                                "genomes. Nat Genet 2023.",
-    "Privé 2020 Bioinformatics": "Privé F et al. LDpred2: better, faster, stronger. Bioinformatics 2020.",
+    "Byrska-Bishop 2022 Cell": "Byrska-Bishop M et al. Cell 2022.",
+    "All of Us 2019 N Engl J Med": "All of Us Research Program Investigators. N Engl J Med 2019.",
+    "Rubinacci 2023 Nat Genet": "Rubinacci S et al. Nat Genet 2023.",
+    "Privé 2020 Bioinformatics": "Privé F et al. Bioinformatics 2020.",
 }
-"""Each reference as the References section prints it: first author, title, journal and year, each checked against
-the journal (Cell 185:3426; N Engl J Med 381:668; Nat Genet 55:1088; Bioinformatics 36:5424)."""
+"""Each reference as the References section prints it: first author, journal and year, each checked against the
+journal (Cell 185:3426; N Engl J Med 381:668; Nat Genet 55:1088; Bioinformatics 36:5424). Titles would take the
+section past the Discussion's height at any size from REFERENCE up."""
 SUPERSCRIPT = dict(zip(range(1, 10), "¹²³⁴⁵⁶⁷⁸⁹"))
 DESIGN_SHARES = (0.0, 0.05, 0.2)
 """The shares of causal variants that are SVs over benchmarks/power/grid.py's POINTS, which
@@ -462,7 +460,7 @@ QR_MOST, REFERENCE_AFTER = 5.0, 8
 
 def references(height: float) -> list[Block]:
     """The References section in ``height`` inches (the Discussion's beside it): its bar, then the references (first
-    author, title, journal, year) beside the QR code to the repository. The type is as large as fits, from REFERENCE up
+    author, journal, year) beside the QR code to the repository. The type is as large as fits, from REFERENCE up
     to below the body size, and then the code as large as fits, from QR up to QR_MOST, so the section is as tall as the
     Discussion and leaves no white under it."""
     room = height - BAR - GAPS["bar"]
