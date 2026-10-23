@@ -53,7 +53,7 @@ other than aou-wl15 was read)
 - The threshold sits 16 orders of magnitude above the collapsed fits. The non-null seeds have per-variant mean |b| of
   2.6e-7 to 9e-4, so their scores' variances are many orders above it.
 
-When (added 18:20 PDT, before any pair other than aou-wl15 was read)
+When (committed 18:09 PDT in cd542c9b, before any pair other than aou-wl15 was read)
 - The primary runs once, over every trait whose pair has finished, at the earlier of two times: when all 11 traits'
   pairs have finished or failed, or 2026-10-23 08:00 PDT.
 - Before then, each trait is reported alone as its pair finishes: its gain, 95% interval, p and upper bound. These
