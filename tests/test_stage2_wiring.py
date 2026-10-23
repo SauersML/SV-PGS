@@ -1,4 +1,4 @@
-"""RUN-ONLY (run/svpgs-bench-1): the real engine behind fit_model.fit and the bench-real adapter, on synthetic data.
+"""The real engine behind fit_model.fit and the bench-real adapter, on synthetic data.
 
 Machinery checks only: the fit is certified at the draw count's tolerance, the artifact round-trips, and scoring the
 store reproduces the fitted model's in-sample predictor. Accuracy comes from bench-real and bench-sim.

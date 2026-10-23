@@ -254,7 +254,7 @@ def test_a_seed_is_checked_when_it_is_made() -> None:
 
 
 def test_a_settled_search_stands_only_for_the_seed_s_own_problem() -> None:
-    """A seed's settled mode search is for its own posterior (Codex EB review 11): for another problem, offsets or store
+    """A seed's settled mode search is for its own posterior: for another problem, offsets or store
     sites it is cleared, its components still the mixture's start, so the fit searches for its modes again."""
     prior = _prior(_CLASSES, _NODES)
     components = np.ones((2, 12))
@@ -272,7 +272,7 @@ def test_a_settled_search_stands_only_for_the_seed_s_own_problem() -> None:
 
 
 def test_a_seed_read_from_memory_is_named_by_its_content() -> None:
-    """A seed with no saved model's digest is named by everything a fit takes from it (Codex EB review 12): two read
+    """A seed with no saved model's digest is named by everything a fit takes from it: two read
     from memory under one source but with other means are two seeds, and the same content is one."""
     prior = _prior(_CLASSES, _NODES)
     hyperparameters = _hyperparameters(prior)
@@ -442,8 +442,8 @@ def test_a_model_saved_before_the_whole_budget_search_seeds_no_settled_search(ar
 @_hook
 def test_a_fit_hands_on_a_settled_search_only_for_the_seed_s_own_problem(arms: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
     """``fit_model.fit`` gives the wiring each seed with its settled mode search where the request is the seed's own
-    problem, offsets and store sites, and with it cleared where any differs, here the targets (Codex EB review 11). Its
-    checkpoints name an in-memory seed by its content, so a seed with other means is another fit (review 12)."""
+    problem, offsets and store sites, and with it cleared where any differs, here the targets. Its
+    checkpoints name an in-memory seed by its content, so a seed with other means is another fit."""
     (seed,) = read_seeds(arms.root / "models" / "with_sv" / "trait", _WORKING_BYTES).values()
     assert seed.settled
     handed = []

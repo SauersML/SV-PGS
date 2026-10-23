@@ -156,7 +156,7 @@ def test_logistic_recalibration_returns_the_maximum_of_a_score_far_from_zero():
 
 
 def test_logistic_recalibration_terminates_at_the_same_maximum_for_small_offset_samples():
-    # bug-recent's stall shape: n = 30, prevalence near 0.2, spread 0.1, far offsets. Each fit must
+    # A shape that once stalled: n = 30, prevalence near 0.2, spread 0.1, far offsets. Each fit must
     # return, and its log-likelihood in the centred score's coordinates must reach the centred fit's
     # to within the rounding of evaluating it (gamma_{n+3} of the summed magnitudes).
     unit_roundoff = np.finfo(np.float64).eps / 2.0
