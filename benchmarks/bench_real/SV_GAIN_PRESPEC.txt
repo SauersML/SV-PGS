@@ -253,6 +253,23 @@ changes only the time)
   finished by then is left out and listed.
 - The post-amendment sensitivity analysis (amendment 5) runs as soon as the c4 continuations finish.
 - Family Q8 (amendment 3) is cut by cardio to the 5 traits of its Pair A. Q8's test runs when Pair A finishes.
+  - Written 2026-10-23 about 00:40 PDT at the coordinator's request, for speed. No Q8 pair had finished and no Q8 result
+    (pair or fast baseline) had been read.
+  - Traits (5): height, body_mass_index, systolic_blood_pressure, hemoglobin_a1c, hdl_cholesterol. Pair A is round
+    q8a on main 7c4ab988 (the mode-search fix), submitted 00:00 PDT: runs aou-q8a-{h,b,s,a,l}1 (snv_indel) and -2
+    (with_sv), cold, seed shared within each pair, SVPGS_GPU_GUARD=sync.
+  - Dropped before any result, for time alone: diastolic_blood_pressure, triglycerides and total_cholesterol. The DBP
+    and TC preps were still in a phenotypes step with no checkpoint that Spot had preempted (DBP was restarted on a
+    standard VM at 23:20 PDT), so their pairs would have finished after 05:00 PDT. Their prep jobs were stopped at
+    about 00:25 PDT. TG's prep finished its steps before the fit at 00:23 PDT, and an automatic watcher submitted its
+    pair (round q8at). Both TG jobs were deleted at about 00:30 PDT, one never started and the other 34 s after its
+    VM started, so TG has no fit.
+  - No Pair B. The test runs once, as soon as all 5 Pair A pairs have finished or failed. 2026-10-24 12:00 PDT stays
+    the fallback, and a pair not finished then is left out and listed. Statistic, one-sided test, calibration and Holm
+    over the two families are as in amendment 3.
+  - Power, by amendment 3's model over the 5 traits (sum r^2 n 1,087 instead of 1,529): at 1 - rho = 0.022 the SE is
+    1.27% and power at g = 2% is 0.47. At 1 - rho = 0.005 the SE is 0.61% and power at g = 2% is 0.95. At 1 - rho =
+    0.0004 the SE is 0.17%, and power is 0.90 at g = 0.5% and 1.00 at g = 1%.
 
 Results seen (log; no test definition changes because of them)
 - Before 2bf5cb24: aou-wl15 (LDL), as listed at the top.
