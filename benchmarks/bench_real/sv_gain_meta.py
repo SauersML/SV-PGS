@@ -444,7 +444,18 @@ def read_run(name: str, contrast: str = "arms") -> dict[str, object]:
     path = f"/tmp/sv_gain_meta_{name}.json"
     json.dump(config, open(path, "w", encoding="utf-8"))
     run = _Run(WorkspaceConfig.read(path), workspace_bindings(), detect_compute_budget(), {})
-    cohort, scores = _read_cohort(run), _read_scores(run)
+    cohort_run, source = run, config.get("accept_steps_from")
+    while not (cohort_run.output("cohort") / "cohort.npz").exists() and source:
+        # a run that kept its cohort step from an earlier run's tree (accept_steps_from: .../svpgs/<run>/source) holds
+        # no copy of it; the earlier run's cohort (or the one that run kept) is the one its score step indexes
+        earlier_name = source.rstrip("/").split("/")[-2]
+        earlier = dict(config, run_directory=f"{OPS}/{earlier_name}/run")
+        json.dump(earlier, open(f"/tmp/sv_gain_meta_{name}_cohort.json", "w", encoding="utf-8"))
+        cohort_run = _Run(WorkspaceConfig.read(f"/tmp/sv_gain_meta_{name}_cohort.json"), workspace_bindings(), detect_compute_budget(), {})
+        source = json.load(open(f"{OPS}/{earlier_name}/run_config.json", encoding="utf-8")).get("accept_steps_from")
+    cohort, scores = _read_cohort(cohort_run), _read_scores(run)
+    if scores.held_out_genetic.shape[1] != len(cohort.research_ids):
+        raise ValueError(f"{name}: its scores hold {scores.held_out_genetic.shape[1]} people and its cohort {len(cohort.research_ids)}")
     (trait,) = range(len(cohort.trait_names))
     if len(cohort.evaluated_folds(trait, run.config.fold_count)) != 1:
         raise ValueError(f"{name}: the test reads one held-out fold")
