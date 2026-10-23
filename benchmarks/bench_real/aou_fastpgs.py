@@ -437,19 +437,12 @@ def trait_rows(cohort, trait: int) -> tuple[int, np.ndarray, np.ndarray]:
     return model, training, held[np.argsort(cohort.store_columns[held], kind="stable")]
 
 
-def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np.ndarray, cohort, trait: int, seed: int,
-              units: Units | None, cores: int, methods: tuple[str, ...] = METHODS,
-              shared: tuple[np.ndarray, np.ndarray] | None = None) -> tuple[list[dict[str, object]], dict[str, np.ndarray]]:
-    """Both arms' ``methods`` for one trait: the aggregate lines and the held-out people's arrays (module docstring).
-    ``shared`` is codes already read with their ascending store columns, which hold every column the trait reads."""
-    return start_trait(store, records, cm, short, cohort, trait, seed, units, cores, methods, shared)()
-
-
 def start_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np.ndarray, cohort, trait: int, seed: int,
                 units: Units | None, cores: int, methods: tuple[str, ...] = METHODS,
                 shared: tuple[np.ndarray, np.ndarray] | None = None) -> Callable[[], tuple[list[dict[str, object]], dict[str, np.ndarray]]]:
-    """``fit_trait`` up to its R sessions, which are left running (``start_effects``). Returns the call that waits for
-    them and gives ``fit_trait``'s result."""
+    """Both arms' ``methods`` for one trait up to their R sessions, which are left running (``start_effects``). Returns
+    the call that waits for them and gives the aggregate lines and the held-out people's arrays (module docstring).
+    ``shared`` is codes already read with their ascending store columns, which hold every column the trait reads."""
     name = cohort.trait_names[trait]
     binary = cohort.trait_types[trait] == TraitType.BINARY
     model, training, held = trait_rows(cohort, trait)
@@ -488,7 +481,7 @@ def _written(fitted: dict[str, np.ndarray], units: Units | None, path: pathlib.P
 def _finish_trait(fitted: dict[str, np.ndarray], codes: np.ndarray, cohort, trait: int, seed: int, methods: tuple[str, ...],
                   short: np.ndarray, binary: bool, training: np.ndarray, held: np.ndarray, tuning: np.ndarray,
                   where: Mapping[str, np.ndarray], own: np.ndarray) -> tuple[list[dict[str, object]], dict[str, np.ndarray]]:
-    """``fit_trait``'s scores, tuning choice, aggregate lines and arrays from the trait's fitted effects."""
+    """``start_trait``'s scores, tuning choice, aggregate lines and arrays from the trait's fitted effects."""
     name = cohort.trait_names[trait]
     labels = fitted["labels"]
     tuning_rows, scored = training[tuning], np.r_[where["training"][tuning], where["held"]]
