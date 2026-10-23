@@ -128,15 +128,18 @@ def copy(numbers: dict) -> dict:
     return {
         # ¹ is Byrska-Bishop 2022, the first of REFERENCES: ~9,679 SVs discovered per genome
         "introduction": ["Each genome carries ~9,700 structural variants (SVs)¹",
-                         "Polygenic scores rarely include them; we test if imputed SVs help"],
-        "methods": ["Empirical Bayes priors use r², frequency and SV length"],
+                         "Polygenic scores rarely use SVs; we test if imputed SVs improve accuracy"],
+        "methods": ["Priors depend on imputation r², frequency, SV length"],
         "code": ["Code:", "github.com/", "SauersML/SV-PGS"],
         "design": [
             f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22",
-            f"Baseline: liability h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}, "
-            f"{accuracy['causal']} causal variants, {accuracy['baseline_sv_share']:.0%} SVs; "
-            f"{gain['shown'] - 1} other architectures vary these",
-            "LDpred2-auto: common SNVs at HapMap3 density",
+            # the ranges over benchmarks/power/grid.py's POINTS (HERITABILITY, PREVALENCE, CAUSAL_VARIANTS and each
+            # point's overrides)
+            f"{gain['shown']} architectures: h² 0.01–0.1, prevalence 1–10%, 50–2,000 causal variants, 0–20% SVs",
+            # SV-PGS fits every measured record with no frequency or r² floor (stage2_wiring.fit_models); LDpred2-auto
+            # takes SNVs of training MAF >= 1% thinned evenly in genetic distance to HapMap3's chr22 count, so at most
+            # 16,000 (benchmarks/bench_sim/submissions/ldpred2_auto.py)
+            "SV-PGS: all SNVs, indels and SVs. LDpred2-auto: up to 16,000 SNVs with MAF ≥ 1%",
         ],
         "whole_note": f"Simulations on whole chr22, tested on {people(accuracy['test_people'])} people",
         "gain_note": f"Mean and 95% CI over {simulations} simulations in 3 Mb of chr22",
