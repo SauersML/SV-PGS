@@ -203,6 +203,7 @@ Continued fits (amendment 4, written 2026-10-22 about 23:20 PDT, after hypertens
   rule 2). Each arm starts from its own saved model and is refitted by one code and one set of settings, the same for
   both arms, to its convergence criterion. A continued arm that again stops uncertified counts and is flagged, as
   amendment 2 says. A continuation that fails or does not finish leaves its pair at its original fits, flagged.
+- All qualifying pairs are continued together, submitted at the same time, or none is. No pair is continued alone.
 - Pairs whose arms are both certified are not refitted.
 - Use: the primary statistic, computed with the continued pairs in place of their original fits, is the primary
   result. The same statistic on the original fits is reported beside it as the pre-amendment result.
