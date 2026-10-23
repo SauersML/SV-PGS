@@ -204,6 +204,22 @@ Results seen (log; no test definition changes because of them)
   [-7.02, 3.11], permutation p 0.87. Its with_sv arm is uncertified and flagged.
 - About 20:16 PDT: the same on aou-x3-g2 (gout, arms g2 and g1): +4.53% [-24.6, 33.6], permutation p 0.28. Arm
   agreement 0.934. Its with_sv arm is uncertified and flagged.
+- About 23:10 PDT: the gout pair checked against the validity rule. Both arms are non-null (held-out score variance
+  0.00015 snv_indel, 0.000199 with_sv), neither run has a NULL_COLLAPSE marker, and g1 and g2 share fit key
+  22481ae0... and seed 1. It counts, with its uncertified with_sv arm flagged as amendment 2 says.
+- About 23:14 PDT, after a laptop restart: sv_gain_meta (main fbdb04af, counts under 40 masked; long-read people
+  excluded; 200 family arm swaps) on the two pairs finished since 20:16.
+  - LDL, aou-x3-l2 alone (arms l2 and l1, fit key and seed shared, both certified): -0.01% [-0.17, 0.14], permutation
+    p 0.56. Arm agreement 1.0000: the two arms' held-out scores are nearly the same score.
+  - LDL as the pre-specification merges it, aou-wl15 with aou-x3-l2: -0.22% [-2.73, 2.28], permutation p 0.66.
+  - Hypertension, aou-m3f-h2 (arms h2 and h1, fit key and seed shared, both non-null): -53.7% [-81.9, -25.5],
+    permutation p 1.00 (two-sided 0.005). Arm agreement 0.860. Its with_sv arm is uncertified and flagged
+    (outer_criterion_met, prediction_move). The fit logs show why the arms differ. Both arms started from the
+    snv_indel seed aou-m3fs-h1. The snv_indel arm took no EB step (remaining gain 0.0018). The with_sv arm took 5
+    and stopped uncertified with remaining gain 0.044 ("planned twice from one state"). Neither log has a gain-nan
+    step. The pair counts under amendment 2. The flag goes beside the trait, and no test definition changes.
+- The primary family test is not computed early. It runs once, at the earlier of all 11 traits' pairs finished or
+  2026-10-23 08:00 PDT (When, above).
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
