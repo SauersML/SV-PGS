@@ -1,4 +1,4 @@
-SV gain in All of Us: pre-specified analysis, amendment 2
+SV gain in All of Us: pre-specified analysis, amendment 3
 Written 2026-10-22 17:58 PDT and committed before any matched pairing run other than aou-wl15 had been scored.
 
 What had been seen when this was written
@@ -136,3 +136,54 @@ Power (analytic, one-sided 0.05)
   design) is the lever. The trait weights matter far less.
 - rho is outcome-free, so it is printed for every trait (held-out correlation of the two arms' scores) before the
   test.
+
+
+Family Q8, quantitative cardiometabolic traits (amendment 3, added 2026-10-22 20:25 PDT at cardio's request, before
+any Q8 fit was submitted)
+- What had been seen when this was written:
+  - an aggregate census of the eight traits' test and training counts (below);
+  - the per-trait descriptive results of the primary's pairs aou-wl15 (LDL), aou-x3-o1 (hypothyroidism), aou-x3-a1
+    (AF) and aou-m3f-e1 (eGFR);
+  - the outcome-free arm agreement of the last three: 1 - rho of 0.0002, 0.0000 and 0.0004.
+  Q8 uses the primary's statistic unchanged, so none of these chose its test.
+- Traits (8): height, body_mass_index, systolic_blood_pressure, diastolic_blood_pressure, hemoglobin_a1c,
+  hdl_cholesterol, triglycerides, total_cholesterol.
+  - The last four are new measurement definitions. HDL, TG and TC follow LDL's mg/dL rules. TC is divided by 0.8 on a
+    statin, and DBP gets 10 mmHg added on antihypertensives.
+  - Census, test / training people with any value: height 8,480 / 34,120; BMI 8,424 / 33,922; SBP and DBP 8,380 /
+    33,609; HbA1c 4,424 / 17,724; HDL 4,610 / 18,516; TG 4,651 / 18,607; TC 4,727 / 18,990.
+  - Left out before any result: urate (1,199 test people, too little power); fasting glucose (fasting status is
+    unreliable); CRP (noisy); apoB (rarely measured); Lp(a), MCV and bilirubin (chosen for known SV loci, which the
+    user rejected as selection); LDL (already in the primary and unblinded).
+- Pairs: two matched pairing runs per trait, both on one code hash of main.
+  - Pair A is cold: neither arm is warm-started, and both have the same seed.
+  - Pair B is cross-seeded as in round x3: each arm is warm-started from its own pair-A model, and the mode search is
+    seeded from both pair-A arms' modes.
+  - A trait's pairs are merged per arm (sv_gain_meta.merge_pairs). A trait whose pair B has not finished when the
+    test runs enters on pair A alone.
+  - The validity rule (amendment 2) and the long-read exclusion apply unchanged. A run whose partner's name is not
+    the run's own with its last digit 1 and 2 swapped is given as RUN:PARTNER.
+- Test (one): the common relative gain g as in the primary.
+  - One-sided at 0.05, H1 g > 0.
+  - Permutation p from 1,000 family arm swaps, with the normal p beside it under the same calibration rule.
+  - Reported with it: g's 95% interval, its one-sided upper 95% bound, each trait's weight share, and each trait's
+    arm agreement printed before the test.
+- Two families: the primary and Q8. The report gives Q8's own p and, beside each family's p, its Holm-adjusted p over
+  the two families. A combined g over the traits of both families is reported as a secondary result only.
+- When: Q8's test runs once, over every Q8 trait with a finished pair, at the earlier of two times: when all 8 traits'
+  pairs have finished or failed, or 2026-10-24 12:00 PDT. Each trait's gain, interval, p and upper bound are reported
+  as it finishes, as descriptive results. An interim combination may be shown, labelled interim, and nothing is
+  stopped or added because of it.
+- Secondary:
+  - The fast baselines (aou_fastpgs as each trait's prep run's AFTER_SCRIPT): C+T, lassosum2 and LDpred2-auto, with
+    the same g and Holm across the 3 methods.
+  - Ancestry strata as in the primary's secondary 2.
+- Power, by the primary's model:
+  - Assumed r^2: height 0.06, BMI 0.02, SBP 0.008, DBP 0.008, HbA1c 0.015, HDL 0.06, TG 0.04, TC 0.04. Then sum
+    r^2 n is 1,529, and the pooled relative SE is sqrt(8 (1 - rho) / sum r^2 n).
+  - At 1 - rho = 0.022 the SE is 1.07%, and power at g = 2% is 0.59.
+  - At 1 - rho = 0.005 the SE is 0.51%, and power at g = 2% is 0.99.
+  - At 1 - rho = 0.0004 (the largest of the three finished pairs' agreements above) the SE is 0.14%. Power is 0.96 at
+    g = 0.5% and 1.00 at g = 1%.
+  - The model predicted the finished pairs' gain SEs to within 25% (hypothyroidism 0.33 vs 0.40 x1e-4, eGFR 0.92 vs
+    0.97 x1e-4).
