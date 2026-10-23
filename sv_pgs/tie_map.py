@@ -6,17 +6,12 @@ from typing import Mapping, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
-from sv_pgs.data import TieGroupTable, TieMap
-
-
-def _tie_map(kept_indices: NDArray[np.int32], original_to_reduced: NDArray[np.int32], signs: NDArray[np.float32]) -> TieMap:
-    return TieMap(kept_indices=kept_indices, original_to_reduced=original_to_reduced,
-                  reduced_to_group=TieGroupTable(kept_indices, original_to_reduced, signs))
+from sv_pgs.data import TieMap
 
 
 def _compact_identity_tie_map(variant_count: int) -> TieMap:
     identity_indices = np.arange(int(variant_count), dtype=np.int32)
-    return _tie_map(identity_indices, identity_indices.copy(), np.ones(identity_indices.shape[0], dtype=np.float32))
+    return TieMap(identity_indices, identity_indices.copy(), np.ones(identity_indices.shape[0], dtype=np.float32))
 
 
 def tie_map_from_representatives(representative: NDArray[np.int64], sign: NDArray[np.float32]) -> TieMap:
@@ -28,7 +23,7 @@ def tie_map_from_representatives(representative: NDArray[np.int64], sign: NDArra
     if np.any(representatives < 0) or not np.all(is_representative[representatives]):
         raise ValueError("every variant needs a representative that represents itself (its group's own member)")
     reduced_index = np.cumsum(is_representative, dtype=np.int64) - 1
-    return _tie_map(
+    return TieMap(
         np.flatnonzero(is_representative).astype(np.int32),
         reduced_index[representatives].astype(np.int32),
         np.asarray(sign, dtype=np.float32),

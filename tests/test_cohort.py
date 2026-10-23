@@ -262,7 +262,6 @@ def test_a_participant_in_both_halves_keeps_only_the_truth_row() -> None:
     assert rows.research_ids == tuple(_research("R3", "R1", "R2"))
     assert rows.genotype_source == ("imputed", "long_read", "long_read")
     assert (rows.store_half, rows.store_column) == ((0, 1, 1), (1, 0, 1))
-    assert rows.imputed_rows_sharing_a_research_id == 1
 
 
 def test_names_that_collide_across_the_halves_are_different_people() -> None:
@@ -275,7 +274,6 @@ def test_names_that_collide_across_the_halves_are_different_people() -> None:
     )
 
     assert rows.research_ids == tuple(_research("2002", "1001", "3003"))
-    assert rows.imputed_rows_sharing_a_research_id == 0
     assert rows.kinship_pairs == ((ResearchId("2002"), ResearchId("3003"), 0.25),)
 
 
@@ -311,8 +309,6 @@ def test_a_duplicate_genome_across_halves_keeps_the_truth_row_but_twins_within_a
 
     assert rows.research_ids == tuple(_research("R5", "R6", "R7", "R1", "R2"))
     assert rows.store_half == (0, 1, 1, 2, 2)
-    assert rows.imputed_rows_duplicating_a_truth_genome == 1
-    assert rows.imputed_rows_sharing_a_research_id == 0
 
 
 @pytest.mark.parametrize(

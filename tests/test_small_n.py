@@ -217,7 +217,8 @@ def test_stage0_standardizes_and_merges_exact_ties():
     # Active positions: 0 -> column 0, 1 -> 1, 2 -> 2 (copy of 0), 3 -> 3 (negated 0), 4 -> 5, 5 -> 6 (tie of 5).
     np.testing.assert_array_equal(tie_map.kept_indices, [0, 1, 4])
     np.testing.assert_array_equal(tie_map.original_to_reduced, [0, 1, 0, 0, 2, 2])
-    signs = {int(group.representative_index): dict(zip(group.member_indices.tolist(), group.signs.tolist())) for group in tie_map.reduced_to_group}
+    signs = {int(representative): {int(member): float(tie_map.signs[member]) for member in np.flatnonzero(tie_map.original_to_reduced == group)}
+             for group, representative in enumerate(tie_map.kept_indices)}
     assert signs[0] == {0: 1.0, 2: 1.0, 3: -1.0}
     assert signs[4] == {4: 1.0, 5: 1.0}
     # (I - H_C) X~ with the intercept over every member (review-mathbugs T1), oriented: each member's column is its

@@ -246,9 +246,9 @@ def test_projected_ld_matches_a_dense_float64_reference(tmp_path) -> None:
     assert tie_map.original_to_reduced[active_position[11]] == tie_map.original_to_reduced[active_position[10]]
     assert tie_map.original_to_reduced[active_position[12]] == tie_map.original_to_reduced[active_position[10]]
     assert tie_map.original_to_reduced[active_position[41]] == tie_map.original_to_reduced[active_position[40]]
-    group = tie_map.reduced_to_group[tie_map.original_to_reduced[active_position[10]]]
-    assert group.representative_index == active_position[10]
-    np.testing.assert_array_equal(group.signs, [1.0, 1.0, -1.0])
+    group = tie_map.original_to_reduced[active_position[10]]
+    assert tie_map.kept_indices[group] == active_position[10]
+    np.testing.assert_array_equal(tie_map.signs[tie_map.original_to_reduced == group], [1.0, 1.0, -1.0])
     for index in range(standardized.shape[1]):
         reduced = tie_map.original_to_reduced[index]
         representative = kept[reduced]

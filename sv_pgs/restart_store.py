@@ -387,11 +387,11 @@ def load_statistics(directory: Path) -> Any:
     """The statistics ``save_statistics`` wrote in ``directory``, its LD store opened from ``directory``/ld."""
     from sv_pgs.genotype_statistics import GenotypeSufficientStatistics, LdGramStore
     from sv_pgs.ld_partition import LdBlockBoundaries
-    from sv_pgs.tie_map import _tie_map
+    from sv_pgs.data import TieMap
 
     with np.load(directory / STATISTICS, allow_pickle=False) as saved:
         arrays = {name: np.array(saved[name]) for name in saved.files}
-    ties = _tie_map(arrays.pop("tie_kept"), arrays.pop("tie_reduced"), arrays.pop("tie_signs"))
+    ties = TieMap(arrays.pop("tie_kept"), arrays.pop("tie_reduced"), arrays.pop("tie_signs"))
     names = [str(name) for name in arrays.pop("cut_names").tolist()]
     boundary = {
         "cut_costs": {name: arrays.pop(f"cut{index}") for index, name in enumerate(names)},

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from sv_pgs.data import TieGroup, TieMap
+from sv_pgs.data import TieMap
 from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, tied_groups
 
 
@@ -87,11 +87,7 @@ def test_from_tie_map_reads_groups_and_signs():
     tie_map = TieMap(
         kept_indices=np.array([0, 1, 3], dtype=np.int32),
         original_to_reduced=np.array([0, 1, 1, 2], dtype=np.int32),
-        reduced_to_group=[
-            TieGroup(representative_index=0, member_indices=np.array([0], dtype=np.int32), signs=np.array([1.0], dtype=np.float32)),
-            TieGroup(representative_index=1, member_indices=np.array([1, 2], dtype=np.int32), signs=np.array([1.0, -1.0], dtype=np.float32)),
-            TieGroup(representative_index=3, member_indices=np.array([3], dtype=np.int32), signs=np.array([1.0], dtype=np.float32)),
-        ],
+        signs=np.array([1.0, 1.0, -1.0, 1.0], dtype=np.float32),
     )
     ties = TieGroups.from_tie_map(tie_map)
     np.testing.assert_array_equal(ties.group, [0, 1, 1, 2])
@@ -163,7 +159,9 @@ def test_a_genome_scale_tie_map_is_built_and_read_in_linear_numpy():
     assert ties.group_count == count - tied.shape[0]
     np.testing.assert_array_equal(ties.group[tied], ties.group[tied - 1])
     np.testing.assert_array_equal(ties.sign, sign)
-    group = tie_map_from_representatives(representative, sign).reduced_to_group[int(ties.group[tied[-1]])]
-    assert group.representative_index == tied[-1] - 1
-    np.testing.assert_array_equal(group.member_indices, [tied[-1] - 1, tied[-1]])
-    np.testing.assert_array_equal(group.signs, [1.0, sign[tied[-1]]])
+    tie_map = tie_map_from_representatives(representative, sign)
+    group = int(ties.group[tied[-1]])
+    members = np.flatnonzero(tie_map.original_to_reduced == group)
+    assert tie_map.kept_indices[group] == tied[-1] - 1
+    np.testing.assert_array_equal(members, [tied[-1] - 1, tied[-1]])
+    np.testing.assert_array_equal(tie_map.signs[members], [1.0, sign[tied[-1]]])

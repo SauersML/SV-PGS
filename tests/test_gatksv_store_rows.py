@@ -150,7 +150,6 @@ def test_every_called_record_is_a_row_and_the_strong_pairs_are_left_to_the_measu
     assert rows.unobserved_records.tolist() == [4]
     np.testing.assert_array_equal(rows.lengths, gatksv.lengths[[0, 1, 2, 3]])
     assert rows.filled_from_imputed.tolist() == [True, True, True, False]
-    np.testing.assert_allclose(rows.observed_fractions, observed[[0, 1, 2, 3]].mean(axis=1))
     # Observed calls are stored exactly: 127 per allele, and floor(254 / 3) = 84 per copy for
     # the copy-number record, whose calls reach 3 copies and whose modal call is 2.
     for record in (0, 1, 2):

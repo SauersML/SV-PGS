@@ -17,7 +17,7 @@ from scipy.special import expit
 
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy, detect_compute_budget
 from sv_pgs.config import TraitType
-from sv_pgs.data import TieGroup, TieMap
+from sv_pgs.data import TieMap
 from sv_pgs.fast_scoring import (
     ScoringModel,
     GeneticScores,
@@ -238,12 +238,7 @@ def test_reduced_fit_expands_mean_and_draws_by_prior_variance_weights_and_signs(
     tie_map = TieMap(
         kept_indices=np.array([0, 2, 3, 5], dtype=np.int32),
         original_to_reduced=np.array([0, 0, 1, 2, 0, 3], dtype=np.int32),
-        reduced_to_group=[
-            TieGroup(representative_index=0, member_indices=np.array([0, 1, 4], dtype=np.int32), signs=np.array([1.0, 1.0, -1.0], dtype=np.float32)),
-            TieGroup(representative_index=2, member_indices=np.array([2], dtype=np.int32), signs=np.array([1.0], dtype=np.float32)),
-            TieGroup(representative_index=3, member_indices=np.array([3], dtype=np.int32), signs=np.array([1.0], dtype=np.float32)),
-            TieGroup(representative_index=5, member_indices=np.array([5], dtype=np.int32), signs=np.array([1.0], dtype=np.float32)),
-        ],
+        signs=np.array([1.0, 1.0, 1.0, 1.0, -1.0, 1.0], dtype=np.float32),
     )
     prior_variances = np.array([1.0, 3.0, 5.0, 7.0, 4.0, 2.0])
     beta_reduced = np.array([0.8, -0.2, 0.1, 0.05])

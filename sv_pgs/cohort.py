@@ -57,8 +57,6 @@ class CohortRows:
     store_half: tuple[int, ...]
     store_column: tuple[int, ...]
     kinship_pairs: tuple[tuple[ResearchId, ResearchId, float], ...]
-    imputed_rows_sharing_a_research_id: int
-    imputed_rows_duplicating_a_truth_genome: int
 
 
 def resolve_cohort_rows(
@@ -138,8 +136,6 @@ def resolve_cohort_rows(
         store_half=tuple(half for half, _column, _research_id, _source in kept),
         store_column=tuple(column for _half, column, _research_id, _source in kept),
         kinship_pairs=research_pairs,
-        imputed_rows_sharing_a_research_id=len(shared_research_ids),
-        imputed_rows_duplicating_a_truth_genome=len(duplicated_genomes),
     )
 
 
