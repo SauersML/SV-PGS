@@ -57,8 +57,8 @@ class MedicationClass:
 
 
 # Statins and statin combinations, ezetimibe, PCSK9 inhibitors (evolocumab,
-# alirocumab), bempedoic acid and inclisiran: the drugs the LDL/0.7 convention
-# is about. Fibrates, niacin and omega-3 (elsewhere in C10) barely move LDL.
+# alirocumab), bempedoic acid and inclisiran: the drugs the LDL/0.7 and total
+# cholesterol/0.8 conventions are about. Fibrates, niacin and omega-3 (elsewhere in C10) barely move LDL.
 LDL_LOWERING = MedicationClass(
     "LDL-lowering therapy",
     ("C10AA", "C10BA", "C10BX", "C10AX09", "C10AX13", "C10AX14", "C10AX15", "C10AX16"),
@@ -882,6 +882,18 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         treatment=TreatmentRule(ANTIHYPERTENSIVE, TreatmentCorrection.ADD, 15.0, _CUI_TOBIN),
     ),
     MeasurementDefinition(
+        canonical_name="diastolic_blood_pressure",
+        aliases=("dbp",),
+        description="Diastolic blood pressure (mmHg); the enrollment value is the mean of the 2nd and 3rd readings.",
+        # 8462-4; 8453-3; 76535-4; PM mean 903115.
+        loinc_codes=("8462-4", "8453-3", "76535-4"),
+        physical_measurement_concept_ids=(903115,),
+        excluded_source_concept_ids=(903110, 903129, 903106),
+        canonical_unit="millimeter mercury column",
+        unit_conversions=_MILLIMETERS_OF_MERCURY,
+        treatment=TreatmentRule(ANTIHYPERTENSIVE, TreatmentCorrection.ADD, 10.0, _CUI_TOBIN),
+    ),
+    MeasurementDefinition(
         canonical_name="heart_rate",
         aliases=("pulse", "resting_heart_rate"),
         description="Heart rate (beats/min); the enrollment value is the mean of the 2nd and 3rd readings.",
@@ -990,6 +1002,37 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_unit="milligram per deciliter",
         unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("milligram per deciliter calculated", 1.0)),
         treatment=TreatmentRule(LDL_LOWERING, TreatmentCorrection.DIVIDE, 0.7, _PELOSO_2014),
+    ),
+    MeasurementDefinition(
+        canonical_name="hdl_cholesterol",
+        aliases=("hdl", "hdl_c"),
+        description="HDL cholesterol (mg/dL); no treatment correction, as in the lipid consortia.",
+        # 2085-9. The "milligram per milliliter" rows carry mg/dL values (median 50).
+        loinc_codes=("2085-9",),
+        canonical_unit="milligram per deciliter",
+        unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("milligram per milliliter", 1.0)),
+    ),
+    MeasurementDefinition(
+        canonical_name="triglycerides",
+        aliases=("tg", "triglyceride"),
+        description="Triglycerides, fasting or not (mg/dL); no treatment correction, as in the lipid consortia.",
+        # 2571-8; 3043-7; 12951-0 (fasting); 14927-8, whose rows here carry
+        # mg/dL labels and values. The "milligram per milliliter" rows carry
+        # mg/dL values (median 112).
+        loinc_codes=("2571-8", "3043-7", "12951-0", "14927-8"),
+        canonical_unit="milligram per deciliter",
+        unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("milligram per milliliter", 1.0)),
+    ),
+    MeasurementDefinition(
+        canonical_name="total_cholesterol",
+        aliases=("tc", "cholesterol"),
+        description="Total cholesterol (mg/dL); pre-treatment values preferred.",
+        # 2093-3. The "milligram per milliliter" and "gram per deciliter" rows
+        # carry mg/dL values (medians 175 and 192).
+        loinc_codes=("2093-3",),
+        canonical_unit="milligram per deciliter",
+        unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("milligram per milliliter", 1.0), ("gram per deciliter", 1.0)),
+        treatment=TreatmentRule(LDL_LOWERING, TreatmentCorrection.DIVIDE, 0.8, _PELOSO_2014),
     ),
     # --- Glycemia.
     MeasurementDefinition(

@@ -810,11 +810,11 @@ def test_every_disease_and_trait_name_resolves_to_exactly_its_own_definition():
             assert resolve_measurement_definition(name) is measurement
 
 
-def test_catalogue_is_the_panels_eleven_quantitative_traits():
+def test_catalogue_is_the_panels_fifteen_quantitative_traits():
     assert available_measurement_names() == sorted([
-        "height", "body_mass_index", "systolic_blood_pressure", "heart_rate", "mean_corpuscular_volume",
-        "platelet_count", "white_blood_cell_count", "total_bilirubin", "egfr_ckd_epi_2021",
-        "ldl_cholesterol", "hemoglobin_a1c",
+        "height", "body_mass_index", "systolic_blood_pressure", "diastolic_blood_pressure", "heart_rate",
+        "mean_corpuscular_volume", "platelet_count", "white_blood_cell_count", "total_bilirubin", "egfr_ckd_epi_2021",
+        "ldl_cholesterol", "hdl_cholesterol", "triglycerides", "total_cholesterol", "hemoglobin_a1c",
     ])
 
 
@@ -827,8 +827,15 @@ def test_medication_rules_follow_the_published_conventions():
     assert treatments["ldl_cholesterol"] == TreatmentRule(
         LDL_LOWERING, TreatmentCorrection.DIVIDE, 0.7, treatments["ldl_cholesterol"].citation
     )
+    assert treatments["total_cholesterol"] == TreatmentRule(
+        LDL_LOWERING, TreatmentCorrection.DIVIDE, 0.8, treatments["ldl_cholesterol"].citation
+    )
     assert treatments["systolic_blood_pressure"].correction is TreatmentCorrection.ADD
     assert treatments["systolic_blood_pressure"].amount == 15.0
+    assert treatments["diastolic_blood_pressure"].correction is TreatmentCorrection.ADD
+    assert treatments["diastolic_blood_pressure"].amount == 10.0
+    # The lipid consortia correct neither HDL nor triglycerides for treatment.
+    assert "hdl_cholesterol" not in treatments and "triglycerides" not in treatments
     for trait in ("heart_rate", "body_mass_index"):
         assert treatments[trait].correction is TreatmentCorrection.EXCLUDE
     # HbA1c is restricted to people without diabetes.
@@ -1379,7 +1386,7 @@ def test_census_suppresses_cells_of_twenty_or_fewer_participants(monkeypatch, tm
     ]
     parameters = {parameter.name: parameter for parameter in fake_client.job_config.query_parameters}
     assert parameters["census_loinc_traits"].values.count("height") == 2
-    assert parameters["census_physical_measurement_concept_ids"].values == [903133, 903118, 903126]
+    assert parameters["census_physical_measurement_concept_ids"].values == [903133, 903118, 903115, 903126]
 
 
 def test_cli_census_all_of_us_traits_writes_the_census(monkeypatch, tmp_path: Path, capsys):
