@@ -124,9 +124,9 @@ def forest(panels: list[Panel], least: float = 0.0):
     with more than one series has their key over it, wrapped onto further lines when it is wider than the column. When
     a panel stars a mark, STAR_NOTE ends the first panel's key, which it starts when that panel has none. A row's note
     follows its marks or its name (Panel). A log panel spans its estimates and is ticked at the
-    decades inside; a linear one is symmetric about 0 over its estimates. Either way each mark clears an arrowhead at
+    decades inside; a linear one spans its estimates and 0. Either way each mark clears an arrowhead at
     the axis's end, and an interval past the axis ends in one, its tip at the axis's end. The rows are a line of type
-    apart, and the axis is under the last of them, AXIS_GAP under it when it is a note without marks. Every margin and row height is measured from the type,
+    apart, and the axis is under the last of them, AXIS_GAP under it when notes end the rows. Every margin and row height is measured from the type,
     so the figure is as short as its type allows, unless ``least`` inches is taller: then the extra height goes
     between the panels, or over a lone panel."""
     fig = plt.figure(figsize=(COLUMN, 1.0))
@@ -161,15 +161,10 @@ def forest(panels: list[Panel], least: float = 0.0):
                + tallest(fig, ["0.1"], fontsize=style["xtick.labelsize"])
                + tallest(fig, [panel.xlabel], fontsize=style["axes.labelsize"]) + POSTER_PAD for panel in panels]
     bottoms[-1] += EDGE - POSTER_PAD
-    gaps = [AXIS_GAP if panel.notes else 0.0 for panel in panels]
-    natural = EDGE + sum(key + sum(rows) + gap + bottom for key, rows, gap, bottom in zip(keys, heights, gaps, bottoms))
-    height = max(least, natural)
-    spare = height - natural
     # an arrowhead at the axis's start reaches half its width to the left, toward the names
     # an arrowhead ends at the axis's end, so it reaches its full length, twice this, inside the axis
     arrow = max(marks) * 0.7 / 2 / 72
     left = EDGE + max(named.values()) + LABEL_GAP
-    fig.set_size_inches(COLUMN, height)
     # each mark clears the axis's ends by its half width, its ring, an arrowhead and a pad
     halves = [(mark + RING) / 2 / 72 for mark in marks]
     clears = [half + 2 * arrow + POSTER_PAD for half in halves]
@@ -181,6 +176,13 @@ def forest(panels: list[Panel], least: float = 0.0):
                            for panel, column in zip(panels, columns) for name, estimates in panel.rows
                            if estimates and name in panel.notes))
         width = plot_width(fig, panels, clears, halves, COLUMN - left, ends_noted=False)
+    # notes at the rows' ends sit over the axis, so AXIS_GAP keeps the last of them off it; in the notes' column they
+    # sit left of it
+    gaps = [AXIS_GAP if panel.notes and ending else 0.0 for panel in panels]
+    natural = EDGE + sum(key + sum(rows) + gap + bottom for key, rows, gap, bottom in zip(keys, heights, gaps, bottoms))
+    height = max(least, natural)
+    spare = height - natural
+    fig.set_size_inches(COLUMN, height)
     star = widest(fig, [STAR], fontsize=size)
     top = height - EDGE
     top -= spare if len(panels) == 1 else 0.0
@@ -362,7 +364,9 @@ def drawn_ticks(fig, panel: Panel, width: float, low: float, high: float) -> lis
     while len(kept) > 1 and any(width * (place(right) - place(left)) - (widest(fig, [tick_text(panel)(left)], fontsize=size)
                                                                        + widest(fig, [tick_text(panel)(right)], fontsize=size)) / 2
                                 < TICK_SPACE for left, right in zip(kept, kept[1:])):
-        kept = kept[1:] if beyond(kept[0]) >= beyond(kept[-1]) else kept[:-1]
+        # a linear axis keeps its 0
+        first = beyond(kept[0]) >= beyond(kept[-1]) if panel.log or 0.0 not in (kept[0], kept[-1]) else kept[-1] == 0.0
+        kept = kept[1:] if first else kept[:-1]
     return kept
 
 
@@ -394,7 +398,7 @@ def tick_text(panel: Panel):
 
 def limits(panel: Panel, width: float, clear: float) -> tuple[float, float]:
     """The axis's ends: each estimate ``clear`` inches from them at least, over ``width`` inches; on a linear axis also
-    symmetric about 0 and wide enough for its ticks, on a log axis its estimates' span, each end that falls within
+    reaching 0 and wide enough for its ticks, on a log axis its estimates' span, each end that falls within
     DECADE_REACH of a decade moved out to it, so that decade is ticked."""
     values = [value for _, estimates in panel.rows for value, _, _ in estimates]
     if panel.log:
@@ -406,10 +410,10 @@ def limits(panel: Panel, width: float, clear: float) -> tuple[float, float]:
         if math.ceil(high) - high < DECADE_REACH:
             high = math.ceil(high)
         return 10.0 ** low, 10.0 ** high
-    reach = max(abs(value) for value in values) / (1 - 2 * clear / width)
+    low, high = min(min(values), 0.0), max(max(values), 0.0)
+    margin = (high - low) / (1 - 2 * clear / width) * clear / width
     marks = ticks(panel)
-    reach = max(reach, -marks[0], marks[-1])
-    return -reach, reach
+    return min(low - margin, marks[0]), max(high + margin, marks[-1])
 
 
 DECADE_REACH = 0.25
