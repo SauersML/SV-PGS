@@ -131,7 +131,7 @@ def prepare(work):
         q = np.zeros(len(sites))
         error_file = work / f'bcftools_batch_{batch}.private.stderr'
         with error_file.open('w') as error:
-            process = subprocess.Popen(['bcftools', 'query', '-R', str(region),
+            process = subprocess.Popen(['bcftools', 'query', '--regions-overlap', '0', '-R', str(region),
                                         '-f', '%POS\t%REF\t%ALT\t%INFO/INFO[\t%GT]\n', path],
                                        stdout=subprocess.PIPE, stderr=error, text=True)
             seen = set()

@@ -150,7 +150,7 @@ def original_info(path, chromosome, keys):
     with tempfile.NamedTemporaryFile('w', suffix='.tsv') as regions:
         regions.writelines(f'{chromosome}\t{p}\n' for p in np.unique(keys['positions']))
         regions.flush()
-        result = subprocess.run(['bcftools', 'query', '-R', regions.name, '-f',
+        result = subprocess.run(['bcftools', 'query', '--regions-overlap', '0', '-R', regions.name, '-f',
                                  '%POS\t%INFO/ID\t%REF\t%ALT\t%AF\t%INFO\t%AN\n', str(path)],
                                 capture_output=True, text=True)
     if result.returncode:
