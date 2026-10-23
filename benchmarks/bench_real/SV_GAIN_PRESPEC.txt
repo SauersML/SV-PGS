@@ -1,4 +1,4 @@
-SV gain in All of Us: pre-specified analysis, amendment 6
+SV gain in All of Us: pre-specified analysis, amendment 7
 Written 2026-10-22 17:58 PDT and committed before any matched pairing run other than aou-wl15 had been scored.
 
 What had been seen when this was written
@@ -283,6 +283,26 @@ changes only the time)
   - Power over the 4 traits (sum r^2 n 579): at 1 - rho = 0.022 the SE is 1.74% and power at g = 2% is 0.31. At
     1 - rho = 0.005 the SE is 0.83% and power at g = 2% is 0.78. At 1 - rho = 0.0004 the SE is 0.24%, and power is
     0.68 at g = 0.5% and 1.00 at g = 1%.
+
+Primary now (amendment 7, written 2026-10-23 at 06:20 PDT at the coordinator's request, because the user needs the
+final results now; no CAD or hyperlipidemia value had been read, and no primary had run)
+- The primary runs now, at about 06:25 PDT, on every pair that has both arms' reports, and does not wait for the 08:00 PDT
+  fallback. Its statistic, tests, weights and long-read exclusion are amendment 5's, with 1,000 swaps, one-sided.
+- Left out because they have not finished, a reason of time alone, not outcome:
+  - CAD: its seed aou-m3fs-c1 is still training (train-4 failed, train-5 running), so its pair aou-m3h-c has not
+    started;
+  - hyperlipidemia (aou-m3h-y): y1 finished and y2 is still training. If y2 finishes before the primary starts,
+    hyperlipidemia goes in under this same rule.
+  Asthma stays excluded (null seed, amendment 6).
+- The pairs in the primary: LDL (aou-wl15 and aou-x3-l2, merged), hypothyroidism (aou-x3-o1), atrial fibrillation
+  (aou-x3-a1), eGFR (aou-m3f-e1), gout (aou-x3-g2), hypertension (aou-m3f-h2), T2D (aou-m3f-t2) and CKD (aou-m3g-k2).
+- Then, in order: the same analysis without T2D (the post hoc sensitivity analysis logged at 00:29 PDT), and the
+  amendment-5 sensitivity analysis with the c4 continuations in place of their pairs' original fits (aou-c4-l1 for
+  aou-wl15, aou-c4-g2 for aou-x3-g2, aou-c4-h2 for aou-m3f-h2). All six c4 arms finished by 06:15 PDT.
+- The app watcher ~/xw/svgain_watch.sh is stopped before the primary runs, so that it does not run the primary a second
+  time at 08:00 PDT. Q8's watcher and the Holm step keep running. Q8 has not run (HDL is its only finished pair), so
+  the Holm-adjusted primary p is reported as lying between the primary's own p and twice it, until Q8 runs.
+- Each trait's descriptive row is that pair analysed alone with the same code, as before.
 
 Results seen (log; no test definition changes because of them)
 - Before 2bf5cb24: aou-wl15 (LDL), as listed at the top.
