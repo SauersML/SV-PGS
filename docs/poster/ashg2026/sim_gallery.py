@@ -994,6 +994,9 @@ figure (the left column, LEFT), each placed at its column's full width."""
 POSTER_GAIN_HEIGHT = 9.18
 """Inches: the SV gain forest's height, which fills the middle column from the training-size figures to the References
 at its foot (build_pptx.py's layout leaves 0.02 in to spare)."""
+GAIN_WEIGHT, GAIN_OFFSET = 1.6, 0.27
+"""The SV gain forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR), and the rows each
+source's interval sits above (true genotypes) or below (imputed SVs) its set's row."""
 FOREST_SIZES = SIZES[:3]
 """The training sizes the SV gain forest averages over, 5,000 to 20,000. Both genotype sources reached 40,000 in one
 simulation only, a control one, and the gain grows with training size: with it, the control's gain with imputed SVs
@@ -1021,6 +1024,84 @@ def gain_sets(grids) -> dict[str, dict]:
     return sets
 
 
+def gain_forest(rows: list[dict], bold: dict, band: bool):
+    """The SV gain forest of ``poster_sv_gain_figure`` at POSTER_GAIN_HEIGHT, its rows sharing the height over the
+    measured x axis, ``bold``'s label in bold. The two genotype sources are named after marks like their own, on one
+    line in a band over the plot with ``band``, else stacked in the plot's lower right, which returns None when the
+    names would overlap an interval there."""
+    top, right, height = POSTER_PAD, 0.5, POSTER_GAIN_HEIGHT
+    mark, bar, ring = POSTER_MARK * GAIN_WEIGHT, POSTER_BAR * GAIN_WEIGHT, 6.0 * GAIN_WEIGHT
+    fig = plt.figure(figsize=(POSTER_GAIN, height))
+    style = dict(fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0)
+    gap = 0.5
+    key = tallest(fig, [label for label, _, _ in SOURCES], **style) + 2 * POSTER_PAD if band else 0.0
+    bottom = under_axes(fig, ["Test AUC gain from adding SVs"])
+    left = widest(fig, [row["label"] for row in rows], fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0) + 0.75
+    ax = frame(fig, left, bottom, POSTER_GAIN - left - right, height - key - top - bottom)
+    ends = [row[source][end] for row in rows for source in ("true", "imputed") for end in ("lower", "upper")
+            if math.isfinite(row[source][end])]
+    low, high = min(0.0, *ends), max(ends)
+    limits = (low - 0.05 * (high - low), high + 0.05 * (high - low))
+    drawn = []
+    for y, row in enumerate(rows):
+        for offset, source, (_, color, filled) in ((-GAIN_OFFSET, "true", SOURCES[0]), (GAIN_OFFSET, "imputed", SOURCES[1])):
+            test = row[source]
+            if math.isfinite(test["lower"]):
+                ax.hlines(y + offset, test["lower"], test["upper"], color=color, linewidth=bar, zorder=3,
+                          capstyle="round")
+                drawn.append((y + offset, test["upper"]))
+            ax.plot([test["mean"]], [y + offset], "o", markersize=mark, color=color,
+                    markerfacecolor=color if filled else "white", markeredgecolor=color,
+                    markeredgewidth=0 if filled else ring, zorder=4)
+        ax.text(0, y, row["label"], transform=shifted(ax, -0.3), ha="right", va="center", linespacing=1.0,
+                fontweight="bold" if row is bold else "normal")
+    ax.axvline(0, color=INK, linewidth=4.0, zorder=2)
+    ax.set_yticks([])
+    ax.spines["left"].set_visible(False)
+    ax.set_ylim(len(rows) - 0.5, -0.5)
+    ax.set_xlim(*limits)
+    step = 0.002
+    ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
+    ax.set_xticks(ticks, [plain(tick, 3) for tick in ticks])
+    ax.set_xlabel("Test AUC gain from adding SVs")
+    if band:
+        # on one line in the band over the plot, ending at its right edge, each name 0.5 in after its mark and 1 in
+        # after the name before it
+        widths = [widest(fig, [label], **style) for label, _, _ in SOURCES]
+        across, up = POSTER_GAIN - right - sum(widths) - 2 * gap - 1.0, height - key / 2
+        for (label, color, filled), width in zip(SOURCES, widths):
+            ax.plot([across], [up], "o", transform=fig.dpi_scale_trans, markersize=mark, color=color,
+                    markerfacecolor=color if filled else "white", markeredgecolor=color,
+                    markeredgewidth=0 if filled else ring, clip_on=False, zorder=4)
+            fig.text(across + gap, up, label, transform=fig.dpi_scale_trans, color=color, va="center", ha="left",
+                     **style)
+            across += gap + width + 1.0
+        return fig
+    # stacked in the plot's lower right: the names, wrapped after "and", end at the plot's right edge and the column's
+    # foot stands a pad over the x axis, each mark 0.5 in before its name and level with its first line
+    names = [label.replace(" and ", " and\n") for label, _, _ in SOURCES]
+    heights = [tallest(fig, [name], **style) for name in names]
+    line = tallest(fig, ["Called"], **style)
+    across = POSTER_GAIN - right - widest(fig, names, **style) - gap
+    foot, head = bottom + POSTER_PAD, bottom + POSTER_PAD + sum(heights) + POSTER_PAD
+    # the column, marks included, must clear every interval level with it
+    inches = fig.dpi_scale_trans.inverted()
+    reach = bar / 2 / 72
+    for y, upper in drawn:
+        x_end, y_at = inches.transform(ax.transData.transform((upper, y)))
+        if foot - reach - POSTER_PAD <= y_at <= head + reach + POSTER_PAD and x_end + reach > across - mark / 2 / 72 - POSTER_PAD:
+            plt.close(fig)
+            return None
+    up = head
+    for (label, color, filled), name, tall in zip(SOURCES, names, heights):
+        ax.plot([across], [up - line / 2], "o", transform=fig.dpi_scale_trans, markersize=mark, color=color,
+                markerfacecolor=color if filled else "white", markeredgecolor=color,
+                markeredgewidth=0 if filled else ring, clip_on=False, zorder=4)
+        fig.text(across + gap, up, name, transform=fig.dpi_scale_trans, color=color, va="top", ha="left", **style)
+        up -= tall + POSTER_PAD
+    return fig
+
+
 def poster_sv_gain_figure(grids):
     """The AUC gain from adding SVs with true genotypes and with called SNVs and imputed SVs over simulated truths
     (``gain_sets``), a row per set with its label at the left and the true gain's mean and 95% interval over the imputed gain's; the label of
@@ -1038,49 +1119,9 @@ def poster_sv_gain_figure(grids):
                  for key, row in sets.items()},
     }
     rows = list(sets.values())
-    # the rows share the height left under the key band, which holds the sources' names and a pad over and under
-    # them, and over the measured x axis
-    top, right, height = POSTER_PAD, 0.5, POSTER_GAIN_HEIGHT
-    fig = plt.figure(figsize=(POSTER_GAIN, height))
-    key = tallest(fig, [label for label, _, _ in SOURCES], fontsize=POSTER_TYPE, fontweight="bold") + 2 * POSTER_PAD
-    bottom = under_axes(fig, ["Test AUC gain from adding SVs"])
-    left = widest(fig, [row["label"] for row in rows], fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0) + 0.75
-    ax = frame(fig, left, bottom, POSTER_GAIN - left - right, height - key - top - bottom)
-    ends = [row[source][end] for row in rows for source in ("true", "imputed") for end in ("lower", "upper")
-            if math.isfinite(row[source][end])]
-    low, high = min(0.0, *ends), max(ends)
-    limits = (low - 0.05 * (high - low), high + 0.05 * (high - low))
-    for y, row in enumerate(rows):
-        for offset, source, (_, color, filled) in ((-0.2, "true", SOURCES[0]), (0.2, "imputed", SOURCES[1])):
-            test = row[source]
-            if math.isfinite(test["lower"]):
-                ax.hlines(y + offset, test["lower"], test["upper"], color=color, linewidth=POSTER_BAR, zorder=3,
-                          capstyle="round")
-            ax.plot([test["mean"]], [y + offset], "o", markersize=POSTER_MARK, color=color,
-                    markerfacecolor=color if filled else "white", markeredgecolor=color,
-                    markeredgewidth=0 if filled else 6.0, zorder=4)
-        ax.text(0, y, row["label"], transform=shifted(ax, -0.3), ha="right", va="center", linespacing=1.0,
-                fontweight="bold" if row is sets["well_imputed"] else "normal")
-    ax.axvline(0, color=INK, linewidth=4.0, zorder=2)
-    ax.set_yticks([])
-    ax.spines["left"].set_visible(False)
-    ax.set_ylim(len(rows) - 0.5, -0.5)
-    ax.set_xlim(*limits)
-    step = 0.002
-    ticks = np.arange(math.ceil(limits[0] / step) * step, limits[1], step)
-    ax.set_xticks(ticks, [plain(tick, 3) for tick in ticks])
-    ax.set_xlabel("Test AUC gain from adding SVs")
-    # the two genotype sources named on one line in the band over the plot, ending at its right edge, each name 0.5 in
-    # after a mark like its own and 1 in after the name before it
-    widths = [widest(fig, [label], fontsize=POSTER_TYPE, fontweight="bold") for label, _, _ in SOURCES]
-    across, up = POSTER_GAIN - right - sum(widths) - 2 * 0.5 - 1.0, height - key / 2
-    for (label, color, filled), width in zip(SOURCES, widths):
-        ax.plot([across], [up], "o", transform=fig.dpi_scale_trans, markersize=POSTER_MARK, color=color,
-                markerfacecolor=color if filled else "white", markeredgecolor=color,
-                markeredgewidth=0 if filled else 6.0, clip_on=False, zorder=4)
-        fig.text(across + 0.5, up, label, transform=fig.dpi_scale_trans, color=color, fontsize=POSTER_TYPE,
-                 fontweight="bold", va="center", ha="left")
-        across += 0.5 + width + 1.0
+    # the sources' names stand in the plot's empty lower right when they clear every interval there, else on one line
+    # in a band over the plot
+    fig = gain_forest(rows, sets["well_imputed"], band=False) or gain_forest(rows, sets["well_imputed"], band=True)
     description = (
         "Test AUC gain from adding SVs to SV-PGS with true genotypes (filled) and with SNVs called from simulated reads "
         "and SVs imputed by Beagle (open), mean and 95% interval over simulations at training N 5,000 to 20,000, for "
