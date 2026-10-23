@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 
-
 from aou_gallery import HERE
 from sim_gallery import BLUE, INK, ORANGE, VERMILLION, plt
 
@@ -36,19 +35,18 @@ def main() -> None:
                 continue
             value, low, high = found[name][method]
             ax.hlines(index + shift, max(low, 1e-5), high, color=color, linewidth=2.0)
-            ax.plot([value], [index + shift], marker=marker, markersize=7, color=color, markeredgewidth=0,
+            ax.plot([value], [index + shift], marker=marker, markersize=7, color=color, markeredgewidth=0, linestyle="none",
                     label=label if index == 0 else None)
     ax.set_yticks(range(len(names)), names)
     ax.tick_params(axis="y", length=0)
     ax.set_ylim(len(names) - 0.5, -0.5)
-    ax.set_xlim(2e-4, 0.1)
-    ax.set_xticks([0.001, 0.01, 0.1], ["0.001", "0.01", "0.1"])
+    ax.set_xlim(5e-5, 0.1)
+    ax.set_xticks([0.0001, 0.001, 0.01, 0.1], ["0.0001", "0.001", "0.01", "0.1"])
     ax.set_xlabel("Held-out r²")
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
-    handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles[::-1], labels[::-1], loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=3, frameon=False,
-              handletextpad=0.2, columnspacing=1.0, borderaxespad=0.2)
+    ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=3, frameon=False,
+              handlelength=1.0, handletextpad=0.3, columnspacing=1.2, borderaxespad=0.2)
     fig.tight_layout()
     for suffix in ("pdf", "png"):
         fig.savefig(REVIEW / f"svpgs_vs_ldpred2.{suffix}", dpi=300)
