@@ -644,9 +644,9 @@ def build() -> None:
         "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy",
         "poster_model")}
     discussion = [bar(95, "Discussion"), text(bullets([*words["discussion"], *aou_result()]))]
-    # the poster reads Introduction and Methods, the simulation's results, All of Us with the QR code to the repository
-    # and the references at its foot, then the Discussion in a band across the foot of the middle and right columns.
-    # The All of Us result (its common gain) adds a Discussion bullet.
+    # the poster reads Introduction and Methods, the simulation's results with the Discussion at their foot, then All of
+    # Us with the QR code to the repository and the references at its foot. The All of Us result (its common gain) adds
+    # a Discussion bullet.
     columns = [
         [
             bar(97, "Introduction"), text(bullets(words["introduction"])),
@@ -663,13 +663,11 @@ def build() -> None:
         [bar(119, "All of Us cohort results"), text(bullets(words["aou"])), *aou_blocks(), *references()],
     ]
     poster = Poster(xml, rels, work / "ppt/media")
-    across = COLUMNS[2][0] + RIGHT - COLUMNS[1][0]
-    # the Discussion alone in the band, so its bullets run the band's width
-    band = discussion
-    top = BOTTOM - poster.stack_height(band, across)
-    poster.stack(band, COLUMNS[1][0], top, across, None)
+    # the Discussion at the foot of the middle column, which ends above it
+    top = BOTTOM - poster.stack_height(discussion, MIDDLE)
+    poster.stack(discussion, COLUMNS[1][0], top, MIDDLE, None)
     for index, ((x, width), blocks) in enumerate(zip(COLUMNS, columns)):
-        poster.stack(blocks, x, TOP, width, top - GAPS["section"] if index else BOTTOM)
+        poster.stack(blocks, x, TOP, width, top - GAPS["section"] if index == 1 else BOTTOM)
     xml = poster.xml.replace("</p:spTree>", "".join(poster.shapes) + "</p:spTree>")
     rels = poster.rels
 

@@ -273,6 +273,63 @@ def test_the_overall_rows_write_the_pooled_values_the_json_files_give():
     plt.close(fig)
 
 
+GROUPS = {"EUR": {"sv_gain": {"percent": 0.07, "lower": -0.21, "upper": 0.35, "p_one": 0.32},
+                  "vs_ldpred2": {"percent": 21.9, "lower": 2.8, "upper": 45.1, "p_one": 0.011}},
+          "AFR": {"sv_gain": {"percent": -0.5, "lower": -2.1, "upper": 1.2, "p_one": 0.61},
+                  "vs_ldpred2": {"percent": 34.6, "lower": -10.0, "upper": 80.0, "p_one": 0.2}},
+          "AMR": {"sv_gain": {"percent": 0.3, "lower": -1.5, "upper": 2.0, "p_one": 0.41},
+                  "vs_ldpred2": {"percent": -2.6, "lower": -20.0, "upper": 18.0, "p_one": 0.0042}}}
+"""aou_ancestry.json's "groups": each group's pooled SV gain and its pooled change over LDpred2-auto."""
+
+
+def test_each_ancestry_group_has_a_row_under_overall_in_both_panels_when_the_file_gives_it():
+    rows = [{"trait": trait, "relative": 0.5, "relative_lower": -1.0, "relative_upper": 2.0}
+            for trait in ("ldl_cholesterol", "egfr")]
+    common = {"relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1, "p_sharp": 0.3197, "traits": 2}
+    with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
+        fig, lines = aou_gallery.gain_figure(rows, common, compared_rows(), POOLED, GROUPS)
+    fig.canvas.draw()
+    top, gain = fig.axes
+    assert row_names(top)[-4:] == row_names(gain)[-4:] == ["Overall", "EUR", "AFR", "AMR"]
+    by_row = {}
+    for ax in (top, gain):
+        names = [text for text in ax.texts if text.get_gid() == "name"]
+        for text in ax.texts:
+            if text.get_gid() == "note":
+                # a note's line belongs to the row whose name is nearest above it, or level with it
+                owner = max((name for name in names if name.get_position()[1] <= text.get_position()[1] + 1e-9),
+                            key=lambda name: name.get_position()[1])
+                by_row.setdefault((ax is top, owner.get_text()), []).append(text.get_text())
+    assert by_row[True, "EUR"] == ["+22%, p = 0.01"] and by_row[True, "AFR"] == ["+35%, p = 0.20"]
+    assert by_row[True, "AMR"] == ["−3%, p = 0.004"]
+    assert [by_row[False, group] for group in ("Overall", "EUR", "AFR", "AMR")] == \
+        [["p = 0.32"], ["p = 0.32"], ["p = 0.61"], ["p = 0.41"]]
+    # the gain panel draws each group's common g and its interval, in percent like Overall's
+    segments = [segment for collection in gain.collections for segment in collection.get_segments()]
+    assert [tuple(np.round(segment[:, 0] * 100, 2)) for segment in segments[-3:]] == [(-0.21, 0.35), (-2.1, 1.2),
+                                                                                       (-1.5, 2.0)]
+    assert "ancestry group" in lines[0] and max(sim_gallery.overhang(fig)) <= 0
+    plt.close(fig)
+
+
+def test_the_figure_is_drawn_without_ancestry_rows_when_aou_ancestry_json_is_missing(monkeypatch, tmp_path):
+    numbers = {"matched": {"rows": [{"trait": "egfr", "relative": 0.3, "relative_lower": -1.1, "relative_upper": 1.7}],
+                           "common": {"relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1,
+                                      "p_sharp": 0.32, "traits": 1}}}
+    (tmp_path / "aou_numbers.json").write_text(json.dumps(numbers))
+    (tmp_path / "aou_vs_ldpred2.json").write_text(json.dumps({"rows": compared_rows()[:1], "combined": POOLED}))
+    for name, path in (("NUMBERS", "aou_numbers.json"), ("COMPARED", "aou_vs_ldpred2.json"),
+                       ("ANCESTRY", "aou_ancestry.json")):
+        monkeypatch.setattr(aou_gallery, name, tmp_path / path)
+    monkeypatch.setattr(aou_gallery, "OUT", tmp_path)
+    aou_gallery.main()
+    assert "ancestry" not in (tmp_path / "aou_1_gain.txt").read_text()
+    (tmp_path / "aou_ancestry.json").write_text(json.dumps({"groups": GROUPS}))
+    aou_gallery.main()
+    assert "ancestry group" in (tmp_path / "aou_1_gain.txt").read_text()
+    assert (tmp_path / "aou_1_gain.png").is_file()
+
+
 def test_p_values_are_written_to_one_significant_figure_below_001_and_two_decimals_otherwise():
     assert [aou_gallery.p_text(p) for p in (0.0047, 0.00012, 0.0099, 0.0123, 0.3197, 0.05)] == \
         ["0.005", "0.0001", "0.01", "0.01", "0.32", "0.05"]

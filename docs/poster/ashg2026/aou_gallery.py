@@ -49,6 +49,7 @@ from sim_gallery import (INK, LDPRED2, POSTER_BAR, POSTER_LABEL, POSTER_MARK, PO
 HERE = Path(__file__).resolve().parent
 NUMBERS = HERE / "aou_numbers.json"
 COMPARED = HERE / "aou_vs_ldpred2.json"
+ANCESTRY = HERE / "aou_ancestry.json"
 OUT = HERE / "figures"
 COLUMN = 11.4
 """Inches: the poster's right column (build_pptx.py's RIGHT), each figure's width, so its type prints at its own size."""
@@ -70,7 +71,10 @@ STAR, STAR_NOTE = "*", "* BH q < 0.05"
 STAR_GAP = 0.06
 """Inches between a mark's drawn end (its interval, arrowhead or mark) and its asterisk."""
 NOTE_GAP = 0.2
-"""Inches between a row's marks, or its name in a row without marks, and its note."""
+"""Inches between a row's marks, or the widest name of the panel's rows with notes, and a note."""
+MIN_AXIS = 3.5
+"""Inches: the narrowest x axis a panel's notes may leave by following their rows' marks; below it they follow the
+names instead."""
 LABEL_GAP = 0.3
 """Inches between the widest row name and the plot."""
 MARK = 1.5
@@ -100,8 +104,9 @@ class Panel:
     """One panel of the All of Us figure: a row per (name, marks), each mark an (estimate, low, high) in its series'
     place, under the title ``xlabel``. A series is (its name in the key, colour, marker, filled). Each (row name, series
     index) in ``starred`` has STAR past its interval's end. A row's entry in ``notes`` is a note in the figure's type,
-    as the pieces it may break between: past the row's marks on one line, or in a row without marks after its name,
-    wrapped onto further lines from the names' margin where the column is too narrow for it."""
+    as the pieces it may break between. In a row with marks it follows them on one line, at the row's end, unless the
+    axis would then be narrower than MIN_AXIS; then it starts in a column NOTE_GAP right of the widest name among the
+    panel's rows with notes. In a row without marks it starts in that column, wrapped onto further lines there."""
 
     rows: list[tuple[str, list[tuple[float, float, float]]]]
     series: list[tuple[str, str, str, bool]]
@@ -116,7 +121,7 @@ def forest(panels: list[Panel], least: float = 0.0):
     bold. In each row the series' marks stand one above the next, each an estimate with its 95% interval, and a panel
     with more than one series has their key over it, wrapped onto further lines when it is wider than the column. When
     a panel stars a mark, STAR_NOTE ends the first panel's key, which it starts when that panel has none. A row's note
-    follows its marks, or its name in a row without marks (Panel). A log panel spans its estimates and is ticked at the
+    follows its marks or its name (Panel). A log panel spans its estimates and is ticked at the
     decades inside; a linear one is symmetric about 0 over its estimates. Either way each mark clears an arrowhead at
     the axis's end, and an interval past the axis ends in one. Every margin and row height is measured from the type,
     so the figure is as short as its type allows, unless ``least`` inches is taller: then its rows share the extra
@@ -132,8 +137,12 @@ def forest(panels: list[Panel], least: float = 0.0):
     line = tallest(fig, ["Hg"], fontsize=size)
     stacks = [sum(mark / 72 + (0.0 if filled else RING / 72) for *_, filled in panel.series)
               + (len(panel.series) - 1) * MARK_GAP for panel, mark in zip(panels, marks)]
-    wrapped = [{name: note_lines(fig, panel.notes[name], COLUMN - 2 * EDGE - named[name] - NOTE_GAP, COLUMN - 2 * EDGE)
-                for name, estimates in panel.rows if not estimates and name in panel.notes} for panel in panels]
+    # each panel's notes start in a column right of the widest name among its rows with notes
+    columns = [max([EDGE + named[name] + NOTE_GAP for name, _ in panel.rows if name in panel.notes], default=EDGE)
+               for panel in panels]
+    wrapped = [{name: note_lines(fig, panel.notes[name], COLUMN - EDGE - column, COLUMN - EDGE - column)
+                for name, estimates in panel.rows if not estimates and name in panel.notes}
+               for panel, column in zip(panels, columns)]
     heights = [[(len(notes[name]) * line if name in notes
                  else max(tallest(fig, [name], fontsize=size, fontweight=weight[name]) if "\n" in name else line, stack))
                 + ROW_GAP for name, _ in panel.rows] for panel, stack, notes in zip(panels, stacks, wrapped)]
@@ -162,11 +171,18 @@ def forest(panels: list[Panel], least: float = 0.0):
     # each mark clears the axis's ends by its half width, its ring, an arrowhead and a pad
     halves = [(mark + RING) * growth / 2 / 72 for mark, growth in zip(marks, growths)]
     clears = [half + arrow + POSTER_PAD for half in halves]
-    width = plot_width(fig, panels, clears, halves, COLUMN - left, arrow)
+    # the notes of rows with marks at the rows' ends, or, when that leaves too narrow an axis, in the notes' column
+    width = plot_width(fig, panels, clears, halves, COLUMN - left, arrow, ends_noted=True)
+    ending = width >= MIN_AXIS
+    if not ending:
+        left = max(left, *(column + widest(fig, [" ".join(panel.notes[name])], fontsize=size) + LABEL_GAP + arrow
+                           for panel, column in zip(panels, columns) for name, estimates in panel.rows
+                           if estimates and name in panel.notes))
+        width = plot_width(fig, panels, clears, halves, COLUMN - left, arrow, ends_noted=False)
     star = widest(fig, [STAR], fontsize=size)
     top = height - EDGE
-    for panel, mark, rows, key, key_rows, bottom, growth, clear, half, notes in zip(
-            panels, marks, heights, keys, lines, bottoms, growths, clears, halves, wrapped):
+    for panel, mark, rows, key, key_rows, bottom, growth, clear, half, notes, column in zip(
+            panels, marks, heights, keys, lines, bottoms, growths, clears, halves, wrapped, columns):
         mark, bar, ring = mark * growth, POSTER_BAR * growth, RING * growth
         span = sum(rows) + extra * len(rows)
         # the key over the panel from the canvas's left edge, a line at a time: each series' mark, then its name
@@ -206,16 +222,15 @@ def forest(panels: list[Panel], least: float = 0.0):
                     ax.text(0, y, STAR, ha="left", va="baseline", color=INK, gid="star",
                             transform=shifted(ax, each[index] + STAR_GAP, -star_middle(size) / 72))
             if name in notes:
-                # the note after the name, its later lines from the names' margin, the name on its first line
+                # the note's lines in the notes' column, the name on its first line
                 first = centre - len(notes[name]) * line / 2 + line / 2
                 for index, text in enumerate(notes[name]):
-                    across = EDGE + (named[name] + NOTE_GAP if index == 0 else 0.0) - left
-                    ax.text(0, first + index * line, text, transform=shifted(ax, across), ha="left", va="center",
-                            gid="note")
+                    ax.text(0, first + index * line, text, transform=shifted(ax, column - left), ha="left",
+                            va="center", gid="note")
                 centre = first
             elif name in panel.notes:
-                ax.text(0, centre, " ".join(panel.notes[name]), transform=shifted(ax, past + NOTE_GAP), ha="left",
-                        va="center", gid="note")
+                ax.text(0, centre, " ".join(panel.notes[name]), ha="left", va="center", gid="note",
+                        transform=shifted(ax, past + NOTE_GAP if ending else column - left))
             ax.text(0, centre, shown[name], transform=shifted(ax, EDGE - left), ha="left", va="center",
                     fontweight=weight[name], gid="name")
         if not panel.log:
@@ -224,7 +239,7 @@ def forest(panels: list[Panel], least: float = 0.0):
         ax.spines["left"].set_visible(False)
         ax.set_ylim(span, 0)
         ax.set_xlim(low_limit, high_limit)
-        drawn = inside(panel, low_limit, high_limit)
+        drawn = drawn_ticks(fig, panel, width, low_limit, high_limit)
         ax.set_xticks(drawn, [tick_text(panel)(tick) for tick in drawn])
         ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
         ax.tick_params(axis="x", which="major", pad=style["xtick.major.pad"])
@@ -282,10 +297,12 @@ def star_middle(size: float) -> float:
     return (extent.y0 + extent.y1) / 2
 
 
-def plot_width(fig, panels: list[Panel], clears: list[float], halves: list[float], room: float, arrow: float) -> float:
+def plot_width(fig, panels: list[Panel], clears: list[float], halves: list[float], room: float, arrow: float,
+               ends_noted: bool) -> float:
     """Inches of the panels' shared x axis in ``room`` inches right of the names: as wide as leaves EDGE past the
     farthest of an arrowhead at the axis's end, the half of each drawn tick label that sits past it, and each row's
-    STARs and note past its marks (``ends``; ``halves``: each panel's marks' half widths). Only drawn ticks count, so a
+    STARs past its marks, and its note too when ``ends_noted`` (``ends``; ``halves``: each panel's marks' half
+    widths). Only drawn ticks count, so a
     decade outside a log axis takes no room. The widest axis that fits is found by bisection."""
     size = matplotlib.rcParams["xtick.labelsize"]
     star = widest(fig, [STAR], fontsize=matplotlib.rcParams["font.size"])
@@ -296,14 +313,14 @@ def plot_width(fig, panels: list[Panel], clears: list[float], halves: list[float
             low, high = limits(panel, width, clear)
             place = (lambda value: math.log10(value / low) / math.log10(high / low)) if panel.log \
                 else (lambda value: (value - low) / (high - low))
-            for tick in inside(panel, low, high):
+            for tick in drawn_ticks(fig, panel, width, low, high):
                 reach = max(reach, width * (place(tick) - 1) + widest(fig, [tick_text(panel)(tick)], fontsize=size) / 2)
             for name, estimates in panel.rows:
                 if not estimates:
                     continue
                 _, past = ends(panel, name, estimates, width, low, high, half, arrow, star)
                 note = (NOTE_GAP + widest(fig, [" ".join(panel.notes[name])], fontsize=matplotlib.rcParams["font.size"])
-                        if name in panel.notes else 0.0)
+                        if ends_noted and name in panel.notes else 0.0)
                 reach = max(reach, past + note - width)
         return width + reach + EDGE <= room
 
@@ -316,6 +333,27 @@ def plot_width(fig, panels: list[Panel], clears: list[float], halves: list[float
         middle = (low + high) / 2
         low, high = (middle, high) if fits(middle) else (low, middle)
     return low
+
+
+def drawn_ticks(fig, panel: Panel, width: float, low: float, high: float) -> list[float]:
+    """The panel's ticks inside its axis (``inside``) over ``width`` inches, less an end tick while two neighbours'
+    labels come closer than TICK_SPACE inches: of the two ends, the one farther outside the estimates goes first."""
+    size = matplotlib.rcParams["xtick.labelsize"]
+    place = (lambda value: math.log10(value / low) / math.log10(high / low)) if panel.log \
+        else (lambda value: (value - low) / (high - low))
+    values = [value for _, estimates in panel.rows for value, _, _ in estimates]
+    scale = (lambda value: math.log10(value)) if panel.log else (lambda value: value)
+    beyond = lambda tick: max(scale(min(values)) - scale(tick), scale(tick) - scale(max(values)), 0.0)
+    kept = inside(panel, low, high)
+    while len(kept) > 1 and any(width * (place(right) - place(left)) - (widest(fig, [tick_text(panel)(left)], fontsize=size)
+                                                                       + widest(fig, [tick_text(panel)(right)], fontsize=size)) / 2
+                                < TICK_SPACE for left, right in zip(kept, kept[1:])):
+        kept = kept[1:] if beyond(kept[0]) >= beyond(kept[-1]) else kept[:-1]
+    return kept
+
+
+TICK_SPACE = 0.3
+"""Inches at least between neighbouring tick labels."""
 
 
 def inside(panel: Panel, low: float, high: float) -> list[float]:
@@ -426,15 +464,24 @@ def signed(percent_value: float) -> str:
     return f"{round(percent_value):+d}%".replace("-", "−")
 
 
-def pooled_note(pooled: dict) -> list[str]:
-    """The r² panel's pooled row: aou_vs_ldpred2.json's combined.with_sv, SV-PGS with SVs against LDpred2-auto pooled
-    over the traits, as its change in r² over LDpred2-auto's and its one-sided p (p_one), in the pieces it may break
-    between."""
-    return ["SV-PGS", f"r² {signed(pooled['relative'])}", "vs", "LDpred2-auto,", f"p = {p_text(pooled['p_one'])}"]
+def pooled_note(percent_value: float, p: float) -> list[str]:
+    """The r² panel's pooled row: SV-PGS with SVs against LDpred2-auto pooled over the traits, as its change in r² over
+    LDpred2-auto's (``percent_value``) and its one-sided ``p``, in the pieces it may break between."""
+    return ["SV-PGS", f"r² {signed(percent_value)}", "vs", "LDpred2-auto,", f"p = {p_text(p)}"]
+
+
+def group_note(percent_value: float, p: float) -> list[str]:
+    """An ancestry group's row under the r² panel's pooled row, which names what its numbers are: the change and p
+    alone, so the row is one line of type."""
+    return [f"{signed(percent_value)},", f"p = {p_text(p)}"]
+
+
+GROUPS = ("EUR", "AFR", "AMR")
+"""The ancestry groups under each panel's pooled row, in this order, from ANCESTRY's "groups"."""
 
 
 def gain_figure(matched: list[dict], common: dict | None = None, compared: list[dict] | None = None,
-                pooled: dict | None = None) -> tuple:
+                pooled: dict | None = None, groups: dict | None = None) -> tuple:
     """Each trait's change in held-out partial r² from adding SVs, relative to the r² without SVs (baseline_relative of
     the pre-specified g), with its 95% interval, a row per trait, and when ``common`` is given a bold row for the traits'
     common g itself, relative to the two arms' mean r². The two scales differ by about 0.1 percentage point at these
@@ -444,7 +491,10 @@ def gain_figure(matched: list[dict], common: dict | None = None, compared: list[
     the traits in ``compared``'s order, then any other trait, then the pooled row, COMBINED: in the gain panel the
     common g with its one-sided swap p (p_sharp) at the row's end, and in the r² panel, when ``pooled``
     (aou_vs_ldpred2.json's "combined") is given, a note of SV-PGS's pooled change in r² over LDpred2-auto and its p
-    (pooled_note), since a pooled change has no place on the absolute axis. No figure on the poster uses a fit
+    (pooled_note), since a pooled change has no place on the absolute axis. Under each pooled row, for each of
+    GROUPS that ``groups`` (aou_ancestry.json's "groups") gives, a row of that group's pooled values: in the gain
+    panel its common g with its interval and its one-sided p ("sv_gain"), in the r² panel its change over LDpred2-auto
+    and its one-sided p ("vs_ldpred2", group_note). No figure on the poster uses a fit
     that did not converge, so a trait whose SV-PGS fit did not converge is in neither panel."""
     keys = ("relative", "relative_lower", "relative_upper")
     dropped = {trait_name(row["trait"]) for row in matched if not converged(row)}
@@ -454,16 +504,26 @@ def gain_figure(matched: list[dict], common: dict | None = None, compared: list[
         rows.append((COMBINED, [tuple(common[key] / 100 for key in keys)]))
     gained = {trait_name(row["trait"]) for row in compared or [] if significant(row, "sv_gain")}
     swap = (common or {}).get("p_sharp")
+    noted = {COMBINED: [f"p = {p_text(swap)}"]} if common and swap is not None else {}
+    for group in GROUPS:
+        gain = ((groups or {}).get(group) or {}).get("sv_gain") or {}
+        if rows and all(key in gain for key in ("percent", "lower", "upper", "p_one")):
+            rows.append((group, [tuple(gain[key] / 100 for key in ("percent", "lower", "upper"))]))
+            noted[group] = [f"p = {p_text(gain['p_one'])}"]
     panels = [Panel(rows, [("", SKY, "o", False)], "Change in r² with SVs (%)",
-                    starred={(name, 0) for name, _ in rows if name in gained},
-                    notes={COMBINED: [f"p = {p_text(swap)}"]} if common and swap is not None else {})] if rows else []
+                    starred={(name, 0) for name, _ in rows if name in gained}, notes=noted)] if rows else []
     measured = [row for row in compared or [] if "r2" in row and trait_name(row["trait"]) not in dropped]
     against = (pooled or {}).get("with_sv") or {}
     if measured:
         r2 = [(trait_name(row["trait"]), [tuple(100 * row["r2"][arm][key] for key in ("r2", "lower", "upper"))
                                           for arm in ("ldpred2_auto", "with_sv")]) for row in measured]
-        notes = {COMBINED: pooled_note(against)} if "relative" in against and "p_one" in against else {}
-        panels.insert(0, Panel(r2 + [(COMBINED, [])] * bool(notes), METHODS, "Held-out r² (%)", log=True,
+        notes = {COMBINED: pooled_note(against["relative"], against["p_one"])} \
+            if "relative" in against and "p_one" in against else {}
+        for group in GROUPS:
+            versus = ((groups or {}).get(group) or {}).get("vs_ldpred2") or {}
+            if "percent" in versus and "p_one" in versus:
+                notes[group] = group_note(versus["percent"], versus["p_one"])
+        panels.insert(0, Panel(r2 + [(name, []) for name in notes], METHODS, "Held-out r² (%)", log=True,
                                starred={(trait_name(row["trait"]), 1) for row in measured if significant(row, "with_sv")},
                                notes=notes))
     stars = any(panel.starred for panel in panels)
@@ -477,6 +537,7 @@ def gain_figure(matched: list[dict], common: dict | None = None, compared: list[
                  + (" with its one-sided p" if common and swap is not None else "")
                  + (", and in the r² panel's bold row SV-PGS's pooled change in r² over LDpred2-auto with its one-sided p"
                     if measured and "relative" in against and "p_one" in against else "")
+                 + (", and under each pooled row the same for each ancestry group" if groups else "")
                  + (", an asterisk marking a Benjamini-Hochberg q below 0.05 for SV-PGS against LDpred2-auto (top) or "
                     "for the change with SVs (bottom)" if stars else "")]
 
@@ -487,8 +548,10 @@ def main() -> None:
         drawn = []
         if numbers.get("matched", {}).get("rows"):
             compared = json.loads(COMPARED.read_text()) if COMPARED.is_file() else {}
+            ancestry = json.loads(ANCESTRY.read_text()) if ANCESTRY.is_file() else {}
             drawn.append(("aou_1_gain", gain_figure(numbers["matched"]["rows"], numbers["matched"].get("common"),
-                                                    compared.get("rows"), compared.get("combined"))))
+                                                    compared.get("rows"), compared.get("combined"),
+                                                    ancestry.get("groups"))))
         for name, (fig, lines) in drawn:
             reach = overhang(fig)
             if max(reach) > 0:

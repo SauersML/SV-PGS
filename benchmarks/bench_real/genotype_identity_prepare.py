@@ -41,6 +41,10 @@ def prepare(work):
     home = Path.home()
     cdr = home / 'workspace/vwb-aou-datasets-controlled/v9'
     reference = cdr / 'wgs/short_read/snpindel/acaf_threshold/pgen/acaf_threshold.chr22'
+    staged = work / 'reference_local/acaf_threshold.chr22'
+    marker = work / 'reference_stage_state.txt'
+    if marker.exists() and marker.read_text().strip() == 'ready':
+        reference = staged
     old = work / 'mount_imputed/deliverables/batch-001/aou2_50k_init.batch-001.chr22.prod-05fea60.glimpse2.popped.bcf'
     pattern = ('gs://long-reads-phase-2-imputation-staging-wb-rapid-tomato-9816/'
                '50k-tsps-finalized-vcfs/finalized-vcfs/teaspoons_50001_batch_{batch}.chr22.vcf.gz')
@@ -154,7 +158,7 @@ def prepare(work):
         raise ValueError('Insufficient common high-quality sites across batches')
     # Deterministic thinning spans the chromosome without looking at matches.
     columns = np.flatnonzero(usable)
-    columns = columns[np.linspace(0, len(columns)-1, min(4096, len(columns)), dtype=int)]
+    columns = columns[np.linspace(0, len(columns)-1, 2048, dtype=int)]
     variants = np.array([f'chr22:{sites[i][0]}:{sites[i][1]}:{sites[i][2]}' for i in columns])
     np.savez(work / 'query.private.npz', ids=np.array(query_ids), variants=variants,
              genotypes=np.concatenate([part[:, columns] for part in query_arrays]))

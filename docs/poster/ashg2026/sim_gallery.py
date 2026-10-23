@@ -825,7 +825,7 @@ sources written beside their marks. A poster figure carries no legend and no tit
 figure's own labels, state its message."""
 POSTER_LINE, POSTER_MARK, POSTER_BAR = 8.0, 26.0, 6.0
 """Points: a data line's width, a mean's marker and an interval's line in the poster's figures."""
-POSTER_HEIGHT = 10.6
+POSTER_HEIGHT = 9.6
 """Inches: the height of the two figures side by side at the top of the poster's middle column."""
 POSTER_HALF = 10.56
 """Inches: the width each of those two figures is placed at (half of build_pptx.py's 21.92 in middle column less its
