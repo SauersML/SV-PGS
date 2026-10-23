@@ -32,7 +32,8 @@ Unit and inputs
   true genotypes, and keeping them would raise the SV gain above what imputed SVs give anyone else. Only the count is
   printed.
 
-Validity (amendment 2, added 2026-10-22 19:55 PDT, before any pair other than aou-wl15 was read)
+Validity (amendment 2, written about 19:50 PDT on 2026-10-22 and committed at 19:52 (2ec5cea2), before any pair
+other than aou-wl15 was read)
 - A matched pairing run counts only if all three hold (sv_gain_meta.validity):
   1. Each arm's fit is non-null: its genetic score's variance over the trait's held-out people is above 1e-12 (in the
      trait's units squared), and the score step did not quarantine the trait as unscorable.
@@ -138,8 +139,8 @@ Power (analytic, one-sided 0.05)
   test.
 
 
-Family Q8, quantitative cardiometabolic traits (amendment 3, added 2026-10-22 20:25 PDT at cardio's request, before
-any Q8 fit was submitted)
+Family Q8, quantitative cardiometabolic traits (amendment 3, committed 2026-10-22 19:58 PDT (1dbe5300) at cardio's
+request, before any Q8 fit was submitted)
 - What had been seen when this was written:
   - an aggregate census of the eight traits' test and training counts (below);
   - the per-trait descriptive results of the primary's pairs aou-wl15 (LDL), aou-x3-o1 (hypothyroidism), aou-x3-a1
@@ -191,15 +192,15 @@ any Q8 fit was submitted)
 
 Results seen (log; no test definition changes because of them)
 - Before 2bf5cb24: aou-wl15 (LDL), as listed at the top.
-- About 19:55 PDT on 2026-10-22, after 2bf5cb24 and cd542c9b: runwatch read the run reports of aou-x3-o1
+- About 19:55 PDT on 2026-10-22, after 2bf5cb24 and cd542c9b (the coordinator's time): runwatch read the run reports of aou-x3-o1
   (hypothyroidism, +1.5% relative, p 0.086), aou-x3-a1 (AF, -0.6%) and aou-m3f-e1 (eGFR, +0.3%). The coordinator
   passed them to the user and the poster agent.
-- About 20:15 PDT: sv_gain_meta (main 2ec5cea2) was run on each of those three pairs alone, as descriptive per-trait
+- From 19:53 to about 19:57 PDT: sv_gain_meta (main 2ec5cea2) was run on each of those three pairs alone, as descriptive per-trait
   results: long-read people excluded, 200 arm swaps each.
   - Hypothyroidism: +1.42% [-0.37, 3.18], permutation p 0.025.
   - AF: -0.62% [-9.43, 8.18], permutation p 0.83.
   - eGFR: +0.26% [-1.13, 1.65], permutation p 0.31.
-- About 20:35 PDT: the same on aou-wl15 (LDL) alone, with its arms' runs aou-wl13 and wl14 checked: -1.96%
+- About 20:00 PDT: the same on aou-wl15 (LDL) alone, with its arms' runs aou-wl13 and wl14 checked: -1.96%
   [-7.02, 3.11], permutation p 0.87. Its with_sv arm is uncertified and flagged.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
