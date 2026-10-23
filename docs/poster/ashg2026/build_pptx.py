@@ -92,7 +92,8 @@ REFERENCES = [
     "Wray 2010 PLoS Genet",
     "All of Us 2019 N Engl J Med",
 ]
-"""First author, year and journal, one to a line."""
+"""First author, year and journal, one to a line, numbered in superscript as the text cites them."""
+SUPERSCRIPT = dict(zip(range(1, 10), "¹²³⁴⁵⁶⁷⁸⁹"))
 PLACEHOLDERS = [
     ("Change in test r² with SVs", "All held-out people and by genetic ancestry"),
 ]
@@ -125,14 +126,17 @@ def copy(numbers: dict) -> dict:
     rows = gain["rows"]  # true and imputed: [mean, lower, upper, simulations]; share: [ratio, lower, upper]
     simulations = rows["all"]["true"][3] + rows["null"]["true"][3]
     return {
-        "introduction": ["We test whether structural variants (SVs) improve polygenic scores"],
-        "methods": ["Empirical Bayes priors depend on imputation r², frequency and SV length"],
+        # ¹ is Byrska-Bishop 2022, the first of REFERENCES: ~9,679 SVs discovered per genome
+        "introduction": ["Each genome carries ~9,700 structural variants (SVs)¹",
+                         "Polygenic scores rarely include them; we test if imputed SVs help"],
+        "methods": ["Empirical Bayes priors use r², frequency and SV length"],
         "code": ["Code:", "github.com/", "SauersML/SV-PGS"],
         "design": [
-            f"{people(svs['people'])} genomes from 1000 Genomes chr22, one cohort",
+            f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22",
             f"Baseline: liability h² = {accuracy['h2']:g}, prevalence {accuracy['prevalence']:.0%}, "
             f"{accuracy['causal']} causal variants, {accuracy['baseline_sv_share']:.0%} SVs; "
-            f"{gain['shown'] - 1} other architectures vary settings",
+            f"{gain['shown'] - 1} other architectures vary these",
+            "LDpred2-auto: common SNVs at HapMap3 density",
         ],
         "whole_note": f"Simulations on whole chr22, tested on {people(accuracy['test_people'])} people",
         "gain_note": f"Mean and 95% CI over {simulations} simulations in 3 Mb of chr22",
@@ -602,12 +606,12 @@ def build() -> None:
 
     gallery = {name: GALLERY / f"{name}.png" for name in (
         "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy",
-        "poster_model", "poster_variants")}
+        "poster_model")}
     columns = [
         [
             bar(97, "Introduction"), text(bullets(words["introduction"])),
             bar(91, "Methods"), figure(gallery["poster_model"]), text(bullets(words["methods"])),
-            bar(93, "Simulation design"), text(bullets(words["design"])), figure(gallery["poster_variants"]),
+            bar(93, "Simulation design"), text(bullets(words["design"])),
             figure(gallery["poster_imputation_accuracy"], flex=True, legend=GALLERY / "fig5_simulated_svs.txt"),
         ],
         [
@@ -621,7 +625,9 @@ def build() -> None:
         ],
         [
             bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks(),
-            bar(96, "References"), text([Para([(reference, "")], REFERENCE, bullet=False, after=0) for reference in REFERENCES]),
+            bar(96, "References"),
+            text([Para([(f"{SUPERSCRIPT[index]}{reference}", "")], REFERENCE, bullet=False, after=0)
+                  for index, reference in enumerate(REFERENCES, start=1)]),
             code(words["code"]),
         ],
     ]

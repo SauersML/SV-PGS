@@ -1127,10 +1127,8 @@ VARIANTS = (("SNV", INK, 0.09), ("indel", GREEN, 0.3), ("SV", IMPUTED, 1.1))
 """The variant classes as the left column draws them: name, colour, and the width in inches of the block that stands for
 one variant on a chromosome (one base for an SNV, a few for an indel, many for an SV)."""
 SCHEMATICS = {
-    "poster_model": "An SNV, an indel and an SV on a chromosome, each class with its own effect-size prior, all fitted "
+    "poster_model": "An SNV, an indel and an SV on a chromosome, each class with its own effect size prior, all fitted "
                     "together into SV-PGS.",
-    "poster_variants": "A table of the variants each method is given: SV-PGS all SNVs, indels and SVs; LDpred2-auto SNVs "
-                       "of MAF ≥ 1% thinned to HapMap3 density, and no indels or SVs.",
 }
 """Each schematic's one-sentence description, which build_pptx.py uses as its picture's alt text."""
 
@@ -1147,7 +1145,7 @@ def canvas(height: float):
 
 def poster_model_figure():
     """The SV-PGS model for the poster's Methods: an SNV, an indel and an SV on a chromosome, each class with its own
-    effect-size prior, all fitted together into one score."""
+    effect size prior, all fitted together into one score."""
     height = 4.6
     fig, ax = canvas(height)
     # left to right, in inches: the class names, a stretch of chromosome after the widest, the priors, the arrows, and
@@ -1164,7 +1162,7 @@ def poster_model_figure():
     spreads = (0.2, 0.28, 0.5)
     area = 0.75 * spreads[0] * math.sqrt(2 * math.pi)
     effect = np.linspace(-reach, reach, 400)
-    ax.text(centre, height - 0.04, "Effect-size prior", ha="center", va="top", color=INK)
+    ax.text(centre, height - 0.04, "Effect size prior", ha="center", va="top", color=INK)
     for (name, colour, block), base, spread in zip(VARIANTS, bases, spreads):
         middle = base + 0.4
         ax.text(EDGE, middle, name, ha="left", va="center", color=colour, **name_style)
@@ -1188,29 +1186,6 @@ def poster_model_figure():
                                                    box_tall, boxstyle="round,pad=0,rounding_size=0.2",
                                                    facecolor=SV_PGS, edgecolor="none"))
     ax.text((box_left + COLUMN - EDGE) / 2, box_middle, "SV-PGS", ha="center", va="center", color="white", **name_style)
-    return fig
-
-
-def poster_variants_figure():
-    """The variants each method is given, as a table: a row per variant class, a column per method. SV-PGS is given
-    every imputed SNV, indel and SV; LDpred2-auto only a common subset of the SNVs, those of MAF >= 1% thinned evenly
-    in genetic distance to HapMap3's chr22 count (benchmarks/bench_sim/submissions/ldpred2_auto.py)."""
-    height = 3.3
-    fig, ax = canvas(height)
-    cells = {"SNV": ("all", "common subset"), "indel": ("all", "none"), "SV": ("all", "none")}
-    # each method's column centred: SV-PGS's on its cells a gap right of the class names (its name reaching left over
-    # the empty corner), LDpred2-auto's on the widest of its name and cells, ending at the right margin
-    ours = EDGE + widest(fig, [f"{name}s" for name in cells], fontweight="bold") + 0.6 + widest(fig, ["all"]) / 2
-    theirs = COLUMN - EDGE - max(widest(fig, ["LDpred2-auto"], fontweight="bold"),
-                                 widest(fig, [cell for _, cell in cells.values()])) / 2
-    top, pitch = height - 0.66, 0.82
-    ax.text(ours, top, "SV-PGS", ha="center", va="baseline", color=SV_PGS, fontweight="bold")
-    ax.text(theirs, top, "LDpred2-auto", ha="center", va="baseline", color=LDPRED2, fontweight="bold")
-    for row, (name, colour, _) in enumerate(VARIANTS, start=1):
-        y = top - row * pitch
-        ax.text(EDGE, y, f"{name}s", ha="left", va="baseline", color=colour, fontweight="bold")
-        for x, cell in zip((ours, theirs), cells[name]):
-            ax.text(x, y, cell, ha="center", va="baseline", color=INK)
     return fig
 
 
@@ -1243,7 +1218,7 @@ def main() -> None:
                             ("poster_wins", poster_wins_figure(grids)),
                             ("poster_sv_gain", gain),
                             ("poster_imputation_accuracy", poster_imputation_figure(summary)),
-                            ("poster_model", poster_model_figure()), ("poster_variants", poster_variants_figure())):
+                            ("poster_model", poster_model_figure())):
             # transparent, so the page shows through: an opaque white ground renders a shade off the page white in a PDF
             panel.savefig(OUT / f"{name}.png", transparent=True)
             plt.close(panel)
