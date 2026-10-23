@@ -212,8 +212,7 @@ class _Ledger:
 
 def _traits(root: Path, count: int = 1):
     """(covariates with the intercept, targets [n, count], training [n, count], held-out rows): the store's simulated
-    trait and up to two more on its genetic value (``grouped_fit``'s), all trained on the first four fifths of the
-    samples."""
+    trait and up to two more on its genetic value, all trained on the first four fifths of the samples."""
     import numpy as np
 
     trait = np.load(root / "trait.npz")
