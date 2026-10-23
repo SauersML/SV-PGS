@@ -162,7 +162,7 @@ def aou_matched() -> list[str]:
     rows = json.loads(path.read_text()).get("matched", {}).get("rows", []) if path.is_file() else []
     # every matched run's run_config.json: fit_minimum_minor_allele_frequency 0.01, fit_minimum_r2 0.3 and
     # fit_variant_sites HapMap3, which keeps the SNVs at HapMap3 sites and every SV (workspace_pipeline.fit_filtered)
-    return ["We fit SV-PGS with and without SVs for each trait and compared them in held-out people",
+    return ["We fit SV-PGS with and without SVs and tested both in held-out people",
             "Variants with MAF ≥ 1% and imputation r² ≥ 0.3: HapMap3 SNVs and SVs"] if rows else []
 
 

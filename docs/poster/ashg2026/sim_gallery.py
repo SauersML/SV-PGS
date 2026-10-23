@@ -77,6 +77,10 @@ SKY = "#56B4E9"
 GREEN = "#009E73"
 PURPLE = "#CC79A7"
 INK = "#000000"
+# two beyond Okabe-Ito for the poster's three SV shares, which must stay apart from SV-PGS's blue and LDpred2-auto's
+# vermillion as well as each other (validate_palette.js passes the five against white)
+VIOLET = "#5E35B1"
+WINE = "#882255"
 SV_PGS, LDPRED2, IMPUTED = BLUE, VERMILLION, SKY
 """The colours that name a method or a genotype source wherever it appears: SV-PGS (and any SV-PGS gain), LDpred2-auto,
 and imputed SV genotypes beside true ones."""
@@ -266,6 +270,25 @@ def widest(fig, texts, **style) -> float:
         widths.append(artist.get_window_extent(renderer).width / fig.dpi)
         artist.remove()
     return max(widths)
+
+
+def tallest(fig, texts, **style) -> float:
+    """Inches the tallest of ``texts`` takes when set in ``style``, its descenders included, as ``widest`` measures."""
+    renderer = fig.canvas.get_renderer()
+    heights = [0.0]
+    for text in texts:
+        artist = fig.text(0, 0, text, **style)
+        heights.append(artist.get_window_extent(renderer).height / fig.dpi)
+        artist.remove()
+    return max(heights)
+
+
+def overhang(fig) -> tuple[float, float, float, float]:
+    """Inches the drawn figure reaches past its canvas at the left, bottom, right and top, negative where it stays
+    inside: the tight box of everything drawn, axis titles, tick labels, legends and notes among it."""
+    across, up = fig.get_size_inches()
+    box = fig.get_tightbbox(fig.canvas.get_renderer())
+    return -box.x0, -box.y0, box.x1 - across, box.y1 - up
 
 
 def shifted(ax, across: float, up: float = 0.0, data_rows: bool = True):
@@ -801,43 +824,99 @@ POSTER_STYLE = {
 }
 
 
+POSTER_PAD = 0.1
+"""Inches between a poster figure's outermost type and its canvas's edge, and between a name and the marks beside it."""
+POSTER_X_TITLES = ("Training size (thousands)", "LDpred2-auto test AUC")
+"""The x axes' titles of the two figures side by side at the top of the poster's middle column."""
+POSTER_SHARES = (("null", "0", GREEN), ("sv_5pct", "5", VIOLET), ("sv_20pct", "20%", WINE))
+"""The accuracy figure's architectures by the share of causal variants that are SVs, as its key writes each, and the
+colour of their simulations' dots."""
+POSTER_METHODS = (("with_sv_auc", "SV-PGS", SV_PGS, "o", -1), ("ldpred2_auc", "LDpred2-auto", LDPRED2, "s", 1))
+"""Each method's AUC column, name, colour, marker, and the side of its training size its simulations' dots take."""
+DOT_OFFSET, DOT_JITTER, DOT_ALPHA = 0.12, 0.05, 0.25
+"""Doublings of training size a method's simulation dots sit to its side of the size, the most a dot moves at random
+about that, and the dots' opacity."""
+
+
+def under_axes(fig, titles=POSTER_X_TITLES) -> float:
+    """Inches under a poster figure's x axis that its ticks, tick labels and the tallest of ``titles`` take in the
+    poster's style, plus POSTER_PAD; by default the top row's titles, one bottom margin for both figures, so their x
+    axes line up."""
+    style = matplotlib.rcParams
+    return ((style["xtick.major.size"] + style["xtick.major.pad"] + style["axes.labelpad"]) / 72
+            + tallest(fig, ["0.50"], fontsize=style["xtick.labelsize"])
+            + tallest(fig, titles, fontsize=style["axes.labelsize"]) + POSTER_PAD)
+
+
 def poster_accuracy_figure(grids, summary):
-    """Figure 1a for the poster: test AUC against training size for SV-PGS and LDpred2-auto, pooled over 0%, 5% and 20%
-    causal SVs, each mean with its 95% interval as an error bar and each method named beside its line, under the AUC of
-    the true genetic value."""
+    """Figure 1a for the poster: test AUC against training size for SV-PGS (circles) and LDpred2-auto (squares), pooled
+    over the architectures with 0%, 5% and 20% causal SVs. Each mean has its 95% interval as an error bar, over every
+    simulation's own AUC as a faint dot in its architecture's colour, left of its size for SV-PGS and right for
+    LDpred2-auto. Each method is named beside its marks, under the AUC of the true genetic value and the colours' key.
+    The y axis spans every mark with room for the names and the key, measured from their type."""
     grouped = cells(grids["grid"])
     fig = plt.figure(figsize=(POSTER_HALF, POSTER_HEIGHT))
     # the left margin holds the ticks and the axis title
-    top, bottom, left, right = 0.25, 2.05, widest(fig, ["0.00"], fontsize=POSTER_TYPE) + 1.45, 0.3
-    ax = frame(fig, left, bottom, POSTER_HALF - left - right, POSTER_HEIGHT - top - bottom)
+    top, bottom, left, right = 0.25, under_axes(fig), widest(fig, ["0.00"], fontsize=POSTER_TYPE) + 1.45, 0.3
+    width, height = POSTER_HALF - left - right, POSTER_HEIGHT - top - bottom
+    ax = frame(fig, left, bottom, width, height)
     log_size_axis(ax)
     # the title runs longer than the axis, so it ends at the axis's far end
-    ax.set_xlabel("Training size (thousands)", loc="right")
-    ceiling = summary["points"]["null"]["true_value_auc"]
-    ax.axhline(ceiling, color=INK, linestyle=(0, (1, 1.2)), linewidth=4.0, zorder=1)
-    # named over its line, so the room under it is SV-PGS's
-    ax.text(SIZES[0] / 1.25, ceiling + 0.004, "Best possible", color=INK, va="bottom", ha="left")
-    upper = {}
-    for key, method, color in (("with_sv_auc", "SV-PGS", SV_PGS), ("ldpred2_auc", "LDpred2-auto", LDPRED2)):
-        pooled = [interval([row[key] for point, *_ in SV_SHARES for row in grouped.get((point, size), [])])
+    ax.set_xlabel(POSTER_X_TITLES[0], loc="right")
+    first, last = ax.get_xlim()
+    doubling = width / math.log2(last / first)
+    random = np.random.default_rng(0)
+    marks = []
+    for key, _, color, marker, side in POSTER_METHODS:
+        for point, _, share in POSTER_SHARES:
+            for size in SIZES:
+                values = finite(grouped.get((point, size), []), key)
+                across = size * 2.0 ** (side * DOT_OFFSET + random.uniform(-DOT_JITTER, DOT_JITTER, len(values)))
+                ax.plot(across, values, marker, color=share, alpha=DOT_ALPHA, markersize=POSTER_MARK * 0.5,
+                        markeredgewidth=0, linestyle="none", zorder=2)
+                marks.extend(zip(across, values))
+        pooled = [interval(finite([row for point, *_ in POSTER_SHARES for row in grouped.get((point, size), [])], key))
                   for size in SIZES]
         mean, low, high = (np.array([cell[i] for cell in pooled]) for i in range(3))
-        upper[method] = high
         # marks smaller than the poster's usual, so each interval shows past its mark
         ax.errorbar(SIZES, mean, yerr=(mean - low, high - mean), color=color, elinewidth=POSTER_BAR, capsize=0,
-                    marker="o", markersize=POSTER_MARK * 0.7, markeredgewidth=0, zorder=3)
-    # each method's name on the empty side of its own line: SV-PGS over its left half, clear of its bar at 20,000;
-    # LDpred2-auto under its right half
-    ax.text(SIZES[0] / 1.2, upper["SV-PGS"][2] + 0.006, "SV-PGS", color=SV_PGS, fontsize=POSTER_NAME,
+                    marker=marker, markersize=POSTER_MARK * 0.7, markeredgewidth=0, zorder=3)
+        marks.extend([*zip(SIZES, low), *zip(SIZES, high)])
+    marks = np.asarray(marks)
+    ceiling = summary["points"]["null"]["true_value_auc"]
+    names = {method: (widest(fig, [method], fontsize=POSTER_NAME, fontweight="bold"),
+                      tallest(fig, [method], fontsize=POSTER_NAME, fontweight="bold"))
+             for _, method, *_ in POSTER_METHODS}
+    line = tallest(fig, ["Best possible"], fontsize=POSTER_TYPE)
+    # SV-PGS's name over the marks it spans from the left, LDpred2-auto's under the marks it spans to the right end
+    start = SIZES[0] / 1.2
+    spans = {"SV-PGS": (start, start * 2.0 ** (names["SV-PGS"][0] / doubling)),
+             "LDpred2-auto": (last / 2.0 ** (names["LDpred2-auto"][0] / doubling), last)}
+    beside = {method: marks[(marks[:, 0] >= low) & (marks[:, 0] <= high), 1] for method, (low, high) in spans.items()}
+    # inches over the best possible AUC: its label, then the key, then the pad; under LDpred2-auto's marks: its name
+    above = POSTER_PAD + 2 * line + POSTER_PAD
+    under = POSTER_PAD + names["LDpred2-auto"][1] + POSTER_PAD
+    span = max((ceiling - beside["LDpred2-auto"].min()) / (1 - (above + under) / height),
+               (ceiling - marks[:, 1].min()) / (1 - (above + POSTER_PAD) / height))
+    per_inch = span / height
+    upper = ceiling + above * per_inch
+    ax.set_ylim(upper - span, upper)
+    ax.axhline(ceiling, color=INK, linestyle=(0, (1, 1.2)), linewidth=4.0, zorder=1)
+    ax.text(SIZES[0] / 1.25, ceiling + POSTER_PAD * per_inch, "Best possible", color=INK, va="bottom", ha="left")
+    # the key: each share of causal variants that are SVs in its dots' colour
+    piece = ax.text(SIZES[0] / 1.25, ceiling + (POSTER_PAD + line) * per_inch, POSTER_SHARES[0][1],
+                    color=POSTER_SHARES[0][2], va="bottom", ha="left")
+    for words, color in (*((part, tint) for _, label, share in POSTER_SHARES[1:] for part, tint in ((", ", INK), (label, share))),
+                         (" causal SVs", INK)):
+        piece = ax.annotate(words, xy=(1, 0), xycoords=piece, va="bottom", ha="left", color=color)
+    ax.text(start, beside["SV-PGS"].max() + POSTER_PAD * per_inch, "SV-PGS", color=SV_PGS, fontsize=POSTER_NAME,
             fontweight="bold", ha="left", va="bottom")
-    ax.text(1, 0.496, "LDpred2-auto", transform=shifted(ax, 0.0), color=LDPRED2, fontsize=POSTER_NAME,
-            fontweight="bold", ha="right", va="bottom")
-    # which simulations the means average, between SV-PGS's name and the best possible AUC
-    ax.text(SIZES[0] / 1.2, upper["SV-PGS"][-1] + 0.008, f"{SV_SHARES[0][1][:-1]}–{SV_SHARES[-1][1]} causal SVs",
-            color=INK, ha="left", va="bottom")
-    ax.set_ylim(0.49, ceiling + 0.03)
-    ax.set_yticks(np.arange(0.5, 0.651, 0.05), ["0.50", "0.55", "0.60", "0.65"])
-    ax.set_ylabel("Mean test AUC (95% CI)")
+    ax.text(1, beside["LDpred2-auto"].min() - POSTER_PAD * per_inch, "LDpred2-auto", transform=shifted(ax, 0.0),
+            color=LDPRED2, fontsize=POSTER_NAME, fontweight="bold", ha="right", va="top")
+    levels = np.arange(math.ceil((upper - span) / 0.05) * 0.05, ceiling, 0.05)
+    ax.set_yticks(levels, [f"{level:.2f}" for level in levels])
+    # the title runs longer than the axis, so it ends at the axis's top and runs on into the margin under it
+    ax.set_ylabel("Test AUC, mean (95% CI)", loc="top")
     return fig
 
 
@@ -864,7 +943,7 @@ def poster_wins_figure(grids):
                               "gain": interval(gain), "null_gain": interval(gain[null]), "window_gain": interval(window)}
     fig = plt.figure(figsize=(POSTER_HALF, POSTER_HEIGHT))
     ticks = widest(fig, ["0.00"], fontsize=POSTER_TYPE)
-    top, bottom, left = 0.25, 2.05, ticks + 1.6
+    top, bottom, left = 0.25, under_axes(fig), ticks + 1.6
     width, height = POSTER_HALF - left - 0.3, POSTER_HEIGHT - top - bottom
     ax = frame(fig, left, bottom, width, height)
     # one scale on both axes, so the line of equal AUC runs at 45 degrees: 0.465 to 0.68 along the shorter axis, and
@@ -885,7 +964,7 @@ def poster_wins_figure(grids):
         levels = np.arange(0.5, end, 0.05)
         axis.set_ticks(levels, [plain(level) for level in levels])
     # the x axis's title runs longer than its axis, so it ends at the axis's far end
-    ax.set_xlabel("LDpred2-auto test AUC", loc="right")
+    ax.set_xlabel(POSTER_X_TITLES[1], loc="right")
     ax.set_ylabel("SV-PGS test AUC")
     # over the dots at the top left, on one line each and reaching into the top margin, so the second line clears the
     # highest bar: which side is SV-PGS's, then the training size
@@ -1229,6 +1308,10 @@ def main() -> None:
                             ("poster_sv_gain", gain),
                             ("poster_imputation_accuracy", poster_imputation_figure(summary)),
                             ("poster_model", poster_model_figure())):
+            reach = dict(zip(("left", "bottom", "right", "top"), overhang(panel)))
+            if max(reach.values()) > 0:
+                raise SystemExit(f"{name}: its type runs past the canvas: "
+                                 + ", ".join(f"{side} {inches:.2f} in" for side, inches in reach.items() if inches > 0))
             # transparent, so the page shows through: an opaque white ground renders a shade off the page white in a PDF
             panel.savefig(OUT / f"{name}.png", transparent=True)
             plt.close(panel)
