@@ -1,7 +1,38 @@
 import numpy as np
 import pytest
 
-from benchmarks.bench_real.sv_gain_replication import ALPHA, SCREENING_LEVEL, promising, replicate, report
+from benchmarks.bench_real.sv_gain_replication import (
+    ALPHA,
+    SCREENING_LEVEL,
+    batch_drift,
+    drift_lines,
+    promising,
+    replicate,
+    report,
+)
+
+
+def test_drift_is_summarized_per_kind_and_asymmetric_sv_drift_is_called_a_lower_bound():
+    rng = np.random.default_rng(3)
+    records = 400
+    structural = np.zeros(records, dtype=bool)
+    structural[:100] = True
+    frequency = rng.uniform(0.05, 0.5, size=records)
+    quality = rng.uniform(0.8, 1.0, size=records)
+    # The SV records drift ten times as much and lose quality; the short ones barely move.
+    other_frequency = frequency + np.where(structural, rng.normal(0, 0.02, records), rng.normal(0, 0.002, records))
+    other_quality = quality - np.where(structural, 0.05, 0.001)
+    drift = batch_drift(frequency, other_frequency, quality, other_quality, structural)
+    assert drift["structural"]["records"] == 100 and drift["short"]["records"] == 300
+    assert (drift["structural"]["median_absolute_frequency_difference"]
+            > 3.0 * drift["short"]["median_absolute_frequency_difference"])
+    assert drift["structural"]["median_quality_change"] < drift["short"]["median_quality_change"] < 0.0
+    text = "\n".join(drift_lines(drift))
+    assert "lower bound on the gain" in text
+
+    same = batch_drift(frequency, frequency, quality, quality, structural)
+    assert "no asymmetric drift" in "\n".join(drift_lines(same))
+    assert batch_drift(frequency, other_frequency, quality, other_quality, np.zeros(records, dtype=bool))["structural"] == {"records": 0}
 
 
 def test_promising_screens_on_one_sided_p_and_a_valid_matched_pair():

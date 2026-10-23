@@ -26,6 +26,16 @@ so the replicates give the null of z. Reported: the null mean and SD of z (the S
 the share of replicates below ALPHA one-sided, and the permutation p of the observed z. The permutation p is primary
 instead of the bootstrap p where the null SD of z is outside [0.8, 1.25].
 
+Batch effects, fixed as a limitation before any replication value was computed. The discovery people's genotypes came
+from one imputation run and the replication people's from a later, separately run one. Drift between the two runs is
+not symmetric across the arms: an SV's imputed dosage is the less reproducible of the two kinds, so drift degrades the
+with_sv arm's SV columns while leaving both arms' short-variant columns almost untouched. The models were fitted on the
+earlier run, so such drift biases the replication gain DOWNWARD, and a null replication is therefore not evidence
+against the discovery result on its own. ``batch_drift`` is run first and reported beside the gain: per record, the
+ALT frequency and imputation quality of the two runs, summarized separately over the model's SV records and its
+short-variant records. Drift in the SV records that is clearly larger than in the short-variant records makes the
+replication a lower bound on the gain rather than a test of it, which the report says plainly.
+
 Which traits are tested here. Only a trait whose discovery result is promising (``promising``), fixed now: a one-sided
 discovery p below SCREENING_LEVEL in a valid matched pair (two separately fitted arms, identical code, one held-out
 fold). Testing every trait would spend the new people's power on traits with no signal and need a multiplicity
@@ -73,6 +83,53 @@ def shown(count: int) -> str:
 def promising(p_one_sided: float, matched_arms: bool, identical_code: bool) -> bool:
     """Whether a trait's discovery result qualifies it for the new people (the docstring's fixed rule)."""
     return bool(matched_arms and identical_code and p_one_sided < SCREENING_LEVEL)
+
+
+def batch_drift(frequency: np.ndarray, other_frequency: np.ndarray, quality: np.ndarray, other_quality: np.ndarray,
+                structural: np.ndarray) -> dict[str, dict[str, float]]:
+    """Per-record drift between two imputation runs at the same sites, summarized over the SV records (``structural``)
+    and the short-variant records on their own.
+
+    The inputs are site-level fields only: each record's ALT frequency and the imputation's own quality
+    (INFO/AF and INFO/INFO) in the run the models were fitted on and in the run the replication people come from.
+    Each group gets the median absolute frequency difference, the frequency correlation, the median quality in each run
+    and the median quality change. The SV group drifting much more than the short-variant group is what biases the
+    replication against SVs (the docstring)."""
+    def summary(member: np.ndarray) -> dict[str, float]:
+        if int(member.sum()) < 2:
+            return {"records": int(member.sum())}
+        first, second = frequency[member], other_frequency[member]
+        return {
+            "records": int(member.sum()),
+            "median_absolute_frequency_difference": float(np.median(np.abs(second - first))),
+            "frequency_correlation": float(np.corrcoef(first, second)[0, 1]),
+            "median_quality_fitted": float(np.median(quality[member])),
+            "median_quality_replication": float(np.median(other_quality[member])),
+            "median_quality_change": float(np.median(other_quality[member] - quality[member])),
+        }
+    structural = np.asarray(structural, dtype=bool)
+    return {"structural": summary(structural), "short": summary(~structural)}
+
+
+def drift_lines(drift: dict[str, dict[str, float]]) -> list[str]:
+    """``batch_drift`` as the report prints it, with the verdict the pre-specification fixed."""
+    lines = []
+    for name, found in (("SV records", drift["structural"]), ("short-variant records", drift["short"])):
+        if "frequency_correlation" not in found:
+            lines.append(f"  {name}: {shown(found['records'])} records, too few to summarize")
+            continue
+        lines.append(f"  {name}: {found['records']} records, median |dAF| {found['median_absolute_frequency_difference']:.4f}, "
+                     f"AF correlation {found['frequency_correlation']:.4f}, median quality "
+                     f"{found['median_quality_fitted']:.3f} -> {found['median_quality_replication']:.3f} "
+                     f"({found['median_quality_change']:+.3f})")
+    both = all("frequency_correlation" in drift[key] for key in ("structural", "short"))
+    if both:
+        ratio = (drift["structural"]["median_absolute_frequency_difference"]
+                 / max(drift["short"]["median_absolute_frequency_difference"], 1e-12))
+        lines.append(f"  SV drift is {ratio:.1f}x the short-variant drift: "
+                     + ("the replication is a lower bound on the gain, not a test of it" if ratio >= 2.0
+                        else "no asymmetric drift, so the replication tests the gain"))
+    return lines
 
 
 def gains(weights: np.ndarray, target: np.ndarray, covariates: np.ndarray, baseline: np.ndarray, candidate: np.ndarray,
