@@ -674,3 +674,39 @@ def test_the_fit_step_gives_every_model_both_arms_saved_models_as_mode_seeds(arm
     assert (first.source, second.source) == tuple(str(mirror / "a" / "models" / arm / "trait") for arm in ("snv_indel", "with_sv"))
     assert workspace_pipeline._mode_seeds(SimpleNamespace(config=SimpleNamespace(mode_seed_models=()), budget=_budget()), cohort, arms.store, request, "with_sv") is None
 
+
+def test_a_seed_must_hold_the_models_name_and_be_trained_on_its_training_people_alone(arms: SimpleNamespace) -> None:
+    """``_seed_compatible``: a saved model whose fit trained on other people (here a newer one, which ranks first) and
+    one without this model's name (a released or another fold's model) seed neither the warm start nor the mode search.
+    Without a compatible model the fit starts cold: no model falls back to the trait's released one, which could hold
+    the outcomes of the people this model is tested on."""
+    mirror = arms.root / "provenance_mirror"
+    saved = arms.root / "models" / "with_sv" / "trait"
+    places = {
+        "own": (mirror / "a" / "models" / "with_sv" / "trait", 1_000),
+        "other_name": (mirror / "b" / "models" / "with_sv" / "trait", 2_000),
+        "other_people": (mirror / "c" / "models" / "with_sv" / "trait", 3_000),
+    }
+    for target, modified in places.values():
+        shutil.copytree(saved, target)
+    for key, change in (("other_name", lambda metadata: metadata.update(model_names=["trait/all_rows"])),
+                        ("other_people", lambda metadata: metadata["provenance"].update(cohort_digest="every person"))):
+        metadata = json.loads((places[key][0] / "model.json").read_text())
+        change(metadata)
+        (places[key][0] / "model.json").write_text(json.dumps(metadata))
+    for target, modified in places.values():
+        os.utime(target / "model.json", (modified, modified))
+    cohort = SimpleNamespace(trait_names=("trait",), trait_models=lambda trait: np.array([0]))
+    request = fit_model.FitRequest(**_request_arguments(arms.store, arms.covariate, arms.targets, arms.offsets["with_sv"], arms.root / "work" / "unused"))
+    assert load_model(saved).provenance.cohort_digest == workspace_pipeline._request_people(request, 0)
+    pattern = str(mirror / "*" / "models" / "{arm}" / "{trait}")
+    warm = SimpleNamespace(config=SimpleNamespace(warm_start_models=(pattern,)), budget=_budget())
+    mode = SimpleNamespace(config=SimpleNamespace(mode_seed_models=(pattern,)), budget=_budget())
+    (seed,) = workspace_pipeline._warm_seeds(warm, cohort, arms.store, request, "with_sv")
+    assert seed is not None and seed.source == str(places["own"][0])
+    ((only,),) = workspace_pipeline._mode_seeds(mode, cohort, arms.store, request, "with_sv")
+    assert only.source == str(places["own"][0])
+    shutil.rmtree(places["own"][0])
+    assert workspace_pipeline._warm_seeds(warm, cohort, arms.store, request, "with_sv") == (None,)
+    assert workspace_pipeline._mode_seeds(mode, cohort, arms.store, request, "with_sv") == ((),)
+

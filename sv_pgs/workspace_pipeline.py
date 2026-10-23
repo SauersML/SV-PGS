@@ -3652,18 +3652,34 @@ def _request_problem(request: FitRequest) -> str:
     )
 
 
+def _request_people(request: FitRequest, model: int) -> str:
+    """The digest of model ``model``'s training research IDs in ``request`` (``artifact.cohort_digest``)."""
+    return cohort_digest([research_id for research_id, kept in zip(request.research_ids, request.training[:, model]) if kept])
+
+
+def _seed_compatible(metadata: Mapping[str, Any], name: str, people: str) -> bool:
+    """Whether the saved model ``metadata`` describes may seed the model ``name``, whose training research IDs have the
+    digest ``people``: it holds a model of that name, and its fit trained on exactly those people (its provenance's
+    ``cohort_digest``, of every person any of its models trained on). So a seed never carries the outcome of a person
+    this model holds out or calibrates on. A released or all-rows model, a model of another fold, and a fit over more
+    people (other traits', another cohort's) are passed over, as is a saved model with no cohort digest. Taking the
+    trait's released model where the name was missing could start a fold's fit from its own test outcomes."""
+    return name in metadata.get("model_names", ()) and metadata.get("provenance", {}).get("cohort_digest") == people
+
+
 def _mode_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequest, arm: str) -> tuple[tuple[Seed, ...], ...] | None:
     """Each of ``request``'s models' mode seeds (``warm_seeds.start_components``) from the saved models
     ``WorkspaceConfig.mode_seed_models`` names, or None where none is configured: per trait, every matching saved model
-    that indexes this store's sites and holds a mean-field model, in path order, each read whole (an unreadable one is
-    skipped and logged), and of each its model of this model's name, else the trait's released one. The patterns name
-    both arms' models, so the two arms' fits get the same starts."""
+    that indexes this store's sites and holds a mean-field model, in path order, and of each its model of this model's
+    name where its fit trained on this model's training people alone (``_seed_compatible``), read whole (an unreadable
+    one is skipped and logged). The patterns name both arms' models, and the arms share their training people, so the
+    two arms' fits get the same starts."""
     if not run.config.mode_seed_models:
         return None
     sites = sites_digest(store.root)
     modes: list[list[Seed]] = [[] for _name in request.model_names]
     for trait, trait_name in enumerate(cohort.trait_names):
-        folders: list[str] = []
+        folders: dict[str, Mapping[str, Any]] = {}
         for pattern in run.config.mode_seed_models:
             for folder in sorted(glob.glob(pattern.replace("{arm}", glob.escape(arm)).replace("{trait}", glob.escape(trait_name)))):
                 try:
@@ -3674,16 +3690,22 @@ def _mode_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequ
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     LOGGER.info("workspace pipeline: %s is no mode seed (%s)", folder, error)
                     continue
-                if folder not in folders:
-                    folders.append(folder)
-        for folder in folders:
-            found = read_seeds(folder, run.budget.working_bytes, run.budget.host_bytes // 2, run.budget.cpu_threads)
-            if not found:
-                continue
-            released = list(found.values())[-1]
-            for model in cohort.trait_models(trait).tolist():
-                modes[model].append(found.get(request.model_names[model], released))
-        LOGGER.info("workspace pipeline: the %s fit of %s starts its mode search from %d saved models: %s", arm, trait_name, len(folders), ", ".join(folders))
+                folders.setdefault(folder, metadata)
+        read: dict[str, dict[str, Seed]] = {}
+        used: list[str] = []
+        for model in cohort.trait_models(trait).tolist():
+            name, people = request.model_names[model], _request_people(request, model)
+            for folder, metadata in folders.items():
+                if not _seed_compatible(metadata, name, people):
+                    LOGGER.info("workspace pipeline: %s is no mode seed of %s (no model of that name, or a fit over other people)", folder, name)
+                    continue
+                if folder not in read:
+                    read[folder] = read_seeds(folder, run.budget.working_bytes, run.budget.host_bytes // 2, run.budget.cpu_threads)
+                if name in read[folder]:
+                    modes[model].append(read[folder][name])
+                    if folder not in used:
+                        used.append(folder)
+        LOGGER.info("workspace pipeline: the %s fit of %s starts its mode search from %d saved models: %s", arm, trait_name, len(used), ", ".join(used))
     return tuple(tuple(entry) for entry in modes)
 
 
@@ -3691,14 +3713,15 @@ def _warm_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequ
     """Each of ``request``'s models' seed (``warm_seeds``) from the saved models ``WorkspaceConfig.warm_start_models``
     names for this ``arm``, or None where none is configured: per trait, every saved model the patterns match that
     indexes this store's sites (``artifact.sites_digest``, which ``warm_start`` maps rows by) and holds a mean-field
-    model, ranked by ``_seed_rank`` from its ``model.json`` alone, and the best read whole. A model takes its own name's
-    seed (the same trait and fold), else the trait's released one (its last model). A pattern that names an arm in
-    place of ``{arm}`` seeds this arm from that one (with_sv from snv_indel: the shared records' effects, the structural
-    records' at zero); the two arms of a comparison started alike (both cold, or each from its own arm) keep their
-    difference the data's, not the starts' (the study's rule: each arm from its own arm's earlier model). The patterns
-    key the fit step and each seed's digest its engine checkpoints (``warm_seeds``), so patterns that name an earlier
-    round's runs, whose models no longer change, start a preempted fit's restart where it first started. An unreadable
-    candidate is skipped (``warm_seeds.read_seeds``) for the next."""
+    model, ranked by ``_seed_rank`` from its ``model.json`` alone. A model takes the best one that holds a model of its
+    own name (the same trait and fold) and whose fit trained on this model's training people alone
+    (``_seed_compatible``), read whole; a model with no such seed starts cold. A pattern that names an arm in place of
+    ``{arm}`` seeds this arm from that one (with_sv from snv_indel: the shared records' effects, the structural records'
+    at zero); the two arms of a comparison started alike (both cold, or each from its own arm) keep their difference the
+    data's, not the starts' (the study's rule: each arm from its own arm's earlier model). The patterns key the fit step
+    and each seed's digest its engine checkpoints (``warm_seeds``), so patterns that name an earlier round's runs, whose
+    models no longer change, start a preempted fit's restart where it first started. An unreadable candidate is skipped
+    (``warm_seeds.read_seeds``) for the next."""
     if not run.config.warm_start_models:
         return None
     sites = sites_digest(store.root)
@@ -3706,7 +3729,7 @@ def _warm_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequ
     offsets = fit_model.offset_digest(request.log_variance_offset)
     seeds: list[Seed | None] = [None] * len(request.model_names)
     for trait, trait_name in enumerate(cohort.trait_names):
-        candidates: list[tuple[tuple, str]] = []
+        candidates: list[tuple[tuple, str, Mapping[str, Any]]] = []
         for pattern in run.config.warm_start_models:
             for folder in sorted(glob.glob(pattern.replace("{arm}", glob.escape(arm)).replace("{trait}", glob.escape(trait_name)))):
                 path = Path(folder) / "model.json"
@@ -3714,21 +3737,27 @@ def _warm_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequ
                     metadata = json.loads(path.read_text(encoding="utf-8"))
                     if metadata["provenance"]["sites_digest"] != sites or "product_mixture" not in metadata["draw_laws"]:
                         continue
-                    candidates.append((_seed_rank(metadata, problem, offsets, path.stat().st_mtime), folder))
+                    candidates.append((_seed_rank(metadata, problem, offsets, path.stat().st_mtime), folder, metadata))
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     LOGGER.info("workspace pipeline: %s is no seed (%s)", folder, error)
-        found: dict[str, Seed] = {}
-        for _rank, folder in sorted(candidates, key=lambda candidate: candidate[0], reverse=True):
-            found = read_seeds(folder, run.budget.working_bytes, run.budget.host_bytes // 2, run.budget.cpu_threads)
-            if found:
-                break
-        if not found:
-            LOGGER.info("workspace pipeline: no warm seed for the %s fit of %s among %d candidates", arm, trait_name, len(candidates))
-            continue
-        released = list(found.values())[-1]
+        ranked = sorted(candidates, key=lambda candidate: candidate[0], reverse=True)
+        read: dict[str, dict[str, Seed]] = {}
         for model in cohort.trait_models(trait).tolist():
-            seeds[model] = found.get(request.model_names[model], released)
-        LOGGER.info("workspace pipeline: the %s fit of %s starts from %s (%d candidates)", arm, trait_name, released.source, len(candidates))
+            name, people = request.model_names[model], _request_people(request, model)
+            compatible = [folder for _rank, folder, metadata in ranked if _seed_compatible(metadata, name, people)]
+            for folder in compatible:
+                if folder not in read:
+                    read[folder] = read_seeds(folder, run.budget.working_bytes, run.budget.host_bytes // 2, run.budget.cpu_threads)
+                if name in read[folder]:
+                    seeds[model] = read[folder][name]
+                    break
+            seed = seeds[model]
+            if seed is None:
+                LOGGER.info("workspace pipeline: no warm seed for the %s fit of %s among %d candidates (%d trained on its training people alone)",
+                            arm, name, len(candidates), len(compatible))
+            else:
+                LOGGER.info("workspace pipeline: the %s fit of %s starts from %s (%d candidates, %d trained on its training people alone)",
+                            arm, name, seed.source, len(candidates), len(compatible))
     return tuple(seeds)
 
 
