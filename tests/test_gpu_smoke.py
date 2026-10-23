@@ -109,3 +109,41 @@ def test_batch_spec_takes_the_sweep_benchmark_alone_and_refuses_an_unknown_step(
     refused = subprocess.run(["bash", "benchmarks/gpu_smoke.sh", "spec"], cwd=root, env=dict(environment, STEPS="smoke benchmark"),
                              capture_output=True, text=True)
     assert refused.returncode == 2 and "not benchmark" in refused.stderr
+
+
+def test_batch_spec_runs_the_restore_benchmark_on_the_fit_jobs_disks():
+    """STEPS=restore makes, restores and removes a synthetic mirror under the run's ops prefix, on the disk type and
+    provisioning given (the fit jobs' four local SSDs on Spot); the defaults stay pd-balanced and STANDARD."""
+    root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ, PROJECT_ID="smoke-project", REGION="us-central1", OPS_BUCKET="smoke-ops", RUN_ID="smoke",
+                       SERVICE_ACCOUNT="smoke@example.invalid", NETWORK="default", SUBNETWORK="default", STEPS="restore seeds",
+                       RUN_DISK_TYPE="local-ssd", RUN_DISK_GB="1500", PROVISIONING_MODEL="SPOT")
+    environment.pop("MACHINE_TYPE", None)
+    spec = json.loads(subprocess.run(["bash", "benchmarks/gpu_smoke.sh", "spec"], cwd=root, env=environment,
+                                    capture_output=True, text=True, check=True).stdout)
+    variables = spec["taskGroups"][0]["taskSpec"]["environment"]["variables"]
+    assert variables["STEPS"] == "restore seeds" and variables["BENCH_MIRROR"] == "gs://smoke-ops/svpgs/smoke/bench_mirror"
+    policy = spec["allocationPolicy"]["instances"][0]["policy"]
+    assert policy["disks"][0]["newDisk"] == {"type": "local-ssd", "sizeGb": 1500} and policy["provisioningModel"] == "SPOT"
+    for name in ("RUN_DISK_TYPE", "RUN_DISK_GB", "PROVISIONING_MODEL"):
+        environment.pop(name)
+    policy = json.loads(subprocess.run(["bash", "benchmarks/gpu_smoke.sh", "spec"], cwd=root, env=environment,
+                                      capture_output=True, text=True, check=True).stdout)["allocationPolicy"]["instances"][0]["policy"]
+    assert policy["disks"][0]["newDisk"] == {"type": "pd-balanced", "sizeGb": 100} and policy["provisioningModel"] == "STANDARD"
+
+
+def test_the_restore_benchmark_s_synthetic_stream_repeats_its_block_and_seeks_like_a_file():
+    from benchmarks.restore_bench import _Synthetic
+
+    stream = _Synthetic(b"abcde", 12)
+    assert stream.read(3) == b"abc" and stream.read(4) == b"deab" and stream.read() == b"cdeab" and stream.read() == b""
+    assert stream.seek(-4, os.SEEK_END) == 8 and stream.read(2) == b"de" and stream.tell() == 10
+    assert stream.seek(0) == 0 and stream.read(100) == b"abcdeabcdeab"
+
+
+def test_the_seeds_benchmark_passes_on_the_host(capsys):
+    from benchmarks import restore_bench
+
+    assert restore_bench.seeds(members=3000, nodes=16, components=3) == 0
+    out = capsys.readouterr().out
+    assert "PASS 3 components read at once are the bits read one at a time" in out and "RESULT seeds 3000 members" in out

@@ -3669,7 +3669,7 @@ def _mode_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequ
                 if folder not in folders:
                     folders.append(folder)
         for folder in folders:
-            found = read_seeds(folder, run.budget.working_bytes)
+            found = read_seeds(folder, run.budget.working_bytes, run.budget.host_bytes // 2, run.budget.cpu_threads)
             if not found:
                 continue
             released = list(found.values())[-1]
@@ -3711,7 +3711,7 @@ def _warm_seeds(run: _Run, cohort: _Cohort, store: DosageStore, request: FitRequ
                     LOGGER.info("workspace pipeline: %s is no seed (%s)", folder, error)
         found: dict[str, Seed] = {}
         for _rank, folder in sorted(candidates, key=lambda candidate: candidate[0], reverse=True):
-            found = read_seeds(folder, run.budget.working_bytes)
+            found = read_seeds(folder, run.budget.working_bytes, run.budget.host_bytes // 2, run.budget.cpu_threads)
             if found:
                 break
         if not found:

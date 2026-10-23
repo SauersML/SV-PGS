@@ -195,6 +195,39 @@ def test_the_seed_s_means_are_the_main_fixed_point_s_of_the_saved_mixture() -> N
     assert warm_seeds.component_noise(halved, 0, 0.7) == 0.7
 
 
+def test_components_read_on_threads_are_the_bits_read_one_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``component_means`` reads several components at once, each the same call as alone, so the same bits. Its threads
+    are as many as the host bytes hold of one call's node-wide intermediates, at most the CPUs, and one where the host
+    bytes hold one call or none."""
+    generator = np.random.default_rng(13)
+    members, nodes, count = 5000, 40, 6
+    log_density = generator.standard_normal((3, nodes))
+    law = ProductMixtureDraws(
+        class_index=generator.integers(0, 3, members), log_scale=generator.normal(-9.0, 1.0, members),
+        log_density=log_density - np.log(np.exp(log_density).sum(axis=1, keepdims=True)), log_variance_grid=np.linspace(-6.0, 4.0, nodes),
+        shift=generator.standard_normal((count, members)) * 3.0, omega=generator.uniform(10.0, 4000.0, (count, members)),
+        weights=np.full(count, 1.0 / count), key=(1, 2), draw_count=4,
+    )
+    working = 700 * (law.tile_row_bytes() + 8 * law.shape[1])
+    alone = np.stack([warm_seeds.main_means(law, working, component) for component in range(count)])
+    workers = []
+
+    class Pool(warm_seeds.ThreadPoolExecutor):
+        def __init__(self, max_workers: int) -> None:
+            workers.append(max_workers)
+            super().__init__(max_workers)
+
+    monkeypatch.setattr(warm_seeds, "ThreadPoolExecutor", Pool)
+    per_call = 700 * nodes * warm_seeds._ROW_INTERMEDIATES * 8
+    assert warm_seeds.component_means(law, working, count, host_bytes=4 * per_call + 1, cpu_threads=8).tobytes() == alone.tobytes()
+    assert workers == [4]
+    assert warm_seeds.component_means(law, working, count, host_bytes=10**12, cpu_threads=3).tobytes() == alone.tobytes()
+    assert workers == [4, 3]
+    for host_bytes in (per_call, 0):
+        assert warm_seeds.component_means(law, working, count, host_bytes=host_bytes, cpu_threads=8).tobytes() == alone.tobytes()
+    assert workers == [4, 3]
+
+
 def test_a_seed_of_another_store_is_no_start() -> None:
     prior = _prior(_CLASSES, _NODES)
     seed = _seed(prior, _hyperparameters(prior), _ROWS + 20, np.ones(12), np.ones(12))

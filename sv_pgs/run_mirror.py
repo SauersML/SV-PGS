@@ -65,6 +65,7 @@ of it again.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -75,10 +76,12 @@ import shutil
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from itertools import repeat
 from pathlib import Path
 from typing import Protocol
+
+import google_crc32c
 
 from sv_pgs.content_identity import GCS_MOUNTS, record_restored
 from sv_pgs.postfit_checkpoint import RECORD
@@ -157,7 +160,21 @@ class Remote(Protocol):
 
     def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None] | None: ...
 
+    def version(self, name: str) -> Version: ...
+
+    def download_range(self, name: str, path: Path, start: int, stop: int, generation: int | None) -> None: ...
+
     def delete(self, names: Iterable[str]) -> None: ...
+
+
+@dataclass(frozen=True)
+class Version:
+    """An object as a ranged read takes it: its size, the generation every range is read from (None where the mirror
+    keeps none) and its CRC32C, big-endian, which the bytes written are checked against (``_download_pieces``)."""
+
+    size: int
+    generation: int | None
+    crc32c: bytes
 
 
 @dataclass(frozen=True)
@@ -285,6 +302,25 @@ class GcsRemote:
         with ProcessPoolExecutor(max_workers=len(os.sched_getaffinity(0)), mp_context=multiprocessing.get_context("spawn")) as pool:
             return list(pool.map(_download_in_process, repeat(self._url), [name for _, name in pairs], [path for path, _ in pairs]))
 
+    def version(self, name: str) -> Version:
+        blob = self._bucket.get_blob(self._root + name)
+        if blob is None:
+            raise FileNotFoundError(f"{self._url}/{name} left the mirror after it was listed; restore again.")
+        return Version(int(blob.size), int(blob.generation), base64.b64decode(blob.crc32c))
+
+    def download_range(self, name: str, path: Path, start: int, stop: int, generation: int | None) -> None:
+        """Bytes ``start`` to ``stop`` of the object's ``generation`` written at the same offsets of the file at
+        ``path``, which holds the object's size already. A broken read resumes from its last byte, as ``download``'s
+        does; no checksum covers a range, so the caller checks the whole file's CRC32C (``_download_pieces``)."""
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        with open(path, "r+b") as handle:
+            written = _RangeWriter(handle, start, stop)
+            self._bucket.blob(self._root + name, generation=generation).download_to_file(
+                written, start=start, end=stop - 1, checksum=None, retry=DEFAULT_RETRY.with_timeout(None),
+            )
+            written.close()
+
     def delete(self, names: Iterable[str]) -> None:
         blobs = [self._bucket.blob(self._root + name) for name in names]
         if blobs:
@@ -337,6 +373,20 @@ class DirectoryRemote:
     def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None]:
         return _transfer(pairs, lambda path, name: self.download(name, path))
 
+    def version(self, name: str) -> Version:
+        checksum = google_crc32c.Checksum()
+        with open(self._root / name, "rb") as source:
+            for chunk in iter(lambda: source.read(shutil.COPY_BUFSIZE), b""):
+                checksum.update(chunk)
+        return Version((self._root / name).stat().st_size, None, checksum.digest())
+
+    def download_range(self, name: str, path: Path, start: int, stop: int, generation: int | None) -> None:
+        with open(self._root / name, "rb") as source, open(path, "r+b") as handle:
+            source.seek(start)
+            written = _RangeWriter(handle, start, stop)
+            written.write(source.read(stop - start))
+            written.close()
+
     def delete(self, names: Iterable[str]) -> None:
         for name in names:
             path = self._root / name
@@ -377,6 +427,12 @@ class _Within:
     def download_many(self, pairs: list[tuple[Path, str]]) -> list[str | None] | None:
         return self._remote.download_many([(path, self._prefix + name) for path, name in pairs])
 
+    def version(self, name: str) -> Version:
+        return self._remote.version(self._prefix + name)
+
+    def download_range(self, name: str, path: Path, start: int, stop: int, generation: int | None) -> None:
+        self._remote.download_range(self._prefix + name, path, start, stop, generation)
+
     def delete(self, names: Iterable[str]) -> None:
         self._remote.delete([self._prefix + name for name in names])
 
@@ -389,6 +445,12 @@ def _download_in_process(url: str, name: str, path: Path) -> str | None:
     if url not in _PROCESS_REMOTES:
         _PROCESS_REMOTES[url] = GcsRemote(url)
     return _PROCESS_REMOTES[url].download(name, path)
+
+
+def _download_range_in_process(url: str, name: str, path: Path, start: int, stop: int, generation: int | None) -> None:
+    if url not in _PROCESS_REMOTES:
+        _PROCESS_REMOTES[url] = GcsRemote(url)
+    _PROCESS_REMOTES[url].download_range(name, path, start, stop, generation)
 
 
 def _upload_range_in_process(url: str, path: Path, start: int, stop: int, name: str) -> None:
@@ -417,6 +479,38 @@ class _FileRange:
         base = {os.SEEK_SET: self._start, os.SEEK_CUR: self._handle.tell(), os.SEEK_END: self._stop}[whence]
         self._handle.seek(base + offset)
         return self.tell()
+
+
+class _RangeWriter:
+    """Bytes ``start`` to ``stop`` of an open file, written front to back by one ranged read (``download_range``). The
+    client seeks only to start a transcoded object again from its first byte (``_HashingFile``), which is the range's
+    here. ``close`` checks that the range was filled exactly."""
+
+    def __init__(self, handle, start: int, stop: int) -> None:
+        self._handle, self._start, self._stop = handle, start, stop
+        handle.seek(start)
+
+    def write(self, data) -> int:
+        if self._handle.tell() + len(data) > self._stop:
+            raise OSError(f"a ranged read returned bytes past {self._stop}; restore again.")
+        return self._handle.write(data)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if offset != 0 or whence != os.SEEK_SET:
+            raise io.UnsupportedOperation("a ranged read starts again only from its first byte")
+        self._handle.seek(self._start)
+        return 0
+
+    def tell(self) -> int:
+        return self._handle.tell() - self._start
+
+    def flush(self) -> None:
+        self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.flush()
+        if self._handle.tell() != self._stop:
+            raise OSError(f"a ranged read wrote {self._handle.tell() - self._start} of {self._stop - self._start} bytes; restore again.")
 
 
 class _HashingFile:
@@ -725,9 +819,90 @@ def _replaced_stores(names: dict[str, int]) -> set[str]:
     stores = [step for step in STEP_NAMES if step in complete and step in holding]
     return set(stores[:-1])
 
-def _restore_downloads(objects: list[tuple[Remote, Path, str]]) -> list[str | None] | None:
+def _piece_bytes(total: int, workers: int) -> int:
+    """The range a restore's large files are read in (``_download_pieces``): its ``total`` bytes over ``workers``
+    squared, so each worker reads about ``workers`` pieces and the last pieces, read at a worker's share of the rate,
+    end within 1/``workers`` of the restore's time after its last byte could; at least the client library's chunk for
+    ranged reads at once (``transfer_manager.TM_DEFAULT_CHUNK_SIZE``). One stream read each file before: the AoU
+    store's codes are 22 files of 10-43 GB (dosage/half0/<chromosome>, 525 of the 568 GB a fit job restores [real,
+    aou-wk5's mirror]), so a restore's last minutes read its largest files on a few streams."""
+    from google.cloud.storage import transfer_manager
+
+    return max(transfer_manager.TM_DEFAULT_CHUNK_SIZE, total // max(workers, 1) ** 2)
+
+
+def _hash_pieces(path: Path, version: Version, pieces: list[tuple[int, int, Future]]) -> str:
+    """The SHA-256 of the file at ``path`` (``RESTORED_DIGESTS``), read back a piece at a time as each piece's download
+    ends, in file order, and its CRC32C checked against ``version``'s."""
+    digest, checksum = hashlib.sha256(), google_crc32c.Checksum()
+    with open(path, "rb", buffering=0) as handle:
+        for start, stop, written in pieces:
+            written.result()
+            handle.seek(start)
+            while start < stop:
+                chunk = handle.read(min(stop - start, shutil.COPY_BUFSIZE))
+                if not chunk:
+                    raise OSError(f"{path} ended at {start} of its {version.size} bytes; restore again.")
+                digest.update(chunk)
+                checksum.update(chunk)
+                start += len(chunk)
+    if checksum.digest() != version.crc32c:
+        raise OSError(f"{path}'s restored bytes do not match its object's CRC32C; restore again.")
+    return digest.hexdigest()
+
+
+def _download_pieces(objects: list[tuple[Remote, Path, str, int]], piece: int) -> list[str]:
+    """Each (mirror, local path, object name, listed size) object read in ranges of ``piece`` bytes, in one pool (spawned
+    processes, each with its own client, for GCS objects: ``_download_range_in_process``), with each file's SHA-256 in
+    the same order. Every range is read from the generation the object had when the restore began, and each file's
+    CRC32C is checked against that generation's. The pieces are queued by their place in their file, the first of every
+    file first, so every file grows at a rate in proportion to its size and they all end together: no file is left
+    to a few streams at the end, and each is hashed (``_hash_pieces``) as its pieces arrive, at a few hundred MB/s,
+    beside the downloads."""
+    versions = [source.version(name) for source, _path, name, _size in objects]
+    for (_source, path, name, size), version in zip(objects, versions):
+        if version.size != size:
+            raise RuntimeError(f"{name} changed on its mirror after it was listed; restore again.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.truncate(size)
+    queued = sorted(
+        (start / version.size, -version.size, index, start)
+        for index, version in enumerate(versions) for start in range(0, version.size, piece)
+    )
+    spawned = all(isinstance(source, GcsRemote) for source, _path, _name, _size in objects)
+    workers = len(os.sched_getaffinity(0))
+    # spawn, not fork: a forked child would share the parent client's connections
+    pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) if spawned else ThreadPoolExecutor(max_workers=workers)
+    pieces: list[list[tuple[int, int, Future]]] = [[] for _object in objects]
+    with pool:
+        try:
+            for _place, _size, index, start in queued:
+                source, path, name, size = objects[index]
+                stop = min(start + piece, size)
+                if spawned:
+                    written = pool.submit(_download_range_in_process, source._url, name, path, start, stop, versions[index].generation)
+                else:
+                    written = pool.submit(source.download_range, name, path, start, stop, versions[index].generation)
+                pieces[index].append((start, stop, written))
+            with ThreadPoolExecutor(max_workers=len(objects)) as hashers:
+                hashed = [
+                    hashers.submit(_hash_pieces, path, version, own)
+                    for (_source, path, _name, _size), version, own in zip(objects, versions, pieces)
+                ]
+                return [future.result() for future in hashed]
+        except BaseException:
+            for own in pieces:
+                for _start, _stop, written in own:
+                    written.cancel()
+            raise
+
+
+def _restore_downloads(objects: list[tuple[Remote, Path, str]], sizes: Sequence[int]) -> list[str | None] | None:
     """The planned restore's objects in one pool, with each file's digest in the same order. A carried step may read
-    another mirror; GCS objects still use spawned processes with each process's own clients (``_download_in_process``)."""
+    another mirror; GCS objects still use spawned processes with each process's own clients (``_download_in_process``).
+    A file of more than one piece (``_piece_bytes``) is read in pieces (``_download_pieces``), in a pool of its own
+    beside this one."""
     if not objects:
         return []
     unwrapped = []
@@ -736,6 +911,23 @@ def _restore_downloads(objects: list[tuple[Remote, Path, str]]) -> list[str | No
             name = source._prefix + name
             source = source._remote
         unwrapped.append((source, path, name))
+    piece = _piece_bytes(sum(sizes), len(os.sched_getaffinity(0)))
+    large = [index for index, size in enumerate(sizes) if size > piece]
+    if large:
+        whole = [index for index in range(len(unwrapped)) if index not in set(large)]
+        with ThreadPoolExecutor(max_workers=1) as beside:
+            pieced = beside.submit(_download_pieces, [(*unwrapped[index], sizes[index]) for index in large], piece)
+            downloaded = _restore_downloads([unwrapped[index] for index in whole], [sizes[index] for index in whole])
+            hashed = pieced.result()
+        LOGGER.info(
+            "run mirror: %d files of %.1f GB read in pieces of %.3f GB", len(large), sum(sizes[index] for index in large) / 1e9, piece / 1e9,
+        )
+        digests: list[str | None] = [None] * len(unwrapped)
+        for index, digest in zip(whole, downloaded or [None] * len(whole)):
+            digests[index] = digest
+        for index, digest in zip(large, hashed):
+            digests[index] = digest
+        return digests
     first = unwrapped[0][0]
     if all(source is first for source, _path, _name in unwrapped):
         return first.download_many([(path, name) for _source, path, name in unwrapped])
@@ -821,7 +1013,7 @@ def restore(
         planned.append((step, name, aside, target, source, origin, marker, pairs))
         downloads.extend((source, path, entry) for path, entry in pairs)
     downloads.sort(key=lambda item: (-objects[item[2]], item[2]))
-    digests = _restore_downloads(downloads)
+    digests = _restore_downloads(downloads, [objects[entry] for _source, _path, entry in downloads])
     restored = {path: digest for (_source, path, _entry), digest in zip(downloads, digests or ())}
     for step, name, aside, target, source, origin, marker, pairs in planned:
         if marker is not None and source.read(f"{step}/{COMPLETE_FILE}") != marker:

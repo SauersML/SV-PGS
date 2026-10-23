@@ -56,8 +56,10 @@ each arm's search happened to try.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -66,9 +68,10 @@ import numpy as np
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.artifact import _METADATA, FittedModel, load_model, named_digest
 from sv_pgs.config import TraitType
-from sv_pgs.draw_laws import ProductMixtureDraws, tile_rows
+from sv_pgs.draw_laws import _FLOAT64_BYTES, ProductMixtureDraws, tile_rows
 from sv_pgs.progress import log
 from sv_pgs.scale_mixture_ep import (
+    _ROW_INTERMEDIATES,
     MixtureHyperparameters,
     ScaleMixturePrior,
     _components,
@@ -211,6 +214,23 @@ def main_means(law: ProductMixtureDraws, working_bytes: int, component: int = 0)
     return means
 
 
+def component_means(law: ProductMixtureDraws, working_bytes: int, count: int, host_bytes: int = 0, cpu_threads: int = 1) -> F64Array:
+    """``main_means`` of each of the law's first ``count`` components (count x members), several at once on threads:
+    as many as ``host_bytes`` holds of one call's node-wide intermediates (a tile's rows x the lattice x
+    ``_ROW_INTERMEDIATES`` float64s, all ``main_means`` makes), at most ``cpu_threads``, and one where ``host_bytes``
+    holds no more. Each component's is the same call it is alone, on its own thread with the caller's context, so the
+    same bits; numpy's array work releases the interpreter lock. One at a time, round x3's LDL fits read their 140
+    saved mode components on one core for 35 minutes, about 15 s each, while their GPUs waited [real]."""
+    rows = int(law.shape[0])
+    per_call = min(rows, tile_rows(law, working_bytes)) * int(np.shape(law.log_variance_grid)[0]) * _ROW_INTERMEDIATES * _FLOAT64_BYTES
+    threads = max(1, min(count, int(cpu_threads), int(host_bytes) // max(per_call, 1)))
+    if threads == 1 or count <= 1:
+        return np.stack([main_means(law, working_bytes, component) for component in range(count)])
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = [pool.submit(contextvars.copy_context().run, main_means, law, working_bytes, component) for component in range(count)]
+        return np.stack([future.result() for future in futures])
+
+
 def component_noise(law: ProductMixtureDraws, component: int, noise: float) -> float:
     """The noise variance of the law's ``component``, from the first's (``noise``): each component's omega is its
     members' squared projected columns over its own noise (``full_data_fit._mode_mixture``), so omega_0 / omega_c is
@@ -221,11 +241,14 @@ def component_noise(law: ProductMixtureDraws, component: int, noise: float) -> f
     return float(noise) * float(np.median(first[usable] / other[usable])) if usable.any() else float(noise)
 
 
-def seeds_from_model(model: FittedModel, source: str, working_bytes: int, digest: str = "") -> dict[str, Seed]:
+def seeds_from_model(
+    model: FittedModel, source: str, working_bytes: int, digest: str = "", host_bytes: int = 0, cpu_threads: int = 1,
+) -> dict[str, Seed]:
     """Each model of ``model`` that can seed a fit, by its name: a quantitative model fitted by the mean-field route
     (its draw law the product mixture's, which holds its lattice, densities, log scales and its main fixed point's
     natural parameters) with at least one member. A binary model (its start is its Polya-Gamma sites, which no artifact
-    holds), an EP or tied fit (a dense law) and the null genetic model (no member) are none."""
+    holds), an EP or tied fit (a dense law) and the null genetic model (no member) are none. Its components' means are
+    read several at once within ``host_bytes`` and ``cpu_threads`` (``component_means``)."""
     seeds: dict[str, Seed] = {}
     # Each model's count of components (the law pads a group's shorter mixtures with its first at weight zero), whether
     # nothing of its fit ended at a work budget, its mode search included (``FitCertificate.budget_unresolved``), and
@@ -239,7 +262,7 @@ def seeds_from_model(model: FittedModel, source: str, working_bytes: int, digest
         if scoring.trait_type != TraitType.QUANTITATIVE or getattr(law, "kind", None) != "product_mixture" or scoring.store_rows.shape[0] == 0:
             continue
         count = int(counts[index])
-        components = np.stack([main_means(law, working_bytes, component) for component in range(count)]) if 0 < count <= len(law.shift) else None
+        components = component_means(law, working_bytes, count, host_bytes, cpu_threads) if 0 < count <= len(law.shift) else None
         seeds[name] = Seed(
             source=source, model_name=name, store_rows=np.asarray(scoring.store_rows, dtype=np.int64),
             signed_scales=np.asarray(scoring.signed_scales, dtype=np.float64), means=main_means(law, working_bytes) if components is None else components[0].copy(),
@@ -254,12 +277,13 @@ def seeds_from_model(model: FittedModel, source: str, working_bytes: int, digest
     return seeds
 
 
-def read_seeds(directory: str | Path, working_bytes: int) -> dict[str, Seed]:
-    """The seeds of the saved model at ``directory`` (``seeds_from_model``, within ``working_bytes``), or none, with
-    the reason logged, where it is not a whole saved model (``artifact.load_model`` checks its arrays' checksum)."""
+def read_seeds(directory: str | Path, working_bytes: int, host_bytes: int = 0, cpu_threads: int = 1) -> dict[str, Seed]:
+    """The seeds of the saved model at ``directory`` (``seeds_from_model``, within ``working_bytes``, its components
+    within ``host_bytes`` and ``cpu_threads``), or none, with the reason logged, where it is not a whole saved model
+    (``artifact.load_model`` checks its arrays' checksum)."""
     try:
         digest = hashlib.sha256((Path(directory) / _METADATA).read_bytes()).hexdigest()
-        return seeds_from_model(load_model(directory), str(directory), working_bytes, digest)
+        return seeds_from_model(load_model(directory), str(directory), working_bytes, digest, host_bytes, cpu_threads)
     except (OSError, ValueError, KeyError, TypeError) as error:
         log(f"warm seeds: {directory} is no seed ({error})")
         return {}

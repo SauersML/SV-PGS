@@ -410,6 +410,150 @@ def test_a_restore_pools_gcs_objects_from_the_run_and_its_bases(tmp_path: Path, 
     assert _tree(restored) == {**_tree(base_run), **_tree(own_run)}
 
 
+def _pieced_run(root: Path) -> Path:
+    """A run whose store holds two files larger than a 100-byte piece and one smaller, each of distinct bytes."""
+    rng = np.random.default_rng(5)
+    for chromosome, size in (("chr1", 350), ("chr2", 1000), ("chr22", 60)):
+        _write(root / "store" / "store" / "dosage" / "half0" / chromosome / "c" / "0" / "0", rng.integers(0, 256, size, dtype=np.uint8).tobytes())
+    _write(root / "store" / COMPLETE_FILE, '{"key": "b"}')
+    return root
+
+
+def test_a_restore_s_piece_is_its_bytes_over_its_workers_squared_and_at_least_the_client_s_chunk() -> None:
+    transfer_manager = pytest.importorskip("google.cloud.storage.transfer_manager")
+    # The AoU fit job's restore: 568 GB on 24 CPUs, about 0.99 GB a piece.
+    assert run_mirror._piece_bytes(568 * 10**9, 24) == 568 * 10**9 // 576
+    assert run_mirror._piece_bytes(10**6, 24) == transfer_manager.TM_DEFAULT_CHUNK_SIZE
+
+
+def test_a_large_file_is_restored_in_pieces_queued_by_their_place_in_it_and_hashed_as_written(tmp_path: Path, monkeypatch) -> None:
+    """Files over one piece are read in ranges, the first of every file first and then by their place in their file,
+    so all of them grow together; each is hashed in file order and its digest recorded like a whole download's."""
+    run, mirror = _pieced_run(tmp_path / "run"), tmp_path / "mirror"
+    push(run, DirectoryRemote(mirror))
+    monkeypatch.setattr(run_mirror, "_piece_bytes", lambda _total, _workers: 100)
+    # One worker, so the pieces are read in the order they were queued.
+    monkeypatch.setattr(run_mirror.os, "sched_getaffinity", lambda _pid: {0})
+    ranges, whole, receipts = [], [], {}
+
+    class Recording(DirectoryRemote):
+        def download_range(self, name, path, start, stop, generation):
+            ranges.append((name.split("/")[4], start, stop, generation))
+            super().download_range(name, path, start, stop, generation)
+
+        def download_many(self, pairs):
+            whole.extend(name for _path, name in pairs)
+            return super().download_many(pairs)
+
+    def record(pairs):
+        # Recorded before the step's rename, at its place aside.
+        for path, digest in pairs:
+            receipts[path.relative_to(tmp_path / "restored" / f"store{run_mirror.RESTORING}").as_posix()] = digest
+
+    monkeypatch.setattr(run_mirror, "record_restored", record)
+    restore(tmp_path / "restored", Recording(mirror))
+    assert _tree(tmp_path / "restored") == _tree(run)
+    assert receipts == {name.removeprefix("store/"): hashlib.sha256(content).hexdigest() for name, content in _tree(run).items()}
+    assert not any("/dosage/" in name and "/chr22/" not in name for name in whole)
+    assert [(chromosome, start) for chromosome, start, _stop, _generation in ranges] == [
+        ("chr2", 0), ("chr1", 0), ("chr2", 100), ("chr2", 200), ("chr1", 100), ("chr2", 300), ("chr2", 400), ("chr2", 500),
+        ("chr1", 200), ("chr2", 600), ("chr2", 700), ("chr2", 800), ("chr1", 300), ("chr2", 900),
+    ]
+    assert all(stop == min(start + 100, {"chr1": 350, "chr2": 1000}[chromosome]) and generation is None for chromosome, start, stop, generation in ranges)
+
+
+def test_a_piece_whose_bytes_differ_from_the_object_stops_the_restore_before_any_step_is_published(tmp_path: Path, monkeypatch) -> None:
+    run, mirror = _pieced_run(tmp_path / "run"), tmp_path / "mirror"
+    push(run, DirectoryRemote(mirror))
+    monkeypatch.setattr(run_mirror, "_piece_bytes", lambda _total, _workers: 100)
+
+    class Damaging(DirectoryRemote):
+        def download_range(self, name, path, start, stop, generation):
+            super().download_range(name, path, start, stop, generation)
+            if "/chr1/" in name and start == 200:
+                with open(path, "r+b") as handle:
+                    handle.seek(start + 7)
+                    handle.write(bytes([(path.read_bytes()[start + 7] + 1) % 256]))
+
+    with pytest.raises(OSError, match="CRC32C"):
+        restore(tmp_path / "restored", Damaging(mirror))
+    assert not (tmp_path / "restored" / "store").exists()
+
+
+def test_a_gcs_range_is_read_from_its_listed_generation_at_its_own_offsets_and_must_fill_its_range(tmp_path: Path) -> None:
+    calls = []
+
+    class Blob:
+        def __init__(self, name: str, generation: int | None = None) -> None:
+            self.name, self.generation = name, generation
+
+        def download_to_file(self, handle, **options) -> None:
+            calls.append((self.name, self.generation, options))
+            # A transcoded read starts again from the range's first byte; then it writes the whole range.
+            handle.write(b"xx")
+            handle.seek(0)
+            handle.write(b"cod")
+            handle.write(b"es" if options["end"] == 6 else b"e")
+
+    class Bucket:
+        def blob(self, name, generation=None):
+            return Blob(name, generation)
+
+        def get_blob(self, name):
+            blob = Blob(name, 1712)
+            blob.size, blob.crc32c = 10, "AAAAKg=="
+            return blob
+
+    remote = GcsRemote.__new__(GcsRemote)
+    remote._bucket, remote._root, remote._url = Bucket(), "svpgs/run/", "gs://ops/svpgs/run"
+    assert remote.version("store/chr1") == run_mirror.Version(10, 1712, bytes([0, 0, 0, 42]))
+    target = _write(tmp_path / "chr1", b"0123456789")
+    remote.download_range("store/chr1", target, 2, 7, 1712)
+    (name, generation, options), = calls
+    assert name == "svpgs/run/store/chr1" and generation == 1712 and target.read_bytes() == b"01codes789"
+    assert options["start"] == 2 and options["end"] == 6 and options["checksum"] is None and options["retry"].timeout is None
+    with pytest.raises(OSError, match="4 of 5 bytes"):
+        remote.download_range("store/chr1", target, 3, 8, 1712)
+
+
+def test_gcs_pieces_are_read_in_spawned_processes_through_each_process_s_client(tmp_path: Path, monkeypatch) -> None:
+    run, mirror = _pieced_run(tmp_path / "run"), tmp_path / "mirror"
+    push(run, DirectoryRemote(mirror))
+    monkeypatch.setattr(run_mirror, "_piece_bytes", lambda _total, _workers: 100)
+    contexts, submitted = [], []
+
+    class Remote(GcsRemote):
+        def __init__(self, url, directory):
+            self._url, self.directory = url, directory
+
+        def sizes(self, prefix):
+            return self.directory.sizes(prefix)
+
+        def read(self, name):
+            return self.directory.read(name)
+
+        def version(self, name):
+            return self.directory.version(name)
+
+    class Pool(ThreadPoolExecutor):
+        def __init__(self, max_workers, mp_context):
+            contexts.append(mp_context.get_start_method())
+            super().__init__(max_workers)
+
+        def submit(self, function, *arguments):
+            submitted.append(function)
+            return super().submit(function, *arguments)
+
+    url = "gs://ops/svpgs/run"
+    monkeypatch.setitem(run_mirror._PROCESS_REMOTES, url, DirectoryRemote(mirror))
+    monkeypatch.setattr(run_mirror, "ProcessPoolExecutor", Pool)
+    restore(tmp_path / "restored", Remote(url, DirectoryRemote(mirror)))
+    assert _tree(tmp_path / "restored") == _tree(run)
+    # The small file's pool and the pieces' pool, both spawned; every piece through its process's own client.
+    assert contexts == ["spawn", "spawn"] and submitted.count(run_mirror._download_range_in_process) == 14
+    assert set(submitted) == {run_mirror._download_in_process, run_mirror._download_range_in_process}
+
+
 def test_the_mirror_is_found_on_the_bucket_mount_that_shows_it(monkeypatch) -> None:
     monkeypatch.setenv(GCS_MOUNTS, '{"/mnt/disks/ops": "gs://ops", "/mnt/disks/cdr": "gs://cdr/v8"}')
     assert mounted("gs://ops/svpgs/run1/run") == Path("/mnt/disks/ops/svpgs/run1/run")
