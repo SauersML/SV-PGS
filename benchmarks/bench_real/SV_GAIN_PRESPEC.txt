@@ -473,6 +473,21 @@ Results seen (log; no test definition changes because of them)
   HbA1c and height pairs failed), and sv_gain_meta at c1f5570 stopped with "Unsupported trait: hdl_cholesterol". No Q8
   result exists. The Holm step was stopped at 06:41 PDT, before it ran anything, so that its combined run would not
   race the sensitivity analyses.
+- 06:58 PDT on 2026-10-23, read: Q8, the converged set with HDL, Holm and the without-T2D analysis. All were run on
+  sv_gain_meta c1f5570 plus main 91e59473's base_run_of (the q8a pairs keep their cohort in the base run aou-q8p-l),
+  with sv_pgs at 7c4ab988 for HDL, 1,000 swaps and the long-read people excluded.
+  - Unfinished, left out: BMI (aou-q8a-b2 ended without finishing) and hyperlipidemia (aou-m3h-y2 FAILED).
+  - Q8, on HDL alone (aou-q8a-l2, arms l1 and l2, both certified; every other Q8 pair failed): g = +0.24% [-0.13,
+    0.61], one-sided swap p 0.109, bootstrap p 0.105, one-sided 95% upper bound 0.55%.
+  - Holm over the two families: sharp-null p, primary 0.131 and Q8 0.109, are both 0.218 after Holm. Weak-null p,
+    primary 0.107 and Q8 0.105, are both 0.209. Neither family detects a gain.
+  - Converged set with HDL (amendment 8's addendum, 5 traits): g = +0.03% [-0.11, 0.17], one-sided swap p 0.320,
+    bootstrap p 0.349, one-sided 95% upper bound 0.15%. Weights: LDL 0.83, HDL 0.15, the other three 0.01 each. Read
+    with sv_pgs at 7c4ab988, hypothyroidism's and atrial fibrillation's per-trait rows differ slightly from the
+    4-trait run read with 9f83b6f: relative gains +1.43% and -0.60%, against +1.42% and -0.62%.
+  - Without T2D (post hoc sensitivity analysis, 7 traits; amendment 7's run, finished 06:52 PDT): g = +0.21% [-0.63,
+    1.04], one-sided swap p 0.238, bootstrap p 0.312, one-sided 95% upper bound 0.91%.
+  - aou_numbers.json keeps the 4-trait converged rows, which the coordinator made final for the poster at 06:55 PDT.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
