@@ -86,15 +86,27 @@ COLOURS = {"blue": BLUE, "vermillion": VERMILLION, "grey": GREY, "sky": SKY}
 TITLE = ["Enabling Polygenic Prediction from Structural", "Variants in the NIH All of Us Multi-Ancestry Biobank"]
 REFERENCES = [
     "Byrska-Bishop 2022 Cell",
-    "Taylor 2024 Nature",
     "Privé 2020 Bioinformatics",
-    "Browning 2018 AJHG",
-    "Wray 2010 PLoS Genet",
     "All of Us 2019 N Engl J Med",
     "Rubinacci 2023 Nat Genet",
 ]
-"""First author, year and journal, one to a line, numbered in superscript as the text cites them."""
+"""First author, year and journal, one to a line, numbered in superscript in the order the text first cites them
+(``cite``): the SVs per genome, LDpred2, All of Us and GLIMPSE2."""
 SUPERSCRIPT = dict(zip(range(1, 10), "¹²³⁴⁵⁶⁷⁸⁹"))
+DESIGN_SETTINGS = {"h2": (0.01, 0.1), "prevalence": (0.01, 0.1), "causal_variants": (50, 200, 2000),
+                   "sv_causal_fraction": (0.0, 0.05, 0.2)}
+"""The values each setting takes over benchmarks/power/grid.py's POINTS (a point's own value, else HERITABILITY,
+PREVALENCE or CAUSAL_VARIANTS), which tests/test_poster_simulation.py checks against the grid."""
+
+
+def cite(reference: str) -> str:
+    """The superscript number of ``reference`` in REFERENCES."""
+    return SUPERSCRIPT[REFERENCES.index(reference) + 1]
+
+
+def listed(values: list[str]) -> str:
+    """"a, b or c": the values a setting takes."""
+    return f"{', '.join(values[:-1])} or {values[-1]}" if len(values) > 1 else values[0]
 PLACEHOLDERS = [
     ("Change in test r² with SVs", "All held-out people and by genetic ancestry"),
 ]
@@ -127,30 +139,35 @@ def copy(numbers: dict) -> dict:
     rows = gain["rows"]  # true and imputed: [mean, lower, upper, simulations]; share: [ratio, lower, upper]
     simulations = rows["all"]["true"][3] + rows["null"]["true"][3]
     return {
-        # ¹ is Byrska-Bishop 2022, the first of REFERENCES: ~9,679 SVs discovered per genome
-        "introduction": ["Each genome carries ~9,700 structural variants (SVs)¹",
-                         "Polygenic scores rarely use SVs",
-                         "We test if imputed SVs improve accuracy"],
+        # Byrska-Bishop 2022: "On average, ~9,679 SVs were discovered in each genome"
+        "introduction": [f"Each genome has ~9,700 structural variants (SVs){cite('Byrska-Bishop 2022 Cell')}",
+                         "Polygenic scores rarely use SVs, so we test if imputed SVs improve accuracy"],
         "methods": ["Priors depend on imputation r², frequency, SV length"],
         "code": ["Code:", "github.com/", "SauersML/SV-PGS"],
         "design": [
             f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22",
-            # the ranges over benchmarks/power/grid.py's POINTS (HERITABILITY, PREVALENCE, CAUSAL_VARIANTS and each
-            # point's overrides)
-            f"{gain['shown']} architectures: h² 0.01–0.1, prevalence 1–10%, 50–2,000 causal variants, 0–20% SVs",
+            # each setting's values over the grid's points (DESIGN_SETTINGS), listed rather than as a range
+            f"{gain['shown']} architectures: h² {listed([f'{h2:g}' for h2 in DESIGN_SETTINGS['h2']])}, prevalence "
+            f"{listed([f'{share:.0%}' for share in DESIGN_SETTINGS['prevalence']])}, "
+            f"{listed([f'{count:,}' for count in DESIGN_SETTINGS['causal_variants']])} causal variants, "
+            f"{listed([f'{share:.0%}' for share in DESIGN_SETTINGS['sv_causal_fraction']])} SVs",
             # SV-PGS fits every measured record with no frequency or r² floor (stage2_wiring.fit_models); LDpred2-auto
             # takes SNVs of training MAF >= 1% thinned evenly in genetic distance to HapMap3's chr22 count, so at most
             # 16,000 (benchmarks/bench_sim/submissions/ldpred2_auto.py)
-            "SV-PGS: all SNVs, indels and SVs. LDpred2-auto: up to 16,000 SNVs with MAF ≥ 1%",
+            f"SV-PGS: all SNVs, indels and SVs. LDpred2-auto{cite('Privé 2020 Bioinformatics')}: up to 16,000 SNVs "
+            "with MAF ≥ 1%",
         ],
         "whole_note": f"Simulations on whole chr22 with test N = {people(accuracy['test_people'])}",
         "gain_note": f"Mean and 95% CI over {simulations} simulations in 3 Mb of chr22",
-        # GLIMPSE2 is Rubinacci 2023
-        "aou": ["We imputed SVs from 12,212 long-read assemblies into 100,000 All of Us genomes with "
-                f"GLIMPSE2{SUPERSCRIPT[REFERENCES.index('Rubinacci 2023 Nat Genet') + 1]}", *aou_matched()],
+        # GLIMPSE2 is Rubinacci 2023; the assemblies are the accepted abstract's 12,212 phased genome assemblies
+        "aou": ["We imputed SVs from 12,212 long-read assemblies into 100,000 All of Us"
+                f"{cite('All of Us 2019 N Engl J Med')} genomes with GLIMPSE2{cite('Rubinacci 2023 Nat Genet')}",
+                *aou_matched()],
+        # the mean gain over the scatter's simulations at its training N (40,000). Without causal SVs the gain is
+        # positive at every training N, and at 40,000 the h² = 0.01 architecture gains about a quarter of the rest
         "discussion": [
             f"SV-PGS gained {wins['gain'][0]:.3f} AUC over LDpred2-auto on whole chr22",
-            "The gain was as large without causal SVs and grew with h²",
+            "The gain remained without causal SVs and was smaller at h² = 0.01",
         ],
     }
 

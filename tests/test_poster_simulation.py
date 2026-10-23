@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import json
 import math
+import re
 import sys
 
 import numpy as np
@@ -119,48 +120,46 @@ def test_missing_results_remove_an_optional_figure_from_a_previous_run(monkeypat
     assert not list(tmp_path.glob("fig_sim_architectures.*"))
 
 
-def test_poster_does_not_call_an_inconclusive_comparison_equivalent(monkeypatch, tmp_path):
-    monkeypatch.setattr(sys, "argv", ["build_pptx.py", "template.pptx", "poster.pptx", str(tmp_path / "missing.json")])
-    poster = importlib.import_module("docs.poster.ashg2026.build_pptx")
-    for name in ("SIMULATION_METHODS", "SIMULATION_ACCURACY", "SIMULATION_GENOTYPES", "DISCUSSION"):
-        monkeypatch.setattr(poster, name, getattr(poster, name))
-    entry = simulation.interval([-0.01, 0.0, 0.01])
-    cell = dict(replicates=3, delta_auc=entry, delta_auc_vs_ldpred2=entry,
-                delta_auc_vs_ldpred2_allvar=simulation.interval([0.1, 0.2]),
-                power=dict(replicates=3, rate=0.0, lower=0.0, upper=0.56), length_rho=[0.0, 0.01])
-    poster.simulation_copy(dict(train_counts=[5000, 40000], points={"sv_20pct": {"sizes": {"40000": cell}}}))
-    copy = " ".join(text for paragraph in poster.SIMULATION_ACCURACY for text, _flag in paragraph)
-    assert "matched" not in copy and "outperformed" not in copy
-    assert "95% CI" in copy and "SNV subset" in copy
-    # Three core completions do not justify a sentence about an optional comparator with only two replicates.
-    assert "all variant classes" not in copy
+def poster_module(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["build_pptx.py", "template.pptx", "poster.pptx", str(tmp_path / "figures")])
+    return importlib.import_module("docs.poster.ashg2026.build_pptx")
 
 
-def test_partial_poster_replaces_template_numbers_with_actual_coverage(monkeypatch, tmp_path):
-    monkeypatch.setattr(sys, "argv", ["build_pptx.py", "template.pptx", "poster.pptx", str(tmp_path / "missing.json")])
-    poster = importlib.import_module("docs.poster.ashg2026.build_pptx")
-    for name in ("SIMULATION_METHODS", "SIMULATION_ACCURACY", "SIMULATION_GENOTYPES", "DISCUSSION"):
-        monkeypatch.setattr(poster, name, getattr(poster, name))
-    poster.simulation_copy(dict(train_counts=[5000, 40000], points={"sv_20pct": {"sizes": {"40000": {"replicates": 2}}}}))
-    copy = " ".join(text for paragraph in poster.SIMULATION_ACCURACY for text, _flag in paragraph)
-    assert "2 paired comparisons" in copy and "grid is incomplete" in copy
-    assert not any(flag == "ph" for paragraphs in (poster.SIMULATION_ACCURACY, poster.SIMULATION_GENOTYPES)
-                   for paragraph in paragraphs for _text, flag in paragraph)
+def poster_copy(poster) -> dict:
+    return poster.copy(json.loads((poster.HERE / "figures/gallery/numbers.json").read_text()))
 
 
-def test_window_sentence_compares_true_imputed_and_control_at_one_training_size(monkeypatch, tmp_path):
-    monkeypatch.setattr(sys, "argv", ["build_pptx.py", "template.pptx", "poster.pptx", str(tmp_path / "missing.json")])
-    poster = importlib.import_module("docs.poster.ashg2026.build_pptx")
-    for name in ("SIMULATION_METHODS", "SIMULATION_ACCURACY", "SIMULATION_GENOTYPES", "DISCUSSION", "WINDOW"):
-        monkeypatch.setattr(poster, name, getattr(poster, name))
+def test_poster_design_lists_each_setting_value_the_grid_simulates(monkeypatch, tmp_path):
+    from benchmarks.power import grid
 
-    def cell(*gains):
-        return dict(replicates=len(gains), delta_auc=simulation.interval(gains))
+    poster = poster_module(monkeypatch, tmp_path)
+    simulated = {
+        "h2": {point.get("truth", {}).get("h2", grid.HERITABILITY) for point in grid.POINTS.values()},
+        "prevalence": {point.get("truth", {}).get("prevalence", grid.PREVALENCE) for point in grid.POINTS.values()},
+        "causal_variants": {point.get("causal_variants", grid.CAUSAL_VARIANTS) for point in grid.POINTS.values()},
+        "sv_causal_fraction": {point["sv_causal_fraction"] for point in grid.POINTS.values()},
+    }
+    assert {name: set(values) for name, values in poster.DESIGN_SETTINGS.items()} == simulated
+    line = poster_copy(poster)["design"][1]
+    # each value is named and none is given as a range
+    assert "–" not in line
+    assert "h² 0.01 or 0.1" in line and "prevalence 1% or 10%" in line
+    assert "50, 200 or 2,000 causal variants" in line and "0%, 5% or 20% SVs" in line
 
-    window = {"cohort": dict(start_bp=1, end_bp=3_000_001, first_record=0, last_record=60_000),
-              "true": {"sv_20pct_fold3": {"sizes": {"10000": cell(.03, .031, .032), "20000": cell(.05, .06)}},
-                       "null": {"sizes": {"10000": cell(.001, .001, .001), "20000": cell(.009, .009, .009)}}},
-              "imputed": {"sv_20pct_fold3": {"sizes": {"10000": cell(.002, .002, .002), "20000": cell(.007, .007, .007)}}}}
-    poster.simulation_copy(dict(train_counts=[5000, 40000], points={}, window=window))
-    sentence = " ".join(text for paragraph in poster.WINDOW for text, _flag in paragraph)
-    assert "10k" in sentence and "0.002 imputed" in sentence and "no causal SVs: 0.001" in sentence
+
+def test_poster_cites_every_reference_in_order(monkeypatch, tmp_path):
+    poster = poster_module(monkeypatch, tmp_path)
+    words = poster_copy(poster)
+    text = " ".join(line for key in ("introduction", "methods", "design", "aou", "discussion") for line in words[key])
+    # h² and r² are exponents, not citations
+    text = re.sub(r"[hr]²", "", text)
+    marks = [poster.SUPERSCRIPT[index] for index in range(1, len(poster.REFERENCES) + 1)]
+    assert all(mark in text for mark in marks)
+    assert [text.index(mark) for mark in marks] == sorted(text.index(mark) for mark in marks)
+
+
+def test_poster_gain_note_counts_the_simulations_the_forest_draws(monkeypatch, tmp_path):
+    poster = poster_module(monkeypatch, tmp_path)
+    rows = json.loads((poster.HERE / "figures/gallery/numbers.json").read_text())["poster_sv_gain"]["rows"]
+    drawn = sum(row["true"][3] for row in rows.values() if row is not rows.get("well_imputed"))
+    assert f"over {drawn} simulations" in poster_copy(poster)["gain_note"]
