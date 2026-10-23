@@ -1457,6 +1457,36 @@ def test_steps_kept_under_the_earlier_key_formula_where_their_tree_made_them_fro
     assert (run / "samples" / COMPLETE_FILE).read_text() == written["samples"]
 
 
+def test_a_tree_lacking_a_trait_definition_keeps_the_steps_that_read_none(workspace, tmp_path: Path) -> None:
+    """accept_steps_from naming a tree that lacks one of the run's trait definitions (a trait defined since): the run
+    goes on, keeps the steps that read no definition where that tree made them, and makes the phenotypes step and every
+    step after it again."""
+    synthetic, client = workspace
+    run_pipeline(WorkspaceConfig.from_mapping(synthetic.raw), _bindings(_Recorder(), client), BUDGET, through="direct_sv")
+    tree = _earlier_tree(tmp_path)
+    definitions = tree / "sv_pgs" / "all_of_us.py"
+    named = 'canonical_name="total_bilirubin",'
+    assert definitions.read_text().count(named) == 1
+    definitions.write_text(definitions.read_text().replace(named, 'canonical_name="total_bilirubin_earlier",'))
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "accept_steps_from": str(tree)})
+    run, before = config.run_directory, STEP_NAMES[:STEP_NAMES.index("fit")]
+    steps = {step.name: step for step in workspace_pipeline._STEPS}
+    keyed = workspace_pipeline._Run(config, _bindings(_Recorder(), client), BUDGET, {})
+    keyed.inputs.update({name: steps[name].inputs(config) for name in before})
+    earlier = workspace_pipeline._earlier(keyed)
+    assert earlier["entries"] is None
+    for name in before:
+        record = json.loads((run / name / COMPLETE_FILE).read_text())
+        key = workspace_pipeline._earlier_key(keyed, name, earlier)
+        assert key is not None and key != record["key"]
+        (run / name / COMPLETE_FILE).write_text(json.dumps({**record, "key": key}))
+    shutil.rmtree(config.marker_directory)
+    run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="direct_sv")
+    found = {path.name.split("_", 1)[1] for path in config.marker_directory.iterdir()}
+    assert {"samples_accepted", "store_accepted", "phenotypes_completed", "cohort_completed", "measurement_completed", "direct_sv_completed"} <= found
+    assert "phenotypes_accepted" not in found
+
+
 def test_frozen_probability_calibration_uses_only_reserved_development_families(workspace):
     from sv_pgs.probability_calibration import FrozenCalibration
     synthetic, client = workspace

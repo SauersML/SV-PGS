@@ -986,15 +986,19 @@ for step in pipeline._STEPS:
         code = None
     steps[step.name] = {{"upstream": list(step.upstream), "code": code}}
 lists = json.loads(sys.argv[1])
-print(json.dumps({{"file": pipeline.__file__, "steps": steps, "entries": _definition_entries(all_of_us, lists["diseases"], lists["traits"])}}))
+try:
+    entries = _definition_entries(all_of_us, lists["diseases"], lists["traits"])
+except ValueError:
+    entries = None
+print(json.dumps({{"file": pipeline.__file__, "steps": steps, "entries": entries}}))
 """
 
 
 def _earlier(run: _Run) -> dict[str, Any]:
     """What ``_accepted`` reads of the tree ``accept_steps_from`` names: each of its steps' upstream names and code
     digest under the formula it keys by (``_source_digest`` of its listed code; None where that is not its formula),
-    the trait definitions it holds for this run (``_definition_entries``) and its code digest of each step before
-    the fit by today's formula (``step_code``). The first three come from a Python process that imports that tree's
+    the trait definitions it holds for this run (``_definition_entries``; None where it lacks one, a trait defined
+    since) and its code digest of each step before the fit by today's formula (``step_code``). The first three come from a Python process that imports that tree's
     sv_pgs, writing no bytecode and keeping numba's cache in a directory removed afterwards. A tree that cannot be read
     stops the run before any step is set aside: a run told to keep an earlier tree's steps never makes them again
     unasked."""
@@ -1038,7 +1042,8 @@ def _accepted(run: _Run, step: _Step, record: dict[str, Any]) -> bool:
     """Whether a completed step whose record holds another key is kept as this run's. Only a step before the fit
     qualifies, with ``accept_steps_from`` set and every step it follows kept by this run, where:
     - the earlier tree made it from this run's inputs: its key there (``_earlier_key``) is the record's;
-    - its code there is this tree's by today's formula (``step_code``, the trait definitions it reads included).
+    - its code there is this tree's by today's formula (``step_code``, the trait definitions it reads included), so a
+      step that reads a trait definition the earlier tree lacks is made again.
     The earlier formula keyed a step by whole modules, so the live whole-genome runs' phenotypes, cohort, measurement
     and direct_sv steps took other keys for an edit to another trait's definition or to ``progress``, which none of
     them runs. The record is left as it is, as the base run's mirror holds it (``run_mirror``'s BASE_RUN), so each job
@@ -1048,6 +1053,9 @@ def _accepted(run: _Run, step: _Step, record: dict[str, Any]) -> bool:
     earlier = _earlier(run)
     if _earlier_key(run, step.name, earlier) != record["key"]:
         LOGGER.info("workspace pipeline: %s was not made by %s from this run's inputs", step.name, run.config.accept_steps_from)
+        return False
+    if step.definitions and earlier["entries"] is None:
+        LOGGER.info("workspace pipeline: %s reads a trait definition %s does not hold", step.name, run.config.accept_steps_from)
         return False
     code = _digest([earlier["codes"][step.name], earlier["entries"] if step.definitions else None])
     if code != _step_code(run, step):
