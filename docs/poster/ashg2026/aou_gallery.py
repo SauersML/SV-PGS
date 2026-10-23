@@ -4,8 +4,8 @@ count of 1 to 20 is among them, and the file, like the figures, stays out of git
 
 NUMBERS holds:
 - "matched": the rows of SV-PGS with SVs against SV-PGS without them, fitted by identical code and scored on the same
-  held-out people, one a trait: the held-out partial r² with SVs less without as a percentage of the partial r² without
-  (relative, relative_lower, relative_upper: its 95% interval);
+  held-out people, one a trait: the held-out partial r² with SVs less without as a percentage of the two models' mean
+  partial r², the pre-specified g of sv_gain_meta.py (relative, relative_lower, relative_upper: its 95% interval);
 - "enrichment": prior_enrichment.tsv's rows of arm with_sv, one a (trait, class) and one a trait for every SV together:
   the class's mean posterior E[beta^2 | data] per record over the SNVs' (posterior_enrichment, with its jackknife
   interval), the learned prior's (prior_enrichment), and the class's share of the model's genetic variance and of the
@@ -112,8 +112,8 @@ def span(values: list[float]) -> list[float]:
 
 
 def gain_figure(matched: list[dict]) -> tuple:
-    """Each trait's change in held-out partial r² from adding SVs, as a share of the partial r² without them, with its
-    95% interval, a row per trait."""
+    """Each trait's change in held-out partial r² from adding SVs, as a share of the two models' mean partial r², with
+    its 95% interval, a row per trait."""
     rows = [(trait_name(row["trait"]), row["relative"] / 100, row["relative_lower"] / 100, row["relative_upper"] / 100)
             for row in matched]
     # the axis spans every estimate and each interval up to twice the median interval's width; a wider one runs off
@@ -121,8 +121,8 @@ def gain_figure(matched: list[dict]) -> tuple:
     typical = 2 * float(np.median([high - low for _, _, low, high in rows]))
     ends = [end for _, value, low, high in rows for end in ((value,) if high - low > typical else (low, high))]
     fig = forest(rows, "Change in r² with SVs (%)\nand 95% CI", span(ends), percent, log=False)
-    return fig, ["Change in held-out partial r² from adding SVs to SV-PGS for each trait, with 95% intervals, an "
-                 "arrowhead marking an interval that runs past the axis"]
+    return fig, ["Change in held-out partial r² from adding SVs to SV-PGS for each trait, as a percentage of the two "
+                 "models' mean partial r², with 95% intervals, an arrowhead marking an interval that runs past the axis"]
 
 
 def main() -> None:
