@@ -136,6 +136,7 @@ def people(count: int) -> str:
 def copy(numbers: dict) -> dict:
     """The poster's sentences, each number from the gallery figure that shows it."""
     svs = numbers["fig5"]
+    share = numbers["poster_sv_gain"]["rows"]["all"]["share"]
     return {
         # Byrska-Bishop 2022: "On average, ~9,679 SVs were discovered in each genome"
         "introduction": [f"Each genome has ~9,700 structural variants (SVs).{cite('Byrska-Bishop 2022 Cell')}",
@@ -153,11 +154,12 @@ def copy(numbers: dict) -> dict:
         "aou": ["We imputed SVs from 12,212 long-read assemblies into 100,000 All of Us"
                 f"{cite('All of Us 2019 N Engl J Med')} genomes with GLIMPSE2.{cite('Rubinacci 2023 Nat Genet')}"],
         # what the simulations mean. SV-PGS's AUC gain over LDpred2-auto at training N 40,000 holds without causal
-        # SVs (wins' null_gain, its 95% interval above 0), so causal SVs are not its source. Imputed SVs' gain is
-        # largest where the causal SVs are well imputed (the SV-gain forest's well_imputed and all rows)
+        # SVs (wins' null_gain, its 95% interval above 0), so causal SVs are not its source. Imputed SVs give a share of
+        # true SVs' AUC gain over every simulation with causal SVs (the SV-gain forest's "all" row, Fieller's interval)
         "discussion": [
             "SV-PGS was more accurate than LDpred2-auto with and without causal SVs.",
-            "Imputed SVs helped most when causal SVs were well imputed.",
+            f"Imputed SVs gave {share[0]:.0%} of the AUC gain of true SV genotypes (95% CI {share[1] * 100:.0f}–"
+            f"{share[2]:.0%}).",
         ],
     }
 
@@ -557,7 +559,7 @@ class Poster:
             shape = self.xml[start:end]
             first = re.search(r"<a:r>.*?</a:r>", shape).group(0)
             # the template's run, bold at the bars' size, once for each piece of the label (*All of Us* in italics)
-            styled = re.sub(r'sz="\d+" b="0" i="0"', f'sz="{BAR_SIZE * 100}" b="1" i="{{italic}}"', first)
+            styled = re.sub(r'sz="\d+" b="[01]" i="0"', f'sz="{BAR_SIZE * 100}" b="1" i="{{italic}}"', first)
             styled = re.sub(r"<a:t>[^<]*</a:t>", '<a:t xml:space="preserve">{text}</a:t>', styled)
             runs = "".join(styled.format(italic=int("i" in flags.split()), text=escape(piece, quote=False))
                            for piece, flags in marked(label))
@@ -671,7 +673,7 @@ def build() -> None:
             bar(118, "Simulation results"),
             row([figure(gallery["poster_accuracy_by_training_size"], legend=GALLERY / "fig1_accuracy_by_training_size.txt")],
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
-            figure(gallery["poster_sv_gain"]),
+            figure(gallery["poster_sv_gain"], flex=True),
         ],
         [bar(119, "All of Us cohort results"), text(bullets([*words["aou"], *aou_compared()])), *aou_blocks()],
     ]

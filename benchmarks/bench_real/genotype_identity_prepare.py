@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -23,6 +24,12 @@ from benchmarks.bench_real.genotype_identity import shown
 def command(args, **kwargs):
     result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
     if result.returncode:
+        error = result.stderr.decode(errors='replace') if isinstance(result.stderr, bytes) else result.stderr
+        known = {label: needle.lower() in error.lower() for label, needle in
+                 [('missing_path', 'No such file'), ('access_denied', 'Permission denied'),
+                  ('unknown_tag', 'not defined in the VCF header'), ('authentication', '401'),
+                  ('authorization', '403'), ('memory', 'out of memory')]}
+        print(json.dumps({'command_failed': Path(args[0]).name, 'categories': known}), flush=True)
         raise RuntimeError("Workspace extraction command failed")
     return result.stdout
 
@@ -48,9 +55,14 @@ def prepare(work):
     if site_file.exists():
         sites = json.loads(site_file.read_text())
     else:
-        output = command(['bcftools', 'query', '-i',
-                          'TYPE="snp" && N_ALT=1 && INFO/INFO>0.97 && INFO/RAF>0.2 && INFO/RAF<0.8',
-                          '-f', '%POS\t%REF\t%ALT\n', str(old)], text=True)
+        source = str(old) if old.is_file() else pattern.format(batch=0)
+        header = command(['bcftools', 'view', '-h', source], text=True)
+        fields = set(re.findall(r'##INFO=<ID=([^,]+)', header))
+        frequency_field = 'RAF' if 'RAF' in fields else 'AF'
+        expression = (f'TYPE="snp" && N_ALT=1 && INFO/INFO>0.97 && '
+                      f'INFO/{frequency_field}>0.2 && INFO/{frequency_field}<0.8')
+        output = command(['bcftools', 'query', '-i', expression,
+                          '-f', '%POS\t%REF\t%ALT\n', source], text=True)
         sites, last = [], -5000
         for line in output.splitlines():
             pos, ref, alt = line.split('\t')
@@ -90,10 +102,13 @@ def prepare(work):
         for column, (index, key) in enumerate(selected):
             reader.read(index, row)
             genotypes[:, column] = np.where(row < 0, 3, row)
-    called = genotypes != 3
-    frequency = np.where(called, genotypes, 0).sum(axis=0) / (2 * called.sum(axis=0))
-    good = (called.mean(axis=0) >= .99) & (frequency >= .1) & (frequency <= .9)
-    del called
+    good = np.zeros(genotypes.shape[1], dtype=bool)
+    for start in range(0, genotypes.shape[1], 256):
+        part = genotypes[:, start:start + 256]
+        called = part != 3
+        frequency = np.where(called, part, 0).sum(axis=0) / (2 * called.sum(axis=0))
+        good[start:start + 256] = (called.mean(axis=0) >= .99) & (frequency >= .1) & (frequency <= .9)
+    del called, part
     sites = [key for (_, key), keep in zip(selected, good) if keep]
     genotypes = genotypes[:, good]
     if len(sites) < 2048:

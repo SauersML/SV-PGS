@@ -6,7 +6,7 @@ NUMBERS holds:
 - "matched": the rows of SV-PGS with SVs against SV-PGS without them, fitted by identical code and scored on the same
   held-out people, one a trait: the held-out partial r² with SVs less without as a percentage of the two models' mean
   partial r², the pre-specified g of sv_gain_meta.py (relative, relative_lower, relative_upper: its 95% interval),
-  for the traits whose two fits both converged alone (a row marked "unconverged" stops the figure). An optional
+  for the traits whose two fits both converged alone (a row marked "unconverged" is left out). An optional
   "common" holds those traits' common g the same way, with "traits", the number of traits it combines;
 - "enrichment": prior_enrichment.tsv's rows of arm with_sv, one a (trait, class) and one a trait for every SV together:
   the class's mean posterior E[beta^2 | data] per record over the SNVs' (posterior_enrichment, with its jackknife
@@ -17,10 +17,14 @@ None of the last three is drawn: their posterior moments E[beta^2 | data] are mo
 data say little about each record (gout's SVs: 98% posterior variance), so they are no measure of what the data put on
 SVs.
 
+COMPARED, aou_vs_ldpred2.json, holds each converged trait's held-out partial r² for LDpred2-auto and SV-PGS with and
+without SVs, as fractions with their 95% intervals ("r2").
+
 Outputs, in figures/: aou_1_gain.png from "matched", a row per trait and one for "common" when it is given, drawn when
 NUMBERS holds its rows (transparent, at the width of the poster's right column), with its .txt, whose first line
-describes the picture. The figure gives each g as a change relative to the r² without SVs (baseline_relative), so its
-axis title, "Change in r² with SVs (%)", reads as it says.
+describes the picture. Over it, when COMPARED gives the r², a panel of each trait's r² in percent for LDpred2-auto and
+SV-PGS, its traits in COMPARED's order, which the gain panel keeps. The figure gives each g as a change relative to the
+r² without SVs (baseline_relative), so its axis title, "Change in r² with SVs (%)", reads as it says.
 
     uv run --with matplotlib --with scipy python docs/poster/ashg2026/aou_gallery.py
 """
@@ -107,15 +111,15 @@ def forest(panels: list[Panel], least: float = 0.0):
     extra = (height - natural) / sum(len(rows) for rows in heights)
     # an arrowhead at the axis's start reaches half its width to the left, toward the names
     arrow = max(marks) * GROWTH * 0.7 / 2 / 72
-    left = max(widest(fig, [shown[name]], fontsize=size, fontweight=weight[name]) for name in shown) + LABEL_GAP + arrow
-    right = max(max(widest(fig, [tick_text(panel)(tick)], fontsize=size) / 2 for tick in ticks(panel))
-                for panel in panels)
-    right = max(right, arrow) + POSTER_PAD
+    left = (POSTER_PAD + max(widest(fig, [shown[name]], fontsize=size, fontweight=weight[name]) for name in shown)
+            + LABEL_GAP + arrow)
     fig.set_size_inches(COLUMN, height)
-    width = COLUMN - left - right
+    growths = [min(1 + extra / min(rows), GROWTH) for rows in heights]
+    # each mark clears the axis's ends by its half width, its ring, an arrowhead and a pad
+    clears = [(mark * growth / 2 + 6.0 * growth / 2) / 72 + arrow + POSTER_PAD for mark, growth in zip(marks, growths)]
+    width = plot_width(fig, panels, clears, COLUMN - left, arrow)
     top = height
-    for panel, mark, rows, key, bottom in zip(panels, marks, heights, keys, bottoms):
-        growth = min(1 + extra / min(rows), GROWTH)
+    for panel, mark, rows, key, bottom, growth, clear in zip(panels, marks, heights, keys, bottoms, growths, clears):
         mark, bar, ring = mark * growth, POSTER_BAR * growth, 6.0 * growth
         span = sum(rows) + extra * len(rows)
         if key:
@@ -132,7 +136,7 @@ def forest(panels: list[Panel], least: float = 0.0):
         # the axes' y is inches down from its top, each row centred in its height
         ax = frame(fig, left, top - span, width, span)
         centres = np.cumsum([0.0, *(row + extra for row in rows)])[:-1] + (np.array(rows) + extra) / 2
-        low_limit, high_limit = limits(panel, width, (mark / 2 + ring / 2) / 72 + arrow + POSTER_PAD)
+        low_limit, high_limit = limits(panel, width, clear)
         if panel.log:
             ax.set_xscale("log")
         for (name, estimates), centre in zip(panel.rows, centres):
@@ -155,7 +159,7 @@ def forest(panels: list[Panel], least: float = 0.0):
         ax.spines["left"].set_visible(False)
         ax.set_ylim(span, 0)
         ax.set_xlim(low_limit, high_limit)
-        drawn = [tick for tick in ticks(panel) if low_limit <= tick <= high_limit]
+        drawn = inside(panel, low_limit, high_limit)
         ax.set_xticks(drawn, [tick_text(panel)(tick) for tick in drawn])
         ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
         ax.set_xlabel(panel.xlabel)
@@ -165,31 +169,71 @@ def forest(panels: list[Panel], least: float = 0.0):
     return fig
 
 
+def plot_width(fig, panels: list[Panel], clears: list[float], room: float, arrow: float) -> float:
+    """Inches of the panels' shared x axis in ``room`` inches right of the names: as wide as leaves POSTER_PAD past the
+    farther of an arrowhead at the axis's end and the half of each drawn tick label that sits past it. Only drawn ticks
+    count, so a decade outside a log axis takes no room. A narrower axis can draw another tick, so it narrows until its
+    own ticks fit."""
+    size = matplotlib.rcParams["xtick.labelsize"]
+    width = room - arrow - POSTER_PAD
+    for _ in range(20):
+        reach = arrow
+        for panel, clear in zip(panels, clears):
+            low, high = limits(panel, width, clear)
+            place = (lambda tick: math.log10(tick / low) / math.log10(high / low)) if panel.log \
+                else (lambda tick: (tick - low) / (high - low))
+            for tick in inside(panel, low, high):
+                reach = max(reach, width * (place(tick) - 1) + widest(fig, [tick_text(panel)(tick)], fontsize=size) / 2)
+        if width + reach + POSTER_PAD <= room + 1e-9:
+            return width
+        width = room - reach - POSTER_PAD
+    raise SystemExit("the forest's x axis found no width whose tick labels fit the canvas")
+
+
+def inside(panel: Panel, low: float, high: float) -> list[float]:
+    """The panel's ticks between the axis's ends ``low`` and ``high``."""
+    slack = 1e-9 * (high - low)
+    return [tick for tick in ticks(panel) if low - slack <= tick <= high + slack]
+
+
 def ticks(panel: Panel) -> list[float]:
-    """A log panel's decades from below its smallest estimate to above its largest; a linear panel's span."""
+    """A log panel's decades from two below its smallest estimate to two above its largest, the most its axis spans; a
+    linear panel's span."""
     values = [value for _, estimates in panel.rows for value, _, _ in estimates]
     if panel.log:
-        return [10.0 ** power for power in range(math.floor(math.log10(min(values))), math.ceil(math.log10(max(values))) + 1)]
+        return [10.0 ** power for power in range(math.floor(math.log10(min(values))) - 1,
+                                                 math.ceil(math.log10(max(values))) + 2)]
     return span(values)
 
 
 def tick_text(panel: Panel):
-    """A log panel's ticks as plain decimals, a linear panel's in percent."""
+    """A log panel's ticks as plain decimals (its values are already percentages: 0.1, 1, 10), a linear panel's in
+    percent."""
     return (lambda tick: f"{tick:g}") if panel.log else percent
 
 
 def limits(panel: Panel, width: float, clear: float) -> tuple[float, float]:
     """The axis's ends: each estimate ``clear`` inches from them at least, over ``width`` inches; on a linear axis also
-    symmetric about 0 and wide enough for its ticks, on a log axis its estimates' span alone."""
+    symmetric about 0 and wide enough for its ticks, on a log axis its estimates' span, each end that falls within
+    DECADE_REACH of a decade moved out to it, so that decade is ticked."""
     values = [value for _, estimates in panel.rows for value, _, _ in estimates]
     if panel.log:
         low, high = math.log10(min(values)), math.log10(max(values))
         margin = (high - low) / (1 - 2 * clear / width) * clear / width
-        return 10.0 ** (low - margin), 10.0 ** (high + margin)
+        low, high = low - margin, high + margin
+        if low - math.floor(low) < DECADE_REACH:
+            low = math.floor(low)
+        if math.ceil(high) - high < DECADE_REACH:
+            high = math.ceil(high)
+        return 10.0 ** low, 10.0 ** high
     reach = max(abs(value) for value in values) / (1 - 2 * clear / width)
     marks = ticks(panel)
     reach = max(reach, -marks[0], marks[-1])
     return -reach, reach
+
+
+DECADE_REACH = 0.25
+"""Decades a log axis's end moves out at most, to reach a decade and tick it."""
 
 
 def percent(value: float) -> str:
@@ -226,26 +270,35 @@ def converged(row: dict) -> bool:
     return not row.get("unconverged") and "uncertified" not in row.get("flags", "")
 
 
+def order(rows: list, compared: list[dict] | None) -> list:
+    """``rows`` (name, marks) in the order of ``compared``'s traits, then the others in their own order."""
+    place = {trait_name(row["trait"]): index for index, row in enumerate(compared or [])}
+    return sorted(rows, key=lambda row: place.get(row[0], len(place)))
+
+
 def gain_figure(matched: list[dict], common: dict | None = None, compared: list[dict] | None = None) -> tuple:
     """Each trait's change in held-out partial r² from adding SVs, relative to the r² without SVs (baseline_relative of
     the pre-specified g), with its 95% interval, a row per trait, and when ``common`` is given a bold row for the traits'
     common g itself, relative to the two arms' mean r². The two scales differ by about 0.1 percentage point at these
     gains, so one axis title serves both. Over it, when ``compared`` (aou_vs_ldpred2.json's rows) gives the traits'
-    held-out r², a panel of that r² for LDpred2-auto and for SV-PGS with SVs on a log axis. No figure on the poster uses
-    a fit that did not converge, so a trait whose SV-PGS fit did not converge is in neither panel."""
+    held-out r², a panel of that r² in percent for LDpred2-auto and for SV-PGS with SVs on a log axis. Both panels list
+    the traits in ``compared``'s order, then any other trait, then the common row. No figure on the poster uses a fit
+    that did not converge, so a trait whose SV-PGS fit did not converge is in neither panel."""
     keys = ("relative", "relative_lower", "relative_upper")
-    rows = [(trait_name(row["trait"]), [tuple(baseline_relative(row[key] / 100) for key in keys)])
-            for row in matched if converged(row)]
+    dropped = {trait_name(row["trait"]) for row in matched if not converged(row)}
+    rows = order([(trait_name(row["trait"]), [tuple(baseline_relative(row[key] / 100) for key in keys)])
+                  for row in matched if converged(row)], compared)
     if common:
         rows.append((COMBINED, [tuple(common[key] / 100 for key in keys)]))
     panels = [Panel(rows, [("", SKY, "o", False)], "Change in r² with SVs (%)")]
-    measured = [row for row in compared or [] if "r2" in row]
+    measured = [row for row in compared or [] if "r2" in row and trait_name(row["trait"]) not in dropped]
     if measured:
-        panels.insert(0, Panel([(trait_name(row["trait"]), [tuple(row["r2"][arm][key] for key in ("r2", "lower", "upper"))
+        panels.insert(0, Panel([(trait_name(row["trait"]), [tuple(100 * row["r2"][arm][key] for key in ("r2", "lower", "upper"))
                                                              for arm in ("ldpred2_auto", "with_sv")])
-                                for row in measured], METHODS, "Held-out r²", log=True))
+                                for row in measured], METHODS, "Held-out r² (%)", log=True))
     fig = forest(panels, least=HEIGHT)
-    return fig, [("Held-out partial r² of LDpred2-auto and SV-PGS for each trait, and under it the change " if measured
+    return fig, [("Held-out partial r² in percent of LDpred2-auto and SV-PGS for each trait on a log axis, and under it "
+                  "the change " if measured
                   else "The change ")
                  + "in held-out partial r² from adding SVs to SV-PGS for each trait, relative to the r² without SVs, "
                  "with 95% intervals, an arrowhead marking an interval that runs past the axis"
