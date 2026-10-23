@@ -7,6 +7,10 @@
 # and the image's own Python is not the 3.12 sv-pgs needs, so nothing is fetched and the image's Python is never used.
 # Status goes only to empty marker files in the workspace's ops bucket mount.
 set -uo pipefail
+# The whole task is one group, which bash reads to its closing brace before it runs any of it. The task runs this file
+# from the ops bucket's mount, and bash reads a script by byte offset as it goes: a copy of it changed while the task
+# runs (a patched export) would otherwise be read at the old offsets once the driver ends, and skip the final push.
+{
 OPS=/mnt/disks/ops/svpgs/${RUN_ID}
 RUN=/mnt/disks/run
 # STAGED_SOURCE ("${STAGED_SOURCE}"), when set, is the directory under svpgs/ in the ops bucket whose source/ and env.tar
@@ -334,3 +338,4 @@ if [ -n "$publisher" ]; then
 fi
 mark "exit-${status}"
 exit "$status"
+}

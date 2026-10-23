@@ -464,7 +464,8 @@ def test_a_shared_runtime_is_built_and_published_once_then_unpacked_instead_of_s
 
 _UV_ADOPTING = """#!/bin/bash
 # uv sync, as far as run_step.sh sees it: the venv with its interpreter and an sv-pgs that logs its calls and answers
-# run-mirror adopt with ADOPTED ("adopted" or "waiting").
+# run-mirror adopt with ADOPTED ("adopted" or "waiting"). Where EDIT_TASK names the task script, its driver rewrites it
+# in place, a line longer near its top, as a patch of a running job's script in the bucket would.
 mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
 # A wrapper, not a link: the interpreter finds its own environment (its packages) from its own path.
 printf '#!/bin/sh\\nexec PYTHON "$@"\\n' > "$UV_PROJECT_ENVIRONMENT/bin/python"
@@ -473,14 +474,17 @@ cat > "$UV_PROJECT_ENVIRONMENT/bin/sv-pgs" <<'STUB'
 #!/bin/bash
 echo "$*" >> "$(dirname "$0")/../../sv-pgs-calls"
 [ "$1 $2" != "run-mirror adopt" ] || printf 'partner\\t%s\\n' "$ADOPTED"
+if [ "$1" = workspace-run ] && [ -n "${EDIT_TASK:-}" ]; then
+  "$(dirname "$0")/python" -c 'import sys; text = open(sys.argv[1]).read(); handle = open(sys.argv[1], "r+"); handle.write(text.replace("set -uo pipefail\\n", "set -uo pipefail\\nexport SVPGS_GPU_GUARD=sync\\n", 1)); handle.close()' "$EDIT_TASK"
+fi
 STUB
 chmod +x "$UV_PROJECT_ENVIRONMENT/bin/sv-pgs"
 """
 
 
-def _ran_task(tmp_path: Path, script: str, name: str, adopted: str) -> tuple[list[str], set[str], int]:
+def _ran_task(tmp_path: Path, script: str, name: str, adopted: str, edit: bool = False) -> tuple[list[str], set[str], int]:
     """The rendered task script run once on a new run disk against its own ops directory, with uv and sv-pgs stubbed:
-    sv-pgs's calls, the task's markers and its exit status."""
+    sv-pgs's calls, the task's markers and its exit status. ``edit``: its driver rewrites the script as it runs."""
     ops = tmp_path / name / "ops"
     (ops / "source").mkdir(parents=True)
     (ops / "source/uv.lock").write_text("version = 1\n")
@@ -503,7 +507,8 @@ def _ran_task(tmp_path: Path, script: str, name: str, adopted: str) -> tuple[lis
     task = tmp_path / name / "launcher/run_step.sh"
     task.parent.mkdir(parents=True)
     task.write_text(script.replace("OPS=/mnt/disks/ops/svpgs/study\n", f"OPS={ops}\n").replace("RUN=/mnt/disks/run\n", f"RUN={run}\n"))
-    ran = subprocess.run(["bash", str(task)], env=dict(os.environ, BATCH_TASK_INDEX="0", ADOPTED=adopted), capture_output=True, text=True, timeout=120)
+    edited = {"EDIT_TASK": str(task)} if edit else {}
+    ran = subprocess.run(["bash", str(task)], env=dict(os.environ, BATCH_TASK_INDEX="0", ADOPTED=adopted, **edited), capture_output=True, text=True, timeout=120)
     markers = {path.name.split("_task_", 1)[1] for path in (ops / "markers").iterdir()}
     return (run / "sv-pgs-calls").read_text().splitlines(), markers, ran.returncode
 
@@ -542,6 +547,12 @@ def test_an_arm_job_given_its_partner_finishes_the_run_from_both_arms_parts_or_l
         f"run-mirror adopt {mirrored} {arm} {partner}", "workspace-run --config {ops}/run_config.json --through report --finish", f"run-mirror push {mirrored}",
     ]
     assert calls == [call.format(ops=tmp_path / "adopting" / "ops") for call in expected]
+    assert status == 0 and {"merge-started", "exit-0"} <= markers
+    # The script rewritten in place while its driver runs, a line longer near its top: the task runs as it was read,
+    # through its final push and exit marker.
+    calls, markers, status = _ran_task(tmp_path, arm_script, "edited", "adopted", edit=True)
+    assert "SVPGS_GPU_GUARD=sync" in (tmp_path / "edited/launcher/run_step.sh").read_text()
+    assert calls == [call.format(ops=tmp_path / "edited" / "ops") for call in expected]
     assert status == 0 and {"merge-started", "exit-0"} <= markers
     calls, markers, status = _ran_task(tmp_path, arm_script, "deferring", "waiting")
     assert calls == [call.format(ops=tmp_path / "deferring" / "ops") for call in [*expected[:4], expected[2]]]
