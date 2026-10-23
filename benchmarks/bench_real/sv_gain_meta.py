@@ -110,8 +110,9 @@ class PairedTrait:
 
 
 def shown(count: int) -> str:
-    """A count as a table may show it: 1 to 20 as <=20 (All of Us's rule for small cells)."""
-    return "<=20" if 1 <= count <= 20 else str(count)
+    """A count as a table may show it: 1 to 39 as <40 (the user's rule for All of Us counts, stricter than All of Us's
+    own 1 to 20)."""
+    return "<40" if 1 <= count < 40 else str(count)
 
 
 def union_clusters(memberships: Sequence[tuple[np.ndarray, np.ndarray]], size: int) -> np.ndarray:
