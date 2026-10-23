@@ -61,7 +61,7 @@ COLUMNS = ((MARGIN, LEFT), (MARGIN + LEFT + GUTTER, MIDDLE), (48 - MARGIN - RIGH
 INSET = 0.3
 """Text sits this far inside its column, under the section bars' labels."""
 BAR, BAR_SIZE = 1.25, 68
-BODY, HEADLINE, GLOSS, REFERENCE, PENDING = 56, 60, 56, 28, 50
+BODY, HEADLINE, GLOSS, REFERENCE, PENDING = 56, 60, 56, 36, 50
 LINE_PITCH = 1.066
 """Line pitch per point of type at 90% line spacing, measured on the LibreOffice render."""
 SHIFTED_PITCH = 0.25
@@ -150,7 +150,6 @@ def copy(numbers: dict) -> dict:
         "introduction": [f"Each genome has ~9,700 structural variants (SVs).{cite('Byrska-Bishop 2022 Cell')}",
                          "Polygenic scores rarely use SVs, so we test if imputed SVs improve accuracy."],
         "methods": ["Priors use SV type, length, frequency and imputation r²."],
-        "code": ["Code:", "github.com/SauersML/SV-PGS"],
         "design": [
             f"{people(svs['people'])} genomes simulated from 1000 Genomes chr22.",
             f"Base disease: h² {DESIGN_BASE['h2']:g}, prevalence {DESIGN_BASE['prevalence']:.0%}, "
@@ -447,23 +446,28 @@ def text(paragraphs: list[Para]) -> Block:
     return Block("text", paragraphs)
 
 
-QR = 2.6
-"""Inches: the side of the QR code to the repository."""
-ENDINGS = (6.3, 10.0)
-"""Inches: the widths of the QR code and its small type at the right end of the Discussion band, the type under the
-code or beside it, each the least that sets the repository's address on one line."""
+QR, QR_GAP = 3.5, 0.5
+"""Inches: the side of the QR code to the repository (its one-module border included), and the white between it and the
+References bar over it, which with that border clears the code's four-module quiet zone."""
 
 
-def code(lines: list[str], beside: bool) -> list[Block]:
-    """A QR code to the repository with ``lines`` in small type under it, or ``beside`` it: "Code:", the address in
-    bold, then "References:" and the references."""
-    blocks = [Block("qr", None),
-              Block("text", [Para([(piece, f"b {flags}" if index == 1 else flags) for piece, flags in marked(line)],
-                                  REFERENCE, bullet=False, after=0) for index, line in enumerate(lines)])]
+def width_of(runs: list[tuple[str, str]], size_pt: float) -> float:
+    """Inches a line of ``runs`` takes, unwrapped."""
+    return sum(face("b" in flags.split(), "i" in flags.split()).getlength(text) * run_size(flags, size_pt) / 100 / 72
+               for text, flags in runs)
+
+
+def references(beside: bool) -> tuple[list[Block], float]:
+    """The References section: its bar, then the QR code to the repository with the references in small type under it,
+    or ``beside`` it, one to a line; and the least width that sets each reference on its line."""
+    lines = [marked(f"{SUPERSCRIPT[index]}{reference}") for index, reference in enumerate(REFERENCES, start=1)]
+    words = Block("text", [Para(runs, REFERENCE, bullet=False, after=0) for runs in lines])
+    type_width = max(width_of(runs, REFERENCE) for runs in lines) + 2 * INSET + 0.05
     if not beside:
-        return blocks
-    share = QR / (ENDINGS[1] - GUTTER)
-    return [row([blocks[0]], [blocks[1]], shares=(share, 1 - share))]
+        return [bar(96, "References"), Block("qr", None), words], max(type_width, QR + 2 * INSET)
+    width = INSET + QR + GUTTER + type_width
+    share = (INSET + QR) / (width - GUTTER)
+    return [bar(96, "References"), row([Block("qr", None)], [words], shares=(share, 1 - share))], width
 
 
 def row(*children: list, shares: tuple = ()) -> Block:
@@ -530,7 +534,7 @@ class Poster:
         if block.kind == "placeholder":
             return 0.0
         if block.kind == "qr":
-            return QR
+            return QR + QR_GAP - GAPS["bar"]
         if block.kind == "row":
             return max(self.stack_height(child, part) for child, part in zip(block.children, parts(block, width)))
         raise ValueError(block.kind)
@@ -574,7 +578,8 @@ class Poster:
         elif block.kind == "placeholder":
             self.shapes.append(placeholder(self.fresh(), x, y, width, height, *block.content))
         elif block.kind == "qr":
-            self.shapes.append(image(self.fresh(), "Repository QR code", self.image(self.qr), x + INSET, y, QR, QR,
+            self.shapes.append(image(self.fresh(), "Repository QR code", self.image(self.qr), x + INSET,
+                                     y + QR_GAP - GAPS["bar"], QR, QR,
                                      "QR code to github.com/SauersML/SV-PGS"))
         elif block.kind == "row":
             for child, part in zip(block.children, parts(block, width)):
@@ -652,9 +657,6 @@ def build() -> None:
         xml = delete(xml, shape_id)
     xml = delete(duplicate(duplicate(xml, 93, 118, "Simulation results bar"), 93, 119, "All of Us bar"), 93)
 
-    # the template's References bar goes: the references are a small block at the end of the reading order
-    xml = delete(xml, 96)
-
     gallery = {name: GALLERY / f"{name}.png" for name in (
         "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy",
         "poster_model")}
@@ -680,11 +682,13 @@ def build() -> None:
     ]
     poster = Poster(xml, rels, work / "ppt/media")
     across = COLUMNS[2][0] + RIGHT - COLUMNS[1][0]
-    references = [f"{SUPERSCRIPT[index]}{reference}" for index, reference in enumerate(REFERENCES, start=1)]
-    # the code's type under it or beside it, whichever makes the shorter band: under it while the Discussion is long
-    bands = [[discussion[0], row(discussion[1:], code([*words["code"], "References:", *references], beside),
-                                 shares=(1 - ending / (across - GUTTER), ending / (across - GUTTER)))]
-             for ending, beside in zip(ENDINGS, (False, True))]
+    # the Discussion and the References side by side, the references under the QR code or beside it, whichever makes
+    # the shorter band
+    bands = []
+    for beside in (False, True):
+        ending, width = references(beside)
+        share = width / (across - GUTTER)
+        bands.append([row(discussion, ending, shares=(1 - share, share))])
     band = min(bands, key=lambda band: poster.stack_height(band, across))
     top = BOTTOM - poster.stack_height(band, across)
     poster.stack(band, COLUMNS[1][0], top, across, None)

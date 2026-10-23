@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib
 import numpy as np
+from matplotlib.lines import Line2D
 
 from sim_gallery import (INK, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_PAD, POSTER_STYLE, SKY, frame, overhang, plt,
                          shifted, tallest, under_axes, widest)
@@ -67,64 +69,120 @@ def trait_name(trait: str) -> str:
     return TRAITS.get(trait, trait)
 
 
-def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list[float], tick_text, log: bool,
-           reference: float | None = None, estimates: bool = False, bold: frozenset = frozenset(),
-           least: float = 0.0):
-    """A forest at the column's width in the imputed SVs' sky blue: a row per (label, estimate, low, high), its label
-    at the left of the canvas and its interval level with it, each estimate an open mark as imputed SVs' are in the
-    simulation figures (every All of Us SV is imputed), with the reference drawn (0, or 1 on a log axis, unless given).
-    The axis runs from the first tick to the last, or with ``estimates`` symmetric about the reference over the
-    estimates alone, so that each estimate's mark clears an arrowhead at the axis's end. Every margin and the rows'
-    pitch are measured from the type, so the forest is as short as its type allows, unless ``least`` inches is taller:
-    then its rows share that height and its marks grow with them. The labels in ``bold`` are set in bold."""
-    reference = (1.0 if log else 0.0) if reference is None else reference
+@dataclass
+class Panel:
+    """One panel of the All of Us figure: a row per (name, marks), each mark an (estimate, low, high) in its series'
+    place, under the title ``xlabel``. A series is (its name in the key, colour, marker, filled)."""
+
+    rows: list[tuple[str, list[tuple[float, float, float]]]]
+    series: list[tuple[str, str, str, bool]]
+    xlabel: str
+    log: bool = False
+
+
+def forest(panels: list[Panel], least: float = 0.0):
+    """The panels stacked at the column's width, their rows' names once at the left in a margin they share. In each row
+    the series' marks stand one above the next, each an estimate with its 95% interval, and a panel with more than one
+    series has their key over it. A log panel spans its estimates' decades; a linear one is symmetric about 0 over its
+    estimates, so that each mark clears an arrowhead at the axis's end, and an interval past the axis ends in one.
+    Every margin and the rows' pitch are measured from the type, so the figure is as short as its type allows, unless
+    ``least`` inches is taller: then its rows share that height and their marks grow with them, up to GROWTH."""
     fig = plt.figure(figsize=(COLUMN, 1.0))
-    labels = [label for label, *_ in rows]
-    weight = {label: "bold" if label in bold else "normal" for label in labels}
-    pitch = max(tallest(fig, [label], fontsize=POSTER_STYLE["font.size"], fontweight=weight[label])
-                for label in labels) + ROW_GAP
-    # the right margin holds half of the end tick's label; the bottom, the ticks and the axis title
-    right = widest(fig, [tick_text(ticks[-1])], fontsize=POSTER_STYLE["font.size"]) / 2 + POSTER_PAD
-    top, bottom = POSTER_PAD, under_axes(fig, [xlabel])
-    height = max(top + bottom + pitch * len(rows), least)
-    growth = MARK * min((height - top - bottom) / len(rows) / pitch, GROWTH)
-    mark, bar, ring = POSTER_MARK * growth, POSTER_BAR * growth, 6.0 * growth
+    size = POSTER_STYLE["font.size"]
+    names = [name for panel in panels for name, _ in panel.rows]
+    weight = {name: "bold" if name == COMBINED else "normal" for name in names}
+    line = max(tallest(fig, [name], fontsize=size, fontweight=weight[name]) for name in names) + ROW_GAP
+    # one series' marks at MARK times the poster's, two or more at the poster's own, one above the next in a row
+    marks = [POSTER_MARK * (MARK if len(panel.series) == 1 else 1.0) for panel in panels]
+    pitches = [max(line, len(panel.series) * (mark / 72 + 2 * ROW_GAP)) for panel, mark in zip(panels, marks)]
+    keys = [tallest(fig, [label for label, *_ in panel.series], fontsize=size) + POSTER_PAD if len(panel.series) > 1
+            else 0.0 for panel in panels]
+    bottoms = [under_axes(fig, [panel.xlabel]) for panel in panels]
+    natural = sum(POSTER_PAD + key + pitch * len(panel.rows) + bottom
+                  for panel, key, pitch, bottom in zip(panels, keys, pitches, bottoms))
+    rows = sum(len(panel.rows) for panel in panels)
+    height = max(least, natural)
     # an arrowhead at the axis's start reaches half its width to the left, toward the names
-    arrow = mark * 0.7 / 2 / 72
-    left = max(widest(fig, [label], fontsize=POSTER_STYLE["font.size"], fontweight=weight[label])
-               for label in labels) + LABEL_GAP + arrow
+    arrow = max(marks) * GROWTH * 0.7 / 2 / 72
+    left = max(widest(fig, [name], fontsize=size, fontweight=weight[name]) for name in names) + LABEL_GAP + arrow
+    right = max(widest(fig, [tick_text(panel)(tick) for tick in ticks(panel)[-1:]], fontsize=size) / 2
+                for panel in panels) + POSTER_PAD
     fig.set_size_inches(COLUMN, height)
-    ax = frame(fig, left, bottom, COLUMN - left - right, height - top - bottom)
-    if log:
-        ax.set_xscale("log")
-    low_limit, high_limit = ticks[0], ticks[-1]
-    if estimates:
-        # inches each estimate keeps from the axis's end: its mark's radius and edge, an arrowhead's half, and a pad
-        clear = (mark / 2 + ring / 2) / 72 + arrow + POSTER_PAD
-        reach = max(abs(value - reference) for _, value, _, _ in rows) / (1 - 2 * clear / (COLUMN - left - right))
-        reach = max(reach, reference - ticks[0], ticks[-1] - reference)
-        low_limit, high_limit = reference - reach, reference + reach
-    for row, (label, value, low, high) in enumerate(rows):
-        ax.hlines(row, max(low, low_limit), min(high, high_limit), color=SKY, linewidth=bar, zorder=3,
-                  capstyle="round")
-        for end, edge, marker in ((low, low_limit, "<"), (high, high_limit, ">")):
-            if (end < edge) if marker == "<" else (end > edge):
-                ax.plot([edge], [row], marker=marker, markersize=mark * 0.7, color=SKY, markeredgewidth=0,
-                        zorder=3, clip_on=False)
-        ax.plot([value], [row], "o", markersize=mark, color=SKY, markerfacecolor="white", markeredgecolor=SKY,
-                markeredgewidth=ring, zorder=4)
-        ax.text(0, row, label, transform=shifted(ax, -left), ha="left", va="center", fontweight=weight[label])
-    ax.axvline(reference, color=INK, linewidth=4.0, zorder=2)
-    ax.set_yticks([])
-    ax.spines["left"].set_visible(False)
-    ax.set_ylim(len(rows) - 0.5, -0.5)
-    ax.set_xlim(low_limit, high_limit)
-    ax.set_xticks(ticks, [tick_text(tick) for tick in ticks])
-    ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-    ax.set_xlabel(xlabel)
-    # centred on the canvas, not on the axes, whose margins differ: a title wider than the axes then fits either side
-    ax.xaxis.label.set_x((COLUMN / 2 - left) / (COLUMN - left - right))
+    width = COLUMN - left - right
+    top = height
+    for panel, mark, pitch, key, bottom in zip(panels, marks, pitches, keys, bottoms):
+        grown = pitch + (height - natural) / rows
+        growth = min(grown / pitch, GROWTH)
+        mark, bar, ring = mark * growth, POSTER_BAR * growth, 6.0 * growth
+        top -= POSTER_PAD + key
+        ax = frame(fig, left, top - grown * len(panel.rows), width, grown * len(panel.rows))
+        low_limit, high_limit = limits(panel, width, (mark / 2 + ring / 2) / 72 + arrow + POSTER_PAD)
+        if panel.log:
+            ax.set_xscale("log")
+        offsets = [(index - (len(panel.series) - 1) / 2) * (mark / 72 + 2 * ROW_GAP) / grown
+                   for index in range(len(panel.series))]
+        for row, (name, estimates) in enumerate(panel.rows):
+            for (label, colour, marker, filled), offset, (value, low, high) in zip(panel.series, offsets, estimates):
+                y = row + offset
+                ax.hlines(y, max(low, low_limit), min(high, high_limit), color=colour, linewidth=bar, zorder=3,
+                          capstyle="round")
+                for end, edge, arrowhead in ((low, low_limit, "<"), (high, high_limit, ">")):
+                    if (end < edge) if arrowhead == "<" else (end > edge):
+                        ax.plot([edge], [y], marker=arrowhead, markersize=mark * 0.7, color=colour, markeredgewidth=0,
+                                zorder=3, clip_on=False)
+                ax.plot([value], [y], marker, markersize=mark, color=colour,
+                        markerfacecolor=colour if filled else "white", markeredgecolor=colour,
+                        markeredgewidth=0 if filled else ring, zorder=4)
+            ax.text(0, row, name, transform=shifted(ax, -left), ha="left", va="center", fontweight=weight[name])
+        if not panel.log:
+            ax.axvline(0.0, color=INK, linewidth=4.0, zorder=2)
+        ax.set_yticks([])
+        ax.spines["left"].set_visible(False)
+        ax.set_ylim(len(panel.rows) - 0.5, -0.5)
+        ax.set_xlim(low_limit, high_limit)
+        ax.set_xticks(ticks(panel), [tick_text(panel)(tick) for tick in ticks(panel)])
+        ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+        ax.set_xlabel(panel.xlabel)
+        # centred on the canvas, not on the axes, whose margins differ: a title wider than the axes then fits either side
+        ax.xaxis.label.set_x((COLUMN / 2 - left) / width)
+        if key:
+            handles = [Line2D([0], [0], marker=marker, linestyle="none", markersize=mark, color=colour,
+                              markerfacecolor=colour if filled else "white", markeredgecolor=colour,
+                              markeredgewidth=0 if filled else ring, label=label)
+                       for label, colour, marker, filled in panel.series]
+            fig.legend(handles=handles, loc="lower left", ncol=len(handles), frameon=False, borderpad=0.0,
+                       borderaxespad=0.0, handletextpad=0.3, columnspacing=1.2, handlelength=1.0,
+                       bbox_to_anchor=(POSTER_PAD / COLUMN, (top + POSTER_PAD / 2) / height))
+        top -= grown * len(panel.rows) + bottom
     return fig
+
+
+def ticks(panel: Panel) -> list[float]:
+    """A log panel's decades from below its smallest estimate to above its largest; a linear panel's span."""
+    values = [value for _, estimates in panel.rows for value, _, _ in estimates]
+    if panel.log:
+        return [10.0 ** power for power in range(math.floor(math.log10(min(values))), math.ceil(math.log10(max(values))) + 1)]
+    return span(values)
+
+
+def tick_text(panel: Panel):
+    """A log panel's ticks as plain decimals, a linear panel's in percent."""
+    return (lambda tick: f"{tick:g}") if panel.log else percent
+
+
+def limits(panel: Panel, width: float, clear: float) -> tuple[float, float]:
+    """The axis's ends: each estimate ``clear`` inches from them at least, over ``width`` inches, and on a linear axis
+    symmetric about 0 and wide enough for its ticks; on a log axis, its estimates' span alone."""
+    values = [value for _, estimates in panel.rows for value, _, _ in estimates]
+    if panel.log:
+        low, high = math.log10(min(values)), math.log10(max(values))
+        reach = (high - low) / (1 - 2 * clear / width)
+        margin = (reach - (high - low)) / 2
+        return 10.0 ** (low - margin), 10.0 ** (high + margin)
+    reach = max(abs(value) for value in values) / (1 - 2 * clear / width)
+    marks = ticks(panel)
+    reach = max(reach, -marks[0], marks[-1])
+    return -reach, reach
 
 
 def percent(value: float) -> str:

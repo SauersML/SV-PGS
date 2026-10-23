@@ -124,7 +124,7 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--threads", type=int, default=8)
     args = parser.parse_args()
-    if not Path("/home/jupyter").is_dir() or not Path("/mnt/disks").is_dir():
+    if not Path("/home/jupyter").is_dir() or not Path("/home/jupyter/workspace/vwb-aou-datasets-controlled").is_dir():
         raise RuntimeError("Execution restricted to the AoU workspace")
     from numba import set_num_threads
     set_num_threads(args.threads)
