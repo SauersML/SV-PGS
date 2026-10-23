@@ -202,6 +202,8 @@ Results seen (log; no test definition changes because of them)
   - eGFR: +0.26% [-1.13, 1.65], permutation p 0.31.
 - About 20:00 PDT: the same on aou-wl15 (LDL) alone, with its arms' runs aou-wl13 and wl14 checked: -1.96%
   [-7.02, 3.11], permutation p 0.87. Its with_sv arm is uncertified and flagged.
+- About 20:16 PDT: the same on aou-x3-g2 (gout, arms g2 and g1): +4.53% [-24.6, 33.6], permutation p 0.28. Arm
+  agreement 0.934. Its with_sv arm is uncertified and flagged.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
