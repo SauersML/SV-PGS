@@ -343,11 +343,20 @@ def zero_line(ax, vertical: bool = True) -> None:
 
 
 def load_results() -> dict[str, list[dict]]:
+    """Each grid's simulations, less any whose SV-PGS fit (with or without SVs) missed its convergence certificate
+    (benchmarks/power/grid.py's "uncertified_arms"), which no figure or mean uses. numbers.json's "uncertified" counts
+    them by grid and architecture. A result written before grid.py recorded certification lists no arm and is kept."""
     grids: dict[str, list[dict]] = defaultdict(list)
+    dropped: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for grid in ("grid", "grid-truth", "window", "window-truth"):
         for path in glob.glob(str(LOCAL / grid / "tasks" / "*" / "n*" / "replicate*" / "result.json")):
             with open(path) as handle:
-                grids[grid].append(json.load(handle))
+                row = json.load(handle)
+            if row.get("uncertified_arms"):
+                dropped[grid][row["point"]] += 1
+            else:
+                grids[grid].append(row)
+    NUMBERS["uncertified"] = {grid: dict(sorted(points.items())) for grid, points in sorted(dropped.items())}
     return grids
 
 
@@ -599,7 +608,12 @@ intervals at a size stand side by side."""
 
 
 def gain_ticks(ax, low: float, high: float) -> None:
-    """A gain axis from ``low`` to ``high`` padded by a tenth, ticked at three to five round values, 0 among them."""
+    """A gain axis from ``low`` to ``high`` padded by a tenth, ticked at three to five round values, 0 among them. A panel
+    with nothing drawn (no size has three simulations) shows its zero line alone."""
+    if high <= low:
+        ax.set_ylim(-1, 1)
+        ax.set_yticks([0], ["0"])
+        return
     pad = 0.1 * (high - low)
     ax.set_ylim(low - pad, high + pad)
     ticks = [tick for tick in matplotlib.ticker.MaxNLocator(nbins=4, steps=[1, 2, 5, 10]).tick_values(low - pad, high + pad)

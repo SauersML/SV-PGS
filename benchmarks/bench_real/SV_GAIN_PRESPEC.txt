@@ -439,3 +439,24 @@ Results seen (log; no test definition changes because of them)
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
+
+
+New-50k psoriasis replication (POST HOC selection; fixed 2026-10-23 06:37 PDT before any new-50k scoring)
+- Priority: CKD LDpred2-auto, hypothyroidism x3 SV-PGS, then psoriasis LDpred2-auto.
+- Psoriasis was selected after the discovery screen: partial-r2 gain +4.40e-4, one-sided p 0.057.
+  Its selection is post hoc; this prospective replication does not make the discovery confirmatory.
+- Use run aou-scr-d1's saved psoriasis Units weights, columns with_sv|ldpred2_auto|auto and
+  snv_indel|ldpred2_auto|auto, unchanged, with their saved training means and exact record order.
+  Both arms must have identical code, training rows and settings, and the restricted SNV/indel LD band.
+  No refitting, tuning, new centering or choice of weights after seeing replication outcomes.
+- New-callset people only: exclude the discovery cohort, anyone in either fit, relatives above second degree
+  of fit participants, and every member of ~/xw/longread_ids.txt; require outcome and discovery covariates/PCs.
+- Mirror CKD: paired partial r2(with_sv) minus partial r2(snv_indel), discovery covariates, 2000 family
+  bootstrap resamples, one-sided H1 SVs help at alpha 0.05, bootstrap 95% CI, normal one-sided p and
+  upper 95% bound estimate + 1.645 SE, and absolute/relative gain. Use 500 family arm swaps; report null
+  z mean/SD, type-I rate and permutation p; permutation p is primary if null SD is outside [0.8,1.25].
+- Run and report the existing batch_drift summary first. SV median absolute AF drift at least twice
+  short-variant drift invokes the pre-specified downward-bias/lower-bound interpretation.
+- Report every replication attempted, including null or negative results; report people and cases with
+  every count below 40 masked as <40 and no subgroup or variant summary based on fewer than 20 people.
+- ID linkage and all scoring remain inside the AoU workspace, CPU only. Only aggregate QC/results leave it.

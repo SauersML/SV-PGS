@@ -1,0 +1,116 @@
+diff --git a/sv_pgs/scale_mixture_ep.py b/sv_pgs/scale_mixture_ep.py
+index 24228bc..725225d 100644
+--- a/sv_pgs/scale_mixture_ep.py
++++ b/sv_pgs/scale_mixture_ep.py
+@@ -4741,6 +4741,9 @@ class _OuterTrial:
+     enters: bool = False
+     # The tolerance the weights were searched to when this trial was planned (``weight_tolerances``).
+     weights_tolerance: float = np.nan
++    # A halving that moves the step's finite weights by its fraction as well, from rho_k, not at rho-hat: taken once
++    # a halving at rho-hat had no certified value (``fit_hyperparameters``).
++    blended: bool = False
+ 
+ 
+ @_step_scoped
+@@ -4766,10 +4769,12 @@ def fit_hyperparameters(
+       measured (``_path_gain``). It is accepted when that gain less its resolution exceeds ``tolerance``: V(rho) then
+       rises by more than the fit's resolution at every accepted joint step, so there are at most
+       (V* - V(rho_0)) / tolerance of them. A refused joint trial is halved along its segment at rho-hat (where that
+-      keeps the edges) while each halving raises the realized gain. From a state where V's formula has no certified
+-      value (x_k outside every basin of its integrand at rho_k, as at an arbitrary start) the joint trial enters one:
+-      it is accepted where the trial's own state is certified, uncounted, and every accepted joint step lands in a
+-      certified state, so only an inner step can leave one.
++      keeps the edges) while each halving raises the realized gain; once a halving at rho-hat has no certified value,
++      the later halvings move the finite weights by the same fraction, so they tend to the certified state, not to
++      (x_k, rho-hat), and halve while a trial has no certified value or its gain is positive and rising. From a state
++      where V's formula has no certified value (x_k outside every basin of its integrand at rho_k, as at an arbitrary
++      start) the joint trial enters one: it is accepted where the trial's own state is certified, uncounted, and
++      every accepted joint step lands in a certified state, so only an inner step can leave one.
+     - Otherwise x takes inner steps at rho_k. An inner step ascends L_rho, not V (a function of the weights alone),
+       so it is accepted on any certified rise: the natural monotonicity test where B + S is positive definite
+       (Deuflhard, Newton Methods for Nonlinear Problems, 2004, Section 3.1.4: at the trial's fixed point
+@@ -5204,12 +5209,13 @@ def fit_hyperparameters(
+                         )
+                         pending[model] = None
+                         continue
+-                gain = -np.inf
++                gain, no_value = -np.inf, False
+                 previous_remainder = remainders[model]
+ 
+                 def report(outcome: str, trial_state: _State | None = None, resolution: float = np.nan) -> None:
+                     log(
+-                        f"eb outer: model {model} joint trial at fraction {entry.fraction:.4g} of a step predicted {entry.predicted:.4g}: realized {gain:.4g} "
++                        f"eb outer: model {model} joint trial at fraction {entry.fraction:.4g} of a step{' (x and weights)' if entry.blended else ''} "
++                        f"predicted {entry.predicted:.4g}: realized {gain:.4g} "
+                         f"(resolution {resolution:.3g}), trial state error {trial_state.error if trial_state is not None else np.inf:.3g}, "
+                         f"decrement {trial_state.decrement if trial_state is not None else np.inf:.3g}: {outcome}"
+                     )
+@@ -5223,6 +5229,7 @@ def fit_hyperparameters(
+                     if entry.fraction == 1.0:
+                         whole_uncertifiable[model] = trial_state is None
+                     if trial_state is None:
++                        no_value = True
+                         report("no certified value")
+                     if trial_state is not None:
+                         gain, resolution = _path_gain(prior, state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
+@@ -5268,7 +5275,8 @@ def fit_hyperparameters(
+                             max(segment_reach(model, entry.step.hyperparameters.coefficients - hyperparameters[model].coefficients, entry.fraction, gain), 0.0)
+                             + resolution + state.tail + entry.step.evidence_error + entry.step.stationarity_gain
+                         )
+-                        if state.polished and whole_uncertifiable[model] and fraction_remaining <= tolerance:
++                        # (Not from a blended halving: its trial is off the segment at rho-hat that this bound reads.)
++                        if state.polished and whole_uncertifiable[model] and not entry.blended and fraction_remaining <= tolerance:
+                             # The whole step's end has no certified value (on gene 1 [real] it lies along the width
+                             # -> 0 ray where the curvature has saturated), so the model's prediction beyond this
+                             # fraction is void and its remainder cannot be measured; the fraction's own certified
+@@ -5301,6 +5309,16 @@ def fit_hyperparameters(
+                 newly_refused_edge = bool(edged - refused_edges[model])
+                 refused_edges[model] |= edged
+                 longer = fraction * float(np.linalg.norm(segment)) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(hyperparameters[model].coefficients))))
++                # A halving at rho-hat tends to (x_k, rho-hat) as the fraction falls, not to the certified state, so where
++                # one has no certified value no shorter one need have any: on the whole-genome fits [real, aou-ws6
++                # snv_indel and 9 more of 19 arms] a polished state's step predicting 764.5 had none at fractions 1 to
++                # 0.0625, 45 minutes a trial, and halved on until x's resolution. From there this step's halvings move
++                # its finite weights by the fraction too (``blended``), and tend to (x_k, rho_k).
++                weights = hyperparameters[model].log_smoothing
++                finite = np.isfinite(weights) & np.isfinite(target.log_smoothing)
++                blended = entry.blended or (
++                    no_value and entry.fraction < 1.0 and bool(np.any(weights[finite] != target.log_smoothing[finite]))
++                )
+                 if state.polished and remainders[model] < previous_remainder:
+                     # This whole trial re-measured the model's remainder below the one the plan's certificate carried
+                     # (on the mean-field test problem the first whole trial, from the uncertified start, left 0.106
+@@ -5309,14 +5327,26 @@ def fit_hyperparameters(
+                     # remainder, before any halving. A remainder that did not fall leaves the certificate as it was,
+                     # so this replans at most once per measured decrease.
+                     pending[model] = None
+-                elif same_edges and longer and (np.isneginf(gain) or gain > entry.realized) and (
+-                    # A polished state whose whole step has no certified end halves toward the fraction-certified
+-                    # close above (the trial's error falls with the fraction); elsewhere the halving searches a gain,
+-                    # and ends where the segment's quadratic model reaches none.
+-                    (state.polished and whole_uncertifiable[model]) or segment_reach(model, segment, entry.fraction, gain) - state.error > tolerance
++                elif same_edges and longer and (
++                    # A blended halving searches for a certified value, then for a positive gain while it rises: its
++                    # trials tend to the state itself, where the gain is 0, so the rise ends.
++                    (np.isneginf(gain) or gain > max(entry.realized, 0.0)) if blended
++                    else (np.isneginf(gain) or gain > entry.realized) and (
++                        # A polished state whose whole step has no certified end halves toward the fraction-certified
++                        # close above (the trial's error falls with the fraction); elsewhere the halving searches a gain,
++                        # and ends where the segment's quadratic model reaches none.
++                        (state.polished and whole_uncertifiable[model]) or segment_reach(model, segment, entry.fraction, gain) - state.error > tolerance
++                    )
+                 ):
+-                    halved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients + fraction * segment, log_smoothing=target.log_smoothing)
+-                    pending[model] = replace(entry, hyperparameters=halved, certifying=False, fraction=fraction, realized=max(gain, entry.realized))
++                    log_smoothing = np.array(target.log_smoothing, copy=True)
++                    if blended:
++                        log_smoothing[finite] = weights[finite] + fraction * (target.log_smoothing[finite] - weights[finite])
++                    halved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients + fraction * segment, log_smoothing=log_smoothing)
++                    # A blended halving's gains are along its own path: the first is compared with none.
++                    pending[model] = replace(
++                        entry, hyperparameters=halved, certifying=False, fraction=fraction, blended=blended,
++                        realized=max(gain, entry.realized) if blended == entry.blended else -np.inf,
++                    )
+                 elif state.polished and weight_tolerances[model] < entry.weights_tolerance:
+                     # The decision tightened the weights' tolerance since this plan: the polished state is planned once
+                     # more, with the weights searched to what their share asks.

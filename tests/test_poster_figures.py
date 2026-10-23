@@ -65,10 +65,9 @@ def poster_figures():
                                            ("hypothyroidism", 1.4, -0.4, 3.2), ("gout", 4.5, -24.6, 33.6))]
     with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
         yield "aou_1_gain", aou_gallery.gain_figure(rows)[0]
-        # the final forest: a with-SV fit that stopped unconverged, and the traits' common g
-        flagged = [*rows[:3], {**rows[3], "unconverged": True}]
+        # the final forest, with the converged traits' common g
         common = {"relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1, "traits": 4}
-        yield "aou_1_gain_final", aou_gallery.gain_figure(flagged, common)[0]
+        yield "aou_1_gain_final", aou_gallery.gain_figure(rows, common)[0]
 
 
 def drawn_texts(fig):
@@ -116,21 +115,22 @@ def test_the_poster_places_each_figure_whole(tmp_path):
         assert "srcRect" not in shape and "<a:fillRect/>" in shape
 
 
-def test_the_all_of_us_forest_marks_an_unconverged_fit_and_draws_the_common_gain():
-    rows = [{"trait": "gout", "relative": 4.5, "relative_lower": -24.6, "relative_upper": 33.6, "unconverged": True},
+def test_the_all_of_us_forest_refuses_an_unconverged_fit_and_draws_the_common_gain():
+    rows = [{"trait": "gout", "relative": 4.5, "relative_lower": -24.6, "relative_upper": 33.6},
             {"trait": "egfr", "relative": 0.3, "relative_lower": -1.1, "relative_upper": 1.7}]
     common = {"relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1, "traits": 2}
     with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
         fig, lines = aou_gallery.gain_figure(rows, common)
     shown = [text.get_text() for text in drawn_texts(fig)]
-    assert "Gout†" in shown and aou_gallery.UNCONVERGED in shown and aou_gallery.COMBINED in shown
+    assert "Gout" in shown and aou_gallery.COMBINED in shown
     assert "common change" in lines[0]
     plt.close(fig)
     with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
         fig, _ = aou_gallery.gain_figure(rows[1:])
-    shown = [text.get_text() for text in drawn_texts(fig)]
-    assert aou_gallery.UNCONVERGED not in shown and aou_gallery.COMBINED not in shown
+    assert aou_gallery.COMBINED not in [text.get_text() for text in drawn_texts(fig)]
     plt.close(fig)
+    with pytest.raises(SystemExit, match="gout"):
+        aou_gallery.gain_figure([{**rows[0], "unconverged": True}, rows[1]], common)
 
 
 def test_the_forest_gives_each_traits_change_relative_to_the_r2_without_svs():

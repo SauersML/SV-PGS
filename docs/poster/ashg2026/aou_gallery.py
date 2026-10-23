@@ -5,9 +5,9 @@ count of 1 to 20 is among them, and the file, like the figures, stays out of git
 NUMBERS holds:
 - "matched": the rows of SV-PGS with SVs against SV-PGS without them, fitted by identical code and scored on the same
   held-out people, one a trait: the held-out partial r² with SVs less without as a percentage of the two models' mean
-  partial r², the pre-specified g of sv_gain_meta.py (relative, relative_lower, relative_upper: its 95% interval), and
-  "unconverged": true when the with-SV fit stopped before converging. An optional "common" holds the traits' common g
-  the same way, with "traits", the number of traits it combines;
+  partial r², the pre-specified g of sv_gain_meta.py (relative, relative_lower, relative_upper: its 95% interval),
+  for the traits whose two fits both converged alone (a row marked "unconverged" stops the figure). An optional
+  "common" holds those traits' common g the same way, with "traits", the number of traits it combines;
 - "enrichment": prior_enrichment.tsv's rows of arm with_sv, one a (trait, class) and one a trait for every SV together:
   the class's mean posterior E[beta^2 | data] per record over the SNVs' (posterior_enrichment, with its jackknife
   interval), the learned prior's (prior_enrichment), and the class's share of the model's genetic variance and of the
@@ -69,15 +69,14 @@ def trait_name(trait: str) -> str:
 
 def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list[float], tick_text, log: bool,
            reference: float | None = None, estimates: bool = False, bold: frozenset = frozenset(),
-           note: str | None = None, least: float = 0.0):
+           least: float = 0.0):
     """A forest at the column's width in the imputed SVs' sky blue: a row per (label, estimate, low, high), its label
     at the left of the canvas and its interval level with it, each estimate an open mark as imputed SVs' are in the
     simulation figures (every All of Us SV is imputed), with the reference drawn (0, or 1 on a log axis, unless given).
     The axis runs from the first tick to the last, or with ``estimates`` symmetric about the reference over the
     estimates alone, so that each estimate's mark clears an arrowhead at the axis's end. Every margin and the rows'
     pitch are measured from the type, so the forest is as short as its type allows, unless ``least`` inches is taller:
-    then its rows share that height and its marks grow with them. The labels in ``bold`` are set in bold, and ``note``
-    is one line under the axis title."""
+    then its rows share that height and its marks grow with them. The labels in ``bold`` are set in bold."""
     reference = (1.0 if log else 0.0) if reference is None else reference
     fig = plt.figure(figsize=(COLUMN, 1.0))
     labels = [label for label, *_ in rows]
@@ -86,8 +85,7 @@ def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list
                 for label in labels) + ROW_GAP
     # the right margin holds half of the end tick's label; the bottom, the ticks and the axis title
     right = widest(fig, [tick_text(ticks[-1])], fontsize=POSTER_STYLE["font.size"]) / 2 + POSTER_PAD
-    line = tallest(fig, [note], fontsize=POSTER_STYLE["font.size"]) + POSTER_PAD if note else 0.0
-    top, bottom = POSTER_PAD, under_axes(fig, [xlabel]) + line
+    top, bottom = POSTER_PAD, under_axes(fig, [xlabel])
     height = max(top + bottom + pitch * len(rows), least)
     growth = MARK * min((height - top - bottom) / len(rows) / pitch, GROWTH)
     mark, bar, ring = POSTER_MARK * growth, POSTER_BAR * growth, 6.0 * growth
@@ -126,8 +124,6 @@ def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list
     ax.set_xlabel(xlabel)
     # centred on the canvas, not on the axes, whose margins differ: a title wider than the axes then fits either side
     ax.xaxis.label.set_x((COLUMN / 2 - left) / (COLUMN - left - right))
-    if note:
-        fig.text(0.5, POSTER_PAD / height, note, ha="center", va="bottom")
     return fig
 
 
@@ -152,10 +148,7 @@ def baseline_relative(g: float) -> float:
     return 2 * g / (2 - g)
 
 
-UNCONVERGED = "† With-SV fit not converged"
-"""The line under the All of Us forest's axis title when a trait's with-SV fit stopped before converging; the trait's
-name then ends in the dagger."""
-COMBINED = "All traits"
+COMBINED = "All converged traits"
 """The All of Us forest's row for the traits' common g, its name in bold."""
 
 
@@ -163,17 +156,17 @@ def gain_figure(matched: list[dict], common: dict | None = None) -> tuple:
     """Each trait's change in held-out partial r² from adding SVs, relative to the r² without SVs (baseline_relative of
     the pre-specified g), with its 95% interval, a row per trait, and when ``common`` is given a bold row for the traits'
     common g itself, relative to the two arms' mean r². The two scales differ by about 0.1 percentage point at these
-    gains, so one axis title serves both. A trait whose with-SV fit stopped before converging has a dagger, explained
-    under the axis."""
+    gains, so one axis title serves both. No figure on the poster uses a fit that did not converge."""
+    unconverged = [row["trait"] for row in matched if row.get("unconverged")]
+    if unconverged:
+        raise SystemExit(f"aou_numbers.json has fits that did not converge: {', '.join(unconverged)}")
     keys = ("relative", "relative_lower", "relative_upper")
-    rows = [(trait_name(row["trait"]) + ("†" if row.get("unconverged") else ""),
-             *(baseline_relative(row[key] / 100) for key in keys)) for row in matched]
+    rows = [(trait_name(row["trait"]), *(baseline_relative(row[key] / 100) for key in keys)) for row in matched]
     if common:
         rows.append((COMBINED, *(common[key] / 100 for key in keys)))
-    note = UNCONVERGED if any(row.get("unconverged") for row in matched) else None
     # the axis spans the estimates, not their intervals; an interval that runs past it ends in an arrowhead
     fig = forest(rows, "Change in r² with SVs (%)", span([value for _, value, _, _ in rows]), percent, log=False,
-                 estimates=True, bold=frozenset({COMBINED}), note=note, least=HEIGHT)
+                 estimates=True, bold=frozenset({COMBINED}), least=HEIGHT)
     return fig, ["Change in held-out partial r² from adding SVs to SV-PGS for each trait, relative to the r² without "
                  "SVs, with 95% intervals, an arrowhead marking an interval that runs past the axis"
                  + (", and in bold the traits' common change relative to the two models' mean r²" if common else "")]
