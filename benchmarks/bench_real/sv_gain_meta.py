@@ -451,13 +451,19 @@ def partners_of(name: str) -> list[str]:
 
 def validity(name: str, partners: Sequence[str], cohort_trait: str, variances: dict[str, float], summary: dict[str, object]) -> tuple[list[str], list[str]]:
     """Why a pairing run is not a valid test of SV gain (SV_GAIN_PRESPEC.txt, validity), and its uncertified arms:
-    - an arm whose fit is unscorable (the score step's quarantined) or null (held-out score variance at most NULL_VARIANCE);
+    - an arm whose fit is unscorable (the score step's quarantined) or null (held-out score variance at most NULL_VARIANCE,
+      or a NULL_COLLAPSE.json a round's follower wrote in the run or its partner);
     - a run that fitted an arm (``partners``) under another fit step key, which holds the fit's code and inputs, or
       another seed.
     An uncertified arm (the score step's uncertified) is counted and flagged."""
     reasons = [f"its {cohort_trait} fit cannot be scored ({'; '.join(summary['quarantined'][cohort_trait])})"] if cohort_trait in summary.get("quarantined", {}) else []
     reasons += [f"its {arm} fit is null (held-out genetic score variance {variance:.2g}, at most {NULL_VARIANCE:g})"
                 for arm, variance in variances.items() if not variance > NULL_VARIANCE]
+    for marked in (name, *partners):
+        # a round's follower (f7404f6 on) marks each run of a pair where an arm's saved coefficients have mean |b| < 1e-12
+        marker = Path(f"{OPS}/{marked}/run/NULL_COLLAPSE.json")
+        if marker.exists():
+            reasons.append(f"EB fitted no genetic signal ({marked}/run/NULL_COLLAPSE.json: {json.loads(marker.read_text(encoding='utf-8')).get('why', '')})")
     key = Path(f"{OPS}/{name}/run/fit/_KEY").read_text(encoding="utf-8").strip()
     seed = json.load(open(f"{OPS}/{name}/run_config.json", encoding="utf-8"))["seed"]
     for partner in partners:

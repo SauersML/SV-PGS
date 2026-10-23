@@ -217,3 +217,6 @@ def test_a_null_arm_or_an_arm_fitted_under_another_key_or_seed_excludes_a_pair_a
     assert len(reasons) == 2 and all("null" in reason for reason in reasons)
     reasons, _ = sv_gain_meta.validity("aou-q1", ["aou-q2"], "ldl", {"snv_indel": 1.0, "with_sv": 1.0}, {"quarantined": {"ldl": ["with_sv (nonfinite)"]}})
     assert len(reasons) == 3 and "cannot be scored" in reasons[0] and "fit step key" in reasons[1] and "seed" in reasons[2]
+    (tmp_path / "aou-p2" / "run" / "NULL_COLLAPSE.json").write_text('{"trait": "gout", "null_collapse": true, "why": "mean |b| 1e-21"}', encoding="utf-8")
+    reasons, _ = sv_gain_meta.validity("aou-p1", ["aou-p2"], "gout", {"snv_indel": 1e-4, "with_sv": 2e-4}, summary)
+    assert len(reasons) == 1 and "no genetic signal" in reasons[0] and "1e-21" in reasons[0]
