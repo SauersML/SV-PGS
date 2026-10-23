@@ -179,14 +179,14 @@ def test_discussion_says_well_imputed_svs_helped_most_only_when_their_gain_is_cl
         rows = {"all": {"share": [0.4728, 0.1929, 0.7377]}, "well_imputed": {"versus_rest": versus_rest}}
         return poster.copy({"fig5": {"people": 50_000}, "poster_sv_gain": {"rows": rows}})["discussion"][1]
 
-    assert bullet([0.0031, 0.0002, 0.0060]) == "Imputed SVs helped most when causal SVs imputed well."
+    assert bullet([0.0031, 0.0002, 0.0060]) == "Imputed SVs helped most when causal SVs were well imputed."
     assert bullet([0.0007, -0.0019, 0.0034]) == (
         "Imputed SVs gave 47% of the AUC gain of true SV genotypes (95% CI 19–74%).")
-    # with the imputation figure's numbers, the tandem repeats' range from its VNTR and STR rows
+    # with the imputation figure's numbers, the highest r² of its VNTR and STR rows
     rows = [{"short": short, "r2": r2} for short, r2 in (("Alu", 0.84), ("STR", 0.43), ("VNTR", 0.31))]
     (tmp_path / "imputation_numbers.json").write_text(json.dumps({"by_context": {"rows": rows}}))
-    assert bullet([0.0031, 0.0002, 0.0060]) == ("Imputed SVs helped most when causal SVs imputed well, and tandem "
-                                                "repeat SVs imputed poorly (r² 0.31–0.43).")
+    assert bullet([0.0031, 0.0002, 0.0060]) == ("Imputed SVs helped most when causal SVs were well imputed. Tandem "
+                                                "repeat SVs imputed poorly (r² ≤ 0.43).")
 
 
 def test_discussion_gives_the_pooled_all_of_us_comparison_with_ldpred2(monkeypatch, tmp_path):
@@ -195,7 +195,7 @@ def test_discussion_gives_the_pooled_all_of_us_comparison_with_ldpred2(monkeypat
     assert poster.aou_compared() == ""
     (tmp_path / "aou_vs_ldpred2.json").write_text(json.dumps({"combined": {"with_sv": {"relative": 11.38,
                                                                                        "p_one": 0.0195}}}))
-    assert poster.aou_compared() == ", and in All of Us (r² +11%, p = 0.02)"
+    assert poster.aou_compared() == ", and in All of Us (+11%, p = 0.02)"
     assert [poster.p_value(p) for p in (0.0047, 0.0195, 0.32)] == ["p = 0.005", "p = 0.02", "p = 0.32"]
 
 

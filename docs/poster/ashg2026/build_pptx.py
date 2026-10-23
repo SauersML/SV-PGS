@@ -155,17 +155,17 @@ def aou_compared() -> str:
     if not path.is_file():
         return ""
     pooled = json.loads(path.read_text())["combined"]["with_sv"]
-    return f", and in All of Us (r² {pooled['relative']:+.0f}%, {p_value(pooled['p_one'])})"
+    return f", and in All of Us ({pooled['relative']:+.0f}%, {p_value(pooled['p_one'])})"
 
 
 def repeats() -> str:
-    """The imputation r² range of SVs in tandem repeats (VNTRs and STRs) from the imputation figure's numbers, as a
-    clause for Discussion bullet 2, when figures/imputation/imputation_numbers.json holds them."""
+    """The highest imputation r² of SVs in tandem repeats (VNTRs and STRs) from the imputation figure's numbers, as a
+    second sentence for Discussion bullet 2, when figures/imputation/imputation_numbers.json holds them."""
     path = IMPUTATION / "imputation_numbers.json"
     if not path.is_file():
         return ""
     r2 = sorted(row["r2"] for row in json.loads(path.read_text())["by_context"]["rows"] if row["short"] in ("VNTR", "STR"))
-    return f", and tandem repeat SVs imputed poorly (r² {r2[0]:.2f}–{r2[-1]:.2f})"
+    return f" Tandem repeat SVs imputed poorly (r² ≤ {r2[-1]:.2f})."
 
 
 def copy(numbers: dict) -> dict:
@@ -197,11 +197,11 @@ def copy(numbers: dict) -> dict:
         # over every simulation with causal SVs (its "all" row, Fieller's interval)
         "discussion": [
             # each bullet fills its second line, so neither ends on a word or two
-            f"SV-PGS was more accurate than LDpred2-auto{cite('Privé 2020 Bioinformatics')} with and without causal "
-            f"SVs{compared}.",
-            ("Imputed SVs helped most when causal SVs imputed well" if versus_rest[1] > 0 else
+            f"SV-PGS was more accurate than LDpred2-auto{cite('Privé 2020 Bioinformatics')} both with and without "
+            f"causal SVs{compared}.",
+            ("Imputed SVs helped most when causal SVs were well imputed." if versus_rest[1] > 0 else
              f"Imputed SVs gave {share[0]:.0%} of the AUC gain of true SV genotypes (95% CI {share[1] * 100:.0f}–"
-             f"{share[2]:.0%})") + f"{repeats()}.",
+             f"{share[2]:.0%}).") + repeats(),
         ],
     }
 
