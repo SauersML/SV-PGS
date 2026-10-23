@@ -644,7 +644,8 @@ def build() -> None:
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
             Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)], gap="section"),
             figure(gallery["poster_sv_gain"]),
-            bar(96, "References"), row([text(references[:half])], [text(references[half:])]),
+            # the References bar a block's gap under the forest's axis title, so the forest takes the height
+            Block("bar", (96, "References"), gap="block"), row([text(references[:half])], [text(references[half:])]),
         ],
         [
             bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks(),

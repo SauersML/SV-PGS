@@ -991,6 +991,9 @@ sv_min_realized_r2)."""
 POSTER_GAIN, POSTER_GENOTYPES = 22.92, 11.4
 """Inches: the widths of the SV gain forest (the poster's middle column, build_pptx.py's MIDDLE) and the imputation
 figure (the left column, LEFT), each placed at its column's full width."""
+POSTER_GAIN_HEIGHT = 9.18
+"""Inches: the SV gain forest's height, which fills the middle column from the training-size figures to the References
+at its foot (build_pptx.py's layout leaves 0.02 in to spare)."""
 FOREST_SIZES = SIZES[:3]
 """The training sizes the SV gain forest averages over, 5,000 to 20,000. Both genotype sources reached 40,000 in one
 simulation only, a control one, and the gain grows with training size: with it, the control's gain with imputed SVs
@@ -1035,9 +1038,12 @@ def poster_sv_gain_figure(grids):
                  for key, row in sets.items()},
     }
     rows = list(sets.values())
-    pitch, key, top, bottom, right = 1.7375, 1.0, 0.25, 2.3, 0.5
-    height = key + top + bottom + pitch * len(rows)
+    # the rows share the height left under the key band, which holds the sources' names and a pad over and under
+    # them, and over the measured x axis
+    top, right, height = POSTER_PAD, 0.5, POSTER_GAIN_HEIGHT
     fig = plt.figure(figsize=(POSTER_GAIN, height))
+    key = tallest(fig, [label for label, _, _ in SOURCES], fontsize=POSTER_TYPE, fontweight="bold") + 2 * POSTER_PAD
+    bottom = under_axes(fig, ["Test AUC gain from adding SVs"])
     left = widest(fig, [row["label"] for row in rows], fontsize=POSTER_TYPE, fontweight="bold", linespacing=1.0) + 0.75
     ax = frame(fig, left, bottom, POSTER_GAIN - left - right, height - key - top - bottom)
     ends = [row[source][end] for row in rows for source in ("true", "imputed") for end in ("lower", "upper")
