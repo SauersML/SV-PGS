@@ -242,6 +242,10 @@ Results seen (log; no test definition changes because of them)
     step. The pair counts under amendment 2. The flag goes beside the trait, and no test definition changes.
 - The primary family test is not computed early. It runs once, at the earlier of all 11 traits' pairs finished or
   2026-10-23 08:00 PDT (When, above).
+- 23:50 PDT: amendment 4's continuations were submitted together on Spot as round c4 (code db70b15), before any of
+  them ran: aou-c4-h1/h2 (hypertension, warm from aou-m3f-h1/h2), aou-c4-g1/g2 (gout, from aou-x3-g1/g2) and
+  aou-c4-l1/l2 (LDL, from aou-wl15). Each arm warm-starts from its own arm's saved model. Both arms take the same
+  mode-seed list (both arms' saved models, mode_orders 8), so each pair shares one fit key.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
