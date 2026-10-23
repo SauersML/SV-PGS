@@ -332,6 +332,10 @@ Results seen (log; no test definition changes because of them)
   analysis without T2D. When the three c4 pairs have their reports, or at 12:00 PDT, it runs the amendment-5
   sensitivity analysis, with each c4 pair in place of its original fits. Its logs are ~/xw/svgain_PRIMARY.log,
   svgain_PRIMARY_noT2D.log and svgain_SENSITIVITY_c4.log, with times in ~/xw/svgain_watch.status.
+- 00:32 PDT on 2026-10-23, the coordinator's decision: T2D (aou-m3f-t1/t2) is not continued, although both its arms are
+  uncertified and amendment 4 covers later uncertified arms. Its pair finished after the c4 continuations were
+  submitted, and a continuation would land after the primary. The c4 sensitivity analysis therefore uses T2D's
+  original fits, flagged uncertified.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
