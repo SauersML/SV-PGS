@@ -467,6 +467,8 @@ def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np
                 "tuning_rows": _count(tuning_rows.shape[0]),
                 "tuning_partial_r2": None if index is None or method == "ldpred2_auto" else float(tuning_r2[index]),
                 "held_out_partial_r2": None if index is None else _partial_r2(target, held_scores[:, index], covariates),
+                # every held-out person, long-read panel members too: reports come from fastpgs_meta --exclude
+                "long_read_panel": "not excluded, preliminary",
             }
             if binary:
                 line["cases"] = _cases_text(held.shape[0], cases)

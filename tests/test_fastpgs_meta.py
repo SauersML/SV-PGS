@@ -28,9 +28,12 @@ def test_every_method_is_tested_on_both_traits_and_a_failed_arm_is_named(tmp_pat
     generator = np.random.default_rng(1)
     _write(tmp_path, "run-a", "ldl", False, np.array([f"p{index}" for index in range(600)]), generator)
     _write(tmp_path, "run-b", "gout", True, np.array([f"p{index}" for index in range(300, 900)]), generator, failed=True)
-    assert fastpgs_meta.main(["run-a", "run-b", "--root", str(tmp_path), "--resamples", "60", "--permutations", "3"]) == 0
+    assert fastpgs_meta.main(["run-a", "run-b", "--root", str(tmp_path), "--resamples", "60", "--permutations", "3", "--preliminary"]) == 0
     printed = capsys.readouterr().out
     assert "union of held-out people 900" in printed
+    # Without the long-read panel's exclusion every reported line is marked preliminary.
+    reported = printed[printed.index(fastpgs_meta.PRELIMINARY):].splitlines()
+    assert all(line.startswith("PRELIMINARY") for line in reported)
     for method in aou_fastpgs.METHODS:
         assert f"=== {method}" in printed
     assert "=== lassosum2: 1 traits; no score in an arm for gout" in printed
@@ -48,7 +51,7 @@ def test_a_trait_whose_arms_chose_the_same_model_is_listed_and_not_combined(tmp_
     saved["scores"][2, 1] = saved["scores"][2, 0]
     with open(path, "wb") as handle:
         np.savez(handle, **saved)
-    assert fastpgs_meta.main(["run-a", "run-b", "--root", str(tmp_path), "--resamples", "40", "--permutations", "2"]) == 0
+    assert fastpgs_meta.main(["run-a", "run-b", "--root", str(tmp_path), "--resamples", "40", "--permutations", "2", "--preliminary"]) == 0
     printed = capsys.readouterr().out
     ct = printed[printed.index("=== ct"):]
     assert "the same model in both arms (gain 0, not combined) for gout" in ct
@@ -92,3 +95,24 @@ def test_the_screen_tests_each_admitted_trait_one_sided_and_names_the_rest(tmp_p
     lines = [line for line in printed.splitlines() if line.startswith("  ") and "one-sided p=" in line]
     assert sorted(line.split("\t")[0].strip() for line in lines) == ["gout", "ldl"]
     assert "n=1198" in printed and "traits with a with_sv gain at BH q < 0.05" in printed
+
+
+def test_a_screen_or_primary_report_needs_the_long_read_exclusion(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    generator = np.random.default_rng(5)
+    _write(tmp_path, "run-a", "ldl", False, np.array([f"p{index}" for index in range(300)]), generator)
+    for extra in (["--screen", "ldpred2_auto"], ["--screen", "ldpred2_auto", "--preliminary"], []):
+        with pytest.raises(SystemExit):
+            fastpgs_meta.main(["run-a", "--root", str(tmp_path), "--resamples", "20", *extra])
+    assert "--exclude" in capsys.readouterr().err
+    (tmp_path / "lr.tsv").write_text("research_id\np0\n")
+    assert fastpgs_meta.main(["run-a", "--root", str(tmp_path), "--resamples", "20", "--permutations", "2", "--exclude", str(tmp_path / "lr.tsv")]) == 0
+    assert "PRELIMINARY" not in capsys.readouterr().out
+
+
+def test_a_pooled_gain_carries_its_own_gls_inference_one_sided() -> None:
+    from benchmarks.bench_real import sv_gain_meta
+    from scipy import stats
+
+    text = sv_gain_meta.normal(sv_gain_meta.PairedComparison(0.002, 0.001, 2.0), 1e4, "")
+    assert "20.000 (SE 10.000)" in text and f"one-sided p (gain > 0) = {stats.norm.sf(2.0):.4g}" in text
+    assert f"{stats.norm.sf(-2.0):.4g}" in sv_gain_meta.normal(sv_gain_meta.PairedComparison(-0.002, 0.001, -2.0), 1e4, "")

@@ -31,7 +31,8 @@ when only aou-wl15 (LDL) had been scored, to the primary below. It weights LDL, 
   95% lower and upper bounds. The sharp-null test is the family arm-swap permutation p (Calibration, below). A gain is
   claimed only if both p are below 0.05. A run's traits each enter once: several matched pairing runs of one trait are
   averaged per arm first, with their family memberships joined (``merge_pairs``), and people in an excluded list (the
-  long-read panel) are dropped before anything is computed (``main``).
+  long-read panel) are dropped before anything is computed (``main``). A report without that list is printed only
+  with --preliminary, and every one of its lines is then marked PRELIMINARY.
 - Original primary, now secondary: the two-sided Stouffer combination of the per-trait z = gain / bootstrap SE,
   equal weights, Z = sum(z) / sqrt(1'R1).
 - Secondary:
@@ -44,7 +45,8 @@ when only aou-wl15 (LDL) had been scored, to the primary below. It weights LDL, 
     although they share people;
   - the gain pooled by generalized least squares under the joint-resample covariance
     (``held_out_comparison.meta_analysis``), absolute and relative, over all held-out people and within the EUR, AFR
-    and AMR groups.
+    and AMR groups, each with its own estimate, SE, 95% interval and one-sided p (gain > 0). The Stouffer Z and its
+    permutation p test a different statistic and are never given as the p of a pooled gain.
 - Every trait and every pooled gain also gets its one-sided upper 95% bound ("SVs add at most"): the estimate plus
   1.645 standard errors (HKSJ: the t quantile on k - 1 degrees of freedom), absolute and relative to the snv_indel
   arm's partial r^2.
@@ -387,12 +389,17 @@ def calibrate(traits: Sequence[PairedTrait], clusters: np.ndarray, weights: np.n
     }
 
 
+PRELIMINARY = "PRELIMINARY: the long-read panel's members are not excluded; not a primary or screen report"
+
+
 def normal(comparison: PairedComparison, scale: float, unit: str) -> str:
-    """A pooled gain (times ``scale``) with its normal 95% interval, two-sided p and one-sided upper 95% bound."""
+    """A pooled gain (times ``scale``) with its SE, normal 95% interval, one-sided p (gain > 0) and one-sided upper 95%
+    bound: the inference of that gain's own estimate."""
     half = 1.959963984540054 * comparison.standard_error
-    p = 2.0 * stats.norm.sf(abs(comparison.z_score)) if math.isfinite(comparison.z_score) else math.nan
-    return (f"{comparison.estimate * scale:.3f}{unit} [{(comparison.estimate - half) * scale:.3f}, {(comparison.estimate + half) * scale:.3f}], "
-            f"p = {p:.4g}, at most {(comparison.estimate + UPPER * comparison.standard_error) * scale:.3f}{unit}")
+    p = stats.norm.sf(comparison.z_score) if math.isfinite(comparison.z_score) else math.nan
+    return (f"{comparison.estimate * scale:.3f}{unit} (SE {comparison.standard_error * scale:.3f}{unit}) "
+            f"[{(comparison.estimate - half) * scale:.3f}, {(comparison.estimate + half) * scale:.3f}], "
+            f"one-sided p (gain > 0) = {p:.4g}, at most {(comparison.estimate + UPPER * comparison.standard_error) * scale:.3f}{unit}")
 
 
 def pooled_lines(label: str, absolute: dict[str, object], relative: dict[str, object]) -> list[str]:
@@ -423,8 +430,8 @@ def report(result: dict[str, object], traits: Sequence[PairedTrait], contrast: s
                  + ", ".join(f"{name} {share:.2f}" for name, share in zip(names, common["weight_share"])))
     lines.append(f"  weak null g = 0, family-clustered bootstrap test, one-sided (g > 0): z = {common['z']:.3f}, p = {common['p_one_sided']:.4g}; "
                  f"one-sided 95% bounds: g > {common['lower_95'] * 100:.2f}%, g < {common['upper_95'] * 100:.2f}% (two-sided p {common['p_two_sided']:.4g})")
-    lines.append(f"original primary, now secondary: Stouffer Z = {result['Z']:.3f}, two-sided p = {result['p_stouffer']:.4g} "
-                 f"(one-sided gain > 0: {result['p_stouffer_one_sided']:.4g})")
+    lines.append(f"original primary, now secondary: Stouffer combination of the per-trait z, a separate statistic and not the p of any "
+                 f"pooled gain: Z = {result['Z']:.3f}, two-sided p = {result['p_stouffer']:.4g} (one-sided gain > 0: {result['p_stouffer_one_sided']:.4g})")
     lines.append(f"ACAT p = {result['p_acat']:.4g} (from one-sided p: {result['p_acat_one_sided']:.4g}); omnibus Cauchy(Stouffer, ACAT) p = {result['p_omnibus']:.4g}")
     random = result["relative_random"]
     lines.append(f"relative gain (% of snv_indel r^2), REML + HKSJ, sensitivity analysis treating the traits as independent: {random['estimate'] * 100:.2f}% [{random['ci_low'] * 100:.2f}, {random['ci_high'] * 100:.2f}], "
@@ -452,7 +459,8 @@ def report(result: dict[str, object], traits: Sequence[PairedTrait], contrast: s
                      f"{calibration['type_one']['p_common_one_sided']:.3f}")
         lines.append(f"  Stouffer Z null mean {calibration['Z_mean']:.2f}, SD {calibration['Z_sd']:.2f}; type-I at 0.05: "
                      + ", ".join(f"{name} {value:.3f}" for name, value in calibration["type_one"].items()))
-        lines.append(f"  permutation p: Stouffer Z upper {calibration['p_permutation_Z_upper']:.4g}, two-sided {calibration['p_permutation_Z_two_sided']:.4g}; "
+        lines.append(f"  permutation p of the Stouffer Z (a separate statistic, not the p of g or of a GLS pooled gain): upper "
+                     f"{calibration['p_permutation_Z_upper']:.4g}, two-sided {calibration['p_permutation_Z_two_sided']:.4g}; "
                      f"ACAT {calibration['p_permutation_acat']:.4g}; omnibus {calibration['p_permutation_omnibus']:.4g}")
     return lines
 
@@ -627,9 +635,15 @@ def main(argv: list[str] | None = None) -> int:
                                               "a tab-separated table with a research_id column): the long-read panel's members.")
     parser.add_argument("--only", action="store_true", help="Keep only the people in --exclude's file instead of dropping them "
                                                             "(the descriptive long-read stratum, SV_GAIN_PRESPEC.txt secondary 4).")
+    parser.add_argument("--preliminary", action="store_true", help="Report without --exclude, every line marked PRELIMINARY: the "
+                                                                    "long-read panel's members stay in, so it is no primary report.")
     parser.add_argument("--permutations", type=int, default=PERMUTATIONS)
     parser.add_argument("--resamples", type=int, default=RESAMPLES)
     args = parser.parse_args(argv)
+    if not args.exclude and not args.preliminary:
+        parser.error("--exclude (the long-read panel's research ids) is required; --preliminary reports without it")
+    if args.only and not args.exclude:
+        parser.error("--only needs --exclude")
     named = [(spec.split(":")[0], spec.split(":")[1].split(",") if ":" in spec else None) for spec in args.runs]
     runs, names = [], []
     for name, partners in named:
@@ -668,7 +682,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"runs {' '.join(args.runs)}; contrast {args.contrast}; union of held-out people {shown(labels.shape[0])}, clusters {shown(int(clusters.max()) + 1)}, "
           f"ancestry labels differing between runs {shown(disagreements)}; resamples {args.resamples}, permutations {args.permutations}")
     result = analyse(traits, clusters, labels, int(runs[0]["seed"]), args.resamples, args.permutations)
-    print("\n".join(report(result, traits, args.contrast)))
+    lines = report(result, traits, args.contrast)
+    print("\n".join(lines if args.exclude else [PRELIMINARY, *(f"PRELIMINARY {line}" for line in lines)]))
     return 0
 
 
