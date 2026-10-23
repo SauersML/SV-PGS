@@ -246,6 +246,14 @@ Results seen (log; no test definition changes because of them)
   them ran: aou-c4-h1/h2 (hypertension, warm from aou-m3f-h1/h2), aou-c4-g1/g2 (gout, from aou-x3-g1/g2) and
   aou-c4-l1/l2 (LDL, from aou-wl15). Each arm warm-starts from its own arm's saved model. Both arms take the same
   mode-seed list (both arms' saved models, mode_orders 8), so each pair shares one fit key.
+- About 00:05 PDT on 2026-10-23, at the coordinator's request: an interim combination, labelled interim as When
+  allows. It is not the primary, and nothing is stopped or added because of it (main fbdb04af, long-read people
+  excluded, 200 family arm swaps).
+  - Six traits as they stand: LDL (aou-wl15 with aou-x3-l2), hypothyroidism, AF, eGFR, gout and hypertension, with
+    gout, hypertension and LDL's wl15 part pre-amendment. g = +0.21% [-0.62, 1.05], permutation p 0.23, at most
+    0.92%. Weight shares: AF 0.76, hypothyroidism 0.16, eGFR 0.08, LDL 0.01, gout 0.00, hypertension 0.00.
+  - The four pairs no amendment-4 continuation touches (LDL aou-x3-l2 alone, hypothyroidism, AF, eGFR): g = -0.00%
+    [-0.16, 0.15], permutation p 0.52, at most 0.12%. Weight shares: LDL 0.60, AF 0.31, hypothyroidism 0.06, eGFR 0.03.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
