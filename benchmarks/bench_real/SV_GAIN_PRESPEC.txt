@@ -353,6 +353,13 @@ Results seen (log; no test definition changes because of them)
   uncertified and amendment 4 covers later uncertified arms. Its pair finished after the c4 continuations were
   submitted, and a continuation would land after the primary. The c4 sensitivity analysis therefore uses T2D's
   original fits, flagged uncertified.
+- 00:33 PDT on 2026-10-23: a second watcher on the app (~/xw/q8_watch.sh, the same sv_gain_meta, 1,000 swaps,
+  long-read people excluded) runs Q8's one test over Pair A (aou-q8a-h, -b, -s, -a and -l) as soon as all 5 pairs
+  have their reports, or at 2026-10-24 12:00 PDT over the pairs that have. Its log is ~/xw/svgain_Q8.log.
+- 00:35 PDT on 2026-10-23: a third step (~/xw/holm_watch.sh) waits until the primary and Q8 have both run. It then
+  writes each family's Holm-adjusted p over the two families beside its own p, for the sharp-null and the weak-null
+  one-sided p separately (~/xw/svgain_HOLM.log). Then it runs the combined g over both families' pairs, a secondary
+  result only (~/xw/svgain_COMBINED_secondary.log). Neither changes the rule that decides each family.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
