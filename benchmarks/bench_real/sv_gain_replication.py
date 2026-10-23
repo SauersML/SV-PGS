@@ -59,7 +59,7 @@ new people, and a trait tested here is reported whatever its result.
     python -m benchmarks.bench_real.sv_gain_replication SCORES.npz [--resamples N] [--permutations N]
 
 ``SCORES.npz`` is one trait's file from ``extra_test_people score``: ids, target, covariates, families, ancestry,
-baseline (snv_indel) and candidate (with_sv). Only aggregates are printed, and every count of 1 to 20 is shown as <=20.
+baseline (snv_indel) and candidate (with_sv). Only aggregates are printed, and every count below 40 is shown as <40.
 """
 
 from __future__ import annotations
@@ -130,7 +130,7 @@ MINIMUM_SHOWN = 40
 
 def shown(count: int) -> str:
     """A count as it may be printed: below MINIMUM_SHOWN, only that it is below it."""
-    return f"<{MINIMUM_SHOWN}" if 1 <= count < MINIMUM_SHOWN else str(count)
+    return f"<{MINIMUM_SHOWN}" if count < MINIMUM_SHOWN else str(count)
 
 
 def promising(p_one_sided: float, matched_arms: bool, identical_code: bool) -> bool:
@@ -149,7 +149,7 @@ def batch_drift(frequency: np.ndarray, other_frequency: np.ndarray, quality: np.
     and the median quality change. The SV group drifting much more than the short-variant group is what biases the
     replication against SVs (the docstring)."""
     def summary(member: np.ndarray) -> dict[str, float]:
-        if int(member.sum()) < 2:
+        if int(member.sum()) < 40:
             return {"records": int(member.sum())}
         first, second = frequency[member], other_frequency[member]
         return {
@@ -243,6 +243,8 @@ def replicate(target: np.ndarray, covariates: np.ndarray, families: np.ndarray, 
 
 
 def report(result: dict[str, float], trait: str) -> list[str]:
+    if result['people'] < 40 or min(result['cases'], result['people'] - result['cases']) < 20:
+        return [f"{trait}: people {shown(result['people'])}, cases {shown(result['cases'])}; insufficient group size, statistics suppressed"]
     lines = [
         f"{trait}: replication in new held-out people {shown(result['people'])} (families {shown(result['families'])}, "
         f"cases {shown(result['cases'])}); snv_indel partial r^2 {result['baseline_r2']:.5f}",

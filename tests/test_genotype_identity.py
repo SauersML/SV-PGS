@@ -38,3 +38,12 @@ def test_assignments_reject_ties_duplicate_targets_and_missing_runner_up():
     np.testing.assert_array_equal(ambiguous, [True, True, True, False, True, False])
     assert shown(0) == shown(39) == '<40'
     assert distribution(np.ones(39))['distribution'] == 'suppressed'
+
+
+def test_crosswalk_rejects_ambiguous_identifiers(tmp_path):
+    from benchmarks.bench_real.extra_test_people import read_crosswalk
+    import pytest
+    path = tmp_path / 'map.tsv'
+    path.write_text('research_id\tsequencing_id\nresearch-a\tsample-a\nresearch-a\tsample-b\n')
+    with pytest.raises(ValueError, match='one-to-one'):
+        read_crosswalk(path)

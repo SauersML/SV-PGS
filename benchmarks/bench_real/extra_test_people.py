@@ -19,7 +19,7 @@ ids. A new person enters a trait's rows where the run's phenotype table has thei
 their PCs. They are left out where they are already in the run's cohort or related (above second degree) to one of its
 fit rows. Families come from the same kinship table as the cohort's, joined to the cohort's families where a new person
 is related to someone in it. Everything runs inside the workspace; only counts and aggregates are printed, with counts
-of 1 to 20 shown as <=20.
+below 40 shown as <40.
 
     python -m benchmarks.bench_real.extra_test_people score --callset PATTERN --batches 0 1 2 3 4 \\
         --crosswalk TSV --out DIR PAIR=SNV_RUN,SV_RUN [...]
@@ -56,7 +56,7 @@ MINIMUM_SHOWN = 40
 
 def shown(count: int) -> str:
     """A count as it may be printed: below MINIMUM_SHOWN, only that it is below it."""
-    return f"<{MINIMUM_SHOWN}" if 1 <= count < MINIMUM_SHOWN else str(count)
+    return f"<{MINIMUM_SHOWN}" if count < MINIMUM_SHOWN else str(count)
 
 
 @dataclass(frozen=True)
@@ -281,7 +281,7 @@ def report_found(label: str, table: WeightTable, found: dict[str, np.ndarray], n
     for column, name in enumerate(names):
         members = table.member[:, column]
         lacking = [int((members & ~mask).sum()) for mask in found.values()]
-        print(f"{label} {name}: model records {int(members.sum())}, not in the callset {max(lacking)} (largest over batches)")
+        print(f"{label} {name}: model records {shown(int(members.sum()))}, not in the callset {shown(max(lacking))} (largest over batches)")
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +315,7 @@ def joined_families(old_ids: Sequence[str], old_families: np.ndarray, new_ids: S
     return np.array(labels, dtype=np.int64)
 
 
-def new_people_rows(run, trait_index: int, new_ids: Sequence[str]) -> dict[str, np.ndarray]:
+def new_people_rows(run, trait_index: int, new_ids: Sequence[str], exclude: frozenset[str] = frozenset()) -> dict[str, np.ndarray]:
     """One trait's new people (research ids) with an outcome and PCs, outside the cohort and unrelated to its fit rows."""
     from sv_pgs.cohort import AncestryPcs, ResearchId, build_cohort, kinship_components, read_kinship_pairs, read_predicted_ancestry
     from sv_pgs.workspace_pipeline import _read_cohort, _read_table, trait_table
@@ -335,7 +335,8 @@ def new_people_rows(run, trait_index: int, new_ids: Sequence[str]) -> dict[str, 
     have_pcs = set(ancestry.research_ids)
     counts = {"new": len(new_ids), "in cohort": sum(i in in_cohort for i in new_ids),
               "related to fit rows": sum(i in related_to_fit and i not in in_cohort for i in new_ids)}
-    people = [i for i in new_ids if i not in in_cohort and i not in related_to_fit and i in have_pcs and i in table.targets]
+    counts["long-read excluded"] = sum(i in exclude for i in new_ids)
+    people = [i for i in new_ids if i not in exclude and i not in in_cohort and i not in related_to_fit and i in have_pcs and i in table.targets]
     counts["with outcome and PCs"] = len(people)
     built = build_cohort([ResearchId(i) for i in people], ancestry, ["extra"] * len(people), ["imputed"] * len(people), {name: table})
     wanted = [column for column, used in zip(cohort.covariate_names, cohort.covariate_columns[trait_index]) if used]
@@ -352,12 +353,19 @@ def new_people_rows(run, trait_index: int, new_ids: Sequence[str]) -> dict[str, 
 def read_crosswalk(path: str | Path) -> dict[str, str]:
     """sequencing_id -> research_id."""
     with open(path, newline="", encoding="utf-8") as handle:
-        return {row["sequencing_id"]: row["research_id"] for row in csv.DictReader(handle, delimiter="\t")}
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    sequencing = [row["sequencing_id"] for row in rows]
+    research = [row["research_id"] for row in rows]
+    if (any(not value for value in sequencing + research) or
+            len(set(sequencing)) != len(sequencing) or len(set(research)) != len(research)):
+        raise ValueError("Crosswalk must be nonempty and one-to-one")
+    return dict(zip(sequencing, research))
 
 
 def score(args: argparse.Namespace) -> int:
     from sv_pgs.workspace_pipeline import ARMS
 
+    exclude = frozenset(Path(args.exclude).read_text().split())
     pairs = []
     for spec in args.pairs:
         pair, arms = spec.split("=")
@@ -391,7 +399,7 @@ def score(args: argparse.Namespace) -> int:
         from sv_pgs.workspace_pipeline import _read_cohort
 
         for trait_index, trait in enumerate(_read_cohort(run).trait_names):
-            rows = new_people_rows(run, trait_index, list(research[mapped]))
+            rows = new_people_rows(run, trait_index, list(research[mapped]), exclude)
             place = {person: column for column, person in enumerate(research)}
             columns = np.array([place[person] for person in rows["ids"]], dtype=np.int64)
             arm_scores = {arm: all_scores[entries.index((pair, trait, arm)), columns] for arm in ARMS}
@@ -450,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
     scoring.add_argument("--batches", nargs="+", required=True)
     scoring.add_argument("--crosswalk", required=True)
     scoring.add_argument("--out", required=True)
+    scoring.add_argument("--exclude", required=True, help="Workspace long-read research-ID file; never printed.")
     checking = commands.add_parser("check")
     checking.add_argument("run")
     checking.add_argument("--batch", required=True)

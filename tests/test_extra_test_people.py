@@ -36,7 +36,7 @@ def test_fast_method_weights_reproduce_the_jobs_own_score_and_drop_unused_rows(t
 
 
 def test_counts_below_forty_are_masked():
-    assert shown(0) == "0"
+    assert shown(0) == "<40"
     assert shown(1) == "<40" and shown(39) == "<40"
     assert shown(40) == "40" and shown(7185) == "7185"
 
