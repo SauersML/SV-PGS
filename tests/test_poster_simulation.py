@@ -171,10 +171,15 @@ def matched_common(poster, monkeypatch, tmp_path, common: dict) -> None:
     monkeypatch.setattr(poster, "HERE", tmp_path)
 
 
-def test_discussion_states_the_imputed_share_of_the_true_sv_gain(monkeypatch, tmp_path):
+def test_discussion_says_well_imputed_svs_helped_most_only_when_their_gain_is_clearly_larger(monkeypatch, tmp_path):
     poster = poster_module(monkeypatch, tmp_path)
-    numbers = {"fig5": {"people": 50_000}, "poster_sv_gain": {"rows": {"all": {"share": [0.4728, 0.1929, 0.7377]}}}}
-    assert poster.copy(numbers)["discussion"][1] == (
+
+    def bullet(versus_rest):
+        rows = {"all": {"share": [0.4728, 0.1929, 0.7377]}, "well_imputed": {"versus_rest": versus_rest}}
+        return poster.copy({"fig5": {"people": 50_000}, "poster_sv_gain": {"rows": rows}})["discussion"][1]
+
+    assert bullet([0.0031, 0.0002, 0.0060]) == "Imputed SVs helped most when causal SVs were well imputed."
+    assert bullet([0.0007, -0.0019, 0.0034]) == (
         "Imputed SVs gave 47% of the AUC gain of true SV genotypes (95% CI 19–74%).")
 
 

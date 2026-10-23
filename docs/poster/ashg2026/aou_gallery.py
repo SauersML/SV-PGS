@@ -525,7 +525,7 @@ def gain_figure(matched: list[dict], common: dict | None = None, compared: list[
                if all(key in against for key in (*keys, "p_one")) else None)
     versus, versus_notes = pooled_rows(overall, groups, "vs_ldpred2")
     if versus:
-        panels.append(Panel(versus, [("", SV_PGS, "o", True)], "SV-PGS r² vs LDpred2-auto (%)", notes=versus_notes))
+        panels.append(Panel(versus, [("", SV_PGS, "o", True)], "SV-PGS vs LDpred2-auto (%)", notes=versus_notes))
     rows = order([(trait_name(row["trait"]), [tuple(baseline_relative(row[key] / 100) for key in keys)])
                   for row in matched if converged(row)], compared)
     common_p = ({key: common[key] for key in keys} | {"p": common["p_sharp"]}
