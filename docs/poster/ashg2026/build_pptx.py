@@ -143,11 +143,37 @@ def people(count: int) -> str:
     return f"{count:,}"
 
 
+def p_value(p: float) -> str:
+    """A p value as the All of Us figure writes it: one significant figure below 0.01, two decimals otherwise."""
+    return f"p = {p:.1g}" if p < 0.01 else f"p = {p:.2f}"
+
+
+def aou_compared() -> str:
+    """The All of Us comparison with LDpred2-auto, as a clause for Discussion bullet 1, when aou_vs_ldpred2.json holds
+    it: the pooled change in held-out r² of SV-PGS with SVs over LDpred2-auto's, with its one-sided p."""
+    path = HERE / "aou_vs_ldpred2.json"
+    if not path.is_file():
+        return ""
+    pooled = json.loads(path.read_text())["combined"]["with_sv"]
+    return f", and in All of Us (r² {pooled['relative']:+.0f}%, {p_value(pooled['p_one'])})"
+
+
+def repeats() -> str:
+    """The imputation r² range of SVs in tandem repeats (VNTRs and STRs) from the imputation figure's numbers, as a
+    clause for Discussion bullet 2, when figures/imputation/imputation_numbers.json holds them."""
+    path = IMPUTATION / "imputation_numbers.json"
+    if not path.is_file():
+        return ""
+    r2 = sorted(row["r2"] for row in json.loads(path.read_text())["by_context"]["rows"] if row["short"] in ("VNTR", "STR"))
+    return f", and tandem repeat SVs imputed poorly (r² {r2[0]:.2f}–{r2[-1]:.2f})"
+
+
 def copy(numbers: dict) -> dict:
     """The poster's sentences, each number from the gallery figure that shows it."""
     svs = numbers["fig5"]
     gains = numbers["poster_sv_gain"]["rows"]
     share, versus_rest = gains["all"]["share"], gains["well_imputed"]["versus_rest"]
+    compared = aou_compared()
     return {
         # Byrska-Bishop 2022: "On average, ~9,679 SVs were discovered in each genome"
         "introduction": [f"Each genome has ~9,700 structural variants (SVs).{cite('Byrska-Bishop 2022 Cell')}",
@@ -170,11 +196,12 @@ def copy(numbers: dict) -> dict:
         # "versus_rest", Welch's interval above 0); otherwise the poster gives imputed SVs' share of true SVs' gain
         # over every simulation with causal SVs (its "all" row, Fieller's interval)
         "discussion": [
+            # each bullet fills its second line, so neither ends on a word or two
             f"SV-PGS was more accurate than LDpred2-auto{cite('Privé 2020 Bioinformatics')} with and without causal "
-            "SVs.",
-            "Imputed SVs helped most when causal SVs were well imputed." if versus_rest[1] > 0 else
-            f"Imputed SVs gave {share[0]:.0%} of the AUC gain of true SV genotypes (95% CI {share[1] * 100:.0f}–"
-            f"{share[2]:.0%}).",
+            f"SVs{compared}.",
+            ("Imputed SVs helped most when causal SVs imputed well" if versus_rest[1] > 0 else
+             f"Imputed SVs gave {share[0]:.0%} of the AUC gain of true SV genotypes (95% CI {share[1] * 100:.0f}–"
+             f"{share[2]:.0%})") + f"{repeats()}.",
         ],
     }
 
