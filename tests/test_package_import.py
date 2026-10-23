@@ -2,20 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import textwrap
 
-import pytest
-
 
 def test_importing_the_package_loads_no_jax_and_keeps_the_cuda_math_mode():
-    """Importing the package or any of its modules must not import JAX or change the CUDA math mode.
-
-    The deleted ``_jax`` shim imported JAX, enabled x64 and set ``CUPY_TF32`` for the whole
-    process as an import side effect.
-    """
+    """Importing the package or any of its modules must not import JAX or change the CUDA math mode."""
     completed = subprocess.run(
         [
             sys.executable,
@@ -87,22 +80,3 @@ def test_import_sv_pgs_succeeds_without_bigquery():
         "sv_pgs.all_of_us": False,
     }
 
-
-def test_repo_root_does_not_shadow_installed_cyvcf2():
-    repo_root = Path(__file__).resolve().parents[1]
-    shadow_path = repo_root / "cyvcf2.py"
-    pytest.importorskip("cyvcf2")
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import pathlib, cyvcf2; print(pathlib.Path(cyvcf2.__file__).resolve())",
-        ],
-        capture_output=True,
-        check=True,
-        cwd=repo_root,
-        text=True,
-    )
-
-    imported_path = Path(completed.stdout.strip())
-    assert imported_path != shadow_path

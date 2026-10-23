@@ -1,4 +1,5 @@
 import contextlib
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,26 @@ def _write(path: Path, text: str) -> None:
 def _write_stat(level: Path, key: str, inactive_file: int) -> None:
     """A memory.stat with the reclaimable page-cache entry next to its neighbours."""
     _write(level / "memory.stat", f"anon 4096\nfile {inactive_file + 8192}\n{key} {inactive_file}\nactive_file 8192\n")
+
+
+def test_available_host_ram_is_memavailable_and_never_guessed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``/proc/meminfo``'s MemAvailable counts the page cache the kernel reclaims (MemFree does not). A kernel without
+    it, or a host without the file, is refused: there is no hand-set fallback size."""
+    def meminfo(text: str) -> None:
+        monkeypatch.setattr(compute_budget, "open", lambda path, **_: io.StringIO(text), raising=False)
+
+    meminfo("MemTotal:       263000000 kB\nMemFree:           243000 kB\nMemAvailable:   250000000 kB\n")
+    assert compute_budget._detect_available_host_ram_bytes() == 250_000_000 * 1024
+    meminfo("MemTotal:       263000000 kB\nMemFree:           500000 kB\n")
+    with pytest.raises(RuntimeError, match="MemAvailable"):
+        compute_budget._detect_available_host_ram_bytes()
+
+    def unreadable(path: str, **_: object) -> None:
+        raise OSError(path)
+
+    monkeypatch.setattr(compute_budget, "open", unreadable, raising=False)
+    with pytest.raises(OSError):
+        compute_budget._detect_available_host_ram_bytes()
 
 
 def test_cgroup_v1_headroom_is_limit_minus_usage(tmp_path: Path) -> None:
