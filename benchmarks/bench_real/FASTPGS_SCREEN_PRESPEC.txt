@@ -61,3 +61,31 @@ Follow-up
 
 Budget
 - $120 for all screen runs. Spot n2d-highmem-96, at most 3 retries.
+
+Amendment 1 (2026-10-23, 00:15 PDT, before any screen run's held-out value exists and before any screen result is read)
+- Runs aou-scr-d1 and aou-scr-q1 were submitted on Spot at about 23:55 PDT on 2026-10-22 and are running.
+- 60 SNOMED disease definitions and 28 LOINC laboratory definitions are added to sv_pgs/all_of_us.py. Every SNOMED
+  root was checked active on tx.fhir.org. Each laboratory's unit labels and conversions come from an aggregate census
+  of its LOINC codes in the CDR, which read only labels and value quartiles of cells of 40 or more people.
+- They join the family in nine more screen runs, each with about 10 traits, on Spot:
+  - aou-scr-d2: gastroesophageal_reflux_disease, osteoarthritis, migraine, anxiety_disorder, obstructive_sleep_apnea,
+    allergic_rhinitis, benign_prostatic_hyperplasia, glaucoma, osteoporosis, osteopenia.
+  - aou-scr-d3: anemia, iron_deficiency_anemia, vitamin_d_deficiency, thrombocytopenia, heart_failure, stroke,
+    peripheral_vascular_disease, venous_thromboembolism, varicose_veins, obesity.
+  - aou-scr-d4: steatotic_liver_disease, kidney_stone, gallstones, diverticular_disease, hemorrhoids,
+    irritable_bowel_syndrome, peptic_ulcer, pancreatitis, inguinal_hernia, rheumatoid_arthritis.
+  - aou-scr-d5: fibromyalgia, spinal_stenosis, carpal_tunnel_syndrome, plantar_fasciitis, atopic_dermatitis, acne,
+    rosacea, actinic_keratosis, basal_cell_carcinoma, melanoma.
+  - aou-scr-d6: uterine_leiomyoma, endometriosis, polycystic_ovary_syndrome, erectile_dysfunction,
+    urinary_incontinence, hyperthyroidism, macular_degeneration, hearing_loss, chronic_sinusitis, restless_legs.
+  - aou-scr-d7: insomnia, epilepsy, attention_deficit_hyperactivity_disorder, bipolar_disorder, schizophrenia,
+    posttraumatic_stress_disorder, obsessive_compulsive_disorder, alcohol_use_disorder, nicotine_dependence,
+    opioid_dependence.
+  - aou-scr-q2: alanine_aminotransferase, aspartate_aminotransferase, alkaline_phosphatase, gamma_glutamyltransferase,
+    albumin, total_protein, calcium, phosphate, magnesium, sodium.
+  - aou-scr-q3: potassium, chloride, bicarbonate, urea_nitrogen, urate, glucose, thyrotropin, free_thyroxine, ferritin.
+  - aou-scr-q4: iron, iron_binding_capacity, transferrin_saturation, vitamin_b12, folate, vitamin_d,
+    c_reactive_protein, eosinophil_count, lymphocyte_count.
+- The family is now at most 111 traits: the 11 of the earlier battery and the 100 of runs aou-scr-d1 .. d7 and
+  aou-scr-q1 .. q4, less those below the power threshold. The test, BH q < 0.05 over traits, the threshold and the
+  analysis time (2026-10-23 14:00 PDT at the latest) are unchanged. No further traits are added after this amendment.

@@ -1237,9 +1237,10 @@ def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None
         "/mnt/disks/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.{chromosome}.vcf.gz"
     )
     # Every catalogued disease of the panel, in the catalogue's order (the study abstract's five first, hypertension
-    # leading); Alzheimer's disease, catalogued last for the APOE locus's regional run, is not one of it.
-    assert config.diseases == tuple(definition.canonical_name for definition in DISEASE_DEFINITIONS[:-1])
-    assert DISEASE_DEFINITIONS[-1].canonical_name == "alzheimers_disease"
+    # leading); Alzheimer's disease, catalogued next for the APOE locus's regional run, and the wide screen's diseases
+    # after it are not part of it.
+    assert config.diseases == tuple(definition.canonical_name for definition in DISEASE_DEFINITIONS[:15])
+    assert DISEASE_DEFINITIONS[15].canonical_name == "alzheimers_disease"
     for job in ("job_store.json.template", "job_fit.json.template"):
         network = json.loads(_filled((LAUNCHER / job).read_text()))["allocationPolicy"]["network"]["networkInterfaces"][0]
         assert network["noExternalIpAddress"] is True

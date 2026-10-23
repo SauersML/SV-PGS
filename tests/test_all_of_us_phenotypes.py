@@ -504,8 +504,9 @@ def test_liability_target_uses_sex_specific_incidence_and_pools_unknown_sex():
 
 def test_the_disease_panel_is_the_fifteen_preregistered_diseases():
     # The study abstract's five (hypertension first), then the ten of mixed_panel_v1, then Alzheimer's disease, the
-    # APOE locus's regional score's outcome, which is not one of the panel.
-    assert [definition.canonical_name for definition in DISEASE_DEFINITIONS] == [
+    # APOE locus's regional score's outcome, which is not one of the panel. The wide screen's diseases
+    # (benchmarks/bench_real/FASTPGS_SCREEN_PRESPEC.txt) follow.
+    assert [definition.canonical_name for definition in DISEASE_DEFINITIONS[:16]] == [
         "hypertension", "coronary_artery_disease", "asthma", "hyperlipidemia", "breast_cancer",
         "type2_diabetes", "atrial_fibrillation", "hypothyroidism", "copd", "depression", "gout", "cataract",
         "chronic_kidney_disease", "psoriasis", "prostate_cancer", "alzheimers_disease",
@@ -811,7 +812,8 @@ def test_every_disease_and_trait_name_resolves_to_exactly_its_own_definition():
 
 
 def test_catalogue_is_the_panels_fifteen_quantitative_traits():
-    assert available_measurement_names() == sorted([
+    # The wide screen's laboratory traits (benchmarks/bench_real/FASTPGS_SCREEN_PRESPEC.txt) follow the panel's.
+    assert sorted(definition.canonical_name for definition in MEASUREMENT_DEFINITIONS[:15]) == sorted([
         "height", "body_mass_index", "systolic_blood_pressure", "diastolic_blood_pressure", "heart_rate",
         "mean_corpuscular_volume", "platelet_count", "white_blood_cell_count", "total_bilirubin", "egfr_ckd_epi_2021",
         "ldl_cholesterol", "hdl_cholesterol", "triglycerides", "total_cholesterol", "hemoglobin_a1c",

@@ -547,6 +547,434 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         # boundary; a younger control has not lived through most of its risk.
         minimum_control_age_years=65.0,
     ),
+    # --- The wide SV-gain screen's diseases (benchmarks/bench_real/FASTPGS_SCREEN_PRESPEC.txt), not the panel's.
+    # Each is a case with its diagnosis codes on two or more dates, and a control without any. SNOMED codes and
+    # their displays (in each comment) were read on tx.fhir.org (SNOMED CT International 2025-02-01) on 2026-10-22.
+    DiseaseDefinition(
+        canonical_name="gastroesophageal_reflux_disease",
+        aliases=(),
+        description="Gastroesophageal reflux disease from EHR diagnoses (screen definition).",
+        # 235595009 Gastroesophageal reflux disease.
+        case_snomed_codes=("235595009",),
+    ),
+    DiseaseDefinition(
+        canonical_name="osteoarthritis",
+        aliases=(),
+        description="Osteoarthritis from EHR diagnoses (screen definition).",
+        # 396275006 Osteoarthritis.
+        case_snomed_codes=("396275006",),
+    ),
+    DiseaseDefinition(
+        canonical_name="migraine",
+        aliases=(),
+        description="Migraine from EHR diagnoses (screen definition).",
+        # 37796009 Migraine.
+        case_snomed_codes=("37796009",),
+    ),
+    DiseaseDefinition(
+        canonical_name="anxiety_disorder",
+        aliases=(),
+        description="Anxiety disorder from EHR diagnoses (screen definition).",
+        # 197480006 Anxiety disorder.
+        case_snomed_codes=("197480006",),
+    ),
+    DiseaseDefinition(
+        canonical_name="obstructive_sleep_apnea",
+        aliases=(),
+        description="Obstructive sleep apnea from EHR diagnoses (screen definition).",
+        # 78275009 Obstructive sleep apnea syndrome.
+        case_snomed_codes=("78275009",),
+    ),
+    DiseaseDefinition(
+        canonical_name="allergic_rhinitis",
+        aliases=(),
+        description="Allergic rhinitis from EHR diagnoses (screen definition).",
+        # 61582004 Allergic rhinitis.
+        case_snomed_codes=("61582004",),
+    ),
+    DiseaseDefinition(
+        canonical_name="benign_prostatic_hyperplasia",
+        aliases=(),
+        description="Benign prostatic hyperplasia in men from EHR diagnoses (screen definition).",
+        # 266569009 Benign prostatic hyperplasia.
+        case_snomed_codes=("266569009",),
+        required_sex="male",
+    ),
+    DiseaseDefinition(
+        canonical_name="glaucoma",
+        aliases=(),
+        description="Glaucoma from EHR diagnoses (screen definition).",
+        # 23986001 Glaucoma.
+        case_snomed_codes=("23986001",),
+    ),
+    DiseaseDefinition(
+        canonical_name="osteoporosis",
+        aliases=(),
+        description="Osteoporosis from EHR diagnoses (screen definition).",
+        # 64859006 Osteoporosis.
+        case_snomed_codes=("64859006",),
+    ),
+    DiseaseDefinition(
+        canonical_name="osteopenia",
+        aliases=(),
+        description="Osteopenia from EHR diagnoses (screen definition).",
+        # 312894000 Osteopenia.
+        case_snomed_codes=("312894000",),
+    ),
+    DiseaseDefinition(
+        canonical_name="anemia",
+        aliases=(),
+        description="Anemia from EHR diagnoses (screen definition).",
+        # 271737000 Anemia.
+        case_snomed_codes=("271737000",),
+    ),
+    DiseaseDefinition(
+        canonical_name="iron_deficiency_anemia",
+        aliases=(),
+        description="Iron deficiency anemia from EHR diagnoses (screen definition).",
+        # 87522002 Iron deficiency anemia.
+        case_snomed_codes=("87522002",),
+    ),
+    DiseaseDefinition(
+        canonical_name="vitamin_d_deficiency",
+        aliases=(),
+        description="Vitamin D deficiency from EHR diagnoses (screen definition).",
+        # 34713006 Vitamin D deficiency.
+        case_snomed_codes=("34713006",),
+    ),
+    DiseaseDefinition(
+        canonical_name="thrombocytopenia",
+        aliases=(),
+        description="Thrombocytopenia from EHR diagnoses (screen definition).",
+        # 302215000 Thrombocytopenic disorder.
+        case_snomed_codes=("302215000",),
+    ),
+    DiseaseDefinition(
+        canonical_name="heart_failure",
+        aliases=(),
+        description="Heart failure from EHR diagnoses (screen definition).",
+        # 84114007 Heart failure.
+        case_snomed_codes=("84114007",),
+    ),
+    DiseaseDefinition(
+        canonical_name="stroke",
+        aliases=(),
+        description="Stroke from EHR diagnoses (screen definition).",
+        # 230690007 Cerebrovascular accident.
+        case_snomed_codes=("230690007",),
+    ),
+    DiseaseDefinition(
+        canonical_name="peripheral_vascular_disease",
+        aliases=(),
+        description="Peripheral vascular disease from EHR diagnoses (screen definition).",
+        # 400047006 Peripheral vascular disease.
+        case_snomed_codes=("400047006",),
+    ),
+    DiseaseDefinition(
+        canonical_name="venous_thromboembolism",
+        aliases=(),
+        description="Venous thromboembolism from EHR diagnoses (screen definition).",
+        # 429098002 Thromboembolism of vein; 128053003 Deep venous thrombosis; 59282003 Pulmonary embolism.
+        case_snomed_codes=("429098002", "128053003", "59282003",),
+    ),
+    DiseaseDefinition(
+        canonical_name="varicose_veins",
+        aliases=(),
+        description="Varicose veins of the legs from EHR diagnoses (screen definition).",
+        # 72866009 Varicose veins of lower extremity.
+        case_snomed_codes=("72866009",),
+    ),
+    DiseaseDefinition(
+        canonical_name="obesity",
+        aliases=(),
+        description="Obesity from EHR diagnoses (screen definition).",
+        # 414916001 Obesity.
+        case_snomed_codes=("414916001",),
+    ),
+    DiseaseDefinition(
+        canonical_name="steatotic_liver_disease",
+        aliases=(),
+        description="Steatotic (fatty) liver disease from EHR diagnoses (screen definition).",
+        # 197321007 Steatotic liver disease.
+        case_snomed_codes=("197321007",),
+    ),
+    DiseaseDefinition(
+        canonical_name="kidney_stone",
+        aliases=(),
+        description="Kidney stones from EHR diagnoses (screen definition).",
+        # 95570007 Kidney stone.
+        case_snomed_codes=("95570007",),
+    ),
+    DiseaseDefinition(
+        canonical_name="gallstones",
+        aliases=(),
+        description="Gallstones from EHR diagnoses (screen definition).",
+        # 235919008 Gallstone.
+        case_snomed_codes=("235919008",),
+    ),
+    DiseaseDefinition(
+        canonical_name="diverticular_disease",
+        aliases=(),
+        description="Diverticular disease from EHR diagnoses (screen definition).",
+        # 397881000 Diverticular disease.
+        case_snomed_codes=("397881000",),
+    ),
+    DiseaseDefinition(
+        canonical_name="hemorrhoids",
+        aliases=(),
+        description="Hemorrhoids from EHR diagnoses (screen definition).",
+        # 70153002 Hemorrhoids.
+        case_snomed_codes=("70153002",),
+    ),
+    DiseaseDefinition(
+        canonical_name="irritable_bowel_syndrome",
+        aliases=(),
+        description="Irritable bowel syndrome from EHR diagnoses (screen definition).",
+        # 10743008 Irritable bowel syndrome.
+        case_snomed_codes=("10743008",),
+    ),
+    DiseaseDefinition(
+        canonical_name="peptic_ulcer",
+        aliases=(),
+        description="Peptic ulcer from EHR diagnoses (screen definition).",
+        # 13200003 Peptic ulcer.
+        case_snomed_codes=("13200003",),
+    ),
+    DiseaseDefinition(
+        canonical_name="pancreatitis",
+        aliases=(),
+        description="Pancreatitis from EHR diagnoses (screen definition).",
+        # 75694006 Pancreatitis.
+        case_snomed_codes=("75694006",),
+    ),
+    DiseaseDefinition(
+        canonical_name="inguinal_hernia",
+        aliases=(),
+        description="Inguinal hernia from EHR diagnoses (screen definition).",
+        # 396232000 Inguinal hernia.
+        case_snomed_codes=("396232000",),
+    ),
+    DiseaseDefinition(
+        canonical_name="rheumatoid_arthritis",
+        aliases=(),
+        description="Rheumatoid arthritis from EHR diagnoses (screen definition).",
+        # 69896004 Rheumatoid arthritis.
+        case_snomed_codes=("69896004",),
+    ),
+    DiseaseDefinition(
+        canonical_name="fibromyalgia",
+        aliases=(),
+        description="Fibromyalgia from EHR diagnoses (screen definition).",
+        # 203082005 Fibromyalgia.
+        case_snomed_codes=("203082005",),
+    ),
+    DiseaseDefinition(
+        canonical_name="spinal_stenosis",
+        aliases=(),
+        description="Spinal stenosis from EHR diagnoses (screen definition).",
+        # 76107001 Spinal stenosis.
+        case_snomed_codes=("76107001",),
+    ),
+    DiseaseDefinition(
+        canonical_name="carpal_tunnel_syndrome",
+        aliases=(),
+        description="Carpal tunnel syndrome from EHR diagnoses (screen definition).",
+        # 57406009 Carpal tunnel syndrome.
+        case_snomed_codes=("57406009",),
+    ),
+    DiseaseDefinition(
+        canonical_name="plantar_fasciitis",
+        aliases=(),
+        description="Plantar fasciitis from EHR diagnoses (screen definition).",
+        # 202882003 Plantar fasciitis.
+        case_snomed_codes=("202882003",),
+    ),
+    DiseaseDefinition(
+        canonical_name="atopic_dermatitis",
+        aliases=(),
+        description="Atopic dermatitis from EHR diagnoses (screen definition).",
+        # 24079001 Atopic dermatitis.
+        case_snomed_codes=("24079001",),
+    ),
+    DiseaseDefinition(
+        canonical_name="acne",
+        aliases=(),
+        description="Acne from EHR diagnoses (screen definition).",
+        # 11381005 Acne.
+        case_snomed_codes=("11381005",),
+    ),
+    DiseaseDefinition(
+        canonical_name="rosacea",
+        aliases=(),
+        description="Rosacea from EHR diagnoses (screen definition).",
+        # 398909004 Rosacea.
+        case_snomed_codes=("398909004",),
+    ),
+    DiseaseDefinition(
+        canonical_name="actinic_keratosis",
+        aliases=(),
+        description="Actinic keratosis from EHR diagnoses (screen definition).",
+        # 201101007 Actinic keratosis.
+        case_snomed_codes=("201101007",),
+    ),
+    DiseaseDefinition(
+        canonical_name="basal_cell_carcinoma",
+        aliases=(),
+        description="Basal cell carcinoma of the skin from EHR diagnoses (screen definition).",
+        # 254701007 Basal cell carcinoma of skin.
+        case_snomed_codes=("254701007",),
+    ),
+    DiseaseDefinition(
+        canonical_name="melanoma",
+        aliases=(),
+        description="Malignant melanoma from EHR diagnoses (screen definition).",
+        # 372244006 Malignant melanoma.
+        case_snomed_codes=("372244006",),
+    ),
+    DiseaseDefinition(
+        canonical_name="uterine_leiomyoma",
+        aliases=(),
+        description="Uterine leiomyoma in women from EHR diagnoses (screen definition).",
+        # 95315005 Uterine leiomyoma.
+        case_snomed_codes=("95315005",),
+        required_sex="female",
+    ),
+    DiseaseDefinition(
+        canonical_name="endometriosis",
+        aliases=(),
+        description="Endometriosis in women from EHR diagnoses (screen definition).",
+        # 129103003 Endometriosis (clinical).
+        case_snomed_codes=("129103003",),
+        required_sex="female",
+    ),
+    DiseaseDefinition(
+        canonical_name="polycystic_ovary_syndrome",
+        aliases=(),
+        description="Polycystic ovary syndrome in women from EHR diagnoses (screen definition).",
+        # 237055002 Polycystic ovary syndrome.
+        case_snomed_codes=("237055002",),
+        required_sex="female",
+    ),
+    DiseaseDefinition(
+        canonical_name="erectile_dysfunction",
+        aliases=(),
+        description="Erectile dysfunction in men from EHR diagnoses (screen definition).",
+        # 860914002 Erectile dysfunction.
+        case_snomed_codes=("860914002",),
+        required_sex="male",
+    ),
+    DiseaseDefinition(
+        canonical_name="urinary_incontinence",
+        aliases=(),
+        description="Urinary incontinence from EHR diagnoses (screen definition).",
+        # 165232002 Urinary incontinence.
+        case_snomed_codes=("165232002",),
+    ),
+    DiseaseDefinition(
+        canonical_name="hyperthyroidism",
+        aliases=(),
+        description="Hyperthyroidism from EHR diagnoses (screen definition).",
+        # 34486009 Hyperthyroidism.
+        case_snomed_codes=("34486009",),
+    ),
+    DiseaseDefinition(
+        canonical_name="macular_degeneration",
+        aliases=(),
+        description="Age-related macular degeneration from EHR diagnoses (screen definition).",
+        # 267718000 Age related macular degeneration.
+        case_snomed_codes=("267718000",),
+    ),
+    DiseaseDefinition(
+        canonical_name="hearing_loss",
+        aliases=(),
+        description="Hearing loss from EHR diagnoses (screen definition).",
+        # 15188001 Hearing loss.
+        case_snomed_codes=("15188001",),
+    ),
+    DiseaseDefinition(
+        canonical_name="chronic_sinusitis",
+        aliases=(),
+        description="Chronic sinusitis from EHR diagnoses (screen definition).",
+        # 40055000 Chronic sinusitis.
+        case_snomed_codes=("40055000",),
+    ),
+    DiseaseDefinition(
+        canonical_name="restless_legs",
+        aliases=(),
+        description="Restless legs syndrome from EHR diagnoses (screen definition).",
+        # 32914008 Restless legs.
+        case_snomed_codes=("32914008",),
+    ),
+    DiseaseDefinition(
+        canonical_name="insomnia",
+        aliases=(),
+        description="Insomnia from EHR diagnoses (screen definition).",
+        # 193462001 Insomnia.
+        case_snomed_codes=("193462001",),
+    ),
+    DiseaseDefinition(
+        canonical_name="epilepsy",
+        aliases=(),
+        description="Epilepsy from EHR diagnoses (screen definition).",
+        # 84757009 Epilepsy.
+        case_snomed_codes=("84757009",),
+    ),
+    DiseaseDefinition(
+        canonical_name="attention_deficit_hyperactivity_disorder",
+        aliases=(),
+        description="Attention deficit hyperactivity disorder from EHR diagnoses (screen definition).",
+        # 406506008 Attention deficit hyperactivity disorder.
+        case_snomed_codes=("406506008",),
+    ),
+    DiseaseDefinition(
+        canonical_name="bipolar_disorder",
+        aliases=(),
+        description="Bipolar disorder from EHR diagnoses (screen definition).",
+        # 13746004 Bipolar disorder.
+        case_snomed_codes=("13746004",),
+    ),
+    DiseaseDefinition(
+        canonical_name="schizophrenia",
+        aliases=(),
+        description="Schizophrenia from EHR diagnoses (screen definition).",
+        # 58214004 Schizophrenia.
+        case_snomed_codes=("58214004",),
+    ),
+    DiseaseDefinition(
+        canonical_name="posttraumatic_stress_disorder",
+        aliases=(),
+        description="Posttraumatic stress disorder from EHR diagnoses (screen definition).",
+        # 47505003 Posttraumatic stress disorder.
+        case_snomed_codes=("47505003",),
+    ),
+    DiseaseDefinition(
+        canonical_name="obsessive_compulsive_disorder",
+        aliases=(),
+        description="Obsessive-compulsive disorder from EHR diagnoses (screen definition).",
+        # 191736004 Obsessive-compulsive disorder.
+        case_snomed_codes=("191736004",),
+    ),
+    DiseaseDefinition(
+        canonical_name="alcohol_use_disorder",
+        aliases=(),
+        description="Alcohol use disorder from EHR diagnoses (screen definition).",
+        # 7200002 Alcoholism; 66590003 Alcohol dependence.
+        case_snomed_codes=("7200002", "66590003",),
+    ),
+    DiseaseDefinition(
+        canonical_name="nicotine_dependence",
+        aliases=(),
+        description="Nicotine dependence from EHR diagnoses (screen definition).",
+        # 56294008 Nicotine dependence.
+        case_snomed_codes=("56294008",),
+    ),
+    DiseaseDefinition(
+        canonical_name="opioid_dependence",
+        aliases=(),
+        description="Opioid dependence from EHR diagnoses (screen definition).",
+        # 75544000 Opioid dependence.
+        case_snomed_codes=("75544000",),
+    ),
 )
 
 
@@ -1061,6 +1489,275 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
             ("millimole per mole", 0.09148, 2.152),
         ),
         clinical_windows=(DIABETES,),
+    ),
+    # --- The wide SV-gain screen's laboratory traits (benchmarks/bench_real/FASTPGS_SCREEN_PRESPEC.txt), not the
+    # panel's. Unit labels and their value quartiles were read from an aggregate census of each LOINC code in the CDR
+    # (labels and quartiles of cells of 40 or more people only, ~/fp/screen/census.py on the app, 2026-10-22).
+    MeasurementDefinition(
+        canonical_name="alanine_aminotransferase",
+        aliases=(),
+        description="Alanine aminotransferase (U/L).",
+        # The "nl" rows of 1742-6 hold U/L values (quartiles 16, 22, 33).
+        loinc_codes=("1742-6", "1743-4", "1744-2",),
+        canonical_unit="unit per liter",
+        unit_conversions=_units(("unit per liter", 1.0), (NO_UNIT_LABEL, 1.0), ("international unit per liter", 1.0), ("iu/l", 1.0), ("nl", 1.0)),
+        clinical_windows=_CHOLESTASIS_WINDOWS,
+    ),
+    MeasurementDefinition(
+        canonical_name="aspartate_aminotransferase",
+        aliases=(),
+        description="Aspartate aminotransferase (U/L).",
+        # The "nl" rows of 1920-8 hold U/L values (quartiles 18, 23, 30).
+        loinc_codes=("1920-8", "30239-8",),
+        canonical_unit="unit per liter",
+        unit_conversions=_units(("unit per liter", 1.0), (NO_UNIT_LABEL, 1.0), ("international unit per liter", 1.0), ("iu/l", 1.0), ("nl", 1.0)),
+        clinical_windows=_CHOLESTASIS_WINDOWS,
+    ),
+    MeasurementDefinition(
+        canonical_name="alkaline_phosphatase",
+        aliases=(),
+        description="Alkaline phosphatase (U/L).",
+        # The "nl" rows hold U/L values (quartiles 58, 72, 92).
+        loinc_codes=("6768-6",),
+        canonical_unit="unit per liter",
+        unit_conversions=_units(("unit per liter", 1.0), (NO_UNIT_LABEL, 1.0), ("international unit per liter", 1.0), ("iu/l", 1.0), ("nl", 1.0)),
+        clinical_windows=_CHOLESTASIS_WINDOWS,
+    ),
+    MeasurementDefinition(
+        canonical_name="gamma_glutamyltransferase",
+        aliases=(),
+        description="Gamma-glutamyltransferase (U/L).",
+        loinc_codes=("2324-2",),
+        canonical_unit="unit per liter",
+        unit_conversions=_units(("unit per liter", 1.0), (NO_UNIT_LABEL, 1.0), ("international unit per liter", 1.0), ("iu/l", 1.0), ("nl", 1.0)),
+        clinical_windows=_CHOLESTASIS_WINDOWS,
+    ),
+    MeasurementDefinition(
+        canonical_name="albumin",
+        aliases=(),
+        description="Serum/plasma albumin (g/dL).",
+        # The "gram per liter" rows of 1751-7 hold g/L values (quartiles 35, 40, 43): 1 g/L = 0.1 g/dL.
+        loinc_codes=("1751-7", "61151-7", "61152-5",),
+        canonical_unit="gram per deciliter",
+        unit_conversions=_units(("gram per deciliter", 1.0), (NO_UNIT_LABEL, 1.0), ("gram per liter", 0.1)),
+    ),
+    MeasurementDefinition(
+        canonical_name="total_protein",
+        aliases=(),
+        description="Serum/plasma total protein (g/dL).",
+        loinc_codes=("2885-2",),
+        canonical_unit="gram per deciliter",
+        unit_conversions=_units(("gram per deciliter", 1.0), (NO_UNIT_LABEL, 1.0), ("gram per deciliter calculated", 1.0)),
+    ),
+    MeasurementDefinition(
+        canonical_name="calcium",
+        aliases=(),
+        description="Serum/plasma calcium (mg/dL).",
+        # The "milligram per milliliter" rows hold mg/dL values (quartiles 8.8, 9.2, 9.6).
+        loinc_codes=("17861-6",),
+        canonical_unit="milligram per deciliter",
+        unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("mg/dl", 1.0), ("milligram per milliliter", 1.0)),
+    ),
+    MeasurementDefinition(
+        canonical_name="phosphate",
+        aliases=(),
+        description="Serum/plasma phosphate (mg/dL).",
+        # The "milligram per milliliter" rows hold mg/dL values (quartiles 2.9, 3.4, 4.0).
+        loinc_codes=("2777-1",),
+        canonical_unit="milligram per deciliter",
+        unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("mg/dl", 1.0), ("milligram per milliliter", 1.0)),
+        clinical_windows=(KIDNEY_REPLACEMENT,),
+    ),
+    MeasurementDefinition(
+        canonical_name="magnesium",
+        aliases=(),
+        description="Serum/plasma magnesium (mg/dL).",
+        # Magnesium is 24.305 g/mol and divalent, so 1 mEq/L = 1.215 mg/dL.
+        loinc_codes=("19123-9",),
+        canonical_unit="milligram per deciliter",
+        unit_conversions=_units(("milligram per deciliter", 1.0), (NO_UNIT_LABEL, 1.0), ("mg/dl", 1.0), ("milliequivalent per liter", 1.215)),
+        clinical_windows=(KIDNEY_REPLACEMENT,),
+    ),
+    MeasurementDefinition(
+        canonical_name="sodium",
+        aliases=(),
+        description="Serum/plasma sodium (mmol/L).",
+        # Sodium is monovalent (1 mEq/L = 1 mmol/L); the microequivalent and equivalent per liter rows hold mmol/L values (quartiles 137-142).
+        loinc_codes=("2951-2", "2947-0",),
+        canonical_unit="millimole per liter",
+        unit_conversions=_units(("millimole per liter", 1.0), (NO_UNIT_LABEL, 1.0), ("milliequivalent per liter", 1.0), ("microequivalent per liter", 1.0), ("equivalent per liter", 1.0)),
+    ),
+    MeasurementDefinition(
+        canonical_name="potassium",
+        aliases=(),
+        description="Serum/plasma potassium (mmol/L).",
+        # Monovalent; the microequivalent and equivalent per liter rows hold mmol/L values (quartiles 3.7-4.6).
+        loinc_codes=("2823-3",),
+        canonical_unit="millimole per liter",
+        unit_conversions=_units(("millimole per liter", 1.0), (NO_UNIT_LABEL, 1.0), ("milliequivalent per liter", 1.0), ("microequivalent per liter", 1.0), ("equivalent per liter", 1.0)),
+        clinical_windows=(KIDNEY_REPLACEMENT,),
+    ),
+    MeasurementDefinition(
+        canonical_name="chloride",
+        aliases=(),
+        description="Serum/plasma chloride (mmol/L).",
+        # Monovalent; the microequivalent and equivalent per liter rows hold mmol/L values (quartiles 100-107).
+        loinc_codes=("2075-0",),
+        canonical_unit="millimole per liter",
+        unit_conversions=_units(("millimole per liter", 1.0), (NO_UNIT_LABEL, 1.0), ("milliequivalent per liter", 1.0), ("microequivalent per liter", 1.0), ("equivalent per liter", 1.0)),
+    ),
+    MeasurementDefinition(
+        canonical_name="bicarbonate",
+        aliases=(),
+        description="Serum/plasma total carbon dioxide or bicarbonate (mmol/L).",
+        # The microequivalent per liter and milliequivalent per milliliter rows of 2028-9 hold mmol/L values (quartiles 25-30).
+        loinc_codes=("2028-9", "1963-8",),
+        canonical_unit="millimole per liter",
+        unit_conversions=_units(("millimole per liter", 1.0), (NO_UNIT_LABEL, 1.0), ("microequivalent per liter", 1.0), ("milliequivalent per milliliter", 1.0)),
+        clinical_windows=(KIDNEY_REPLACEMENT,),
+    ),
+    MeasurementDefinition(
+        canonical_name="urea_nitrogen",
+        aliases=(),
+        description="Serum/plasma urea nitrogen (mg/dL).",
+        # The "milligram per milliliter" rows hold mg/dL values (quartiles 11, 15, 20).
+        loinc_codes=("3094-0",),
+        canonical_unit="milligram per deciliter",
+        unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("mg/dl", 1.0), ("milligram per milliliter", 1.0)),
+        clinical_windows=(KIDNEY_REPLACEMENT,),
+    ),
+    MeasurementDefinition(
+        canonical_name="urate",
+        aliases=(),
+        description="Serum/plasma urate (mg/dL); values on antigout drugs are not used.",
+        # The "milligram per milliliter" rows hold mg/dL values (quartiles 4.6, 5.7, 7.0).
+        loinc_codes=("3084-1",),
+        canonical_unit="milligram per deciliter",
+        unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("mg/dl", 1.0), ("milligram per milliliter", 1.0)),
+        treatment=_exclude_treated(ANTIGOUT),
+        clinical_windows=(KIDNEY_REPLACEMENT,),
+    ),
+    MeasurementDefinition(
+        canonical_name="glucose",
+        aliases=(),
+        description="Serum/plasma glucose (mg/dL) in people without diabetes.",
+        # The "milligram per milliliter" rows hold mg/dL values (quartiles 93, 107, 136).
+        loinc_codes=("2345-7",),
+        canonical_unit="milligram per deciliter",
+        unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("mg/dl", 1.0), ("milligram per milliliter", 1.0)),
+        clinical_windows=(DIABETES,),
+    ),
+    MeasurementDefinition(
+        canonical_name="thyrotropin",
+        aliases=(),
+        description="Thyroid stimulating hormone (mIU/L); values on thyroid preparations are not used.",
+        # 1 uIU/mL = 1 mIU/L; the "milli-international unit per milliliter" rows hold mIU/L values (quartiles 0.93-2.93).
+        loinc_codes=("3016-3", "11580-8",),
+        canonical_unit="milli-international unit per liter",
+        unit_conversions=_units(("milli-international unit per liter", 1.0), (NO_UNIT_LABEL, 1.0), ("micro-international unit per milliliter", 1.0), ("microunit per milliliter", 1.0), ("miu/l", 1.0), ("uiu/ml", 1.0), ("no value", 1.0), ("milli-international unit per milliliter", 1.0)),
+        treatment=_exclude_treated(THYROID_PREPARATIONS),
+    ),
+    MeasurementDefinition(
+        canonical_name="free_thyroxine",
+        aliases=(),
+        description="Free thyroxine (ng/dL); values on thyroid preparations are not used.",
+        loinc_codes=("3024-7",),
+        canonical_unit="nanogram per deciliter",
+        unit_conversions=_units(("nanogram per deciliter", 1.0), (NO_UNIT_LABEL, 1.0), ("ng/dl", 1.0)),
+        treatment=_exclude_treated(THYROID_PREPARATIONS),
+    ),
+    MeasurementDefinition(
+        canonical_name="ferritin",
+        aliases=(),
+        description="Serum/plasma ferritin (ng/mL).",
+        # 1 ug/L = 1 ng/mL.
+        loinc_codes=("2276-4",),
+        canonical_unit="nanogram per milliliter",
+        unit_conversions=_units(("nanogram per milliliter", 1.0), (NO_UNIT_LABEL, 1.0), ("microgram per liter", 1.0)),
+        clinical_windows=(TRANSFUSION, ANTIBACTERIAL_COURSE),
+    ),
+    MeasurementDefinition(
+        canonical_name="iron",
+        aliases=(),
+        description="Serum/plasma iron (ug/dL).",
+        # The "mg/dl" rows hold ug/dL values (quartiles 51, 75, 99).
+        loinc_codes=("2498-4",),
+        canonical_unit="microgram per deciliter",
+        unit_conversions=_units(("microgram per deciliter", 1.0), (NO_UNIT_LABEL, 1.0), ("ug/dl", 1.0), ("mg/dl", 1.0), ("no value", 1.0)),
+        clinical_windows=(TRANSFUSION,),
+    ),
+    MeasurementDefinition(
+        canonical_name="iron_binding_capacity",
+        aliases=(),
+        description="Total iron binding capacity (ug/dL).",
+        # The "mg/dl" rows hold ug/dL values (quartiles 274, 320, 365).
+        loinc_codes=("2500-7",),
+        canonical_unit="microgram per deciliter",
+        unit_conversions=_units(("microgram per deciliter", 1.0), (NO_UNIT_LABEL, 1.0), ("mg/dl", 1.0), ("no value", 1.0)),
+        clinical_windows=(TRANSFUSION,),
+    ),
+    MeasurementDefinition(
+        canonical_name="transferrin_saturation",
+        aliases=(),
+        description="Iron saturation of transferrin (%).",
+        loinc_codes=("2502-3",),
+        canonical_unit="percent",
+        unit_conversions=_units(("percent", 1.0), (NO_UNIT_LABEL, 1.0), ("percent calculated", 1.0), ("percentage unit", 1.0)),
+        clinical_windows=(TRANSFUSION,),
+    ),
+    MeasurementDefinition(
+        canonical_name="vitamin_b12",
+        aliases=(),
+        description="Serum/plasma cobalamin (pg/mL).",
+        loinc_codes=("2132-9",),
+        canonical_unit="picogram per milliliter",
+        unit_conversions=_units(("picogram per milliliter", 1.0), (NO_UNIT_LABEL, 1.0), ("pg/ml", 1.0), ("no value", 1.0)),
+    ),
+    MeasurementDefinition(
+        canonical_name="folate",
+        aliases=(),
+        description="Serum/plasma folate (ng/mL).",
+        loinc_codes=("2284-8",),
+        canonical_unit="nanogram per milliliter",
+        unit_conversions=_units(("nanogram per milliliter", 1.0), (NO_UNIT_LABEL, 1.0)),
+    ),
+    MeasurementDefinition(
+        canonical_name="vitamin_d",
+        aliases=(),
+        description="25-hydroxyvitamin D (ng/mL).",
+        loinc_codes=("1989-3", "62292-8",),
+        canonical_unit="nanogram per milliliter",
+        unit_conversions=_units(("nanogram per milliliter", 1.0), (NO_UNIT_LABEL, 1.0)),
+    ),
+    MeasurementDefinition(
+        canonical_name="c_reactive_protein",
+        aliases=(),
+        description="High-sensitivity C-reactive protein (mg/L).",
+        # The unlabelled rows hold mg/L values (quartiles 0.9, 3.1, 10); 1 mg/dL = 10 mg/L.
+        loinc_codes=("30522-7",),
+        canonical_unit="milligram per liter",
+        unit_conversions=_units(("milligram per liter", 1.0), (NO_UNIT_LABEL, 1.0), ("mg/l", 1.0), ("milligram per deciliter", 10.0)),
+        clinical_windows=(ANTIBACTERIAL_COURSE,),
+    ),
+    MeasurementDefinition(
+        canonical_name="eosinophil_count",
+        aliases=(),
+        description="Eosinophil count (10^3/uL).",
+        # Counts per microliter (quartiles 76-220) are 0.001 thousand per microliter; percentages are not counts.
+        loinc_codes=("711-2",),
+        canonical_unit="thousand per microliter",
+        unit_conversions=_BLOOD_COUNT_THOUSANDS_PER_MICROLITER + _units(("cells per microliter", 0.001), ("per microliter", 0.001), ("cells/ul", 0.001), ("no value", 1.0)),
+        clinical_windows=_BLOOD_COUNT_WINDOWS,
+    ),
+    MeasurementDefinition(
+        canonical_name="lymphocyte_count",
+        aliases=(),
+        description="Lymphocyte count (10^3/uL).",
+        # Counts per microliter (quartiles 1,078-2,363) are 0.001 thousand per microliter; percentages are not counts.
+        loinc_codes=("731-0",),
+        canonical_unit="thousand per microliter",
+        unit_conversions=_BLOOD_COUNT_THOUSANDS_PER_MICROLITER + _units(("cells per microliter", 0.001), ("per microliter", 0.001), ("cells/ul", 0.001), ("no value", 1.0)),
+        clinical_windows=_BLOOD_COUNT_WINDOWS,
     ),
 )
 # Analytes that define a disease through a LabCriterion without being panel traits.
