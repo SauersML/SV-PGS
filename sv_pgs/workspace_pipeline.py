@@ -3931,17 +3931,14 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
 
 @dataclass(frozen=True, slots=True)
 class _Scores:
-    """The score step's arrays: [arms, cohort rows, models] over every model, each person's own-fold held-out
-    values [arms, cohort rows, traits] (NaN where the person has no held-out prediction of the trait),
+    """The score step's arrays that the report and effects steps read: ``genetic_mean`` [arms, cohort rows, models] over
+    every model, each person's own-fold held-out values [arms, cohort rows, traits] (NaN where the person has no held-out prediction of the trait),
     ``structural_genetic`` [cohort rows, traits], the genetic score of the structural part (STRUCTURAL_PART) of each
     trait's all-rows ``with_sv`` model, and ``held_out_structural`` [cohort rows, traits], each person's own-fold
     ``with_sv`` model's structural part, as ``held_out_genetic`` is its whole score (the report's stacked baselines: the
     all-rows model trained on everyone, so its part is never a held-out score)."""
 
-    predictive_mean: F64Array
-    linear_predictor: F64Array
     genetic_mean: F64Array
-    held_out_predictive_mean: F64Array
     held_out_linear_predictor: F64Array
     held_out_genetic: F64Array
     structural_genetic: F64Array

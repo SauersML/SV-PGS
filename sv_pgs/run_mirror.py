@@ -371,22 +371,22 @@ _PROCESS_REMOTES: dict[str, GcsRemote] = {}
 """A GcsRemote.download_many worker process's own client, one per mirror URL."""
 
 
-def _download_in_process(url: str, name: str, path: Path) -> str | None:
+def _process_remote(url: str) -> GcsRemote:
     if url not in _PROCESS_REMOTES:
         _PROCESS_REMOTES[url] = GcsRemote(url)
-    return _PROCESS_REMOTES[url].download(name, path)
+    return _PROCESS_REMOTES[url]
+
+
+def _download_in_process(url: str, name: str, path: Path) -> str | None:
+    return _process_remote(url).download(name, path)
 
 
 def _download_range_in_process(url: str, name: str, path: Path, start: int, stop: int, generation: int | None) -> None:
-    if url not in _PROCESS_REMOTES:
-        _PROCESS_REMOTES[url] = GcsRemote(url)
-    _PROCESS_REMOTES[url].download_range(name, path, start, stop, generation)
+    _process_remote(url).download_range(name, path, start, stop, generation)
 
 
 def _upload_range_in_process(url: str, path: Path, start: int, stop: int, name: str) -> None:
-    if url not in _PROCESS_REMOTES:
-        _PROCESS_REMOTES[url] = GcsRemote(url)
-    _PROCESS_REMOTES[url].upload_range(path, start, stop, name)
+    _process_remote(url).upload_range(path, start, stop, name)
 
 
 class _FileRange:
