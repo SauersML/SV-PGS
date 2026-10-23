@@ -31,6 +31,14 @@ Unit and inputs
   true genotypes, and keeping them would raise the SV gain above what imputed SVs give anyone else. Only the count is
   printed.
 
+When (added 18:20 PDT, before any pair other than aou-wl15 was read)
+- The primary runs once, over every trait whose pair has finished, at the earlier of two times: when all 11 traits'
+  pairs have finished or failed, or 2026-10-23 08:00 PDT.
+- Before then, each trait is reported alone as its pair finishes: its gain, 95% interval, p and upper bound. These
+  are descriptive.
+- A running combination of the traits finished so far may be shown, labelled interim. It is never the primary, and
+  nothing is stopped or added because of it.
+
 Primary (one test)
 - The common relative gain g. Each trait's gain (with_sv partial r^2 less snv_indel) is regressed on the two arms'
   mean partial r^2 through the origin, with weights 1 / var(gain): g = sum(a gain) / sum(a r^2), a = r^2 / var(gain)
