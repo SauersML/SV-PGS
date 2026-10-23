@@ -675,8 +675,8 @@ summary keeps each frequency bin's quartiles and count, not its values."""
 
 
 def imputation_panel(ax, accuracy) -> None:
-    """The r² of each variant's Beagle-imputed dosage with its true genotype (benchmarks/power/imputation_accuracy.py,
-    not Beagle's own DR2) by minor allele frequency, SNVs and SVs: each frequency bin's median with its approximate 95%
+    """The r² of each variant's measured dosage with its true genotype (benchmarks/power/imputation_accuracy.py, not
+    Beagle's own DR2) by minor allele frequency, SNVs called from simulated reads and SVs imputed by Beagle: each frequency bin's median with its approximate 95%
     interval (bars), over the bin's interquartile range (band) (Figure 5a)."""
     ends = []
     for key, color, label in (("SNV", INK, "SNVs"), ("SV", IMPUTED, "SVs")):
@@ -783,8 +783,9 @@ def genotype_figure(summary):
                        "classes": {label: int(mask.sum()) for label, mask, _ in groups}}
     caption = (
         f"Figure 5 | The simulated SVs are mostly rare and short, and rare SVs impute poorly. a, The r² of each "
-        f"variant's Beagle-imputed dosage with its true genotype over all {PEOPLE:,} simulated people (not Beagle's DR2), "
-        f"for {accuracy['SV']['records']:,} SVs and {accuracy['SNV']['records']:,} sampled SNVs on chromosome 22, by "
+        f"variant's measured dosage with its true genotype over all {PEOPLE:,} simulated people (not Beagle's DR2), "
+        f"for {accuracy['SV']['records']:,} SVs imputed by Beagle and {accuracy['SNV']['records']:,} sampled SNVs "
+        f"called from simulated reads on chromosome 22, by "
         f"minor allele frequency: each bin's median (points) with an approximate 95% interval ({MEDIAN_Z:.2f} IQR/√n; "
         f"bars), over the bin's middle 50% of variants (bands; SNVs grey, SVs blue). b, Lengths of the "
         f"{int(records['measured'].sum()):,} measured SVs, stacked by class (records without a type are classed by the "
