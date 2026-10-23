@@ -85,6 +85,9 @@ LABEL_GAP = 0.3
 MARK = 1.5
 """The forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR) when its rows are a line of type
 apart."""
+STYLE = {**POSTER_STYLE, "axes.labelsize": POSTER_LABEL, "xtick.major.size": 10.0, "xtick.major.pad": 6.0}
+"""The figure's matplotlib style: the simulation figures', with shorter ticks and pads, so the stacked panels fit the
+column."""
 HEIGHT = 19.90
 """Inches: the room the poster's right column gives the All of Us figure (build_pptx.py's layout), which no other
 block fits beside. What it has beyond the figure's natural height goes equally between the panels; the rows stay a
@@ -490,11 +493,6 @@ def p_text(p: float) -> str:
     return f"{p:.2f}"
 
 
-def signed(percent_value: float) -> str:
-    """A percentage rounded to a whole percent with its sign, "+17%" or "−3%"."""
-    return f"{round(percent_value):+d}%".replace("-", "−")
-
-
 GROUPS = ("EUR", "AFR", "AMR")
 """The ancestry groups under each pooled row, in this order, from ANCESTRY's "groups"."""
 
@@ -513,6 +511,13 @@ def pooled_rows(overall: dict | None, groups: dict | None, test: str) -> tuple[l
             rows.append((group, [tuple(values[key] / 100 for key in ("percent", "lower", "upper"))]))
             notes[group] = [f"p = {p_text(values['p_one'])}"]
     return rows, notes
+
+
+def scope(rows: list) -> str:
+    """Which pooled rows ``rows`` holds, as the figure's description says it: "overall", "by ancestry group" or both."""
+    names = [name for name, _ in rows]
+    return " and ".join((["overall"] if COMBINED in names else []) + (["by ancestry group"] if set(names) & set(GROUPS)
+                                                                       else []))
 
 
 def gain_figure(matched: list[dict], common: dict | None = None, compared: list[dict] | None = None,
@@ -556,18 +561,17 @@ def gain_figure(matched: list[dict], common: dict | None = None, compared: list[
     fig = forest(panels, least=HEIGHT)
     return fig, [("Held-out partial r² in percent of LDpred2-auto and SV-PGS for each trait on a log axis; " if measured
                   else "")
-                 + ("SV-PGS's pooled change in r² over LDpred2-auto, overall and by ancestry group, with one-sided p; "
+                 + (f"SV-PGS's pooled change in r² over LDpred2-auto, {scope(versus)}, with one-sided p; "
                     if versus else "")
                  + "the change in held-out partial r² from adding SVs to SV-PGS for each trait, relative to the r² "
                  "without SVs, with 95% intervals, an arrowhead marking an interval that runs past the axis"
-                 + (", and the pooled change overall and by ancestry group with one-sided p" if combined else "")
+                 + (f", and the pooled change {scope(combined)} with one-sided p" if combined else "")
                  + (", an asterisk marking a Benjamini-Hochberg q below 0.05" if stars else "")]
 
 
 def main() -> None:
     numbers = json.loads(NUMBERS.read_text())
-    # shorter ticks and pads than the simulation figures', so the stacked panels fit the column
-    with plt.rc_context({**POSTER_STYLE, "axes.labelsize": POSTER_LABEL, "xtick.major.size": 10.0, "xtick.major.pad": 6.0}):
+    with plt.rc_context(STYLE):
         drawn = []
         if numbers.get("matched", {}).get("rows"):
             compared = json.loads(COMPARED.read_text()) if COMPARED.is_file() else {}
