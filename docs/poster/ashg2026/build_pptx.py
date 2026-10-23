@@ -62,7 +62,7 @@ COLUMNS = ((MARGIN, LEFT), (MARGIN + LEFT + GUTTER, MIDDLE), (48 - MARGIN - RIGH
 INSET = 0.3
 """Text sits this far inside its column, under the section bars' labels."""
 BAR, BAR_SIZE = 1.25, 72
-BODY, HEADLINE, GLOSS, REFERENCE = 56, 60, 56, 44
+BODY, HEADLINE, GLOSS, REFERENCE = 56, 60, 56, 50
 LINE_PITCH = 1.066
 """Line pitch per point of type at 90% line spacing, measured on the LibreOffice render."""
 SHIFTED_PITCH = 0.25
@@ -94,7 +94,7 @@ REFERENCES = [
 ]
 """First author, year and journal, set as one paragraph."""
 PLACEHOLDERS = [
-    ("SV effect sizes", "By SV class and length"),
+    ("Change in test r² with SVs", "All held-out people and by genetic ancestry"),
 ]
 
 
@@ -137,26 +137,27 @@ def copy(numbers: dict) -> dict:
         "gain_note": f"Mean and 95% CI over {simulations} simulations in 3 Mb of chr22",
         "aou": ["SVs imputed into 50,000 genomes from 12,212 long-read assemblies", *aou_matched()],
         "discussion": [
-            f"SV-PGS gained {wins['gain'][0]:.3f} AUC over LDpred2-auto on whole chr22, "
-            f"{wins['window_gain'][0]:.3f} in 3 Mb",
-            "The gain was the same without SVs and grew with heritability",
+            f"SV-PGS gained {wins['gain'][0]:.3f} AUC over LDpred2-auto on whole chr22",
+            "The gain was as large without causal SVs and grew with h²",
         ],
     }
 
 
-def minus(value: float, digits: int) -> str:
-    return f"{value:.{digits}f}".replace("-", "−")
-
-
 def aou_matched() -> list[str]:
     """The All of Us tests of SV-PGS with SVs against the same model fitted without SVs by identical code, on the
-    same held-out people: aou_numbers.json's "matched" rows (aggregates, every count > 20), as sentences."""
+    same held-out people (aou_numbers.json's "matched" rows: aggregates, every count > 20): what each compares, its
+    held-out people in each genetic ancestry group the figure shows, and its test partial r² without SVs, the scale of
+    the change figures/aou_1_gain.png shows."""
     path = HERE / "aou_numbers.json"
     rows = json.loads(path.read_text()).get("matched", {}).get("rows", []) if path.is_file() else []
     lines = []
     for row in rows:
-        lines.append(f"{row['trait']}: SVs changed test {row['metric']} by {minus(row['relative'], 1)}% (95% CI "
-                     f"{minus(row['relative_lower'], 1)}% to {minus(row['relative_upper'], 1)}%)")
+        lines.append(f"{row['trait']}: SV-PGS fit with and without SVs by identical code, tested on the same "
+                     f"{people(row['held_out'])} people")
+        if row.get("ancestries"):
+            lines.append("Of them, " + ", ".join(f"{people(group['held_out'])} {group['group']}"
+                                                  for group in row["ancestries"]))
+        lines.append(f"Test {row['metric']} without SVs: {row['snv_indel_r2']:.3f}")
     return lines
 
 
@@ -615,10 +616,10 @@ def build() -> None:
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
             Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)], gap="section"),
             figure(gallery["poster_sv_gain"]),
+            bar(95, "Discussion"), text(bullets(words["discussion"])),
         ],
         [
             bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks(),
-            bar(95, "Discussion"), text(bullets(words["discussion"])),
             bar(96, "References"), text([Para([("; ".join(REFERENCES), "")], REFERENCE, bullet=False, after=0)]),
             code(words["code"]),
         ],
