@@ -319,7 +319,7 @@ final results now; no CAD or hyperlipidemia value had been read, and no primary 
   the Holm-adjusted primary p is reported as lying between the primary's own p and twice it, until Q8 runs.
 - Each trait's descriptive row is that pair analysed alone with the same code, as before.
 
-Converged pairs only (amendment 8, written 2026-10-23 at 06:35 PDT, post hoc: after the primary's result below was
+Converged pairs only (amendment 8, written 2026-10-23 at 06:33 PDT, post hoc: after the primary's result below was
 seen, by the user's decision "remake all figures but obviously dont use non-converged sv pgs, and meta analyses")
 - From now on, every reported SV-PGS meta-analysis and figure uses only pairs whose two arms both converged. An arm
   converged when its pairing run's score step lists it as certified (run/score/_COMPLETE.json, summary.uncertified
@@ -451,6 +451,20 @@ Results seen (log; no test definition changes because of them)
   Each trait's gain relative to the SNV-and-indel r^2, from the same report: LDL -0.22%, hypothyroidism +1.42%, atrial
   fibrillation -0.62%, eGFR +0.26%, gout +4.64%, hypertension -42.34%, T2D +0.00% and CKD -65.89%. The without-T2D and
   c4 sensitivity analyses were stopped at 06:32 PDT to give the app's CPUs to amendment 8, and run after it.
+- 06:40 PDT on 2026-10-23, read: the CONVERGED analysis (amendment 8, post hoc), on 4 traits with every arm certified:
+  LDL (aou-x3-l2 + aou-c4-l1), hypothyroidism (aou-x3-o1), atrial fibrillation (aou-x3-a1) and eGFR (aou-m3f-e1); run
+  06:32 to 06:40 PDT with 1,000 swaps and the long-read people excluded. g = -0.01% of the arms' mean partial r^2, 95%
+  CI [-0.16, 0.14]. The one-sided swap p is 0.553 and the one-sided bootstrap p 0.544 (z -0.112). The one-sided 95%
+  upper bound is +0.12%. LDL takes 0.97 of the weight. No gain from SVs is detected.
+  - Each pair alone (g, 95% CI, one-sided swap p / bootstrap p): LDL -0.02% [-0.18, 0.14], 0.61 / 0.59;
+    hypothyroidism +1.41% [-0.37, 3.18], 0.052 / 0.060; atrial fibrillation -0.62% [-9.43, 8.18], 0.69 / 0.56; eGFR
+    +0.26% [-1.13, 1.65], 0.37 / 0.36.
+  - These numbers are in docs/poster/ashg2026/aou_numbers.json (git-ignored), with only converged rows and an "All
+    converged traits" row.
+- 06:40 PDT on 2026-10-23: Q8's test failed to run. cardio restarted its watcher for HDL alone at 06:40 PDT (BMI, SBP,
+  HbA1c and height pairs failed), and sv_gain_meta at c1f5570 stopped with "Unsupported trait: hdl_cholesterol". No Q8
+  result exists. The Holm step was stopped at 06:41 PDT, before it ran anything, so that its combined run would not
+  race the sensitivity analyses.
 - Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
 - Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
   Q8's test runs.
