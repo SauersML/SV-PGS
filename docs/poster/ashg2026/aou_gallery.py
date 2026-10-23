@@ -53,9 +53,12 @@ ANCESTRY = HERE / "aou_ancestry.json"
 OUT = HERE / "figures"
 COLUMN = 11.4
 """Inches: the poster's right column (build_pptx.py's RIGHT), each figure's width, so its type prints at its own size."""
-ROW_GAP = 0.05
-"""Inches between one row's name and the next row's: a row is a line of poster type and this gap, or its marks and
-this gap when they are taller."""
+ROW_GAP = 0.03
+"""Inches at least between the marks of one row and the next: a row is a line of poster type (its size in points
+over 72 inches), or its marks and this gap when they are taller."""
+AXIS_GAP = 0.375
+"""Inches between a panel's last row and its x axis, about half a line of type, when that row is a note without marks,
+whose type would otherwise sit on the axis."""
 MARK_GAP = 0.02
 """Inches between the marks that stand one above the next in a row."""
 EDGE = 0.02
@@ -122,7 +125,8 @@ def forest(panels: list[Panel], least: float = 0.0):
     a panel stars a mark, STAR_NOTE ends the first panel's key, which it starts when that panel has none. A row's note
     follows its marks or its name (Panel). A log panel spans its estimates and is ticked at the
     decades inside; a linear one is symmetric about 0 over its estimates. Either way each mark clears an arrowhead at
-    the axis's end, and an interval past the axis ends in one. Every margin and row height is measured from the type,
+    the axis's end, and an interval past the axis ends in one, its tip at the axis's end. The rows are a line of type
+    apart, and the axis is under the last of them, AXIS_GAP under it when it is a note without marks. Every margin and row height is measured from the type,
     so the figure is as short as its type allows, unless ``least`` inches is taller: then the extra height goes
     between the panels, or over a lone panel."""
     fig = plt.figure(figsize=(COLUMN, 1.0))
@@ -133,7 +137,7 @@ def forest(panels: list[Panel], least: float = 0.0):
     # one series' marks at MARK times the poster's, two or more at the poster's own, one above the next in a row
     marks = [POSTER_MARK * (MARK if len(panel.series) == 1 else 1.0) for panel in panels]
     # a row is a line of type, or as many lines as its name or note takes, or its marks one above the next when taller
-    line = tallest(fig, ["Hg"], fontsize=size)
+    line = size / 72
     stacks = [sum(mark / 72 + (0.0 if filled else RING / 72) for *_, filled in panel.series)
               + (len(panel.series) - 1) * MARK_GAP for panel, mark in zip(panels, marks)]
     # each panel's notes start in a column right of the widest name among its rows with notes
@@ -142,51 +146,51 @@ def forest(panels: list[Panel], least: float = 0.0):
     wrapped = [{name: note_lines(fig, panel.notes[name], COLUMN - EDGE - column, COLUMN - EDGE - column)
                 for name, estimates in panel.rows if not estimates and name in panel.notes}
                for panel, column in zip(panels, columns)]
-    heights = [[(len(notes[name]) * line if name in notes
-                 else max(tallest(fig, [name], fontsize=size, fontweight=weight[name]) if "\n" in name else line, stack))
-                + ROW_GAP for name, _ in panel.rows] for panel, stack, notes in zip(panels, stacks, wrapped)]
+    heights = [[len(notes[name]) * line if name in notes else max((name.count("\n") + 1) * line, stack + ROW_GAP)
+                for name, _ in panel.rows] for panel, stack, notes in zip(panels, stacks, wrapped)]
     # each panel's key: its series, each a mark and its name, and after the first panel's STAR_NOTE when a mark is starred
     entries = [[(label, (colour, marker, filled)) for label, colour, marker, filled in panel.series]
                if len(panel.series) > 1 else [] for panel in panels]
     if any(panel.starred for panel in panels):
         entries[0].append((STAR_NOTE, None))
     lines = [key_lines(fig, entry, mark) for entry, mark in zip(entries, marks)]
-    keys = [len(rows) * (max(tallest(fig, [label for label, _ in entry], fontsize=size), mark / 72) + ROW_GAP)
-            for rows, entry, mark in zip(lines, entries, marks)]
+    keys = [len(rows) * max(line, mark / 72 + ROW_GAP) for rows, mark in zip(lines, marks)]
     # under each axis: its ticks, tick labels and title, and then POSTER_PAD to the next panel or EDGE to the canvas's foot
     style = matplotlib.rcParams
     bottoms = [(style["xtick.major.size"] + style["xtick.major.pad"] + TITLE_PAD) / 72
                + tallest(fig, ["0.1"], fontsize=style["xtick.labelsize"])
                + tallest(fig, [panel.xlabel], fontsize=style["axes.labelsize"]) + POSTER_PAD for panel in panels]
     bottoms[-1] += EDGE - POSTER_PAD
-    natural = EDGE + sum(key + sum(rows) + bottom for key, rows, bottom in zip(keys, heights, bottoms))
+    gaps = [AXIS_GAP if panel.rows and not panel.rows[-1][1] else 0.0 for panel in panels]
+    natural = EDGE + sum(key + sum(rows) + gap + bottom for key, rows, gap, bottom in zip(keys, heights, gaps, bottoms))
     height = max(least, natural)
     spare = height - natural
     # an arrowhead at the axis's start reaches half its width to the left, toward the names
+    # an arrowhead ends at the axis's end, so it reaches its full length, twice this, inside the axis
     arrow = max(marks) * 0.7 / 2 / 72
-    left = EDGE + max(named.values()) + LABEL_GAP + arrow
+    left = EDGE + max(named.values()) + LABEL_GAP
     fig.set_size_inches(COLUMN, height)
     # each mark clears the axis's ends by its half width, its ring, an arrowhead and a pad
     halves = [(mark + RING) / 2 / 72 for mark in marks]
-    clears = [half + arrow + POSTER_PAD for half in halves]
+    clears = [half + 2 * arrow + POSTER_PAD for half in halves]
     # the notes of rows with marks at the rows' ends, or, when that leaves too narrow an axis, in the notes' column
-    width = plot_width(fig, panels, clears, halves, COLUMN - left, arrow, ends_noted=True)
+    width = plot_width(fig, panels, clears, halves, COLUMN - left, ends_noted=True)
     ending = width >= MIN_AXIS
     if not ending:
-        left = max(left, *(column + widest(fig, [" ".join(panel.notes[name])], fontsize=size) + LABEL_GAP + arrow
+        left = max(left, *(column + widest(fig, [" ".join(panel.notes[name])], fontsize=size) + LABEL_GAP
                            for panel, column in zip(panels, columns) for name, estimates in panel.rows
                            if estimates and name in panel.notes))
-        width = plot_width(fig, panels, clears, halves, COLUMN - left, arrow, ends_noted=False)
+        width = plot_width(fig, panels, clears, halves, COLUMN - left, ends_noted=False)
     star = widest(fig, [STAR], fontsize=size)
     top = height - EDGE
     top -= spare if len(panels) == 1 else 0.0
-    for panel, mark, rows, key, key_rows, bottom, clear, half, notes, column in zip(
-            panels, marks, heights, keys, lines, bottoms, clears, halves, wrapped, columns):
+    for panel, mark, rows, key, key_rows, bottom, clear, half, notes, column, gap in zip(
+            panels, marks, heights, keys, lines, bottoms, clears, halves, wrapped, columns, gaps):
         bar, ring = POSTER_BAR, RING
-        span = sum(rows)
+        span = sum(rows) + gap
         # the key over the panel from the canvas's left edge, a line at a time: each series' mark, then its name
         for index, row in enumerate(key_rows):
-            middle = top - index * key / len(key_rows) - (key / len(key_rows) - ROW_GAP) / 2
+            middle = top - (index + 0.5) * key / len(key_rows)
             for x, label, look in row:
                 if look:
                     colour, marker, filled = look
@@ -203,16 +207,17 @@ def forest(panels: list[Panel], least: float = 0.0):
         if panel.log:
             ax.set_xscale("log")
         for (name, estimates), centre in zip(panel.rows, centres):
-            each, past = ends(panel, name, estimates, width, low_limit, high_limit, half, arrow, star)
+            each, past = ends(panel, name, estimates, width, low_limit, high_limit, half, star)
             for index, ((label, colour, marker, filled), (value, low, high)) in enumerate(zip(panel.series, estimates)):
                 y = centre + (index - (len(panel.series) - 1) / 2) * (mark / 72 + (0.0 if filled else ring / 72)
                                                                       + MARK_GAP)
                 ax.hlines(y, max(low, low_limit), min(high, high_limit), color=colour, linewidth=bar, zorder=3,
                           capstyle="round")
-                for end, edge, arrowhead in ((low, low_limit, "<"), (high, high_limit, ">")):
+                # an interval past the axis ends in an arrowhead whose tip is the axis's end
+                for end, edge, arrowhead, side in ((low, low_limit, "<", 0), (high, high_limit, ">", 1)):
                     if (end < edge) if arrowhead == "<" else (end > edge):
-                        ax.plot([edge], [y], marker=arrowhead, markersize=mark * 0.7, color=colour, markeredgewidth=0,
-                                zorder=3, clip_on=False)
+                        ax.plot([side], [y], marker=arrowhead, markersize=mark * 0.7, color=colour, markeredgewidth=0,
+                                zorder=3, clip_on=False, transform=shifted(ax, (0.5 - side) * mark * 0.7 / 72))
                 ax.plot([value], [y], marker, markersize=mark, color=colour,
                         markerfacecolor=colour if filled else "white", markeredgecolor=colour,
                         markeredgewidth=0 if filled else ring, zorder=4)
@@ -264,13 +269,13 @@ def note_lines(fig, pieces: list[str], first: float, rest: float) -> list[str]:
 
 
 def ends(panel: Panel, name: str, estimates: list[tuple[float, float, float]], width: float, low: float, high: float,
-         half: float, arrow: float, star: float) -> tuple[list[float], float]:
-    """Inches from the axis's left at which each of a row's marks ends, the farthest of its interval, the arrowhead of
-    an interval past the axis and the mark itself; and at which the row ends, its STARs after them included."""
+         half: float, star: float) -> tuple[list[float], float]:
+    """Inches from the axis's left at which each of a row's marks ends, the farther of its interval (the axis's end for
+    an interval past it, whose arrowhead ends there) and the mark itself; and at which the row ends, its STARs after
+    them included."""
     place = (lambda value: math.log10(value / low) / math.log10(high / low)) if panel.log \
         else (lambda value: (value - low) / (high - low))
-    each = [max(width * place(min(upper, high)) + (arrow if upper > high else 0.0), width * place(value) + half)
-            for value, _, upper in estimates]
+    each = [max(width * place(min(upper, high)), width * place(value) + half) for value, _, upper in estimates]
     past = max([end + (STAR_GAP + star if (name, index) in panel.starred else 0.0) for index, end in enumerate(each)],
                default=0.0)
     return each, past
@@ -296,10 +301,10 @@ def star_middle(size: float) -> float:
     return (extent.y0 + extent.y1) / 2
 
 
-def plot_width(fig, panels: list[Panel], clears: list[float], halves: list[float], room: float, arrow: float,
+def plot_width(fig, panels: list[Panel], clears: list[float], halves: list[float], room: float,
                ends_noted: bool) -> float:
     """Inches of the panels' shared x axis in ``room`` inches right of the names: as wide as leaves EDGE past the
-    farthest of an arrowhead at the axis's end, the half of each drawn tick label that sits past it, and each row's
+    farthest of the axis's end, the half of each drawn tick label that sits past it, and each row's
     STARs past its marks, and its note too when ``ends_noted`` (``ends``; ``halves``: each panel's marks' half
     widths). Only drawn ticks count, so a
     decade outside a log axis takes no room. The widest axis that fits is found by bisection."""
@@ -307,7 +312,9 @@ def plot_width(fig, panels: list[Panel], clears: list[float], halves: list[float
     star = widest(fig, [STAR], fontsize=matplotlib.rcParams["font.size"])
 
     def fits(width: float) -> bool:
-        reach = arrow
+        if width <= 2 * max(clears) + POSTER_PAD:
+            return False  # no room for the marks inside their clearances
+        reach = 0.0
         for panel, clear, half in zip(panels, clears, halves):
             low, high = limits(panel, width, clear)
             place = (lambda value: math.log10(value / low) / math.log10(high / low)) if panel.log \
@@ -317,13 +324,13 @@ def plot_width(fig, panels: list[Panel], clears: list[float], halves: list[float
             for name, estimates in panel.rows:
                 if not estimates:
                     continue
-                _, past = ends(panel, name, estimates, width, low, high, half, arrow, star)
+                _, past = ends(panel, name, estimates, width, low, high, half, star)
                 note = (NOTE_GAP + widest(fig, [" ".join(panel.notes[name])], fontsize=matplotlib.rcParams["font.size"])
                         if ends_noted and name in panel.notes else 0.0)
                 reach = max(reach, past + note - width)
         return width + reach + EDGE <= room
 
-    low, high = 0.25 * room, room - arrow - EDGE
+    low, high = 2 * max(clears) + 2 * POSTER_PAD, room - EDGE
     if fits(high):
         return high
     if not fits(low):

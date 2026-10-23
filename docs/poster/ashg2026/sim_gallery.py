@@ -700,14 +700,40 @@ def size_figure(grids):
 MEDIAN_Z = stats.norm.ppf(0.975) * math.sqrt(math.pi / 2) / (2 * stats.norm.ppf(0.75))
 """A median's 95% interval half-width per IQR / sqrt(n) under a normal shape (1.96 x 1.2533 / 1.349 = 1.82): the
 summary keeps each frequency bin's quartiles and count, not its values."""
+AOU_IMPUTATION = HERE / "figures" / "imputation" / "imputation_numbers.json"
+"""The All of Us SV imputation summary (git-ignored): each frequency bin's edges (%) and median SV r²."""
+OPEN_LOW = 0.025
+"""The lower edge (%) taken for that summary's open lowest bin, below 0.1%, so its point sits at 0.05%, as
+figures/imputation/imputation_accuracy.py places it."""
+AOU = ORANGE
+"""The All of Us SV imputation curve's colour, apart from the SNVs' black and the simulated SVs' blue."""
+
+
+def aou_imputation():
+    """The All of Us SV imputation curve, each frequency bin's geometric midpoint (%) and median r², or None when the
+    git-ignored summary is missing."""
+    if not AOU_IMPUTATION.exists():
+        return None
+    bins = json.loads(AOU_IMPUTATION.read_text())["by_frequency"]["bins"]
+    return (np.array([math.sqrt((b["low"] or OPEN_LOW) * b["high"]) for b in bins]),
+            np.array([b["r2"] for b in bins]))
+
+
+def runs(ax, x, y, parts, **style):
+    """``parts``, each (words, font style), set on one line from (``x``, ``y``) in data, centred on ``y``."""
+    piece = ax.text(x, y, parts[0][0], fontstyle=parts[0][1], va="center", **style)
+    for words, slant in parts[1:]:
+        piece = ax.annotate(words, xy=(1, 0), xycoords=piece, va="bottom", ha="left", fontstyle=slant,
+                            annotation_clip=False, **style)
 
 
 def imputation_panel(ax, accuracy) -> None:
     """The r² of each variant's measured dosage with its true genotype (benchmarks/power/imputation_accuracy.py, not
     Beagle's own DR2) by minor allele frequency, SNVs called from simulated reads and SVs imputed by Beagle: each
-    frequency bin's median with its approximate 95% interval (Figure 5a)."""
+    frequency bin's median with its approximate 95% interval (Figure 5a). Beside them, when its summary is present, the
+    median r² of SVs imputed in All of Us per frequency bin, with no interval."""
     ends = []
-    for key, color, label in (("SNV", INK, "SNVs"), ("SV", IMPUTED, "SVs")):
+    for key, color, label in (("SNV", INK, [("SNVs", "normal")]), ("SV", IMPUTED, [("SVs, simulated", "normal")])):
         bins = [b for b in accuracy[key]["bins"] if b["count"]]
         centers = np.array([math.sqrt(b["low"] * b["high"]) * 100 for b in bins])
         median = np.array([b["median"] for b in bins])
@@ -715,17 +741,23 @@ def imputation_panel(ax, accuracy) -> None:
         ax.vlines(centers, np.clip(median - half, 0, 1), np.clip(median + half, 0, 1), color=color, linewidth=BAR,
                   zorder=2)
         ax.plot(centers, median, color=color, marker="o", markersize=MARK * 0.85, markeredgewidth=0, zorder=3)
-        ends.append((centers[-1] * 1.25, median[-1], label))
+        ends.append((centers[-1], median[-1], label))
+    real = aou_imputation()
+    if real is not None:
+        ax.plot(*real, color=AOU, marker="o", markersize=MARK * 0.85, markeredgewidth=0, zorder=3, clip_on=False)
+        ends.append((real[0][-1], real[1][-1], [("SVs, ", "normal"), ("All of Us", "italic")]))
     top = 1.12
     ax.set_xscale("log")
     ax.set_xlim(0.05, 100)
     ax.set_ylim(0, top)
     ax.spines["left"].set_bounds(0, 1)
-    # each type named at its own line's end, the SNVs' name lifted over its line where the two ends meet
+    # each line named after the lines' ends, from the highest end down, each name at its line's end or a line under
+    # the name above
     height = ax.get_position().height * ax.figure.get_size_inches()[1]
-    (x, snv, first), (_, sv, second) = ends
-    ax.text(x, max(snv, sv + 0.62 * top / height), first, color=INK, fontweight="bold", va="center")
-    ax.text(x, sv, second, color=INK, fontweight="bold", va="center")
+    x, previous = max(end for end, _, _ in ends) * 1.25, math.inf
+    for _, y, parts in sorted(ends, key=lambda end: -end[1]):
+        previous = min(y, previous - 0.62 * top / height)
+        runs(ax, x, previous, parts, color=INK, fontweight="bold")
     ax.set_xticks([0.1, 1, 10], ["0.1", "1", "10"])
     ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
     ax.set_yticks(np.arange(0, 1.01, 0.25), ["0", "0.25", "0.50", "0.75", "1"])
@@ -808,7 +840,10 @@ def genotype_figure(summary):
         f"for {accuracy['SV']['records']:,} SVs imputed by Beagle and {accuracy['SNV']['records']:,} sampled SNVs "
         f"called from simulated reads on chromosome 22, by "
         f"minor allele frequency: each bin's median (points) with an approximate 95% interval ({MEDIAN_Z:.2f} IQR/√n, "
-        f"bars), SNVs black and SVs blue. b, Lengths of the "
+        f"bars), SNVs black and SVs blue"
+        + (", beside the median r² of SVs imputed in All of Us per frequency bin (orange, no interval)"
+           if aou_imputation() is not None else "")
+        + ". b, Lengths of the "
         f"{int(records['measured'].sum()):,} measured SVs, stacked by class (records without a type are classed by the "
         f"sign of their length change)" + (". The insertions' peak near 300 bp is where Alu elements lie" if alu else "")
         + ". bench-sim v7 cohort from public 1000 Genomes haplotypes."
@@ -975,9 +1010,9 @@ def poster_accuracy_figure(grids, summary):
     return fig
 
 
-WINS_ABOVE, WINS_INDENT = 0.2, 0.18
-"""Inches: how far the scatter's line at the top left reaches over its axes, and how far right of the y axis it
-starts."""
+WINS_ABOVE, WINS_INDENT, WINS_CLEAR = 0.2, 0.18, 0.4
+"""Inches: how far the scatter's line at the top left reaches over its axes, how far right of the y axis it starts,
+and how far under it the line of equal AUC stops."""
 
 
 def poster_wins_figure(grids):
@@ -1018,8 +1053,8 @@ def poster_wins_figure(grids):
         raise SystemExit(f"poster_wins: an AUC of {min(theirs.min(), ours.min()):.3f} is under POSTER_AUC_FLOOR, {low}")
     upper = max(0.705, (reach * height - low * need) / (height - need))
     right = low + (upper - low) / height * width
-    # the line of equal AUC stops under the note at the top left
-    end = upper - need * (upper - low) / height
+    # the line of equal AUC stops WINS_CLEAR inches under the note at the top left
+    end = upper - (need - POSTER_PAD + WINS_CLEAR) * (upper - low) / height
     ax.plot([low, end], [low, end], color=INK, linewidth=4.0, zorder=1)
     for chosen, color in ((~null, SV_PGS), (null, INK)):
         ax.vlines(theirs[chosen], ours[chosen] - half[chosen], ours[chosen] + half[chosen], color=color,
@@ -1201,14 +1236,16 @@ def poster_imputation_figure(summary):
     """The genotype accuracy figure beside the SV gain forest in the lower row of the poster's middle column: each frequency bin's mean r² of the
     measured genotype with the true genotype, for SNVs called from simulated reads and SVs imputed by Beagle, with a
     conservative 95% interval of the mean, ±1.96 √(mean (1 − mean) / n): an r² lies in [0, 1], so its variance is at
-    most mean (1 − mean), and the summary keeps each bin's mean and count, not its values. The names stand in a column
-    after the lines' last marks. The margins are measured from the drawn type, so larger type widens them. The y axis's
+    most mean (1 − mean), and the summary keeps each bin's mean and count, not its values. Beside them, when its summary
+    is present, the median r² of SVs imputed in All of Us per frequency bin, with no interval. The names stand in a
+    column after the lines' last marks, each level with its line's end where the names above leave room. The margins are measured from the drawn type, so larger type widens them. The y axis's
     title is centred on the figure's height, and the x axis's, wider than the axes, ends at the figure's right edge."""
     accuracy = summary["genotype_accuracy"]["r2_by_frequency"]
     width, height, pad = POSTER_GENOTYPES, POSTER_GENOTYPES_HEIGHT, 0.08
     fig = plt.figure(figsize=(width, height))
     ax = frame(fig, 0, 0, width, height)
     mark = POSTER_MARK * 0.7
+    ends = []
     for key, color in (("SNV", INK), ("SV", IMPUTED)):
         bins = [b for b in accuracy[key]["bins"] if b["count"]]
         centers = np.array([math.sqrt(b["low"] * b["high"]) * 100 for b in bins])
@@ -1217,15 +1254,34 @@ def poster_imputation_figure(summary):
         ax.vlines(centers, np.clip(mean - half, 0, 1), np.clip(mean + half, 0, 1), color=color, linewidth=POSTER_BAR,
                   zorder=2, clip_on=False)
         ax.plot(centers, mean, color=color, marker="o", markersize=mark, markeredgewidth=0, zorder=3, clip_on=False)
-    # each name over how its genotypes were measured, in a column level with the SNVs' last mark, since the two last
-    # marks are too close for a two-line name beside each
+        ends.append(mean[-1])
+    real = aou_imputation()
+    if real is not None:
+        ax.plot(*real, color=AOU, marker="o", markersize=mark, markeredgewidth=0, zorder=3, clip_on=False)
+        ends.append(real[1][-1])
+    # each line named in a column after the lines' last marks: a bold name over where its genotypes come from
     after = mark / 2 / 72 + 0.15
-    for name, color, down, size, weight in (("SNVs", INK, -0.1, POSTER_NAME, "bold"),
-                                            ("called", INK, 0.68, POSTER_TYPE, "normal"),
-                                            ("SVs", IMPUTED, 1.5, POSTER_NAME, "bold"),
-                                            ("imputed", IMPUTED, 2.28, POSTER_TYPE, "normal")):
-        ax.text(1, 1, name, transform=shifted(ax, after, -down, False), color=color, fontsize=size, fontweight=weight,
-                ha="left", va="center")
+    labels = []
+    for (name, below, slant), color, end in zip((("SNVs", None, "normal"), ("SVs", "simulated", "normal"),
+                                                  ("SVs", "All of Us", "italic")), (INK, IMPUTED, AOU), ends):
+        parts = [(ax.text(1, 1, name, color=color, fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top"), 0.0)]
+        first = tallest(fig, [name], fontsize=POSTER_NAME, fontweight="bold")
+        total = first
+        if below:
+            parts.append((ax.text(1, 1, below, color=color, fontstyle=slant, ha="left", va="top"), first))
+            total += tallest(fig, [below], fontsize=POSTER_TYPE, fontstyle=slant)
+        labels.append((end, first, total, parts))
+
+    def place():
+        """From the highest line end down, each name's first line centred on its line's end, or a pad under the name
+        above when that is lower."""
+        tall, previous = ax.get_position().height * height, math.inf
+        for end, first, total, parts in sorted(labels, key=lambda label: -label[0]):
+            previous = min(end * tall + first / 2, previous)
+            for artist, down in parts:
+                artist.set_transform(shifted(ax, after, previous - down - tall, False))
+            previous -= total + POSTER_PAD
+
     ax.set_xscale("log")
     ax.set_xlim(0.04, 50)
     ax.set_ylim(0, 1)
@@ -1238,6 +1294,7 @@ def poster_imputation_figure(summary):
     renderer = fig.canvas.get_renderer()
     inches = fig.dpi_scale_trans.inverted()
     for _ in range(6):
+        place()
         outer = ax.get_tightbbox(renderer).transformed(inches)
         inner = ax.get_window_extent(renderer).transformed(inches)
         left, bottom = inner.x0 - outer.x0 + pad, inner.y0 - outer.y0 + pad
@@ -1247,6 +1304,7 @@ def poster_imputation_figure(summary):
         ax.yaxis.label.set_y((height / 2 - bottom) / up)
         title = ax.xaxis.label.get_window_extent(renderer).transformed(inches).width
         ax.xaxis.label.set_x((width - pad - title / 2 - left) / across)
+    place()
     return fig
 
 
