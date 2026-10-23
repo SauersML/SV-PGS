@@ -1026,11 +1026,11 @@ WELL_IMPUTED = ("tagged_sv", "tagged_sv_fold3")
 """The architectures whose causal SVs are drawn only from SVs that Beagle imputed with realized r² ≥ 0.8 (grid.py's
 sv_min_realized_r2)."""
 POSTER_GAIN, POSTER_GENOTYPES = 21.92, 11.4
-POSTER_GENOTYPES_HEIGHT = 7.5
+POSTER_GENOTYPES_HEIGHT = 10.18
 """Inches: the imputation figure's height, which fills the left column under the Methods bullets."""
 """Inches: the widths of the SV gain forest (the poster's middle column, build_pptx.py's MIDDLE) and the imputation
 figure (the left column, LEFT), each placed at its column's full width."""
-POSTER_GAIN_HEIGHT = 10.07
+POSTER_GAIN_HEIGHT = 11.21
 """Inches: the SV gain forest's height, which fills the middle column from the training-size figures to the band of
 Discussion, code and references at its foot (build_pptx.py's layout)."""
 GAIN_WEIGHT, GAIN_OFFSET = 2.0, 0.24
