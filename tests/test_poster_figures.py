@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from matplotlib.transforms import Bbox
 
 matplotlib = pytest.importorskip("matplotlib")
 matplotlib.use("Agg")
@@ -68,10 +69,16 @@ def poster_figures():
         # the final forest, with the converged traits' common g
         common = {"relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1, "traits": 4}
         yield "aou_1_gain_final", aou_gallery.gain_figure(rows, common)[0]
-        # and over it each trait's held-out r² for LDpred2-auto and SV-PGS
-        yield "aou_1_gain_compared", aou_gallery.gain_figure(rows, common, compared_rows())[0]
+        swapped = {**common, "p_sharp": 0.3197}
+        # and over it each trait's held-out r² for LDpred2-auto and SV-PGS, with the pooled rows' notes
+        yield "aou_1_gain_compared", aou_gallery.gain_figure(rows, swapped, compared_rows(), POOLED)[0]
         # with asterisks past the intervals whose q is below 0.05, gout's at the end of its arrowhead
-        yield "aou_1_gain_starred", aou_gallery.gain_figure(rows, common, compared_rows(0.01))[0]
+        yield "aou_1_gain_starred", aou_gallery.gain_figure(rows, swapped, compared_rows(0.01), POOLED)[0]
+
+
+POOLED = {"trait": "All converged traits", "with_sv": {"relative": 17.45, "relative_lower": 4.01, "relative_upper": 32.79,
+                                                       "p_one": 0.0047}}
+"""aou_vs_ldpred2.json's "combined": SV-PGS with SVs pooled against LDpred2-auto, under the json's own name for it."""
 
 
 def compared_rows(q: float = 0.3) -> list[dict]:
@@ -135,7 +142,12 @@ def test_the_poster_places_each_figure_whole(tmp_path):
 
 def row_names(ax) -> list[str]:
     """An All of Us panel's row names, top to bottom, a two-line name as one line."""
-    return [text.get_text().replace("\n", " ") for text in ax.texts if text.get_text() != aou_gallery.STAR]
+    return [text.get_text().replace("\n", " ") for text in ax.texts if text.get_gid() == "name"]
+
+
+def notes(ax) -> str:
+    """An All of Us panel's notes, their lines joined by spaces."""
+    return " ".join(text.get_text() for text in ax.texts if text.get_gid() == "note")
 
 
 def test_the_all_of_us_forest_skips_an_unconverged_fit_and_draws_the_common_gain():
@@ -215,6 +227,58 @@ def test_a_q_below_005_stars_its_interval_and_the_key_and_none_draws_neither():
         plt.close(fig)
 
 
+def test_the_overall_rows_write_the_pooled_values_the_json_files_give():
+    rows = [{"trait": trait, "relative": 0.5, "relative_lower": -1.0, "relative_upper": 2.0}
+            for trait in ("ldl_cholesterol", "gout", "egfr")]
+    common = {"name": "All converged traits", "relative": 0.2, "relative_lower": -0.6, "relative_upper": 1.1,
+              "p_sharp": 0.3197, "traits": 3}
+    for pooled, swap, top_note, gain_note in (
+            (POOLED, common, "SV-PGS r² +17% vs LDpred2-auto, p = 0.005", "p = 0.32"),
+            ({"with_sv": {"relative": -3.4, "p_one": 0.0123}}, {**common, "p_sharp": 0.0004},
+             "SV-PGS r² −3% vs LDpred2-auto, p = 0.01", "p = 0.0004")):
+        with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
+            fig, lines = aou_gallery.gain_figure(rows, swap, compared_rows(), pooled)
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        top, gain = fig.axes
+        assert notes(top) == top_note and notes(gain) == gain_note
+        # each panel's pooled row is last and named here, not by the json
+        assert row_names(top)[-1] == row_names(gain)[-1] == aou_gallery.COMBINED == "Overall"
+        assert "one-sided p" in lines[0]
+        texts = list(drawn_texts(fig))
+        assert not any(word in text.get_text() for text in texts for word in ("converged", "uncertified", "†"))
+        # no two pieces of type overlap, and no note touches a mark, interval or arrowhead
+        boxes = [text.get_window_extent(renderer).transformed(fig.dpi_scale_trans.inverted()) for text in texts]
+        for index, box in enumerate(boxes):
+            for other in boxes[index + 1:]:
+                assert min(box.x1, other.x1) - max(box.x0, other.x0) <= 0.01 or \
+                    min(box.y1, other.y1) - max(box.y0, other.y0) <= 0.01, (box, other)
+        for ax in (top, gain):
+            # marks and arrowheads, but not the zero line, which runs the panel's height, and each interval's ends
+            drawn = [line.get_window_extent(renderer) for line in ax.lines if line.get_marker() not in ("None", "")]
+            drawn += [Bbox(ax.transData.transform(segment)) for collection in ax.collections
+                      for segment in collection.get_segments()]
+            for text in ax.texts:
+                if text.get_gid() == "note":
+                    box = text.get_window_extent(renderer)
+                    assert not any(box.overlaps(mark) for mark in drawn), text.get_text()
+        assert max(sim_gallery.overhang(fig)) <= 0
+        plt.close(fig)
+    # without the pooled values neither panel writes a note, and the r² panel has no pooled row
+    with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
+        fig, _ = aou_gallery.gain_figure(rows, {key: value for key, value in common.items() if key != "p_sharp"},
+                                         compared_rows())
+    top, gain = fig.axes
+    assert notes(top) == notes(gain) == "" and aou_gallery.COMBINED not in row_names(top)
+    plt.close(fig)
+
+
+def test_p_values_are_written_to_one_significant_figure_below_001_and_two_decimals_otherwise():
+    assert [aou_gallery.p_text(p) for p in (0.0047, 0.00012, 0.0099, 0.0123, 0.3197, 0.05)] == \
+        ["0.005", "0.0001", "0.01", "0.01", "0.32", "0.05"]
+    assert [aou_gallery.signed(value) for value in (17.45, -3.4, 0.2)] == ["+17%", "−3%", "+0%"]
+
+
 def test_the_two_marks_in_an_all_of_us_r2_row_stack_without_touching():
     with plt.rc_context({**sim_gallery.POSTER_STYLE, "axes.labelsize": sim_gallery.POSTER_LABEL}):
         fig, _ = aou_gallery.gain_figure([], None, compared_rows())
@@ -239,11 +303,12 @@ def test_the_forest_gives_each_traits_change_relative_to_the_r2_without_svs():
                                                                     / (weights * before).sum())
 
 
-def test_the_discussion_bounds_the_common_all_of_us_gain_only_when_it_is_given(monkeypatch, tmp_path):
+def test_the_discussion_states_the_common_all_of_us_gain_only_when_it_is_given(monkeypatch, tmp_path):
     monkeypatch.setattr(build_pptx, "HERE", tmp_path)
     assert build_pptx.aou_result() == []
     (tmp_path / "aou_numbers.json").write_text(json.dumps({"matched": {"rows": [], "common": {
         "relative": -2.0, "relative_lower": -4.0, "relative_upper": 0.5, "relative_bound": 0.1, "traits": 10}}}))
-    # the primary's one-sided 95% upper bound on the common g
-    assert build_pptx.aou_result() == ["In All of Us, imputed SVs raised r² by at most 0.1% over 10 traits, so these "
-                                       "traits have few SVs with large effects or poorly imputed causal SVs."]
+    # the primary's common g with its 95% interval
+    assert build_pptx.aou_result() == ["In All of Us, imputed SVs changed r² by −2.00% (95% CI −4.00 to 0.50%) over "
+                                       "10 traits, so these traits have few SVs with large effects or poorly imputed "
+                                       "causal SVs."]

@@ -86,12 +86,12 @@ COLOURS = {"blue": BLUE, "vermillion": VERMILLION, "grey": GREY, "sky": SKY}
 TITLE = ["Enabling Polygenic Prediction from Structural", "Variants in the NIH All of Us Multi-Ancestry Biobank"]
 REFERENCES = [
     "Byrska-Bishop 2022 Cell",
-    "Privé 2020 Bioinformatics",
     "All of Us 2019 N Engl J Med",
     "Rubinacci 2023 Nat Genet",
+    "Privé 2020 Bioinformatics",
 ]
 """First author, year and journal, one to a line, numbered in superscript in the order the text first cites them
-(``cite``): the SVs per genome, LDpred2, All of Us and GLIMPSE2."""
+(``cite``): the SVs per genome, All of Us, GLIMPSE2 and LDpred2. Figures carry no citations."""
 SUPERSCRIPT = dict(zip(range(1, 10), "¹²³⁴⁵⁶⁷⁸⁹"))
 DESIGN_SHARES = (0.0, 0.05, 0.2)
 """The shares of causal variants that are SVs over benchmarks/power/grid.py's POINTS, which
@@ -158,28 +158,30 @@ def copy(numbers: dict) -> dict:
         # SVs (wins' null_gain, its 95% interval above 0), so causal SVs are not its source. Imputed SVs give a share of
         # true SVs' AUC gain over every simulation with causal SVs (the SV-gain forest's "all" row, Fieller's interval)
         "discussion": [
-            "SV-PGS was more accurate than LDpred2-auto with and without causal SVs.",
+            f"SV-PGS was more accurate than LDpred2-auto{cite('Privé 2020 Bioinformatics')} with and without causal "
+            "SVs.",
             f"Imputed SVs gave {share[0]:.0%} of the AUC gain of true SV genotypes (95% CI {share[1] * 100:.0f}–"
             f"{share[2]:.0%}).",
         ],
     }
 
 
-def signed(share: float) -> str:
-    """A share in percent to one decimal, with a minus sign for a loss."""
-    return f"{share * 100:.1f}%".replace("-", "−")
+def percent(value: float, sign: bool = False) -> str:
+    """A change in percent to two decimals, with a minus sign for a loss and, with ``sign``, a plus sign for a gain."""
+    return f"{value:{'+' if sign else ''}.2f}".replace("-", "−")
 
 
 def aou_result() -> list[str]:
     """What the All of Us result means, as a Discussion bullet, when aou_numbers.json's "matched" holds the traits'
-    "common" g: the pre-specified primary's change in r² as a fraction of the two arms' mean r², whose one-sided 95%
-    upper bound ("relative_bound", in percent) caps the gain the traits could have from imputed SVs."""
+    "common" g: the pre-specified primary's change in r² as a percent of the two arms' mean r², with its 95% interval,
+    over the traits it pools."""
     path = HERE / "aou_numbers.json"
     common = json.loads(path.read_text()).get("matched", {}).get("common") if path.is_file() else None
     if not common:
         return []
-    return [f"In All of Us, imputed SVs raised r² by at most {signed(common['relative_bound'] / 100)} over "
-            f"{common['traits']} traits, so these traits have few SVs with large effects or poorly imputed causal SVs."]
+    return [f"In All of Us, imputed SVs changed r² by {percent(common['relative'], sign=True)}% (95% CI "
+            f"{percent(common['relative_lower'])} to {percent(common['relative_upper'])}%) over {common['traits']} "
+            "traits, so these traits have few SVs with large effects or poorly imputed causal SVs."]
 
 
 # ------------------------------------------------------------------ DrawingML

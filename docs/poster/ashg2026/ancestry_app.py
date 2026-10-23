@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import os
 import sys
 
 import numpy as np
@@ -44,7 +45,15 @@ def main() -> None:
     for entry in entries:
         runs = [meta.excluded(meta.read_run(name), excluded_ids)[0] for name in entry["runs"]]
         run = meta.merge_pairs(runs) if len(runs) > 1 else runs[0]
-        with np.load(f"{meta.OPS}/{entry['fastpgs']}/fastpgs/{run['name']}.npz", allow_pickle=False) as arrays:
+        # the first of the entry's LDpred2-auto runs (one name or a list) whose fastpgs output has this run's trait; none
+        # found: the trait enters the SV gain alone
+        paths = [f"{meta.OPS}/{name}/fastpgs/{run['name']}.npz" for name in np.atleast_1d(entry.get("fastpgs") or [])]
+        path = next((candidate for candidate in paths if os.path.exists(candidate)), None)
+        if path is None:
+            restricted = {key: np.asarray(run[key]) for key in meta.PER_PERSON}
+            found.append({"label": entry["label"], "binary": run["binary"], **restricted, "ldpred2": None})
+            continue
+        with np.load(path, allow_pickle=False) as arrays:
             methods, arms = arrays["methods"].tolist(), arrays["arms"].tolist()
             ldpred2 = np.asarray(arrays["scores"], dtype=np.float64)[methods.index("ldpred2_auto"), arms.index("snv_indel")]
             ldpred2_target = np.asarray(arrays["target"], dtype=np.float64)
@@ -55,6 +64,7 @@ def main() -> None:
             continue
         restricted = {key: np.asarray(run[key])[keep] for key in meta.PER_PERSON}
         found.append({"label": entry["label"], "binary": run["binary"], **restricted, "ldpred2": ldpred2[other]})
+    print("TRAITS " + json.dumps([[entry["label"], entry["ldpred2"] is not None] for entry in found]))
 
     people, clusters, ancestry, _ = meta.union(found)
     generator = np.random.default_rng(20261023)
@@ -79,6 +89,8 @@ def main() -> None:
                 continue
             cell["analysed"] = True
             for name, (reference, mean_level) in comparisons.items():
+                if entry[reference] is None:
+                    continue
                 trait = meta.PairedTrait(entry["label"], entry["binary"], people[i], target,
                                          np.asarray(entry["covariates"], dtype=np.float64),
                                          np.asarray(entry[reference], dtype=np.float64), np.asarray(entry["candidate"], dtype=np.float64))

@@ -41,7 +41,7 @@ def prepare(work):
     home = Path.home()
     cdr = home / 'workspace/vwb-aou-datasets-controlled/v9'
     reference = cdr / 'wgs/short_read/snpindel/acaf_threshold/pgen/acaf_threshold.chr22'
-    old = home / 'mnt/imp/deliverables/batch-001/aou2_50k_init.batch-001.chr22.prod-05fea60.glimpse2.popped.bcf'
+    old = work / 'mount_imputed/deliverables/batch-001/aou2_50k_init.batch-001.chr22.prod-05fea60.glimpse2.popped.bcf'
     pattern = ('gs://long-reads-phase-2-imputation-staging-wb-rapid-tomato-9816/'
                '50k-tsps-finalized-vcfs/finalized-vcfs/teaspoons_50001_batch_{batch}.chr22.vcf.gz')
     state = work / 'prepare_status.json'

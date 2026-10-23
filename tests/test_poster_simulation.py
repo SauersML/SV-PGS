@@ -142,9 +142,9 @@ def test_poster_cites_every_reference_in_order(monkeypatch, tmp_path):
 
     poster = poster_module(monkeypatch, tmp_path)
     words = poster_copy(poster)
-    # in reading order: the left column, the simulation figures' method names, then the All of Us column
-    lines = [*words["introduction"], *words["methods"], *words["design"],
-             *(name for _, name, *_ in sim_gallery.POSTER_METHODS), *words["aou"], *words["discussion"]]
+    # in reading order: the left column, the All of Us column, then the Discussion; figures cite nothing
+    lines = [*words["introduction"], *words["methods"], *words["design"], *words["aou"], *words["discussion"]]
+    assert not any(mark in name for _, name, *_ in sim_gallery.POSTER_METHODS for mark in "¹²³⁴⁵⁶⁷⁸⁹")
     # h² and r² are exponents, not citations
     text = re.sub(r"[hr]²", "", " ".join(lines))
     marks = [poster.SUPERSCRIPT[index] for index in range(1, len(poster.REFERENCES) + 1)]
@@ -158,3 +158,51 @@ def test_every_poster_bullet_ends_with_a_full_stop(monkeypatch, tmp_path):
         for line in words[key]:
             # a citation's number follows the full stop
             assert line.rstrip("¹²³⁴⁵⁶⁷⁸⁹").endswith("."), line
+
+
+COMMON = {"relative": 0.03, "relative_lower": -0.11, "relative_upper": 0.17, "traits": 5}
+"""A matched common gain as aou_numbers.json holds it, in percent of the two arms' mean r²."""
+
+
+def matched_common(poster, monkeypatch, tmp_path, common: dict) -> None:
+    """aou_numbers.json in ``tmp_path`` with ``common`` as its matched traits' common gain, read as build_pptx's own."""
+    (tmp_path / "aou_numbers.json").write_text(json.dumps({"matched": {"common": common}}))
+    monkeypatch.setattr(poster, "HERE", tmp_path)
+
+
+def test_discussion_states_the_imputed_share_of_the_true_sv_gain(monkeypatch, tmp_path):
+    poster = poster_module(monkeypatch, tmp_path)
+    numbers = {"fig5": {"people": 50_000}, "poster_sv_gain": {"rows": {"all": {"share": [0.4728, 0.1929, 0.7377]}}}}
+    assert poster.copy(numbers)["discussion"][1] == (
+        "Imputed SVs gave 47% of the AUC gain of true SV genotypes (95% CI 19–74%).")
+
+
+def test_aou_result_states_the_common_change_over_its_traits(monkeypatch, tmp_path):
+    poster = poster_module(monkeypatch, tmp_path)
+    matched_common(poster, monkeypatch, tmp_path, COMMON)
+    [sentence] = poster.aou_result()
+    assert "changed r² by +0.03% (95% CI −0.11 to 0.17%) over 5 traits," in sentence
+
+
+def test_references_sit_beside_the_qr_code_within_the_right_column(monkeypatch, tmp_path):
+    poster = poster_module(monkeypatch, tmp_path)
+    heading, beside = poster.references()
+    assert (heading.kind, heading.content) == ("bar", (96, "References"))
+    (qr,), (words,) = beside.children
+    assert (beside.kind, qr.kind, words.kind) == ("row", "qr", "text")
+    assert ["".join(text for text, _ in para.runs) for para in words.content] == [
+        f"{poster.SUPERSCRIPT[index]}{reference}" for index, reference in enumerate(poster.REFERENCES, start=1)]
+    qr_width, type_width = poster.parts(beside, poster.RIGHT)
+    assert qr_width == pytest.approx(poster.QR)
+    longest = max(poster.width_of(para.runs, poster.REFERENCE) for para in words.content)
+    assert poster.QR + poster.GUTTER + longest + 2 * poster.INSET <= poster.RIGHT
+    assert longest + 2 * poster.INSET <= type_width
+
+
+def test_poster_copy_never_mentions_convergence_certification_or_a_dagger(monkeypatch, tmp_path):
+    poster = poster_module(monkeypatch, tmp_path)
+    words = poster_copy(poster)
+    matched_common(poster, monkeypatch, tmp_path, COMMON)
+    lines = [*(line for section in words.values() for line in section), *poster.aou_result()]
+    for line in lines:
+        assert not re.search("converg|certif|†", line, flags=re.IGNORECASE), line
