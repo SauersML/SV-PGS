@@ -187,3 +187,18 @@ any Q8 fit was submitted)
     g = 0.5% and 1.00 at g = 1%.
   - The model predicted the finished pairs' gain SEs to within 25% (hypothyroidism 0.33 vs 0.40 x1e-4, eGFR 0.92 vs
     0.97 x1e-4).
+
+
+Results seen (log; no test definition changes because of them)
+- Before 2bf5cb24: aou-wl15 (LDL), as listed at the top.
+- About 19:55 PDT on 2026-10-22, after 2bf5cb24 and cd542c9b: runwatch read the run reports of aou-x3-o1
+  (hypothyroidism, +1.5% relative, p 0.086), aou-x3-a1 (AF, -0.6%) and aou-m3f-e1 (eGFR, +0.3%). The coordinator
+  passed them to the user and the poster agent.
+- About 20:15 PDT: sv_gain_meta (main 2ec5cea2) was run on each of those three pairs alone, as descriptive per-trait
+  results: long-read people excluded, 200 arm swaps each.
+  - Hypothyroidism: +1.42% [-0.37, 3.18], permutation p 0.025.
+  - AF: -0.62% [-9.43, 8.18], permutation p 0.83.
+  - eGFR: +0.26% [-1.13, 1.65], permutation p 0.31.
+- Asthma (aou-m3-s1) and CKD (aou-m3f-k2): no held-out statistic has been read.
+- Family Q8: nothing beyond the census has been read. No agent reads a Q8 pair's run report or held-out accuracy before
+  Q8's test runs.
