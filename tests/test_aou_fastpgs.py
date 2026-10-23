@@ -208,3 +208,33 @@ def test_ldpred2_auto_alone_skips_lassosum2_and_clumping(tmp_path: Path, monkeyp
     tuning = generator.normal(size=(30, 2))
     chosen, _ = aou_fastpgs.choose(fitted["labels"], tuning, generator.normal(size=30), np.ones((30, 1)), ("ldpred2_auto",))
     assert chosen == {("snv_indel", "ldpred2_auto"): 0, ("with_sv", "ldpred2_auto"): 1}
+
+
+def test_the_r_sessions_run_until_the_fit_is_finished(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # start_effects leaves both arms' R sessions running, so the next trait's GWAS and bands overlap them; the finish
+    # waits for them, reads their outputs and removes the trait's folder.
+    generator = np.random.default_rng(10)
+    view = _view(generator, 60, 70)
+    short = generator.random(60) < 0.8
+    folders, waited = [], []
+
+    def popen(command, env):
+        folder = Path(command[2])
+        folders.append(folder)
+
+        def wait() -> int:
+            waited.append(folder.name)
+            count = int((folder / "meta.txt").read_text().split()[0])
+            np.full(count, 0.25).astype("<f8").tofile(folder / "beta_auto.bin")
+            return 0
+
+        return type("Running", (), {"wait": staticmethod(wait)})()
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(aou_fastpgs.subprocess, "Popen", popen)
+    finish = aou_fastpgs.start_effects(view.variants["cm"], short, view, view, 2, ("ldpred2_auto",))
+    assert len(folders) == 2 and waited == [] and all(folder.exists() for folder in folders)
+    fitted = finish()
+    assert sorted(waited) == ["snv_indel", "with_sv"] and not any(folder.exists() for folder in folders)
+    np.testing.assert_array_equal(fitted["effects"][:, 1], np.full(60, 0.25))
+    np.testing.assert_array_equal(fitted["effects"][:, 0], np.where(short, 0.25, 0.0))

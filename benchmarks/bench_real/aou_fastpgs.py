@@ -20,9 +20,10 @@ One pass over the with_sv records computes both GWAS (all training rows, and the
 both arms' bands (``gwas_and_bands``). The snv_indel arm's band is the with_sv band's correlations among its own
 records. The projected dosages are the same, and its window is the same 3 cM in the same genetic positions, so the
 restriction is exactly the band a pass over its records alone would write. The two arms' R sessions then run side by
-side, each with half the cores. The codes of every record the arms read, over the trait's training and held-out
-columns, are read from the store once (``read_codes``) and kept in memory: about 1.06 million records by 50,000
-people is 53 GB.
+side, each with half the cores, while the next trait's GWAS and bands are computed (``start_trait``): a trait spends
+about 10 minutes in that pass and 7 in R. The codes of every record the arms read, over the trait's training and
+held-out columns, are read from the store once (``read_codes``) and kept in memory: about 1.06 million records by
+50,000 people is 53 GB.
 
 Outputs, per trait:
 - ``--out``: one JSON line per arm and method, aggregates only (the chosen parameter, the tuning and held-out partial
@@ -44,11 +45,12 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import time
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -314,18 +316,17 @@ def _digest(values: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(values)).hexdigest()
 
 
-def fit_effects(cm: np.ndarray, short: np.ndarray, train: MemoryView, part: MemoryView, cores: int,
-                methods: tuple[str, ...] = METHODS) -> dict[str, np.ndarray]:
-    """Every candidate's effects over the with_sv records (0 on the SVs for the snv_indel arm), with the training means
-    and one label per candidate, "arm|method|parameter", for ``methods`` only."""
-    effects, labels = [], []
-    with tempfile.TemporaryDirectory(prefix="fastpgs_", dir=os.environ.get("TMPDIR"), ignore_cleanup_errors=True) as directory:
-        folders = {arm: pathlib.Path(directory) / arm for arm in ARMS}
+def start_effects(cm: np.ndarray, short: np.ndarray, train: MemoryView, part: MemoryView, cores: int,
+                  methods: tuple[str, ...] = METHODS, label: str = "") -> Callable[[], dict[str, np.ndarray]]:
+    """The GWAS, bands and clumping of ``fit_effects``, with both arms' R sessions started and left running. Returns the
+    call that waits for them and gives ``fit_effects``' result."""
+    directory = pathlib.Path(tempfile.mkdtemp(prefix="fastpgs_", dir=os.environ.get("TMPDIR")))
+    try:
+        folders = {arm: directory / arm for arm in ARMS}
         for folder in folders.values():
             folder.mkdir()
         arms = gwas_and_bands(train, part, cm, short, folders)
-        _log(f"GWAS and bands written: {cm.shape[0]} with_sv records, {int(short.sum())} snv_indel")
-        places = {"with_sv": np.arange(cm.shape[0]), "snv_indel": np.flatnonzero(short)}
+        _log(f"{label}GWAS and bands written: {cm.shape[0]} with_sv records, {int(short.sum())} snv_indel")
         clumped = {}
         for arm in ARMS:
             found = arms[arm]
@@ -339,21 +340,46 @@ def fit_effects(cm: np.ndarray, short: np.ndarray, train: MemoryView, part: Memo
             _log("clumped: " + ", ".join(f"{arm} {int(np.any(clumped[arm] != 0, axis=1).sum())} index records at p <= 1" for arm in ARMS))
         single = {name: "1" for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}
         sessions = {arm: subprocess.Popen(["Rscript", str(_SCRIPT), str(folders[arm])], env=os.environ | single) for arm in ARMS}
-        failed = [arm for arm, session in sessions.items() if session.wait() != 0]
-        if failed:
-            raise RuntimeError(f"aou_fastpgs.R failed for {failed}")
-        _log("R sessions done")
-        for arm in ARMS:
-            auto, lasso, grid = r_outputs(folders[arm], places[arm].shape[0])
-            fitted = {"ldpred2_auto": (auto[:, None], ["auto"]), "lassosum2": (lasso, grid)}
-            if arm in clumped:
-                fitted["ct"] = (clumped[arm], [f"p<={threshold:g}" for threshold in THRESHOLDS])
-            for method, (columns, names) in ((method, fitted[method]) for method in methods):
-                wide = np.zeros((cm.shape[0], columns.shape[1]), dtype=np.float32)
-                wide[places[arm]] = columns
-                effects.append(wide)
-                labels.extend(f"{arm}|{method}|{name}" for name in names)
-        means = arms["with_sv"]["means"]
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+    def finish() -> dict[str, np.ndarray]:
+        try:
+            failed = [arm for arm, session in sessions.items() if session.wait() != 0]
+            if failed:
+                raise RuntimeError(f"aou_fastpgs.R failed for {failed}")
+            _log(f"{label}R sessions done")
+            return collected(cm, short, folders, arms, clumped, methods)
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    return finish
+
+
+def fit_effects(cm: np.ndarray, short: np.ndarray, train: MemoryView, part: MemoryView, cores: int,
+                methods: tuple[str, ...] = METHODS) -> dict[str, np.ndarray]:
+    """Every candidate's effects over the with_sv records (0 on the SVs for the snv_indel arm), with the training means
+    and one label per candidate, "arm|method|parameter", for ``methods`` only."""
+    return start_effects(cm, short, train, part, cores, methods)()
+
+
+def collected(cm: np.ndarray, short: np.ndarray, folders: Mapping[str, pathlib.Path], arms: Mapping[str, Mapping[str, np.ndarray]],
+              clumped: Mapping[str, np.ndarray], methods: tuple[str, ...]) -> dict[str, np.ndarray]:
+    """``fit_effects``' result from the finished R sessions' outputs in ``folders``."""
+    effects, labels = [], []
+    places = {"with_sv": np.arange(cm.shape[0]), "snv_indel": np.flatnonzero(short)}
+    for arm in ARMS:
+        auto, lasso, grid = r_outputs(folders[arm], places[arm].shape[0])
+        fitted = {"ldpred2_auto": (auto[:, None], ["auto"]), "lassosum2": (lasso, grid)}
+        if arm in clumped:
+            fitted["ct"] = (clumped[arm], [f"p<={threshold:g}" for threshold in THRESHOLDS])
+        for method, (columns, names) in ((method, fitted[method]) for method in methods):
+            wide = np.zeros((cm.shape[0], columns.shape[1]), dtype=np.float32)
+            wide[places[arm]] = columns
+            effects.append(wide)
+            labels.extend(f"{arm}|{method}|{name}" for name in names)
+    means = arms["with_sv"]["means"]
     return {"means": means, "effects": np.hstack(effects), "labels": np.array(labels)}
 
 
@@ -416,6 +442,14 @@ def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np
               shared: tuple[np.ndarray, np.ndarray] | None = None) -> tuple[list[dict[str, object]], dict[str, np.ndarray]]:
     """Both arms' ``methods`` for one trait: the aggregate lines and the held-out people's arrays (module docstring).
     ``shared`` is codes already read with their ascending store columns, which hold every column the trait reads."""
+    return start_trait(store, records, cm, short, cohort, trait, seed, units, cores, methods, shared)()
+
+
+def start_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np.ndarray, cohort, trait: int, seed: int,
+                units: Units | None, cores: int, methods: tuple[str, ...] = METHODS,
+                shared: tuple[np.ndarray, np.ndarray] | None = None) -> Callable[[], tuple[list[dict[str, object]], dict[str, np.ndarray]]]:
+    """``fit_trait`` up to its R sessions, which are left running (``start_effects``). Returns the call that waits for
+    them and gives ``fit_trait``'s result."""
     name = cohort.trait_names[trait]
     binary = cohort.trait_types[trait] == TraitType.BINARY
     model, training, held = trait_rows(cohort, trait)
@@ -438,11 +472,24 @@ def fit_trait(store: DosageStore, records: np.ndarray, cm: np.ndarray, short: np
         held=_digest(cohort.store_columns[held]), tuning=_digest(tuning), target=_digest(cohort.targets[training, trait]),
         covariates=_digest(cohort.covariates[np.ix_(training, own)]), **({} if methods == METHODS else {"methods": list(methods)}),
     )
-    fitted = None if path is None or units is None else units.read(path)
-    if fitted is None:
-        fitted = fit_effects(cm, short, view(training, where["training"], codes), view(training[~tuning], where["training"][~tuning], codes), cores, methods)
-        if path is not None and units is not None:
-            units.write(path, fitted)
+    cached = None if path is None or units is None else units.read(path)
+    pending = None if cached is not None else start_effects(
+        cm, short, view(training, where["training"], codes), view(training[~tuning], where["training"][~tuning], codes), cores, methods, f"{name}: ")
+    return lambda: _finish_trait(cached if pending is None else _written(pending(), units, path), codes, cohort, trait, seed, methods,
+                                 short, binary, training, held, tuning, where, own)
+
+
+def _written(fitted: dict[str, np.ndarray], units: Units | None, path: pathlib.Path | None) -> dict[str, np.ndarray]:
+    if path is not None and units is not None:
+        units.write(path, fitted)
+    return fitted
+
+
+def _finish_trait(fitted: dict[str, np.ndarray], codes: np.ndarray, cohort, trait: int, seed: int, methods: tuple[str, ...],
+                  short: np.ndarray, binary: bool, training: np.ndarray, held: np.ndarray, tuning: np.ndarray,
+                  where: Mapping[str, np.ndarray], own: np.ndarray) -> tuple[list[dict[str, object]], dict[str, np.ndarray]]:
+    """``fit_trait``'s scores, tuning choice, aggregate lines and arrays from the trait's fitted effects."""
+    name = cohort.trait_names[trait]
     labels = fitted["labels"]
     tuning_rows, scored = training[tuning], np.r_[where["training"][tuning], where["held"]]
     found = candidate_scores(codes, scored, fitted["means"], fitted["effects"])
@@ -529,13 +576,24 @@ def main(argv: list[str] | None = None) -> int:
         _log(f"reading {records.shape[0]} records over {columns.shape[0]} people for {len(cohort.trait_names)} traits")
         shared = (read_codes(store, records, columns), columns)
         _log("codes read")
-        for trait in traits:
-            found, arrays = fit_trait(store, records, cm, short, cohort, trait, int(config.seed), units, cores, methods, shared)
+
+        def write(trait: int, finish: Callable[[], tuple[list[dict[str, object]], dict[str, np.ndarray]]]) -> None:
+            found, arrays = finish()
             for line in found:
                 lines.append(json.dumps(line))
                 print(lines[-1], flush=True)
             with open(args.scores / f"{cohort.trait_names[trait]}.npz", "wb") as handle:
                 np.savez(handle, **arrays)
+
+        # each trait's R sessions run while the next trait's GWAS and bands are computed
+        pending = None
+        for trait in traits:
+            started = (trait, start_trait(store, records, cm, short, cohort, trait, int(config.seed), units, cores, methods, shared))
+            if pending is not None:
+                write(*pending)
+            pending = started
+        if pending is not None:
+            write(*pending)
     pathlib.Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0
 
