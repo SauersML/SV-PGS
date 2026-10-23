@@ -4,7 +4,8 @@ on the same run records' SNVs and indels (aou_fastpgs.py's ldpred2_auto, snv_ind
 joint family bootstrap, and the common relative difference over the traits (sv_gain_meta's primary statistic). Converged
 fits only: each trait enters an arm's comparison only where that arm's SV-PGS fit converged, as SPEC lists (svgain's
 converged list, one JSON entry per trait: label, the pairing runs, the run whose aou_fastpgs.py job fitted LDpred2-auto,
-and the converged arms).
+and the converged arms). Each method's own held-out partial r^2 is printed too ("r2"), with the 2.5% and 97.5% points
+of the same joint family bootstrap.
 
 Runs inside the workspace (the app), where it reads each run's held-out scores; it prints aggregates only, as one JSON
 line, with any count under 40 masked. The long-read panel's members are dropped, as in the primary. svpgs_vs_ldpred2.py
@@ -72,6 +73,22 @@ def main() -> None:
             "gls_absolute": {"estimate": float(analysed["absolute_pooled"]["fixed"].estimate),
                              "standard_error": float(analysed["absolute_pooled"]["fixed"].standard_error)},
         }
+    # each method's own r^2: the snv_indel-arm r^2 of a pair whose two scores are that method's, on analyse's resamples
+    generator = np.random.default_rng(20261023)
+    counts = meta.cluster_bootstrap_counts(np.zeros(int(clusters.max()) + 1, dtype=np.int64), meta.RESAMPLES, generator)
+    weights, unit = counts[:, clusters], np.ones((1, clusters.shape[0]))
+    result["r2"] = {}
+    for i, entry in enumerate(found):
+        cells = {}
+        for method, score in (("ldpred2_auto", entry["ldpred2"]), ("snv_indel", entry["baseline"]), ("with_sv", entry["candidate"])):
+            if method != "ldpred2_auto" and method not in entry["arms"]:
+                continue
+            score = np.asarray(score, dtype=np.float64)
+            alone = meta.PairedTrait(entry["label"], entry["binary"], people[i], np.asarray(entry["target"], dtype=np.float64),
+                                     np.asarray(entry["covariates"], dtype=np.float64), score, score)
+            value, draws = meta.gains(unit, alone)[1][0], meta.gains(weights, alone)[1]
+            cells[method] = [float(value), float(np.nanquantile(draws, 0.025)), float(np.nanquantile(draws, 0.975))]
+        result["r2"][entry["label"]] = cells
     result["held_out"] = [int(entry["ids"].shape[0]) if entry["ids"].shape[0] >= SHOWN else None for entry in found]
     result["notes"] = notes
     print("RESULT " + json.dumps(result))
