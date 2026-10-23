@@ -811,7 +811,7 @@ sources written beside their marks. A poster figure carries no legend and no tit
 figure's own labels, state its message."""
 POSTER_LINE, POSTER_MARK, POSTER_BAR = 8.0, 26.0, 6.0
 """Points: a data line's width, a mean's marker and an interval's line in the poster's figures."""
-POSTER_HEIGHT = 11.15
+POSTER_HEIGHT = 10.65
 """Inches: the height of the two figures side by side at the top of the poster's middle column."""
 POSTER_HALF = 11.06
 """Inches: the width each of those two figures is placed at (half of build_pptx.py's 22.92 in middle column less its
@@ -926,6 +926,11 @@ def poster_accuracy_figure(grids, summary):
     return fig
 
 
+WINS_ABOVE, WINS_INDENT = 0.2, 0.18
+"""Inches: how far the scatter's first line at the top left reaches over its axes, and how far right of the y axis the
+two lines start."""
+
+
 def poster_wins_figure(grids):
     """SV-PGS's test AUC against LDpred2-auto's in every simulation at the largest training size, over the line of equal
     AUC: one dot per simulation (black with no causal SVs), with the 95% interval of the paired AUC difference drawn
@@ -952,11 +957,16 @@ def poster_wins_figure(grids):
     top, bottom, left = 0.25, under_axes(fig), ticks + 1.6
     width, height = POSTER_HALF - left - 0.3, POSTER_HEIGHT - top - bottom
     ax = frame(fig, left, bottom, width, height)
-    # one scale on both axes, so the line of equal AUC runs at 45 degrees: 0.465 to 0.68 along the shorter axis, and
-    # the longer one runs on at the same scale
-    low = 0.465
-    scale = (0.68 - low) / min(width, height)
-    right, upper = low + scale * width, low + scale * height
+    # two lines over the dots at the top left, the first reaching WINS_ABOVE inches into the top margin: which side is
+    # SV-PGS's, then the training size
+    lines = ("SV-PGS better", f"Training N = {size:,}")
+    first = tallest(fig, [lines[0]], fontsize=POSTER_NAME, fontweight="bold")
+    need = first + tallest(fig, [lines[1]], fontsize=POSTER_TYPE) - WINS_ABOVE + POSTER_PAD
+    # one scale on both axes, so the line of equal AUC runs at 45 degrees: up the y axis from 0.465 to at least 0.705,
+    # and far enough that the second line clears the highest bar, and along the x axis at the same scale
+    low, reach = 0.465, (ours + half).max()
+    upper = max(0.705, (reach * height - low * need) / (height - need))
+    right = low + (upper - low) / height * width
     ax.axline((low, low), slope=1, color=INK, linewidth=4.0, zorder=1)
     for chosen, color in ((~null, SV_PGS), (null, INK)):
         ax.vlines(theirs[chosen], ours[chosen] - half[chosen], ours[chosen] + half[chosen], color=color,
@@ -966,17 +976,19 @@ def poster_wins_figure(grids):
     ax.set_xlim(low, right)
     ax.set_ylim(low, upper)
     ax.set_aspect("equal")
-    for axis, end in ((ax.xaxis, right), (ax.yaxis, upper)):
-        levels = np.arange(0.5, end, 0.05)
-        axis.set_ticks(levels, [plain(level) for level in levels])
+    # a tick every 0.1, the x axis's last one far enough from its end that its label stays within the 0.3 in margin
+    inches = height / (upper - low)
+    for axis, levels in ((ax.xaxis, [level for level in np.arange(0.5, right, 0.1)
+                                     if (right - level) * inches + 0.3 >= ticks / 2]),
+                         (ax.yaxis, np.arange(0.5, upper, 0.1))):
+        axis.set_ticks(levels, [plain(level, 1) for level in levels])
     # the x axis's title runs longer than its axis, so it ends at the axis's far end
     ax.set_xlabel(POSTER_X_TITLES[1], loc="right")
     ax.set_ylabel("SV-PGS test AUC")
-    # over the dots at the top left, on one line each and reaching into the top margin, so the second line clears the
-    # highest bar: which side is SV-PGS's, then the training size
-    ax.text(low + 0.005, upper + 0.006, "SV-PGS better", color=SV_PGS, fontsize=POSTER_NAME, fontweight="bold",
+    ax.text(0, 1, lines[0], transform=shifted(ax, WINS_INDENT, WINS_ABOVE, data_rows=False), color=SV_PGS,
+            fontsize=POSTER_NAME, fontweight="bold", ha="left", va="top")
+    ax.text(0, 1, lines[1], transform=shifted(ax, WINS_INDENT, WINS_ABOVE - first, data_rows=False), color=INK,
             ha="left", va="top")
-    ax.text(low + 0.005, upper - 0.019, f"Training N = {size:,}", color=INK, ha="left", va="top")
     # under the line, where no dot falls: what a dot and its bar are at the foot, the key to the black dots over them
     ax.text(right - 0.003, low + 0.003, "Dot: simulation\nBar: 95% CI", color=INK, ha="right", va="bottom",
             linespacing=1.0)
@@ -991,10 +1003,10 @@ sv_min_realized_r2)."""
 POSTER_GAIN, POSTER_GENOTYPES = 22.92, 11.4
 """Inches: the widths of the SV gain forest (the poster's middle column, build_pptx.py's MIDDLE) and the imputation
 figure (the left column, LEFT), each placed at its column's full width."""
-POSTER_GAIN_HEIGHT = 9.0
-"""Inches: the SV gain forest's height, which fills the middle column from the training-size figures to the References
-at its foot (build_pptx.py's layout leaves 0.02 in to spare)."""
-GAIN_WEIGHT, GAIN_OFFSET = 1.6, 0.24
+POSTER_GAIN_HEIGHT = 7.47
+"""Inches: the SV gain forest's height, which fills the middle column from the training-size figures to the band of
+Discussion, code and references at its foot (build_pptx.py's layout)."""
+GAIN_WEIGHT, GAIN_OFFSET = 2.0, 0.24
 """The SV gain forest's marks and intervals relative to the poster's (POSTER_MARK, POSTER_BAR), and the rows each
 source's interval sits above (true genotypes) or below (imputed SVs) its set's row."""
 FOREST_SIZES = SIZES[:3]

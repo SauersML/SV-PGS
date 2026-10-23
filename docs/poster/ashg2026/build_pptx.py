@@ -62,7 +62,7 @@ COLUMNS = ((MARGIN, LEFT), (MARGIN + LEFT + GUTTER, MIDDLE), (48 - MARGIN - RIGH
 INSET = 0.3
 """Text sits this far inside its column, under the section bars' labels."""
 BAR, BAR_SIZE = 1.25, 72
-BODY, HEADLINE, GLOSS, REFERENCE = 56, 60, 56, 50
+BODY, HEADLINE, GLOSS, REFERENCE, PENDING = 56, 60, 56, 28, 50
 LINE_PITCH = 1.066
 """Line pitch per point of type at 90% line spacing, measured on the LibreOffice render."""
 SHIFTED_PITCH = 0.25
@@ -140,7 +140,7 @@ def people(count: int) -> str:
 
 def copy(numbers: dict) -> dict:
     """The poster's sentences, each number from the gallery figure that shows it."""
-    accuracy, wins, gain, svs = numbers["fig1"], numbers["poster_wins"], numbers["poster_sv_gain"], numbers["fig5"]
+    accuracy, gain, svs = numbers["fig1"], numbers["poster_sv_gain"], numbers["fig5"]
     rows = gain["rows"]  # true and imputed: [mean, lower, upper, simulations]; share: [ratio, lower, upper]
     simulations = rows["all"]["true"][3] + rows["null"]["true"][3]
     return {
@@ -170,11 +170,15 @@ def copy(numbers: dict) -> dict:
         "aou": ["We imputed SVs from 12,212 long-read assemblies into 100,000 All of Us"
                 f"{cite('All of Us 2019 N Engl J Med')} genomes with GLIMPSE2{cite('Rubinacci 2023 Nat Genet')}",
                 *aou_matched()],
-        # the mean gain over the scatter's simulations at its training N (40,000). Without causal SVs the gain is
-        # positive at every training N, and at 40,000 the h² = 0.01 architecture gains about a quarter of the rest
+        # what the simulations mean. SV-PGS's AUC gain over LDpred2-auto at training N 40,000 holds without causal
+        # SVs (wins' null_gain, its 95% interval above 0), so causal SVs are not its source. Imputed SVs' gain is
+        # largest where the causal SVs are well imputed, where it matches the gain with true SV genotypes (the SV-gain
+        # forest's well_imputed and all rows: imputed share of the true gain about 1 against about a third)
         "discussion": [
-            f"SV-PGS gained {wins['gain'][0]:.3f} AUC over LDpred2-auto on whole chr22",
-            "The gain remained without causal SVs and was smaller at h² = 0.01",
+            "SV-PGS beat LDpred2-auto with and without causal SVs, so its advantage comes from the model and its "
+            "larger variant set",
+            "Adding imputed SVs helped most when the causal SVs were well imputed, so the gain depends on SV "
+            "imputation accuracy",
         ],
     }
 
@@ -190,27 +194,23 @@ def aou_matched() -> list[str]:
             "Variants with MAF ≥ 1% and imputation r² ≥ 0.3: HapMap3 SNVs and SVs"] if rows else []
 
 
-def baseline_relative(g: float) -> float:
-    """aou_gallery.baseline_relative: g, a change in r² as a fraction of the two models' mean r², as a fraction of the
-    r² without SVs, 2g / (2 - g), so the Discussion gives the same change the All of Us forest draws."""
-    return 2 * g / (2 - g)
-
-
 def signed(share: float) -> str:
     """A share in percent to one decimal, with a minus sign for a loss."""
     return f"{share * 100:.1f}%".replace("-", "−")
 
 
 def aou_result() -> list[str]:
-    """The All of Us result as one Discussion bullet when aou_numbers.json's "matched" holds the traits' "common" g: its
-    change in r² relative to the r² without SVs, with its 95% interval."""
+    """What the All of Us result means, as two Discussion bullets, when aou_numbers.json's "matched" holds the traits'
+    "common" g: the pre-specified primary's change in r² as a fraction of the two arms' mean r², whose one-sided 95%
+    upper bound ("relative_bound", in percent) caps the gain the traits could have from imputed SVs."""
     path = HERE / "aou_numbers.json"
     common = json.loads(path.read_text()).get("matched", {}).get("common") if path.is_file() else None
     if not common:
         return []
-    value, lower, upper = (baseline_relative(common[key] / 100) for key in ("relative", "relative_lower", "relative_upper"))
-    return [f"In All of Us, SVs changed r² by {signed(value)} (95% CI {signed(lower)} to {signed(upper)}) over "
-            f"{common['traits']} traits"]
+    return [f"In All of Us, imputed SVs raised r² by at most {signed(common['relative_bound'] / 100)} across "
+            f"{common['traits']} traits, so these traits have few SVs with large effects, or their causal SVs are "
+            "poorly imputed",
+            "Long-read SV genotypes in the same people would distinguish between these two explanations"]
 
 
 # ------------------------------------------------------------------ DrawingML
@@ -332,7 +332,7 @@ def placeholder(shape_id: int, x: float, y: float, width: float, height: float, 
     """A dashed panel where an All of Us figure will go."""
     text = "".join(
         Para([(words, flags)], size, bullet=False, colour=colour, after=after, align="ctr").xml()
-        for words, flags, size, colour, after in (("All of Us · result pending", "b", REFERENCE, TEAL, 18),
+        for words, flags, size, colour, after in (("All of Us · result pending", "b", PENDING, TEAL, 18),
                                                   (title, "b", HEADLINE, INK, 12), (detail, "", GLOSS, GREY, 0))
     )
     return (
@@ -651,14 +651,20 @@ def build() -> None:
         xml = delete(xml, shape_id)
     xml = duplicate(duplicate(xml, 93, 118, "Simulation results bar"), 93, 119, "All of Us bar")
 
+    # the template's References bar goes: the references are a small block at the end of the reading order
+    xml = delete(xml, 96)
+
     gallery = {name: GALLERY / f"{name}.png" for name in (
         "poster_wins", "poster_sv_gain", "poster_accuracy_by_training_size", "poster_imputation_accuracy",
         "poster_model")}
-    references = [Para([(f"{SUPERSCRIPT[index]}{reference}", "")], BODY, bullet=False, after=0)
-                  for index, reference in enumerate(REFERENCES, start=1)]
-    half = math.ceil(len(references) / 2)
-    # the poster reads Introduction and Methods, the simulation's results, All of Us, then Discussion at the foot of
-    # the last column. The references take the foot of the middle column in two columns.
+    # the four references in small type under the repository's QR code, one to a line
+    references = Block("text", [Para([(f"{SUPERSCRIPT[index]}{reference}", "")], REFERENCE, bullet=False, after=0)
+                                for index, reference in enumerate(REFERENCES, start=1)])
+    discussion = [bar(95, "Discussion"), text(bullets([*words["discussion"], *aou_result()]))]
+    ending = [code(words["code"]), references]
+    # the poster reads Introduction and Methods, the simulation's results, All of Us, then Discussion at the foot of the
+    # middle column, and the code and the references at the foot of the right one, the references in the poster's
+    # bottom right corner. The All of Us result (its common gain) adds two Discussion bullets and every trait's row.
     columns = [
         [
             bar(97, "Introduction"), text(bullets(words["introduction"])),
@@ -673,18 +679,17 @@ def build() -> None:
                 [figure(gallery["poster_wins"], legend=GALLERY / "fig2_gain_over_ldpred2.txt")]),
             Block("text", [Para([(words["gain_note"], "")], bullet=False, after=0)], gap="section"),
             figure(gallery["poster_sv_gain"]),
-            # the References bar a block's gap under the forest's axis title, so the forest takes the height
-            Block("bar", (96, "References"), gap="block"), row([text(references[:half])], [text(references[half:])]),
         ],
-        [
-            bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks(),
-            bar(95, "Discussion"), text(bullets([*aou_result(), *words["discussion"]])),
-            code(words["code"]),
-        ],
+        [bar(119, "All of Us"), text(bullets(words["aou"])), *aou_blocks()],
     ]
     poster = Poster(xml, rels, work / "ppt/media")
-    for (x, width), blocks in zip(COLUMNS, columns):
-        poster.stack(blocks, x, TOP, width, BOTTOM)
+    floors = [BOTTOM]
+    for (x, width), blocks in zip(COLUMNS[1:], (discussion, ending)):
+        top = BOTTOM - poster.stack_height(blocks, width)
+        poster.stack(blocks, x, top, width, None)
+        floors.append(top - GAPS["section"])
+    for (x, width), blocks, floor in zip(COLUMNS, columns, floors):
+        poster.stack(blocks, x, TOP, width, floor)
     xml = poster.xml.replace("</p:spTree>", "".join(poster.shapes) + "</p:spTree>")
     rels = poster.rels
 

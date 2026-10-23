@@ -133,11 +133,10 @@ def test_the_all_of_us_forest_marks_an_unconverged_fit_and_draws_the_common_gain
     plt.close(fig)
 
 
-def test_the_forest_and_the_discussion_give_the_change_relative_to_the_r2_without_svs():
+def test_the_forest_gives_each_traits_change_relative_to_the_r2_without_svs():
     # c = 0.12 against b = 0.10: g = 0.02 / 0.11, and the change relative to b is 20%
     g = 0.02 / 0.11
     assert aou_gallery.baseline_relative(g) == pytest.approx(0.2)
-    assert build_pptx.baseline_relative(g) == pytest.approx(0.2)
     # a weighted g maps to the weighted change relative to b with the same weights
     weights, before, after = np.array([2.0, 1.0]), np.array([0.10, 0.05]), np.array([0.11, 0.04])
     weighted = (weights * (after - before)).sum() / (weights * (after + before) / 2).sum()
@@ -145,10 +144,13 @@ def test_the_forest_and_the_discussion_give_the_change_relative_to_the_r2_withou
                                                                     / (weights * before).sum())
 
 
-def test_the_discussion_states_the_common_all_of_us_change_only_when_it_is_given(monkeypatch, tmp_path):
+def test_the_discussion_bounds_the_common_all_of_us_gain_only_when_it_is_given(monkeypatch, tmp_path):
     monkeypatch.setattr(build_pptx, "HERE", tmp_path)
     assert build_pptx.aou_result() == []
     (tmp_path / "aou_numbers.json").write_text(json.dumps({"matched": {"rows": [], "common": {
-        "relative": -2.0, "relative_lower": -4.0, "relative_upper": 0.5, "traits": 10}}}))
-    line, = build_pptx.aou_result()
-    assert line == "In All of Us, SVs changed r² by −2.0% (95% CI −3.9% to 0.5%) over 10 traits"
+        "relative": -2.0, "relative_lower": -4.0, "relative_upper": 0.5, "relative_bound": 0.1, "traits": 10}}}))
+    bound, follow_up = build_pptx.aou_result()
+    # the primary's one-sided 95% upper bound on the common g
+    assert bound == ("In All of Us, imputed SVs raised r² by at most 0.1% across 10 traits, so these traits have few "
+                     "SVs with large effects, or their causal SVs are poorly imputed")
+    assert follow_up == "Long-read SV genotypes in the same people would distinguish between these two explanations"

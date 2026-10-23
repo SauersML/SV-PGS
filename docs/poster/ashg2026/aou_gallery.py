@@ -39,12 +39,17 @@ from sim_gallery import (INK, POSTER_BAR, POSTER_LABEL, POSTER_MARK, POSTER_PAD,
 HERE = Path(__file__).resolve().parent
 NUMBERS = HERE / "aou_numbers.json"
 OUT = HERE / "figures"
-COLUMN = 9.8
-"""Inches: the poster's right column (build_pptx.py's RIGHT, 10.4) less its INSETs, each figure's width."""
-ROW_GAP = 0.2
+COLUMN = 10.4
+"""Inches: the poster's right column (build_pptx.py's RIGHT), each figure's width, so its type prints at its own size."""
+ROW_GAP = 0.05
 """Inches between one row's name and the next row's: a row is a line of poster type and this gap."""
 LABEL_GAP = 0.3
 """Inches between the widest row name and the plot."""
+HEIGHT = 13.08
+"""Inches: the least height of the gain forest, which fills the right column from its text to the band of Discussion,
+code and references at the poster's foot (build_pptx.py's layout). Rows taller than a line of type have marks up to
+MARK_GROWTH times the poster's."""
+MARK_GROWTH = 1.5
 TRAITS = {
     "ldl_cholesterol": "LDL cholesterol", "egfr": "eGFR", "hypertension": "Hypertension",
     "type_2_diabetes": "Type 2 diabetes", "coronary_artery_disease": "Coronary disease",
@@ -62,29 +67,32 @@ def trait_name(trait: str) -> str:
 
 def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list[float], tick_text, log: bool,
            reference: float | None = None, estimates: bool = False, bold: frozenset = frozenset(),
-           note: str | None = None):
+           note: str | None = None, least: float = 0.0):
     """A forest at the column's width in the imputed SVs' sky blue: a row per (label, estimate, low, high), its label
     at the left of the canvas and its interval level with it, each estimate an open mark as imputed SVs' are in the
     simulation figures (every All of Us SV is imputed), with the reference drawn (0, or 1 on a log axis, unless given).
     The axis runs from the first tick to the last, or with ``estimates`` symmetric about the reference over the
     estimates alone, so that each estimate's mark clears an arrowhead at the axis's end. Every margin and the rows'
-    pitch are measured from the type, so the forest is as short as its type allows. The labels in ``bold`` are set in
-    bold, and ``note`` is one line under the axis title."""
+    pitch are measured from the type, so the forest is as short as its type allows, unless ``least`` inches is taller:
+    then its rows share that height and its marks grow with them. The labels in ``bold`` are set in bold, and ``note``
+    is one line under the axis title."""
     reference = (1.0 if log else 0.0) if reference is None else reference
     fig = plt.figure(figsize=(COLUMN, 1.0))
     labels = [label for label, *_ in rows]
     weight = {label: "bold" if label in bold else "normal" for label in labels}
     pitch = max(tallest(fig, [label], fontsize=POSTER_STYLE["font.size"], fontweight=weight[label])
                 for label in labels) + ROW_GAP
-    # an arrowhead at the axis's start reaches half its width to the left, toward the names
-    arrow = POSTER_MARK * 0.7 / 2 / 72
-    left = max(widest(fig, [label], fontsize=POSTER_STYLE["font.size"], fontweight=weight[label])
-               for label in labels) + LABEL_GAP + arrow
     # the right margin holds half of the end tick's label; the bottom, the ticks and the axis title
     right = widest(fig, [tick_text(ticks[-1])], fontsize=POSTER_STYLE["font.size"]) / 2 + POSTER_PAD
     line = tallest(fig, [note], fontsize=POSTER_STYLE["font.size"]) + POSTER_PAD if note else 0.0
     top, bottom = POSTER_PAD, under_axes(fig, [xlabel]) + line
-    height = top + bottom + pitch * len(rows)
+    height = max(top + bottom + pitch * len(rows), least)
+    growth = min((height - top - bottom) / len(rows) / pitch, MARK_GROWTH)
+    mark, bar, ring = POSTER_MARK * growth, POSTER_BAR * growth, 6.0 * growth
+    # an arrowhead at the axis's start reaches half its width to the left, toward the names
+    arrow = mark * 0.7 / 2 / 72
+    left = max(widest(fig, [label], fontsize=POSTER_STYLE["font.size"], fontweight=weight[label])
+               for label in labels) + LABEL_GAP + arrow
     fig.set_size_inches(COLUMN, height)
     ax = frame(fig, left, bottom, COLUMN - left - right, height - top - bottom)
     if log:
@@ -92,19 +100,19 @@ def forest(rows: list[tuple[str, float, float, float]], xlabel: str, ticks: list
     low_limit, high_limit = ticks[0], ticks[-1]
     if estimates:
         # inches each estimate keeps from the axis's end: its mark's radius and edge, an arrowhead's half, and a pad
-        clear = (POSTER_MARK / 2 + 3.0) / 72 + arrow + POSTER_PAD
+        clear = (mark / 2 + ring / 2) / 72 + arrow + POSTER_PAD
         reach = max(abs(value - reference) for _, value, _, _ in rows) / (1 - 2 * clear / (COLUMN - left - right))
         reach = max(reach, reference - ticks[0], ticks[-1] - reference)
         low_limit, high_limit = reference - reach, reference + reach
     for row, (label, value, low, high) in enumerate(rows):
-        ax.hlines(row, max(low, low_limit), min(high, high_limit), color=SKY, linewidth=POSTER_BAR, zorder=3,
+        ax.hlines(row, max(low, low_limit), min(high, high_limit), color=SKY, linewidth=bar, zorder=3,
                   capstyle="round")
         for end, edge, marker in ((low, low_limit, "<"), (high, high_limit, ">")):
             if (end < edge) if marker == "<" else (end > edge):
-                ax.plot([edge], [row], marker=marker, markersize=POSTER_MARK * 0.7, color=SKY, markeredgewidth=0,
+                ax.plot([edge], [row], marker=marker, markersize=mark * 0.7, color=SKY, markeredgewidth=0,
                         zorder=3, clip_on=False)
-        ax.plot([value], [row], "o", markersize=POSTER_MARK, color=SKY, markerfacecolor="white", markeredgecolor=SKY,
-                markeredgewidth=6.0, zorder=4)
+        ax.plot([value], [row], "o", markersize=mark, color=SKY, markerfacecolor="white", markeredgecolor=SKY,
+                markeredgewidth=ring, zorder=4)
         ax.text(0, row, label, transform=shifted(ax, -left), ha="left", va="center", fontweight=weight[label])
     ax.axvline(reference, color=INK, linewidth=4.0, zorder=2)
     ax.set_yticks([])
@@ -138,7 +146,7 @@ def baseline_relative(g: float) -> float:
     """g, the change in r² from adding SVs as a fraction of the two models' mean r², as a fraction of the r² without SVs:
     (c - b) / ((c + b) / 2) = g gives (c - b) / b = 2g / (2 - g). The map increases, so it takes an interval's ends to
     the same interval's ends, and a weighted g, sum a (c - b) / sum a (c + b) / 2, to sum a (c - b) / sum a b with the
-    same weights. build_pptx.py's aou_result uses the same map."""
+    same weights."""
     return 2 * g / (2 - g)
 
 
@@ -151,21 +159,22 @@ COMBINED = "All traits"
 
 def gain_figure(matched: list[dict], common: dict | None = None) -> tuple:
     """Each trait's change in held-out partial r² from adding SVs, relative to the r² without SVs (baseline_relative of
-    the pre-specified g), with its 95% interval, a row per trait, and a bold row for the traits' common g when
-    ``common`` is given. A trait whose with-SV fit stopped before converging has a dagger, explained under the axis."""
-    def ends(row):
-        return [baseline_relative(row[key] / 100) for key in ("relative", "relative_lower", "relative_upper")]
-
-    rows = [(trait_name(row["trait"]) + ("†" if row.get("unconverged") else ""), *ends(row)) for row in matched]
+    the pre-specified g), with its 95% interval, a row per trait, and when ``common`` is given a bold row for the traits'
+    common g itself, relative to the two arms' mean r². The two scales differ by about 0.1 percentage point at these
+    gains, so one axis title serves both. A trait whose with-SV fit stopped before converging has a dagger, explained
+    under the axis."""
+    keys = ("relative", "relative_lower", "relative_upper")
+    rows = [(trait_name(row["trait"]) + ("†" if row.get("unconverged") else ""),
+             *(baseline_relative(row[key] / 100) for key in keys)) for row in matched]
     if common:
-        rows.append((COMBINED, *ends(common)))
+        rows.append((COMBINED, *(common[key] / 100 for key in keys)))
     note = UNCONVERGED if any(row.get("unconverged") for row in matched) else None
     # the axis spans the estimates, not their intervals; an interval that runs past it ends in an arrowhead
     fig = forest(rows, "Change in r² with SVs (%)", span([value for _, value, _, _ in rows]), percent, log=False,
-                 estimates=True, bold=frozenset({COMBINED}), note=note)
+                 estimates=True, bold=frozenset({COMBINED}), note=note, least=HEIGHT)
     return fig, ["Change in held-out partial r² from adding SVs to SV-PGS for each trait, relative to the r² without "
                  "SVs, with 95% intervals, an arrowhead marking an interval that runs past the axis"
-                 + (", and the traits' common change in bold" if common else "")]
+                 + (", and in bold the traits' common change relative to the two models' mean r²" if common else "")]
 
 
 def main() -> None:
