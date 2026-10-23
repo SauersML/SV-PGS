@@ -1,5 +1,5 @@
 """Stage 2's EP linear response by block flexible GCRO-DR: every direction in one block Krylov space, a read-free
-block-local preconditioner, and a subspace recycled across outer steps (lane speed-recycle).
+block-local preconditioner, and a subspace recycled across outer steps.
 
 The total curvature B needs the cavity response dP to every coefficient direction (``scale_mixture_ep.
 _total_curvature_columns``): the fixed point of an affine map whose linear part is

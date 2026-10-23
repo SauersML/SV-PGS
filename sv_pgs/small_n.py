@@ -28,8 +28,8 @@ r' Sigma r, the variances diag Sigma, and no cavity-information certificate (the
 The genotype side is Stage 0's (``genotype_statistics``) on a dense training matrix: signed codes (code - 127), their
 training means and population SDs, every polymorphic record active (no rarity or other threshold filter: SPEC), and
 exact ties (equal or negated standardized columns) found by the same integer test, over the whole window rather than
-within an LD block. Tie members keep their own effects, sites and class priors (review-mathbugs T1, lead ruling;
-``tie_members.TieGroups`` is the shared representation): only ``_Design`` aggregates them, inside the kernel, so the
+within an LD block. Tie members keep their own effects, sites and class priors
+(``tie_members.TieGroups`` is the shared representation): only ``_Design`` aggregates them, inside the kernel, so the
 kernel costs what the tie groups do, and the posterior's p x p work runs on the units of members that share a group
 and a site (``_Kernel.units``). The variance JVP forms Sigma o Sigma once per fixed point when it fits its memory share (one GEMM
 per call after that), else works from the factors at O(n^2 p) per column (see ``_DensePosterior``).
@@ -109,7 +109,7 @@ _EXACT_RESPONSE_MATRICES = 2
 
 
 class _Design:
-    """Xp over the model's effects (review-mathbugs T1, lead ruling): exact-tie members keep their own effects, so the
+    """Xp over the model's effects: exact-tie members keep their own effects, so the
     columns are the members, in oriented coordinates (member j's column is its group's x_g, its effect gamma_j = s_j
     beta_j, whose prior is beta_j's: every prior is symmetric). Duplicates are aggregated only here: Xp = P G A' with
     P = I - Q Q' (Q an orthonormal basis of the covariates' columns), G ``carriers`` (n x groups, dense, Fortran-ordered)
@@ -269,7 +269,7 @@ class DenseStatistics:
 
     ``active_rows`` are the input columns with training variance (the store rows of ``fast_scoring``), ``means`` and
     ``scales`` their signed-code means and population SDs, ``tie_map`` their exact ties and ``ties`` the same as
-    ``tie_members.TieGroups`` (each member's group and sign). Every effect is a member's (review-mathbugs T1): ``design``
+    ``tie_members.TieGroups`` (each member's group and sign). Every effect is a member's: ``design``
     is Xp = (I - H_C) X~ over the members in oriented coordinates (``_Design``; member j's effect gamma_j = s_j beta_j),
     ``loading`` = C' X~ in the same coordinates (k x members), and ``projected_target`` = (I - H_C) y.
     """
@@ -463,7 +463,7 @@ class _Kernel:
         # A positive site's variance by Woodbury is d (1 - d q) + f (d = 1/t, q = x_j' K^-1 x_j): 1 - d q carries d q's
         # rounding amplified by d q / (1 - d q) = x_j' K_-j^-1 x_j / t_j <= ||x_j||^2 / t_j (K_-j >= I). So a site stays
         # in the bulk only where that amplification is at most 1, t_j >= ||x_j||^2; every other one goes by the Schur
-        # route, which never inverts t and is exact for any sign (review-mathbugs K1: at t_j = 1e-8 ||x_j||^2 the
+        # route, which never inverts t and is exact for any sign (at t_j = 1e-8 ||x_j||^2 the
         # Woodbury variance was 770% off an exact rational reference).
         bulk_mask = (scaled_precision > 0.0) & (scaled_precision >= design.squares)
         self.bulk = np.flatnonzero(bulk_mask)
@@ -589,7 +589,7 @@ class _Kernel:
         and t agree; tied rare variants under one prior reach one site by symmetry), and each member of the rest on
         its own. Then A'^-1 = E G E' + diag(delta) over the members, with G = -Phi_u'Phi_u + Psi_u'Psi_u on the units
         (E the members' unit indicator, delta = 1/t on the bulk, 0 on the rest): p_units ~ the tie groups, not the
-        members (review-mathbugs T1)."""
+        members."""
         if self._units is None:
             groups = self.design.members
             key = np.column_stack([groups[self.bulk].astype(np.float64), self.precision[self.bulk]])
@@ -944,7 +944,7 @@ def _loop_point(
     variance = noise * kernel.variances()
     log_normalizer, tilted_mean, tilted_variance, third, fourth = tilted(cavity_precision, marginal_shift - site_shift)
     values = (log_normalizer, tilted_mean, tilted_variance, third, fourth)
-    # A computed tilted variance of 0 (the engine's below-floor approximation, not the model: review-mathbugs N1) has no
+    # A computed tilted variance of 0 (the engine's below-floor approximation, not the model) has no
     # finite site: outside the domain.
     if not (all(np.all(np.isfinite(value)) for value in values) and np.all(tilted_variance > 0.0)):
         return None
@@ -1129,7 +1129,7 @@ def double_loop_sites(
     while True:
         profile["double_loop_outer"] += 1
         if trace is not None:
-            # Verification only (theory-ep's exact decrease check): the EC free energy at each outer step's start.
+            # Verification only: the EC free energy at each outer step's start.
             trace.append(_ec_free_energy(design, noise, data_score, precision, shift, tilted, largest_variance))
         kernel = _Kernel(design, noise * precision)
         mean = kernel.solve(data_score + noise * shift)
@@ -1198,7 +1198,7 @@ def double_loop_sites(
                 )
                 # Sufficient decrease: at least half of the quadratic model's own decrease along the step, which for a CG
                 # iterate (d'Hd = -g'd = decrement) is fraction (1 - fraction / 2) decrement. Plain decrease can accept
-                # vanishing decreases and stall short of the minimum (theory-ep); this is Armijo with c = 1/4 at
+                # vanishing decreases and stall short of the minimum; this is Armijo with c = 1/4 at
                 # fraction <= 1, and it keeps every exact Newton step on a quadratic.
                 model = fraction * (1.0 - 0.5 * fraction) * decrement
                 if candidate is not None and candidate.value <= point.value - 0.5 * model:
@@ -1232,7 +1232,7 @@ def double_loop_sites(
 
 def _log_evidence(design: _Design, noise: float, data_score: F64Array, site_precision: F64Array, site_shift: F64Array, tilted: Tilted) -> float:
     """log Z_EP at these sites, up to terms shared by every candidate at the same hyperparameters and noise (the
-    fixed-point selection's criterion, lead ruling; ``tests/ep_eb_reference.site_state``'s log_evidence in small_n's
+    fixed-point selection's criterion, ``tests/ep_eb_reference.site_state``'s log_evidence in small_n's
     units): 1/2 r' A'^-1 r / sigma^2 - 1/2 log |A'| + p/2 log sigma^2 + sum_j log Z~_j - sum_j (m_j^2 / (2 v_j) + log(v_j) / 2),
     r = Xp'y + sigma^2 nu, with every cavity from the kernel without cancellation."""
     kernel = _Kernel(design, noise * site_precision)
@@ -1321,7 +1321,7 @@ def _best_double_loop(
     draw_count: int, jvp_bytes: int, profile: dict,
 ) -> tuple[F64Array, F64Array]:
     """The double loop from every start whose precision is positive definite (its only condition: an improper cavity
-    only reseeds the inner problem), keeping the fixed point with the highest log Z_EP (lead ruling: EP's fixed point
+    only reseeds the inner problem), keeping the fixed point with the highest log Z_EP (EP's fixed point
     is not unique in general, and the selection is by the evidence)."""
     best: tuple[float, F64Array, F64Array] | None = None
     for precision, shift in starts:
@@ -1418,7 +1418,7 @@ class _DenseFixedPoints:
         is not positive definite or a cavity's tilted law is not proper, the offending variants are solved back into
         EP's domain by the double loop (``_repair``, growing the set while the rest's cavities leave it) rather than by
         halving negative sites: each halving costs a full
-        build, erases the step that led there and returns the same targets (theory-ep's fix (2): a cycle of 33
+        build, erases the step that led there and returns the same targets (a cycle of 33
         halvings per refresh on svpgs-profiler's g3 [real]).
 
         A cavity is proper when its tilted law is, 1 + v P > 0 at every lattice node, which admits a negative cavity
@@ -1452,7 +1452,7 @@ class _DenseFixedPoints:
                 # Cholesky's own breakdown, not EP's domain.
                 raise NoFixedPoint(failure)
             # A repaired set's new sites, negative ones included, couple into the rest, so a cavity there can leave the
-            # domain after a correct repair: A grows by it and is solved again (theory-ep). A only grows, so this ends;
+            # domain after a correct repair: A grows by it and is solved again. A only grows, so this ends;
             # at A = every variant it is the whole problem's double loop, which reaches a fixed point in the domain (the
             # EC existence argument, with the lattice's finite top), so a set that cannot grow is numerics.
             grown = offending | negative | (improper if improper is not None else False)
@@ -1467,11 +1467,11 @@ class _DenseFixedPoints:
 
     def _repair(self, hyperparameters: MixtureHyperparameters, offending: F64Array) -> None:
         """Solve the ``offending`` variants (improper cavities, non-positive sites) and their tie groups, A, back into
-        EP's domain at the rest's sites by the double loop (theory-ep's fix (2)). At fixed bulk sites (all positive
+        EP's domain at the rest's sites by the double loop. At fixed bulk sites (all positive
         here) A's posterior is exact by the Schur complement (``_conditional_block``), A's problem is small-n EP with
         the whitened design, and the double loop's convex inner problem is +inf outside EP's domain, so every step it
         takes keeps every cavity proper; it starts from A's current sites where they lie in A's domain, and from the
-        prior's moment-matched ones, keeping the fixed point with the highest log Z_EP (lead ruling). One bulk build
+        prior's moment-matched ones, keeping the fixed point with the highest log Z_EP. One bulk build
         and |A|-scale work, against a full build per halving."""
         members = self.design.members
         active = np.flatnonzero(np.isin(members, np.unique(members[np.flatnonzero(offending)])))
@@ -1541,8 +1541,8 @@ class _DenseFixedPoints:
         return tilted
 
     def _targets(self, hyperparameters: MixtureHyperparameters, cavity: Cavity) -> tuple[F64Array, F64Array]:
-        """The mean-matched sites; ``NoFixedPoint`` where a computed tilted variance is 0 or a moment is not finite
-        (review-mathbugs N2). The model's tilted laws always have positive variance; a zero one is the engine's
+        """The mean-matched sites; ``NoFixedPoint`` where a computed tilted variance is 0 or a moment is not finite.
+        The model's tilted laws always have positive variance; a zero one is the engine's
         flat-kernel approximation below the lattice floor (v = 0 there, N1, e2e's) putting all of a far trial's mass on
         those nodes. No finite site matches it, so the trial is refused and the outer loop halves it."""
         started = time.perf_counter()
@@ -1599,7 +1599,7 @@ class _DenseFixedPoints:
             self.mean_move = 2.0 * divergence
             # The check bounds the undamped step, and the distance to the fixed point is the step over 1 - rho, rho
             # the iteration's rate: KL_step / (1 - rho)^2, with rho = sqrt(KL_t / KL_(t-1)) from successive refreshes
-            # (theory-ep: no extra build; the step's own KL where no rate is known yet, and no certificate while the
+            # (no extra build; the step's own KL where no rate is known yet, and no certificate while the
             # iteration does not contract).
             rate = float(np.sqrt(divergence / previous_divergence)) if previous_divergence else 0.0
             distance = divergence / (1.0 - rate) ** 2 if rate < 1.0 else np.inf
@@ -1666,7 +1666,7 @@ class _DenseFixedPoints:
                     break
                 except np.linalg.LinAlgError:
                     fraction *= 0.5
-                # Written so that a non-finite step also ends the halving (review-mathbugs N2).
+                # Written so that a non-finite step also ends the halving.
                 if not fraction * move > _EPSILON * scale:
                     # PD failures halved the damped step to the sites' rounding: no damped EP pass keeps the precision
                     # positive definite from here, so EP falls back to the convergent double loop.
@@ -1716,7 +1716,7 @@ def small_n_prior(
     annotations: Mapping[str, np.ndarray] | None = None, codes_per_unit: np.ndarray | None = None,
     calibration_slope: np.ndarray | None = None,
 ) -> ScaleMixturePrior:
-    """The run wiring's prior (``stage2_wiring._fit_group``) over every member (review-mathbugs T1: an exact-tie member
+    """The run wiring's prior (``stage2_wiring._fit_group``) over every member (an exact-tie member
     keeps its own class and offset, so an SV tied to SNVs keeps the SV prior): one class per variant class present,
     each member's unit offset log(kappa^2 Var(D)) from the unit contract of its input column
     (``imputation_reliability.ColumnMeasurement``: ``log_variance_offset`` is each column's log reliability log r^2,
@@ -2011,7 +2011,7 @@ def fit_small_n(
                 if point is not None:
                     firsts.append((probe, shared))
             solves.append(shared)
-    # The quadrature at the fitted states (review F17): the start lattice is derived from single-variant likelihoods at
+    # The quadrature at the fitted states: the start lattice is derived from single-variant likelihoods at
     # the start, which certify nothing about a fitted density that concentrates more sharply or puts mass at a lattice
     # end. Each solve's normalizers and tilted moments are compared at its own fitted state on the refined and the
     # extended lattice (``lattice_check``); where any comparison fails, every solve continues from its fitted state on
@@ -2072,7 +2072,7 @@ def fit_small_n(
         alpha = statistics.covariate_pseudo_inverse @ (statistics.covariates.T @ statistics.target - statistics.loading @ mean)
         covariate_draws = alpha[:, None] - statistics.covariate_pseudo_inverse @ statistics.loading @ (draws - mean[:, None])
         covariate_covariance = noise * statistics.covariate_pseudo_inverse
-    # Every member is its own effect (review-mathbugs T1): beta_j = s_j gamma_j on its own standardized column, with
+    # Every member is its own effect: beta_j = s_j gamma_j on its own standardized column, with
     # no split of a group's effect; the identity map carries each member's own mean and draws.
     member_count = statistics.active_rows.shape[0]
     scoring = ScoringModel.from_reduced_fit(

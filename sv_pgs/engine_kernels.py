@@ -1,7 +1,7 @@
 """The engine's per-variant loops over the mixing lattice as fused CUDA kernels.
 
 ``scale_mixture_ep`` evaluates, for every effect j of class c and every lattice node k with variance
-v = u_j e^t_k (at every node, below the kernel floor too: review-mathbugs N1), the tilted component
+v = u_j e^t_k (at every node, below the kernel floor too), the tilted component
 
     log pi_ck - log1p(v P_j) / 2 + h_j^2 v / (2 (1 + v P_j)),
 

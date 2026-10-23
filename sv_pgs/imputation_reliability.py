@@ -6,7 +6,7 @@ per record: the prior is on raw effects (per ALT allele, per copy), and its stan
 kappa^2 Var(D) tau^2 = r^2 Var(G) tau^2 with kappa = Cov(G, D) / Var(D) the calibration slope. For a calibrated
 conditional mean (kappa = 1) the reliability is already in Var(D) and enters only the true genotype's variance
 Var(G) = Var(D) / r^2, the frequency function's argument; a prior offset of log r^2 on top of the per-unit
-log Var(D) counted it twice (review F21). r^2, a squared correlation, is invariant to affine maps of D, such as
+log Var(D) counted it twice. r^2, a squared correlation, is invariant to affine maps of D, such as
 the codec's scale and centring; a non-affine map changes it. The piece here:
 
 - ``ColumnMeasurement``: raw unit, encoding scale, calibration slope and
@@ -70,7 +70,7 @@ class ColumnMeasurement:
     A calibrated conditional mean, D = E[G | O] for the evidence O (a GLIMPSE2 or Beagle DS, the measurement step's
     recalibrated D*, a hard call measured exactly), has Cov(G, D) = Var(D), so kappa = 1: its reduced variance already
     carries the lost information, r^2 = Var(D) / Var(G), and multiplying the prior by r^2 again would shrink a poorly
-    measured column twice (Var(beta) = r^2 Var(D) tau^2 = r^4 Var(G) tau^2; review F21). The reliability instead enters
+    measured column twice (Var(beta) = r^2 Var(D) tau^2 = r^4 Var(G) tau^2). The reliability instead enters
     through Var(G), the frequency function's argument. A deliberately uncalibrated column (a confident draw, whose
     variance stays near Var(G)) has kappa^2 = r^2 Var(G) / Var(D) < 1 and takes it here, measured from truth pairs
     (``measurement_model.fit_measurement_model``'s scales), never guessed from its r^2.

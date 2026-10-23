@@ -25,7 +25,7 @@ the rest of the hyperparameters. Nothing here is chosen by hand:
   numeric columns are 0 on a missing row, a continuous annotation gets a missing-state column, and a factor gets
   a missing level. So an annotation constant where observed but missing elsewhere keeps its missing state (its
   observed level is the missing state's complement after class centring), and a binary annotation's unknown stays
-  apart from its false (review F19).
+  apart from its false.
 
 The design is class-centred (the class densities carry each class's location) and rank-screened once, in the order
 the columns are built, against the class-centred Gram the prior itself tests (``scale_mixture_prior``: its least
