@@ -14,7 +14,7 @@
 # the mean-field sweep's CUDA and check test files alone.
 # GPU_COUNT=1 STEPS=bench measures the sweep alone on one A100, GPU_COUNT=1 STEPS=stage0 Stage 0 alone.
 # JOB_ID, MACHINE_TYPE, GPU_TYPE and RUN_DISK_GB may be overridden. JOB_SECONDS includes VM task environment
-# preparation; the smoke command itself has a separate 300-second deadline, the benchmark 600 seconds, the Stage 0
+# preparation; the smoke command itself has a separate 300-second deadline, the benchmark 900 seconds, the Stage 0
 # benchmark STAGE0_BENCH_SECONDS (default 900), the CUDA test files PYTEST_SECONDS (default 1200). No task retries hide
 # a failure.
 # Use "spec" instead of "submit" to print the JSON without submitting. Logs go to Cloud Logging and to
@@ -34,7 +34,7 @@ smoke_task() {
     export LD_LIBRARY_PATH="$(ls -d "$RUN"/venv/lib/python3.12/site-packages/nvidia/*/lib | paste -sd:)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export TMPDIR="$RUN/tmp" PYTHONUNBUFFERED=1
     cd "$RUN/source"
-    # The smoke command first, the mean-field sweep's benchmark (its own ten-minute deadline), then every CUDA test
+    # The smoke command first, the mean-field sweep's benchmark (its own fifteen-minute deadline), then every CUDA test
     # file (env.tar's cache holds the dev group, pytest included): the CUDA tests skip on a laptop and on CI, so this
     # job is where they run. Any of them failing fails the task. The Stage 0 benchmark (stage0: Stage 0 and the steps up
     # to the EB, old against new on one GPU, FAIL where a pair disagrees) runs only where STEPS names it.

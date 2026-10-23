@@ -29,15 +29,15 @@ Each warm time is extrapolated per member to the All of Us whole-genome fits' 1.
 group [real]: a sweep's work is per panel, and every panel has the same work. The codes are uniform random int8 (no
 participant data; a panel's chain does not depend on their values), 146 lattice nodes and 21 covariates [real], 44,000
 samples [real: 1.7e4 to 4.4e4 per group], blocks of ~18,700 members (1.0e6 members in ~55 LD blocks [real]). At the
-defaults the codes take 23 GB of one A100-40GB and the arm's Grams 2.4 GB more, and the whole command about 3-6
-minutes.
+defaults the codes take 23 GB of one A100-40GB and the arm's Grams 2.4 GB more, and the whole command about 10
+minutes (595 s on one A100 at ceac575).
 
 Checks print PASS/FAIL with their times: model 0's old sweep against its new sweep from the same start (rtol 1e-8:
 the same members, order and panels, other summation orders), and model 0 swept alone and among nine models against its
 sweep among three (bit for bit); every arm trait's residual zero off its training rows and its moments zero on the
 members it does not have, and trait 0 swept alone against its sweep among eleven (bit for bit). A RESULT line gives
 old and new seconds per sweep at 1.0e6 members, and the arm's eleven traits in one pass against eleven one-trait
-sweeps. A ten-minute
+sweeps. A fifteen-minute
 subprocess deadline includes imports, the codes' synthesis and kernel compilation; a timeout is a FAIL. ``--host``
 runs the new route's harness on numpy with its reference kernels (``HostPanelKernels``), at a size the host can take,
 and skips the old route, which needs CUDA.
@@ -64,7 +64,7 @@ WIDE_MODELS = 9
 NODES = 146
 COVARIATES = 21
 WHOLE_GENOME_MEMBERS = 1_000_000
-TIMEOUT_SECONDS = 600
+TIMEOUT_SECONDS = 900
 CHECK_RTOL = 1e-8
 WORKSPACE_BYTES = 1 << 26
 CODE_ROWS_PER_DRAW = 1024
@@ -498,7 +498,7 @@ def main(argv=None):
     parser.add_argument("--blocks", type=int, default=BLOCKS)
     parser.add_argument("--devices", type=int, default=DEVICES, help="GPUs to plan the blocks over (default: 1)")
     parser.add_argument("--host", action="store_true", help="the new route's harness on numpy, its reference kernels, no old route")
-    parser.add_argument("--timeout-seconds", type=float, default=TIMEOUT_SECONDS, help="whole command deadline, including compilation (default: 600)")
+    parser.add_argument("--timeout-seconds", type=float, default=TIMEOUT_SECONDS, help="whole command deadline, including compilation (default: 900)")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.worker:
