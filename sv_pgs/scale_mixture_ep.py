@@ -4850,6 +4850,13 @@ def _predicted_gain(newton: _NewtonB, proposal: F64Array) -> float:
     return float(newton.gradient @ proposal) - 0.5 * float(proposal @ newton.total @ proposal)
 
 
+def _ratio_defined(realized: float, predicted: float) -> bool:
+    """Whether the trust-region ratio of the ``realized`` gain to the ``predicted`` one is defined and positive: both
+    gains finite and positive, and their quotient finite. Two finite gains can still give an infinite ratio, as a
+    prediction of 1e-320 against a realized 1e-3 does."""
+    return bool(np.isfinite(realized) and realized > 0.0 and np.isfinite(predicted) and predicted > 0.0 and np.isfinite(realized / predicted))
+
+
 def _next_radius(newton: _NewtonB, proposal: F64Array, radius: float, length: float, realized: float, resolution: float) -> float:
     """The trust radius after an accepted inner step of ``length`` inside ``radius``, from the model's measured
     agreement along it (the trust-region update; Nocedal and Wright, Numerical Optimization, 2nd ed., Section 4.1, its
@@ -5880,9 +5887,9 @@ def fit_hyperparameters(
                 # the state's own error was 9.6 nats.
                 mode_gain = 0.5 * float((newton.gradient + gradient) @ proposal)
                 # The trust-region test (Nocedal and Wright, Algorithm 4.1): a step whose ratio of realized to predicted
-                # gain is undefined (either gain not finite, or a prediction of no gain) is refused and shortened.
-                predicted = _predicted_gain(newton, proposal)
-                accepted = np.isfinite(mode_gain) and mode_gain > 0.0 and np.isfinite(predicted) and predicted > 0.0
+                # gain is undefined (either gain not finite, a prediction of no gain, or a quotient past double
+                # precision's range) is refused and shortened.
+                accepted = _ratio_defined(mode_gain, _predicted_gain(newton, proposal))
             left = False
             # A walk from a state with no certified value and none to return to (no release in flight, no departed
             # state): the model has never held a certified state, and the walk is the search for a first one.

@@ -1892,6 +1892,18 @@ def test_the_trust_radius_follows_the_models_measured_agreement():
     assert _next_radius(SimpleNamespace(gradient=np.array([1.0, 0.0]), total=np.diag([3.0, 1.0])), proposal, 1.0, 1.0, 0.5, 1e-6) == 1.0
 
 
+def test_an_inner_step_is_accepted_only_where_its_trust_region_ratio_is_defined():
+    """``_ratio_defined``: both gains finite and positive and their quotient finite. Two finite positive gains whose
+    quotient overflows (a prediction of 1e-320 against a realized 1e-3) leave the ratio undefined, so the step is
+    refused."""
+    from sv_pgs.scale_mixture_ep import _ratio_defined
+
+    assert _ratio_defined(0.5, 1.0) and _ratio_defined(1e-300, 1e-300)
+    assert not _ratio_defined(1e-3, 1e-320) and 1e-3 / 1e-320 == np.inf
+    for realized, predicted in ((0.0, 1.0), (-1.0, 1.0), (np.nan, 1.0), (np.inf, 1.0), (1.0, 0.0), (1.0, -1.0), (1.0, np.nan), (1.0, np.inf)):
+        assert not _ratio_defined(realized, predicted), (realized, predicted)
+
+
 def test_the_moving_rows_kernel_is_the_log_sum_exp_of_the_kernel_terms():
     # The linear-term sum (one exponential and one square root a node) against the log-sum-exp of _kernel_terms, at
     # ordinary rows and at the edges it hands to the exact form: overflowing and underflowing scales, a near-improper
